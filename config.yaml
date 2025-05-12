@@ -1,0 +1,96 @@
+# General settings
+config_dir: null # overwrite by --config-path
+seed: null
+debug: false
+inference: false
+load: null  # path to pth file or 'true' when checkpoint exists in config_dir
+
+
+# Dataset configuration
+dataset:
+  data_root: "/root/gene/data"
+  name: null  # Main dataset name
+  test_dataset: null
+  resolution: '2k' # 'base' or '2k'
+  video_length: 5
+  color_aug: true
+  crop_type: null  # 'center', 'random', or null
+  res_resize_factor: 1.0
+  stride: 2
+  dataset_split: "train"
+  train_datasets: [mvs-synth, dynamicreplica, tartanair, pointodyssey, spring]  # Comma-separated list of dataset names
+  val_datasets: [sintel,waymo]  # Comma-separated list of validation dataset names
+
+# Training configuration
+training:
+  batch_size: 4
+  workers: 10
+  gradient_checkpointing: false
+  save_freq: 1000
+  val_freq: 1000
+  vis_freq: 1000
+  total_iters: 60001
+  gradient_accumulation: 1
+  loss_type: "l1"
+  wandb: false
+  wandb_name: "experiment"
+  start_with_val: false
+  
+  
+  # Learning rate configuration
+  lr:
+    vit: 5.0e-6  # Set to 0 to freeze
+    fusion: 1.0e-4
+    dpt: 5.0e-5
+    head: 5.0e-5
+    mamba: 1.0e-4
+    warmup_steps: 1000
+
+# Model configuration
+model:
+  # ViT configuration
+  vit_size: "vits"
+  patch_size: 14
+  attn_class: "MemEffAttention"
+
+  # Mamba configuration
+  use_mamba: true
+  mamba_type: "add"
+  num_mamba_layers: 4
+  downsample_mamba: [0.1]
+  mamba_pos_embed: null
+  mamba_in_dpt_layer: [3]
+  mamba_d_conv: 4
+  mamba_d_state: 256
+  use_hydra: false # https://github.com/goombalab/hydra
+  use_transformer_rnn: false
+
+# hybrid model configuration
+hybrid_configs:
+  use_hybrid: true
+  teacher_model_path: null
+  teacher_resolution: 518
+  downsample: "interpolate"
+  same_tokenizer: true
+  cross_attention_type: "full"
+  layers_to_skip: [1,2,3] # only the 0th index (i.e. path 4 in dpt) is used for fusion
+  num_blocks: 4
+  mlp_expand: 2
+  num_heads: 2
+
+
+# Evaluation configuration
+eval:
+  compile: true
+  metrics: false
+  save_grid: false
+  outfolder: "test"
+  test_datasets: [unreal4k,sintel,eth3d,waymo,urbansyn]
+  test_dataset_resolution: '2k'
+  random_input: null
+  out_mp4: false
+  save_res: 518
+  save_depth_npy: true
+  save_vis_map: false
+  dummy_timing: false
+  large_dir: null
