@@ -83,7 +83,7 @@ class HybridFusion(nn.Module):
             ])
 
     
-        logging.info('HybridFusion: layers to skip, num_blocks, num_heads, mlp_expand: %s, %s, %s, %s', layers_to_skip, num_blocks, num_heads, mlp_expand)
+        #logging.info('HybridFusion: layers to skip, num_blocks, num_heads, mlp_expand: %s, %s, %s, %s', layers_to_skip, num_blocks, num_heads, mlp_expand)
 
 
     def forward(self, x, context, path_idx):

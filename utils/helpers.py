@@ -5,7 +5,6 @@ from torch.optim import Optimizer
 from torch.optim.lr_scheduler import _LRScheduler
 import torch.distributed as dist
 import matplotlib
-from plyfile import PlyData, PlyElement
 import logging
 import json, argparse
 import re
@@ -101,23 +100,6 @@ def test_step(model, test_dataloader):
     
     model.train()
     return avg_loss, test_loss_details
-
-def arr_to_ply_pc(arr, filename):
-
-    if arr.ndim > 2:
-        arr = arr.reshape(-1,3)
-
-    # convert to numpy if torch tensor 
-    if isinstance(arr, torch.Tensor):
-        arr = arr.float().detach().cpu().numpy()
-
-    vertices = np.array(
-        [(point[0], point[1], point[2]) for point in arr],
-        dtype=[('x', 'f4'), ('y', 'f4'), ('z', 'f4')]
-    )
-    ply_element = PlyElement.describe(vertices, 'vertex')
-    PlyData([ply_element]).write(filename)
-
 
 
 
@@ -439,23 +421,16 @@ def save_gifs_as_grid(video_frames, gt_frames, pred_frames, output_path, fixed_h
 
 def save_grid_to_mp4(video_frames, gt_frames, pred_frames, output_path, fixed_height=256, spacing=5, fps=24):
     """
-    Create an MP4 video with two or three columns: video, (optional) ground truth, and predictions.
-    Each frame will show the corresponding images side by side.
-
+    Create MP4 videos: one with all frames side by side, and one with only predictions.
+    
     Args:
         video_frames: List of NumPy arrays for the video frames
         gt_frames: List of NumPy arrays for the ground truth depth, or None
         pred_frames: List of NumPy arrays for the predicted depth
-        output_path: Path where the MP4 file will be saved
+        output_path: Path where the MP4 file will be saved (pred-only video will be saved with '_pred' suffix)
         fixed_height: Fixed height for each image in pixels
         spacing: Space between columns in pixels
         fps: Frames per second for the output video
-    
-    Returns:
-        dict: {
-            'stacked_frames': numpy array of shape (T, C, H, W) containing concatenated frames,
-            'grid_img': PIL Image object containing a grid of frames
-        }
     """
     from PIL import Image
     import cv2
@@ -489,6 +464,13 @@ def save_grid_to_mp4(video_frames, gt_frames, pred_frames, output_path, fixed_he
     # Initialize video writer
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     video_writer = cv2.VideoWriter(output_path, fourcc, fps, (total_width, fixed_height))
+    
+    # Create a second video writer for predictions-only
+    pred_output_path = output_path.rsplit('.', 1)[0] + '_pred.mp4'
+    pred_img = Image.fromarray(pred_frames[0])
+    aspect_ratio = pred_img.width / pred_img.height
+    pred_width = int(fixed_height * aspect_ratio)
+    pred_writer = cv2.VideoWriter(pred_output_path, fourcc, fps, (pred_width, fixed_height))
     
     # Process all frames
     for i in range(n_frames):
@@ -530,9 +512,16 @@ def save_grid_to_mp4(video_frames, gt_frames, pred_frames, output_path, fixed_he
         # Convert PIL image to OpenCV format (RGB to BGR) and write to video
         opencv_frame = cv2.cvtColor(np.array(frame), cv2.COLOR_RGB2BGR)
         video_writer.write(opencv_frame)
+        
+        # Write prediction-only frame
+        pred_img = Image.fromarray(pred_frames[i])
+        pred_img.thumbnail((pred_width, fixed_height), Image.Resampling.LANCZOS)
+        pred_opencv = cv2.cvtColor(np.array(pred_img), cv2.COLOR_RGB2BGR)
+        pred_writer.write(pred_opencv)
     
-    # Release the video writer
+    # Release both video writers
     video_writer.release()
+    pred_writer.release()
 
     # Stack all concatenated frames along time dimension
     concat_frames = np.stack(concat_frames, axis=0)  # Shape: (T, C, H, W)
@@ -543,7 +532,8 @@ def save_grid_to_mp4(video_frames, gt_frames, pred_frames, output_path, fixed_he
     return {
         'stacked_frames': concat_frames,
         'grid_img': grid_img,
-        'video_path': output_path
+        'video_path': output_path,
+        'pred_video_path': pred_output_path
     }
 
 

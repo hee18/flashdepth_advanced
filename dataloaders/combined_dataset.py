@@ -7,12 +7,9 @@ import os
 from os.path import join
 import math
 
-try:
-    from .depthanything_preprocess import _load_and_process_image, _load_and_process_depth
-    from .base_dataset_pairs import BaseDatasetPairs
-except:
-    from depthanything_preprocess import _load_and_process_image, _load_and_process_depth
-    from base_dataset_pairs import BaseDatasetPairs
+from .depthanything_preprocess import _load_and_process_image, _load_and_process_depth
+from .base_dataset_pairs import BaseDatasetPairs
+
 
 class CombinedDataset(Dataset):
     def __init__(self, root_dir, enable_dataset_flags, resolution=None, split='train',
@@ -68,10 +65,6 @@ class CombinedDataset(Dataset):
         self.reshape_list = {}
         self.tmp_res = tmp_res
 
-        ## testing sets (don't need same resolution because batch size always 1)
-        # unreal4k 7 scenes
-        # sintel 23 -> 16 scenes
-        # waymo 50 -> 8 scenes; urbansyn 8 val scenes; 50 images each
 
         for dataset_name in enable_dataset_flags:
             dataset = BaseDatasetPairs.create(dataset_name, root_dir, split, load_cache=cache_dir)
@@ -110,18 +103,6 @@ class CombinedDataset(Dataset):
                     self.reshape_list[dataset]['resolution'] = (1918, 1078)
                     self.reshape_list[dataset]['crop_type'] = 'random'
                     self.reshape_list[dataset]['stride'] = 2
-                # if dataset in ['tartanair', 'pointodyssey', 'dynamicreplica']:
-                #     self.reshape_list[dataset]['resolution'] = (518, 518)
-                # if dataset in ['dynamicreplica']:
-                #     self.reshape_list[dataset]['resize_factor'] = 0.8
-
-                if dataset in ['tartanair']:
-                    self.reshape_list[dataset]['resolution'] = (630, 476)
-                if dataset in ['pointodyssey']:
-                    self.reshape_list[dataset]['resolution'] = (952, 532)
-                if dataset in ['dynamicreplica']:
-                    self.reshape_list[dataset]['resolution'] = (1274, 714)
-
             else:
                 for dataset in self.reshape_list:
                     self.reshape_list[dataset]['crop_type'] = None
@@ -152,7 +133,6 @@ class CombinedDataset(Dataset):
       
         self.video_length = video_length
         self.split = split
-        self.color_aug = color_aug
 
         
 
@@ -213,13 +193,6 @@ class CombinedDataset(Dataset):
         dataset_list = self.pairslist[dataset_idx]
         pair = dataset_list[pair_idx]
 
-        # pair = {
-        #     'image': img_path,
-        #     'depth': depth_path,
-        #     'scene_index': index of current frame in scene,
-        #     'scene_length': total frames in scene,
-        #     'scene_name': name of scene
-        # }
 
         scene_index = pair['scene_index']
         scene_length = pair['scene_length']
@@ -285,7 +258,7 @@ class CombinedDataset(Dataset):
                 print(f"seq indices: {sequence_indices}")
                 print("pairslist len: ", len(self.pairslist[dataset_idx]))
                 dist.barrier()
-            image, _current_crop = _load_and_process_image(pair['image'], **self.reshape_list[dataset_idx], color_aug=self.color_aug)
+            image, _current_crop = _load_and_process_image(pair['image'], **self.reshape_list[dataset_idx])
             print_depth_minmax = False #seq_i == 0
             depth = self.depth_read_list[dataset_idx](pair['depth'], is_inverse=True,  print_minmax=print_depth_minmax) # needed for scaling focal length, currently only for Spring
             depth = _load_and_process_depth(depth, image.shape, _current_crop, **self.reshape_list[dataset_idx])
@@ -300,54 +273,4 @@ class CombinedDataset(Dataset):
             dist.barrier()
         
         return images.float(), depths, dataset_idx #, pair['scene_name']
-        
-if __name__ == '__main__':
-    import sys
-    from tqdm import tqdm
-    sys.path.append('/root/gene/video-depth/')
-    sys.path.append('/root/gene/video-depth/dataloaders/')
-    from utils.helpers import *
-    from utils import logging_config
-    from PIL import Image
-    import os
-    from os.path import join
-
-    # from spring_dataset import SpringDepth
-    from depthanything_preprocess import _load_and_process_image, _load_and_process_depth
-    # from mvssynth_dataset import MvsSynthDepth
-    # from urbansyn_dataset import UrbanSynDepth
-    # from eth3d_dataset import Eth3dDepth
-    # from pointodyssey_dataset import PointOdysseyDepth
-    # from dynamicreplica_dataset import DynamicReplicaDepth
-    # from tartanair_dataset import TartanairDepth
-    # from waymo_dataset import WaymoDepth
-    # from unreal4k_dataset import Unreal4kDepth
-
-
-    logging_config.configure_logging()
-
-    # use whichever one is faster
-    root_dir = '/fsx_scanline/from_eyeline/gene/rgbd_data/'
-    root_dir2= '/root/gene/data'
-    dataset = CombinedDataset(root_dir=root_dir2, enable_dataset_flags=['unreal4k'],
-                              split='val', crop_type='center', resolution=(518,518))
-
-    #dataset = Unreal4kDepth(root_dir='/root/gene/data', split='train', load_cache=None)
-
-    savedir = 'vis_unreal4k-metric'
-    os.makedirs(savedir, exist_ok=True)
-
-
-    for idx, batch in tqdm(enumerate(dataset)):
-        video, gt_depth, dataset_name = batch 
-        video = video[::100,...]
-        gt_depth = gt_depth[::100,...]
-        print("video shape: ", video.shape)
-        video_save = torch_batch_to_np_arr(video)
-
-        gt_save = vis_depth_metric(gt_depth, input_is_inverse=True)
-
-        # gt_save = depth_to_np_arr(gt_depth)
-        
-        grid = save_gifs_as_grid(video_save,gt_frames=None, pred_frames=gt_save, 
-        output_path=join(savedir, f'{idx}.gif'), fixed_height=280)
+       

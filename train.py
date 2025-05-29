@@ -132,7 +132,7 @@ def inference(cfg, process_dict):
 
     
     if cfg.eval.dummy_timing:
-        test_dataloader = [torch.randn(1, 100, 3, 1148, 2044)]*3
+        test_dataloader = [torch.randn(1, 105, 3, 1148, 2044)]*3
 
     elif cfg.eval.random_input is not None:
         dataset = RandomDataset(root_dir=cfg.eval.random_input, resolution=cfg.dataset.resolution, large_dir=cfg.eval.large_dir)
@@ -146,7 +146,7 @@ def inference(cfg, process_dict):
                                  shuffle=False, drop_last=False) 
         
 
-    for test_idx, batch in enumerate(tqdm(test_dataloader)):         
+    for test_idx, batch in enumerate(tqdm(test_dataloader)):        
         if isinstance(batch, list) or isinstance(batch, tuple):
             if len(batch) == 3:
                 video, gt_depth, dataset_scene_name = batch
@@ -304,9 +304,7 @@ def setup(cfg: DictConfig):
     hydra_cfg = HydraConfig.get()
     cfg.config_dir = [path["path"] for path in hydra_cfg.runtime.config_sources if path["schema"] == "file"][0]
 
-    if cfg.debug:
-        cfg.config_dir = 'configs/debug'
-        
+ 
     if cfg.inference:
         inference(cfg, process_dict)
     else:

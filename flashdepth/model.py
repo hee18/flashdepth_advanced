@@ -10,7 +10,6 @@ import logging
 from .dinov2 import DINOv2
 
 from .mamba import MambaModel
-from .xlstm_block import xLSTMModel
 from .rnn_transformer import TransformerRNN
 
 from .original_dpt import DPTHead
@@ -74,6 +73,7 @@ class FlashDepth(nn.Module):
 
 
             if kwargs.get('use_xlstm', False): 
+                from .xlstm_block import xLSTMModel
                 self.mamba = xLSTMModel(dpt_dim, training_mode=kwargs['training'], **kwargs)
             
             elif kwargs.get('use_transformer_rnn', False):
@@ -166,7 +166,7 @@ class FlashDepth(nn.Module):
                 main_x = F.interpolate(x, (base_resolution, main_w), mode="bilinear", align_corners=True)
                 high_res_x = x
             else:
-                ## resolution < 518, directly run teacher model stream
+                ## TODO: resolution < 518, directly run teacher model stream
                 main_x = x
                 high_res_x = x
             
@@ -319,14 +319,14 @@ class FlashDepth(nn.Module):
             gt_depth = None
         
         preds = []
-        grid = None
 
         loss = 0
         if use_mamba:
             self.mamba.start_new_sequence()
 
         for i in range(video.shape[1]):
-            if kwargs.get('print_time', False) and i==10:
+            warmup_frames = 5
+            if kwargs.get('print_time', False) and i==warmup_frames:
                 torch.cuda.synchronize()
                 start = time.time()
             frame = video[:, i, :, :, :].to(torch.cuda.current_device())
@@ -362,7 +362,7 @@ class FlashDepth(nn.Module):
             try:
                 torch.cuda.synchronize()
                 end = time.time()
-                logging.info(f'wall time taken: {end - start:.2f}; fps: {((video.shape[1]-10) / (end - start)):.2f}; num frames: {video.shape[1]}')
+                logging.info(f'wall time taken: {end - start:.2f}; fps: {((video.shape[1]-warmup_frames) / (end - start)):.2f}; num frames: {video.shape[1]-warmup_frames}')
             except Exception as e:
                 logging.info(f"Error in printing time: {e}")
                 pass
@@ -370,6 +370,16 @@ class FlashDepth(nn.Module):
         if kwargs.get('dummy_timing', False):
             return 0,0
 
+
+        return self.save_and_return(video, gt_depth, preds, loss, save_depth_npy, gif_path, save_vis_map, out_mp4, resolution, kwargs)
+
+
+
+
+    @torch.compiler.disable
+    def save_and_return(self, video, gt_depth, preds, loss, save_depth_npy, gif_path, save_vis_map, out_mp4, resolution, kwargs):
+
+        grid = None
         if gt_depth is not None and kwargs.get('use_metrics', True):
             l1_loss = loss / video.shape[1]
 
@@ -416,7 +426,7 @@ class FlashDepth(nn.Module):
             except Exception as e:
                 logging.info(f"Error in saving video: {e}")
                 pass
-       
+    
         return loss, grid
 
 

@@ -8,7 +8,7 @@ import logging
 
 def get_dataloader(cfg, dataset_name, len_dataloaders=1):
         
-    dataset = CombinedDataset(root_dir=cfg.dataset.data_root, resolution=cfg.dataset.resolution, enable_dataset_flags=dataset_name, video_length=cfg.dataset.video_length, split='train', color_aug=cfg.dataset.color_aug)
+    dataset = CombinedDataset(root_dir=cfg.dataset.data_root, resolution=cfg.dataset.resolution, enable_dataset_flags=dataset_name, video_length=cfg.dataset.video_length, split='train')
     sampler = DistributedSampler(dataset, shuffle=True, drop_last=True)
     train_dataloader = DataLoader(dataset, batch_size=cfg.training.batch_size, num_workers=int(cfg.training.workers/len_dataloaders), pin_memory=False,
                                   drop_last=True, sampler=sampler) # drop_last=True because current mamba setup seems to require fixed sequence length

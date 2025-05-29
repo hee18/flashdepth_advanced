@@ -68,8 +68,8 @@ class MambaBlock(nn.Module):
 
         residual = x
         x = self.norm1(x)
-        # x = self.mamba(x, inference_params=inference_params)
-        x = self.forward_mamba(x, inference_params=inference_params)
+        # x = self.forward_mamba(x, inference_params=inference_params)
+        x = self.mamba(x, inference_params=inference_params)
         x = residual + x
 
         residual = x
@@ -79,9 +79,9 @@ class MambaBlock(nn.Module):
         
         return x
 
-    @torch.compiler.disable
-    def forward_mamba(self, x, inference_params):
-        return self.mamba(x, inference_params=inference_params)
+    # @torch.compiler.disable
+    # def forward_mamba(self, x, inference_params):
+    #     return self.mamba(x, inference_params=inference_params)
 
 class MambaModel(nn.Module):
     # https://github.com/state-spaces/mamba?tab=readme-ov-file
@@ -121,7 +121,7 @@ class MambaModel(nn.Module):
             )
             nn.init.zeros_(self.final_layer[1].weight)
             nn.init.zeros_(self.final_layer[1].bias)
-            logging.info('zero init mamba modulation')
+            #logging.info('zero init mamba modulation')
             
 
         elif mamba_type == 'add':
@@ -131,7 +131,7 @@ class MambaModel(nn.Module):
             )
             nn.init.zeros_(self.final_layer[1].weight)
             nn.init.zeros_(self.final_layer[1].bias)
-            logging.info('zero init mamba add')
+            #logging.info('zero init mamba add')
 
         elif mamba_type == 'rnn':
             # should initialize all blocks, not just last one; but doesn't matter for now

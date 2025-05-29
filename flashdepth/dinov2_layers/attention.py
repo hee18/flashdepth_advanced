@@ -125,7 +125,7 @@ class CrossAttention(nn.Module):
         k, v = unbind(kv, 2)  
 
         #x = memory_efficient_attention(q, k, v)
-        x = flash_attn_func(q,k,v) # flash attention allows different sequence length for q and k
+        x = flash_attn_func(q,k,v) # flash attention allows different sequence length for q and k without mask
        
         x = x.reshape(B, N, C)
 

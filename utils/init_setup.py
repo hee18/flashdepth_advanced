@@ -274,6 +274,7 @@ def load_checkpoint(cfg, model, optimizer, lr_scheduler):
         #         filtered_state_dict[k] = v
         # model_state_dict = filtered_state_dict
 
+        # import ipdb; ipdb.set_trace()
 
         model.load_state_dict(model_state_dict, strict=True)
         if optimizer is not None:

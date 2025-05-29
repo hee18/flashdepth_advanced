@@ -7,9 +7,9 @@ load: null  # path to pth file or 'true' when checkpoint exists in config_dir
 # Dataset configuration
 dataset:
   data_root: null # change data path
-  resolution: '2k'
+  resolution: 'base'
   video_length: 5
-  train_datasets: [mvs-synth,spring]  # Comma-separated list of dataset names
+  train_datasets: [mvs-synth, dynamicreplica, tartanair, pointodyssey, spring]  # Comma-separated list of dataset names
   val_datasets: [sintel,waymo]  # Comma-separated list of validation dataset names
 
 # Training configuration
@@ -40,7 +40,7 @@ training:
 # Model configuration
 model:
   # ViT configuration
-  vit_size: "vits"
+  vit_size: "vitl"
   patch_size: 14
   attn_class: "MemEffAttention"
 
@@ -50,7 +50,7 @@ model:
   num_mamba_layers: 4
   downsample_mamba: [0.1]
   mamba_pos_embed: null
-  mamba_in_dpt_layer: [1]
+  mamba_in_dpt_layer: [3]
   mamba_d_conv: 4
   mamba_d_state: 256
   use_hydra: false # https://github.com/goombalab/hydra
@@ -59,7 +59,7 @@ model:
 
 # hybrid model configuration
 hybrid_configs:
-  use_hybrid: true
+  use_hybrid: false
   teacher_model_path: null
   teacher_resolution: 490
   layers_to_skip: [1,2,3] # only the 0th index (i.e. path 4 in dpt) is used for fusion
@@ -75,7 +75,7 @@ eval:
   save_grid: false
   outfolder: "test"
   test_datasets: [unreal4k,sintel,eth3d,waymo,urbansyn]
-  test_dataset_resolution: '2k'
+  test_dataset_resolution: 'base'
   random_input: null
   out_video: true # whether to save video at all
   out_mp4: true # mp4 if true, gif if false

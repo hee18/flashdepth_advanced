@@ -28,7 +28,12 @@ def compute_depth_metrics(pred_depth, gt_depth, align=True, use_boundary=True, m
         gt_depth = gt_depth.detach().cpu().numpy()
 
     # scale_std, shift_std = depth_consistency_via_scaleshift_std(pred_depth, gt_depth, max_depth)
-    # scale_std, shift_std = 0, 0
+    # results = depth_consistency_via_scaleshift_std(pred_depth, gt_depth, max_depth)
+
+    # results = depth_consistency_scale_std(pred_depth, gt_depth,
+    #                                               max_depth=70,
+    #                                               window_sizes=[10, 50, 100, 150, 198, 200, 500, 1000])
+
 
     # during preprocessing, we set invalid pixels to -1
     gt_valid_pixel_mask = (gt_depth >= 0)
@@ -70,22 +75,139 @@ def compute_depth_metrics(pred_depth, gt_depth, align=True, use_boundary=True, m
         # 'shift_std': float(shift_std),
     }
 
-def depth_consistency_via_scaleshift_std(pred_depths, gt_depths, max_depth):
+
+
+# ---------- low-level helper ---------- #
+def _solve_scale_lstsq(pred, gt, max_depth=None, eps=1e-8):
+    """
+    Least-squares scale:   s*pred ≈ gt   ⇒   s = (pred·gt)/(pred·pred).
+    Uses only valid pixels < max_depth (if provided).
+    """
+    valid = np.isfinite(gt) & np.isfinite(pred)
+    if max_depth is not None:
+        valid &= (gt < max_depth) & (pred < max_depth)
+
+    if valid.sum() == 0:
+        return 1.0                                # degenerate frame
+
+    p = pred[valid].ravel()
+    g = gt[valid].ravel()
+    return float(np.dot(p, g) / (np.dot(p, p) + eps))
+
+
+# ---------- main metric ---------- #
+def depth_consistency_scale_std(
+    pred_depths: np.ndarray,
+    gt_depths:   np.ndarray,
+    max_depth:   float | None = None,
+    window_sizes=None,
+    relative:    bool = True,
+    return_series: bool = True,
+):
+    """
+    Temporal scale-consistency metric.
+
+    Parameters
+    ----------
+    pred_depths, gt_depths : (T, H, W) arrays
+    max_depth              : ignore pixels deeper than this (optional)
+    window_sizes           : iterable of prefix lengths, or None for whole sequence
+    relative               : if True, use std-dev of (s_t / mean_s)  (unit-free)
+    return_series          : if True, also return prefix-std curve (length T)
+
+    Returns
+    -------
+    * If window_sizes is None and return_series is False:
+         float
+    * If window_sizes is None and return_series is True:
+         (float, np.ndarray[T])
+    * If window_sizes is not None and return_series is False:
+         dict  {f"scale_std_{w}": value, ...}
+    * If window_sizes is not None and return_series is True:
+         (dict, np.ndarray[T])
+    """
+    # 1. sanity checks ---------------------------------------------------------
+    assert pred_depths.ndim == gt_depths.ndim == 3, "inputs must be (T,H,W)"
+    assert pred_depths.shape == gt_depths.shape,    "prediction/GT shapes differ"
+
+    # 2. per-frame scales ------------------------------------------------------
+    scales = [
+        _solve_scale_lstsq(pred, gt, max_depth)
+        for pred, gt in zip(pred_depths, gt_depths)
+    ]
+    scales = np.asarray(scales, dtype=float)
+    T = scales.size
+
+    def _std_of(slice_):
+        """Optionally normalise slice by its own mean before std-dev."""
+        if relative:
+            m = slice_.mean()
+            if m == 0:
+                return 0.0
+            slice_ = slice_ / m
+        return slice_.std()
+
+    # 3. running prefix-std curve (if asked) -----------------------------------
+    # if return_series:
+    #     prefix_std = np.empty(T, dtype=float)
+    #     for i in range(T):                     # O(T²) but T is video length
+    #         prefix_std[i] = _std_of(scales[: i + 1])
+    # else:
+    #     prefix_std = None
+
+    if return_series:
+        if relative:
+            scales_rel = scales / scales.mean()
+        else:
+            scales_rel = scales 
+
+    # 4. whole-seq or windowed report -----------------------------------------
+    if window_sizes is None:
+        result = float(_std_of(scales))
+    else:
+        result = {}
+        for w in window_sizes:
+            if w <= T:
+                result[f"scale_std_{w}"] = float(_std_of(scales[:w]))
+
+    return (result, scales_rel) if return_series else result
+
+def depth_consistency_via_scaleshift_std(pred_depths, gt_depths, max_depth, window_sizes=None):
     scales = []
     shifts = []
 
     assert pred_depths.ndim == 3 and gt_depths.ndim == 3, "check consistency metric dimensions"
     assert pred_depths.shape[0] == gt_depths.shape[0], "check consistency metric dimensions"
+
+    num_frames = pred_depths.shape[0]
     
     for pred, gt in zip(pred_depths, gt_depths):
         _, scale, shift = align_depths_lstsq(pred, gt, max_depth)
         scales.append(scale)
         shifts.append(shift)
     
-    scale_var = np.std(scales)
-    shift_var = np.std(shifts)
-    
-    return scale_var, shift_var
+    window_sizes=[10, 50, 100, 150, 200, 500, 1000]
+
+    if window_sizes is None:
+        scale_var = np.std(scales)
+        shift_var = np.std(shifts)
+        
+        return scale_var, shift_var
+    else:
+        results = {}
+        for window in window_sizes:
+            if window > num_frames:
+                continue
+                
+            scale_var = np.std(scales[:window])
+            shift_var = np.std(shifts[:window])
+            
+            results[f'scale_std_{window}'] = float(scale_var)
+            results[f'shift_std_{window}'] = float(shift_var)
+        
+        return results
+
+
 
 def get_args_parser():
     parser = argparse.ArgumentParser(description="Minimal Depth Evaluation with Scaling")

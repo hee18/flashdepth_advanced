@@ -1,5 +1,17 @@
 # Copyright (c) 2024, Tri Dao, Albert Gu.
 
+'''
+The main difference between this file and the original mamba2.py is a separate inference_forward function.
+By default, Mamba2 first prefills with context, then decodes one token at a time (i.e. autoregressive text generation).
+However, its step() function only supports decoding one token at a time.
+
+In our case, we want to run prefill on each frame, because all tokens can be computed in parallel.
+Our inference_forward function does this and updates the ssm states accordingly. 
+In other words, we process all tokens in a single frame at once, but each frame is still processed independently.
+'''
+
+
+
 import math
 
 import torch
@@ -302,7 +314,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
 
     def inference_forward(self, u, seqlen=None, seq_idx=None, cu_seqlens=None, inference_params=None):
         """
-        the difference between this and forward is that we provide initial states for the conv and ssm functions
+        initial states are provided for ssm states
         """
                 
         batch, seqlen, dim = u.shape
