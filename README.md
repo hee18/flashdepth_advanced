@@ -9,7 +9,7 @@ This repository contains the official implementation of <br>
 Feel free to create a github issue if the model does not work out of the box after installing the environment. 
 
 ## Installation
-We recommend creating a [conda](https://www.anaconda.com/) environment then installing the required packages using our `setup_env.sh` script. Note that the mamba package should be installed from our local folder and the torch version should be 2.4 (as of writing, Mamba2 does not work if compiling torch 2.5 and above).
+We recommend creating a [conda](https://www.anaconda.com/) environment then installing the required packages using our `setup_env.sh` script. Note that the mamba package should be installed from our local folder and the torch version should be 2.4 (as of early May 2025, Mamba2 does not work if compiling torch 2.5 and above).
 
 ```
 conda create -n flashdepth python=3.11 --yes
@@ -20,7 +20,7 @@ bash setup_env.sh
 ## Downloading Pretrained Models 
 We provide three checkpoints on huggingface. They correspond to [FlashDepth (Full)](https://huggingface.co/Eyeline-Research/FlashDepth/tree/main/flashdepth), [FlashDepth-L](https://huggingface.co/Eyeline-Research/FlashDepth/tree/main/flashdepth-l), and [FlashDepth-S](https://huggingface.co/Eyeline-Research/FlashDepth/tree/main/flashdepth-s), respectively, as referenced in the paper. Generally, FlashDepth-L is most accurate and FlashDepth (Full) is fastest, but we recommend using FlashDepth-L when the input resolution is low (e.g. short side less than 518).
 
-Save the checkpoints to `configs/flashdepth/flashdepth.pth`, `configs/flashdepth-l/flashdepth-l.pth`, and `configs/flashdepth-s/flashdepth-s.pth`, respectively. 
+Save the checkpoints to `configs/flashdepth/iter_43002.pth`, `configs/flashdepth-l/iter_10001.pth`, and `configs/flashdepth-s/iter_14001.pth`, respectively. 
 
 ## Inference 
 To run inference on a video:
