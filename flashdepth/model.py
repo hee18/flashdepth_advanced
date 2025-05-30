@@ -422,7 +422,7 @@ class FlashDepth(nn.Module):
                 if not out_mp4:
                     grid = save_gifs_as_grid(video_save,gt_save,pred_save, output_path=gif_path, fixed_height=resolution)
                 else:
-                    grid = save_grid_to_mp4(video_save,gt_save,pred_save, output_path=gif_path.replace('.gif', '.mp4'), fixed_height=resolution)
+                    grid = save_grid_to_mp4(video_save,gt_save,pred_save, output_path=gif_path.replace('.gif', '.mp4'), fixed_height=video.shape[-2])
             except Exception as e:
                 logging.info(f"Error in saving video: {e}")
                 pass

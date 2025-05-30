@@ -28,21 +28,6 @@ class RandomDataset(Dataset):
             raise ValueError(f"provide an mp4 file or a directory of mp4 files")
 
         
-
-        keep_paths = [
-            '2795748-uhd_3840_2160_25fps.mp4',
-            '5192026-hd_1920_1080_30fps.mp4',
-            '5262568-uhd_3840_2160_25fps.mp4',
-            '7334676-hd_1920_1080_24fps.mp4',
-            '7502169-uhd_3840_2160_25fps.mp4',
-            '7583319-hd_1920_1080_25fps.mp4',
-            '8746767-uhd_4096_2160_30fps.mp4',
-            '12123583_3840_2160_25fps.mp4'    
-        ]
-        self.seq_paths = [p for p in self.seq_paths if os.path.basename(p) in keep_paths]
-        
-        # print(f"Found {mp4_paths} in {root_dir}")
-        
         
     def __len__(self):
         return len(self.seq_paths)
@@ -56,8 +41,10 @@ class RandomDataset(Dataset):
         first_img = cv2.imread(img_paths[0])
         h, w = first_img.shape[:2]
         if max(h, w) > 2044: # set max long side to 2044
+            logging.info("resizing long side of video to 2044")
             scale = 2044 / max(h, w)
             res = (int(w * scale), int(h * scale))
+            logging.info(f"new resolution: {res}")
         else:
             res = (w, h)
 
