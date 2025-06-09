@@ -1,6 +1,6 @@
 # FlashDepth: Real-time Streaming Video Depth Estimation at 2K Resolution
 
-[**Paper**](https://arxiv.org/abs/2504.07093) | [**Project Page**](https://eyeline-research.github.io/flashdepth/) <br>
+[**Paper**](https://arxiv.org/abs/2504.07093) | [**Project Page**](https://eyeline-research.github.io/FlashDepth/) <br>
 
 
 This repository contains the official implementation of <br>
