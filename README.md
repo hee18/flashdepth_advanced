@@ -4,9 +4,7 @@
 
 
 This repository contains the official implementation of <br>
-**FlashDepth: Real-time Streaming Video Depth Estimation at 2K Resolution** 
-
-Feel free to create a github issue if the model does not work out of the box after installing the environment. 
+**FlashDepth: Real-time Streaming Video Depth Estimation at 2K Resolution (ICCV 2025)** 
 
 ## Installation
 We recommend creating a [conda](https://www.anaconda.com/) environment then installing the required packages using our `setup_env.sh` script. Note that the mamba package should be installed from our local folder and the torch version should be 2.4 (as of early May 2025, Mamba2 does not work if compiling torch 2.5 and above).
@@ -82,11 +80,10 @@ Our code was modified and heavily borrowed from the following projects: <br>
 
 If you find our code or paper useful, please consider citing
 ```bibtex
-@misc{chou2025flashdepth,
-  author    = {Chou, Gene and Xian, Wenqi and Yang, Guandao and Abdelfattah, Mohamed and Hariharan, Bharath and Snavely, Noah and Yu, Ning and Debevec, Paul},
+@inproceedings{chou2025flashdepth,
   title     = {FlashDepth: Real-time Streaming Video Depth Estimation at 2K Resolution},
-  booktitle = {arXiv preprint arXiv:2504.07093},
-  url       = {https://arxiv.org/abs/2504.07093},
+  author    = {Chou, Gene and Xian, Wenqi and Yang, Guandao and Abdelfattah, Mohamed and Hariharan, Bharath and Snavely, Noah and Yu, Ning and Debevec, Paul},
+  journal   = {The IEEE International Conference on Computer Vision (ICCV)},
   year      = {2025},
 }
 ```
