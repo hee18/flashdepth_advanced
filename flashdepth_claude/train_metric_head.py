@@ -1,7 +1,6 @@
 import os
 import torch
 import torch.nn as nn
-import torch.distributed as dist
 from torch.utils.data import DataLoader
 import logging
 import hydra
@@ -16,6 +15,13 @@ from flashdepth.heads import MetricDepthLoss
 from dataloaders.combined_dataset import CombinedDataset
 from utils.helpers import *
 from utils.eval_metrics.metrics import compute_depth_metrics
+try:
+    from utils.metric_visualization import MetricDepthVisualizer
+    VISUALIZATION_AVAILABLE = True
+except ImportError as e:
+    print(f"Warning: Visualization not available: {e}")
+    VISUALIZATION_AVAILABLE = False
+    MetricDepthVisualizer = None
 
 
 class MetricHeadTrainer:
@@ -26,11 +32,44 @@ class MetricHeadTrainer:
 
     def __init__(self, config):
         self.config = config
-        self.device = torch.cuda.current_device()
 
-        # Setup logging
-        logging.basicConfig(level=logging.INFO)
+        # Multi-GPU setup
+        if torch.cuda.device_count() > 1:
+            available_gpus = list(range(min(3, torch.cuda.device_count())))  # Use GPU 0,1,2
+            self.device = f"cuda:{available_gpus[0]}"
+            self.gpu_ids = available_gpus
+            self.use_multi_gpu = True
+            logging.info(f"Using {len(available_gpus)} GPUs: {available_gpus}")
+        else:
+            self.device = "cuda:0"
+            self.gpu_ids = [0]
+            self.use_multi_gpu = False
+            logging.info("Using single GPU")
+
+        # Setup results directory
+        self.results_dir = Path(config.get('results_dir', './train_results/results_1'))
+        self.results_dir.mkdir(parents=True, exist_ok=True)
+
+        # Setup logging with file output
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler(self.results_dir / 'training.log'),
+                logging.StreamHandler()  # Also log to console
+            ]
+        )
         self.logger = logging.getLogger(__name__)
+
+        self.logger.info(f"Results will be saved to: {self.results_dir}")
+
+        # Initialize visualizer
+        if VISUALIZATION_AVAILABLE:
+            self.visualizer = MetricDepthVisualizer(save_dir=self.results_dir / "visualizations")
+            self.logger.info("Visualization enabled")
+        else:
+            self.visualizer = None
+            self.logger.warning("Visualization disabled - missing dependencies")
 
         # Initialize model
         self.model = self._setup_model()
@@ -58,8 +97,14 @@ class MetricHeadTrainer:
         # Create model with metric head enabled
         model_config = dict(self.config.model)
         model_config['use_metric_head'] = True
+        model_config['batch_size'] = self.config.training.batch_size
 
         model = FlashDepth(**model_config)
+
+        # Multi-GPU setup
+        if self.use_multi_gpu:
+            model = nn.DataParallel(model, device_ids=self.gpu_ids)
+            self.logger.info(f"Model wrapped with DataParallel for GPUs: {self.gpu_ids}")
 
         # Load pre-trained FlashDepth checkpoint
         if self.config.load and self.config.load != 'true':
@@ -90,8 +135,16 @@ class MetricHeadTrainer:
         frozen_params = 0
         trainable_params = 0
 
+        # Debug: Print all parameter names to see the structure
+        self.logger.info("All model parameters:")
         for name, param in model.named_parameters():
-            if name.startswith('gsp_head'):
+            self.logger.info(f"  {name} - {param.shape}")
+
+        for name, param in model.named_parameters():
+            # Handle DataParallel wrapper - parameters have 'module.' prefix
+            param_name = name.replace('module.', '') if name.startswith('module.') else name
+
+            if param_name.startswith('gsp_head'):
                 param.requires_grad = True
                 trainable_params += param.numel()
                 self.logger.info(f"Trainable parameter: {name} - {param.shape}")
@@ -153,8 +206,13 @@ class MetricHeadTrainer:
     def _setup_optimizer(self):
         """Setup optimizer for GSP head parameters only"""
         # Get only GSP head parameters
-        gsp_params = [p for name, p in self.model.named_parameters()
-                      if name.startswith('gsp_head') and p.requires_grad]
+        gsp_params = []
+        for name, param in self.model.named_parameters():
+            # Handle DataParallel wrapper - parameters have 'module.' prefix
+            param_name = name.replace('module.', '') if name.startswith('module.') else name
+            if param_name.startswith('gsp_head') and param.requires_grad:
+                gsp_params.append(param)
+                self.logger.info(f"Optimizer parameter: {name} - {param.shape}")
 
         if len(gsp_params) == 0:
             raise ValueError("No GSP head parameters found for optimization!")
@@ -185,7 +243,8 @@ class MetricHeadTrainer:
         for batch_idx, batch in enumerate(pbar):
             try:
                 # Forward pass and loss computation
-                loss, metrics = self.model.train_metric_head(batch, self.loss_fn)
+                model_fn = self.model.module if self.use_multi_gpu else self.model
+                loss, metrics = model_fn.train_metric_head(batch, self.loss_fn)
 
                 # Backward pass
                 self.optimizer.zero_grad()
@@ -220,10 +279,19 @@ class MetricHeadTrainer:
                         'global_step': self.global_step
                     })
 
-                # Validation and checkpointing
+                # Validation (every val_freq steps)
                 if self.global_step % self.config.training.get('val_freq', 1000) == 0:
-                    val_metrics = self.validate()
-                    self.save_checkpoint(val_metrics['val_loss'])
+                    try:
+                        val_metrics = self.validate()
+                        self.save_checkpoint(val_metrics['val_loss'])
+                    except Exception as val_e:
+                        self.logger.error(f"Validation failed: {val_e}")
+                        # Save checkpoint even if validation fails
+                        self.save_checkpoint(loss.item())
+
+                # Periodic checkpoint saving (every save_freq steps, independent of validation)
+                elif self.global_step % self.config.training.get('save_freq', 1000) == 0:
+                    self.save_checkpoint(loss.item())
 
             except Exception as e:
                 self.logger.error(f"Error in training step {batch_idx}: {e}")
@@ -252,7 +320,8 @@ class MetricHeadTrainer:
                     gt_depth = gt_depth.to(self.device)
 
                     # Forward pass
-                    outputs = self.model.forward_with_metric_head((video, gt_depth))
+                    model_fn = self.model.module if self.use_multi_gpu else self.model
+                    outputs = model_fn.forward_with_metric_head((video, gt_depth))
                     pred_metric = outputs['metric_depth']
 
                     # Compute loss
@@ -272,6 +341,16 @@ class MetricHeadTrainer:
                             valid_mask=gt_depth[0, 0].cpu() >= 0
                         )
                         all_errors.append(metrics)
+
+                        # Save visualization every save_freq steps
+                        if self.global_step % self.config.training.get('save_freq', 1000) == 0 and self.visualizer:
+                            try:
+                                self.visualizer.create_validation_summary(
+                                    batch, outputs, self.global_step
+                                )
+                                self.logger.info(f"Validation visualization saved at step {self.global_step}")
+                            except Exception as viz_e:
+                                self.logger.warning(f"Failed to save visualization: {viz_e}")
 
                     pbar.set_postfix({'val_loss': f'{loss.item():.4f}'})
 
@@ -303,13 +382,16 @@ class MetricHeadTrainer:
 
     def save_checkpoint(self, val_loss):
         """Save model checkpoint"""
-        # Create checkpoint directory
-        checkpoint_dir = Path(self.config.get('config_dir', './checkpoints'))
-        checkpoint_dir.mkdir(exist_ok=True)
+        # Use the configured results directory
+        checkpoint_dir = self.results_dir
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+        # Get model state dict (handle DataParallel wrapper)
+        model_state = self.model.module.state_dict() if self.use_multi_gpu else self.model.state_dict()
 
         checkpoint = {
             'global_step': self.global_step,
-            'model_state_dict': self.model.state_dict(),
+            'model_state_dict': model_state,
             'optimizer_state_dict': self.optimizer.state_dict(),
             'val_loss': val_loss,
             'config': dict(self.config)
@@ -357,12 +439,6 @@ class MetricHeadTrainer:
 @hydra.main(version_base=None, config_path="configs/flashdepth", config_name="config")
 def main(cfg: DictConfig):
     """Main training function"""
-
-    # Initialize distributed training if needed
-    if torch.cuda.device_count() > 1:
-        dist.init_process_group(backend='nccl')
-        local_rank = int(os.environ.get('LOCAL_RANK', 0))
-        torch.cuda.set_device(local_rank)
 
     # Create trainer and start training
     trainer = MetricHeadTrainer(cfg)

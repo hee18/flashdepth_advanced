@@ -26,11 +26,12 @@ from .heads import GlobalScalePredictor, MetricDepthLoss
 
 class FlashDepth(nn.Module):
     def __init__(
-        self, 
-        vit_size='vitl', 
-        dpt_dim=256, 
-        out_channels=[256, 512, 1024, 1024], 
+        self,
+        vit_size='vitl',
+        dpt_dim=256,
+        out_channels=[256, 512, 1024, 1024],
         patch_size=14,
+        batch_size=4,
         **kwargs
     ):
         super(FlashDepth, self).__init__()
@@ -79,8 +80,14 @@ class FlashDepth(nn.Module):
             
             elif kwargs.get('use_transformer_rnn', False):
                 self.mamba = TransformerRNN(dpt_dim, **kwargs)
-            else: 
-                self.mamba = MambaModel(dpt_dim, **kwargs)
+            else:
+                self.mamba = MambaModel(
+                    dpt_dim,
+                    kwargs['mamba_type'],
+                    kwargs['num_mamba_layers'],
+                    batch_size,
+                    **{k: v for k, v in kwargs.items() if k not in ['mamba_type', 'num_mamba_layers', 'batch_size']}
+                )
             
             logging.info(f"downsample_mamba: {self.downsample_mamba}")
             logging.info(f"mamba_in_dpt_layer: {self.mamba_in_dpt_layer}")
@@ -226,13 +233,24 @@ class FlashDepth(nn.Module):
 
         # Handle batch format
         if isinstance(batch, list) or isinstance(batch, tuple):
-            video, gt_depth = batch
+            if len(batch) == 3:
+                video, gt_depth, dataset_idx = batch
+            elif len(batch) == 2:
+                video, gt_depth = batch
+            else:
+                video = batch[0]
+                gt_depth = None
         elif isinstance(batch, torch.Tensor):
             video = batch
             gt_depth = None
         else:
             video = batch
             gt_depth = None
+
+        # Move video to GPU
+        video = video.to(torch.cuda.current_device())
+        if gt_depth is not None:
+            gt_depth = gt_depth.to(torch.cuda.current_device())
 
         if use_mamba:
             self.mamba.start_new_sequence()
@@ -288,7 +306,7 @@ class FlashDepth(nn.Module):
         if loss_fn is None:
             loss_fn = MetricDepthLoss(loss_type='l1')
 
-        video, gt_metric_depth = batch
+        video, gt_metric_depth, dataset_idx = batch
         video = video.to(torch.cuda.current_device())
         gt_metric_depth = gt_metric_depth.to(torch.cuda.current_device())
 

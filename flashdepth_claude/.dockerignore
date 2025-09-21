@@ -1,0 +1,34 @@
+# Exclude large directories and files that don't need to be in container
+train_results/
+test_results/
+checkpoints/
+*.pth
+*.ckpt
+
+# Development files
+.git/
+.gitignore
+*.md
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+.env
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.log

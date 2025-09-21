@@ -17,7 +17,7 @@ import torch.nn as nn
 import torch.utils.checkpoint
 from torch.nn.init import trunc_normal_
 
-from .dinov2_layers import Mlp, PatchEmbed, NestedTensorBlock as Block
+from .dinov2_layers import Mlp, PatchEmbed, NestedTensorBlock as Block, Attention
 from .dinov2_layers.attention import MemEffAttention, FlashLinearAttention
 
 
@@ -146,7 +146,7 @@ class DinoVisionTransformer(nn.Module):
                 block_fn(
                     **block_kwargs,
                     drop_path=dpr[i],
-                    attn_class=MemEffAttention,
+                    attn_class=Attention,
                 )
                 for i in range(depth)
             ]
@@ -160,7 +160,7 @@ class DinoVisionTransformer(nn.Module):
                     blocks_list.append(block_fn(**block_kwargs, drop_path=dpr[i], 
                     attn_class=FlashLinearAttention, attn_feature_map=linearization_configs['feature_map']))
                 else:
-                    blocks_list.append(block_fn(**block_kwargs, drop_path=dpr[i], attn_class=MemEffAttention))
+                    blocks_list.append(block_fn(**block_kwargs, drop_path=dpr[i], attn_class=Attention))
 
         if block_chunks > 0:
             self.chunked_blocks = True
@@ -434,7 +434,7 @@ def vit_base(patch_size=16, num_register_tokens=0, **kwargs):
         depth=12,
         num_heads=12,
         mlp_ratio=4,
-        block_fn=partial(Block, attn_class=MemEffAttention),
+        block_fn=partial(Block, attn_class=Attention),
         num_register_tokens=num_register_tokens,
         **kwargs,
     )

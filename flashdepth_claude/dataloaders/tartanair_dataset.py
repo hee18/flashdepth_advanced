@@ -30,21 +30,18 @@ class TartanairDepth(BaseDatasetPairs):
             if 'amusement' in scene_name:
                 continue
             scene_full_path = os.path.join(scenes_path, scene_name)
-            easy_path = os.path.join(scene_full_path, "Easy")
-            hard_path = os.path.join(scene_full_path, "Hard")
-            
-            # Get directories inside Easy path
-            if os.path.isdir(easy_path):
-                easy_dirs = [os.path.join(scene_name, "Easy", d) for d in os.listdir(easy_path) 
-                        if os.path.isdir(os.path.join(easy_path, d))]
-                all_scenes.extend(easy_dirs)
-            
-            # Get directories inside Hard path
-            if os.path.isdir(hard_path):
-                hard_dirs = [os.path.join(scene_name, "Hard", d) for d in os.listdir(hard_path)
-                        if os.path.isdir(os.path.join(hard_path, d))]
-                all_scenes.extend(hard_dirs)
-        
+
+            # Look for P*** directories (like P001, P002, etc.)
+            p_dirs = [d for d in os.listdir(scene_full_path)
+                     if d.startswith('P') and os.path.isdir(os.path.join(scene_full_path, d))]
+
+            for p_dir in p_dirs:
+                p_path = os.path.join(scene_full_path, p_dir)
+                # Check if this P directory has image_left and depth_left
+                if (os.path.isdir(os.path.join(p_path, 'image_left')) and
+                    os.path.isdir(os.path.join(p_path, 'depth_left'))):
+                    all_scenes.append(os.path.join(scene_name, p_dir))
+
         return sorted(all_scenes)
 
     def get_filter_scenes(self, split):

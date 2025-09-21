@@ -1,6 +1,5 @@
 import torch
 from torch.utils.data import Dataset, DataLoader, Subset, ConcatDataset
-import torch.distributed as dist
 import numpy as np
 import logging
 import os
@@ -58,7 +57,7 @@ class CombinedDataset(Dataset):
 
 
         
-        cache_dir = '/root/gene/video-depth/dataloaders/pairs_cache' if split != 'test' else None
+        cache_dir = './dataloaders/pairs_cache' if split != 'test' else None
 
         self.pairslist = {}
         self.depth_read_list = {}
@@ -146,10 +145,15 @@ class CombinedDataset(Dataset):
         if self.split == 'val':
             dataset_idx, scene_idx = self.pairs[idx]
             scene = self.pairslist[dataset_idx][scene_idx]
-            
+
             images = []
             depths = []
             for pair in scene:
+                # Debug: check if pair is string or dict
+                if isinstance(pair, str):
+                    continue  # Skip invalid pairs
+                elif not isinstance(pair, dict):
+                    continue  # Skip non-dict pairs
                 image, _current_crop = _load_and_process_image(pair['image'], **self.reshape_list[dataset_idx])
                 depth = self.depth_read_list[dataset_idx](pair['depth'], is_inverse=True) # needed for scaling focal length, currently only for Spring
                 # don't resize depth; resize output to match gt instead in inference loop
@@ -257,7 +261,7 @@ class CombinedDataset(Dataset):
                 print("dataset, pair idx: ", dataset_idx, pair_idx)
                 print(f"seq indices: {sequence_indices}")
                 print("pairslist len: ", len(self.pairslist[dataset_idx]))
-                dist.barrier()
+                raise e
             image, _current_crop = _load_and_process_image(pair['image'], **self.reshape_list[dataset_idx])
             print_depth_minmax = False #seq_i == 0
             depth = self.depth_read_list[dataset_idx](pair['depth'], is_inverse=True,  print_minmax=print_depth_minmax) # needed for scaling focal length, currently only for Spring
@@ -270,7 +274,7 @@ class CombinedDataset(Dataset):
             depths = torch.stack(depths, dim=0) if self.split != 'test' else None  # [T, H, W]
         except Exception as e:
             import ipdb; ipdb.set_trace()
-            dist.barrier()
+            raise e
         
         return images.float(), depths, dataset_idx #, pair['scene_name']
        

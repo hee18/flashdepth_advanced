@@ -60,7 +60,9 @@ class BaseDatasetPairs(Dataset):
             
             if load_cache is not None:
                 logging.info(f"saving cache for {self.dataset_name}")
-                pickle.dump(self.pairs, open(self.get_cache_path(load_cache), 'wb'))
+                cache_path = self.get_cache_path(load_cache)
+                os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+                pickle.dump(self.pairs, open(cache_path, 'wb'))
 
     def _build_pairs(self):
         scenes_path = self.get_scenes_path()
