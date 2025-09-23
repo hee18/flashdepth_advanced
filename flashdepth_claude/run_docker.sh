@@ -31,6 +31,7 @@ show_usage() {
     echo "Commands:"
     echo "  build     Build the Docker image"
     echo "  train     Start training with default settings"
+    echo "  test      Start testing with default settings"
     echo "  shell     Start interactive shell in container"
     echo "  clean     Remove containers and images"
     echo "  logs      Show container logs"
@@ -41,27 +42,32 @@ show_usage() {
     echo "  --epochs NUM          Set number of training iterations (default: 60001)"
     echo "  --gpu ID              Set GPU ID (default: 0)"
     echo "  --results-dir PATH    Set results directory (default: train_results/results_1)"
+    echo "  --flashdepth-checkpoint PATH  Set FlashDepth pretrained weights path"
+    echo "  --gsp-checkpoint PATH Set GSP module weights path"
     echo ""
     echo "Examples:"
     echo "  $0 build                              # Build the image"
     echo "  $0 train                              # Start training with defaults"
     echo "  $0 train --batch-size 4 --gpu 1      # Train with custom settings"
+    echo "  $0 test                               # Start testing with defaults"
     echo "  $0 train --results-dir train_results/results_2  # Custom results directory"
     echo "  $0 shell                              # Interactive development"
 }
 
 # Parse command line arguments - using original FlashDepth settings
 COMMAND=""
-BATCH_SIZE=4
-WORKERS=10
-TOTAL_ITERS=60001
+BATCH_SIZE=12
+WORKERS=4
+TOTAL_ITERS=30001
 GPU_ID=0
 RESULTS_DIR="train_results/results_1"
+FLASHDEPTH_CHECKPOINT="configs/flashdepth-l/iter_10001.pth"
+GSP_CHECKPOINT=""
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
-        build|train|shell|clean|logs)
+        build|train|test|shell|clean|logs)
             COMMAND="$1"
             shift
             ;;
@@ -83,6 +89,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --results-dir)
             RESULTS_DIR="$2"
+            shift 2
+            ;;
+        --flashdepth-checkpoint)
+            FLASHDEPTH_CHECKPOINT="$2"
+            shift 2
+            ;;
+        --gsp-checkpoint)
+            GSP_CHECKPOINT="$2"
             shift 2
             ;;
         -h|--help)
@@ -118,7 +132,7 @@ case $COMMAND in
         echo ""
 
         # Update docker compose command with custom parameters (Stage 1: FlashDepth-L)
-        docker compose run --rm flashdepth python train_metric_head.py \
+        DOCKER_CMD="CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm flashdepth python train_metric_head.py \
             --config-path configs/flashdepth-l \
             dataset.data_root=/data/datasets \
             dataset.train_datasets=[tartanair] \
@@ -127,7 +141,37 @@ case $COMMAND in
             training.workers=4 \
             training.total_iters=$TOTAL_ITERS \
             model.attn_class=Attention \
-            +results_dir=$RESULTS_DIR
+            +results_dir=$RESULTS_DIR \
+            +gpu=$GPU_ID"
+
+        # Add checkpoint loading if specified
+        if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
+            DOCKER_CMD="$DOCKER_CMD load=$FLASHDEPTH_CHECKPOINT"
+        fi
+
+        eval $DOCKER_CMD
+        ;;
+
+    test)
+        echo "Starting FlashDepth testing..."
+        echo "Configuration:"
+        echo "  - GPU: $GPU_ID"
+        echo "  - Results directory: $RESULTS_DIR"
+        echo ""
+
+        # Build test command with conditional parameters
+        TEST_CMD="python test_metric_head.py +results_dir=$RESULTS_DIR"
+
+        if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
+            TEST_CMD="$TEST_CMD +flashdepth_checkpoint=$FLASHDEPTH_CHECKPOINT"
+        fi
+
+        if [ -n "$GSP_CHECKPOINT" ]; then
+            TEST_CMD="$TEST_CMD +gsp_checkpoint=$GSP_CHECKPOINT"
+        fi
+
+        # Run test_metric_head.py with custom parameters
+        docker compose run --rm flashdepth $TEST_CMD
         ;;
 
     shell)

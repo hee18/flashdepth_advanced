@@ -9,9 +9,10 @@ class GlobalScalePredictor(nn.Module):
 
     This head takes the [CLS] token feature vector from DINOv2 encoder and predicts
     global scale and shift parameters to transform relative depth to metric depth.
+    FlashDepth outputs are in the range of 100/gt_depth, so scale should be positive.
 
     Architecture: Linear(1024 -> 256) -> ReLU -> Linear(256 -> 2)
-    Output: [scale, shift] where scale > 0 (enforced by Softplus activation)
+    Output: [scale, shift] where scale > 0 (enforced by Softplus activation), shift can be negative
     """
 
     def __init__(self, input_dim=1024, hidden_dim=256):
@@ -55,9 +56,9 @@ class GlobalScalePredictor(nn.Module):
                       Shape: (batch_size, input_dim)
 
         Returns:
-            scale: Global scale parameter (always positive)
+            scale: Global scale parameter (positive, ensured by Softplus activation)
                    Shape: (batch_size, 1)
-            shift: Global shift parameter
+            shift: Global shift parameter (can be negative)
                    Shape: (batch_size, 1)
         """
         # Ensure input has correct shape
@@ -73,8 +74,9 @@ class GlobalScalePredictor(nn.Module):
         # Split scale and shift
         scale_raw, shift = output[:, 0:1], output[:, 1:2]  # Each: (batch_size, 1)
 
-        # Apply Softplus to scale to ensure it's always positive
-        scale = F.softplus(scale_raw)
+        # Apply Softplus to ensure scale is positive (depth must be positive)
+        # Since we're converting from 100/gt_depth to metric depth, scale should be positive
+        scale = F.softplus(scale_raw) + 1e-8  # Add small epsilon to avoid exactly zero
 
         return scale, shift
 
@@ -100,8 +102,13 @@ class GlobalScalePredictor(nn.Module):
         if shift.dim() == 2:
             shift = shift.unsqueeze(-1)  # (batch_size, 1, 1)
 
-        # Apply affine transformation: D_metric = scale * D_rel + shift
-        metric_depth = scale * relative_depth + shift
+        # FlashDepth relative depth is trained as inverse_gt_depth * 100
+        # So we need to: relative_depth / 100 -> 1/value -> apply scale/shift
+        # D_metric = scale * (1 / (relative_depth / 100)) + shift
+        # But we need to handle division by zero
+        inverse_depth = relative_depth / 100.0
+        depth_from_relative = 1.0 / (inverse_depth + 1e-8)
+        metric_depth = scale * depth_from_relative + shift
 
         return metric_depth
 
@@ -111,16 +118,31 @@ class MetricDepthLoss(nn.Module):
     Loss function for training the Global Scale Predictor
     """
 
-    def __init__(self, loss_type='l1'):
+    def __init__(self, loss_type='log_l1'):
         super(MetricDepthLoss, self).__init__()
         self.loss_type = loss_type
 
         if loss_type == 'l1':
             self.loss_fn = nn.L1Loss()
+        elif loss_type == 'log_l1':
+            self.loss_fn = self._log_l1_loss
         elif loss_type == 'l2':
             self.loss_fn = nn.MSELoss()
         else:
             raise ValueError(f"Unsupported loss type: {loss_type}")
+
+    def _log_l1_loss(self, pred, gt):
+        """
+        Log L1 loss function for depth estimation
+
+        Args:
+            pred: Predicted depth values
+            gt: Ground truth depth values
+
+        Returns:
+            Log L1 loss
+        """
+        return F.l1_loss(torch.log(pred + 1e-8), torch.log(gt + 1e-8))
 
     def forward(self, pred_metric_depth, gt_metric_depth, valid_mask=None):
         """
@@ -137,16 +159,16 @@ class MetricDepthLoss(nn.Module):
         Returns:
             loss: Scalar loss value
         """
+        # Use valid mask if provided, otherwise use all pixels
         if valid_mask is not None:
-            # Only compute loss on valid pixels
             valid_pred = pred_metric_depth[valid_mask]
             valid_gt = gt_metric_depth[valid_mask]
-
-            if valid_pred.numel() == 0:
-                return torch.tensor(0.0, device=pred_metric_depth.device, requires_grad=True)
-
-            loss = self.loss_fn(valid_pred, valid_gt)
         else:
-            loss = self.loss_fn(pred_metric_depth, gt_metric_depth)
+            valid_pred = pred_metric_depth.flatten()
+            valid_gt = gt_metric_depth.flatten()
 
+        if valid_pred.numel() == 0:
+            return torch.tensor(0.0, device=pred_metric_depth.device, requires_grad=True)
+
+        loss = self.loss_fn(valid_pred, valid_gt)
         return loss

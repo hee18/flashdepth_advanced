@@ -105,9 +105,11 @@ class MetricDepthMetrics:
 
         # Absolute Relative Error
         abs_rel = torch.mean(torch.abs(pred_valid - gt_valid) / gt_valid)
-
+        
         # Squared Relative Error
         sq_rel = torch.mean(((pred_valid - gt_valid) ** 2) / gt_valid)
+
+        print(f"@@@@@Pred Max {torch.max(pred_valid)} Min {torch.min(pred_valid)} Mean {torch.mean(pred_valid)}@@@@@")
 
         # Log RMSE
         pred_log = torch.log(torch.clamp(pred_valid, min=1e-8))
@@ -282,7 +284,9 @@ class MetricDepthMetrics:
         result = {}
 
         # Basic metric depth metrics
-        result.update(MetricDepthMetrics.compute_metric_depth_metrics(pred, gt, valid_mask))
+        basic_metrics = MetricDepthMetrics.compute_metric_depth_metrics(pred, gt, valid_mask)
+        for k, v in basic_metrics.items():
+            result[k] = v
 
         # Scale-shift invariant metrics (for comparison)
         result["scale_invariant"] = MetricDepthMetrics.compute_scale_shift_invariant_metrics(
@@ -295,7 +299,9 @@ class MetricDepthMetrics:
         )
 
         # Boundary metrics
-        result.update(MetricDepthMetrics.compute_boundary_metrics(pred, gt, valid_mask))
+        boundary_metrics = MetricDepthMetrics.compute_boundary_metrics(pred, gt, valid_mask)
+        for k, v in boundary_metrics.items():
+            result[k] = v
 
         # Additional statistics
         if valid_mask is None:
@@ -305,7 +311,7 @@ class MetricDepthMetrics:
         gt_valid = gt[valid_mask]
 
         if len(pred_valid) > 0:
-            result.update({
+            additional_stats = {
                 "pred_mean": torch.mean(pred_valid).item(),
                 "pred_std": torch.std(pred_valid).item(),
                 "gt_mean": torch.mean(gt_valid).item(),
@@ -317,7 +323,9 @@ class MetricDepthMetrics:
                 "valid_pixels": len(pred_valid),
                 "total_pixels": pred.numel(),
                 "valid_ratio": len(pred_valid) / pred.numel(),
-            })
+            }
+            for k, v in additional_stats.items():
+                result[k] = v
 
         return result
 

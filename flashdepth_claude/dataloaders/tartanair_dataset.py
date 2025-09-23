@@ -59,26 +59,41 @@ class TartanairDepth(BaseDatasetPairs):
     def get_depth_name(self, img_name):
         return img_name.replace('_left.png', '_left_depth.npy')
 
-    def depth_read(self, path, return_torch=False, **kwargs):
+    def depth_read(self, path, is_inverse=False, return_torch=False, **kwargs):
         depth = np.load(path)
-        
+
         invalid_mask = np.logical_or.reduce((
             np.isinf(depth),
             np.isnan(depth),
             depth == 0,
             depth < 0
         ))
-            
-        depth[invalid_mask] = -1 
-       
-        inverse_depth = 1 / depth
-        inverse_depth[inverse_depth < 0.001] = 0  # sky is roughly 10k in tartanair
-        inverse_depth[invalid_mask] = -1
-        
-        if kwargs.get('print_minmax', False):
-            logging.info(f"minmax depth for {path}: {inverse_depth.min():.3f}, {inverse_depth.max():.3f}")
 
-        if return_torch:
-            inverse_depth = torch.from_numpy(inverse_depth).float()
+        if is_inverse:
+            # Convert to inverse depth if requested (legacy mode)
+            depth[invalid_mask] = -1
+            inverse_depth = 1 / depth
+            inverse_depth[inverse_depth < 0.001] = 0  # sky is roughly 10k in tartanair
+            inverse_depth[invalid_mask] = -1
 
-        return inverse_depth
+            if kwargs.get('print_minmax', False):
+                logging.info(f"minmax inverse depth for {path}: {inverse_depth.min():.3f}, {inverse_depth.max():.3f}")
+
+            if return_torch:
+                inverse_depth = torch.from_numpy(inverse_depth).float()
+
+            return inverse_depth
+        else:
+            # For GSP training, return original metric depth
+            depth[invalid_mask] = -1
+
+            # Cap extremely large depths (sky regions in TartanAir can be ~10k)
+            depth[depth > 1000] = -1  # Mark as invalid if > 1km
+
+            if kwargs.get('print_minmax', False):
+                logging.info(f"minmax metric depth for {path}: {depth.min():.3f}, {depth.max():.3f}")
+
+            if return_torch:
+                depth = torch.from_numpy(depth).float()
+
+            return depth

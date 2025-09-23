@@ -21,7 +21,23 @@ logger = logging.getLogger("dinov2")
 try:
     from xformers.ops import memory_efficient_attention, unbind, fmha
 
-    XFORMERS_AVAILABLE = True
+    # Test if xFormers actually works
+    import torch
+    test_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    try:
+        # Quick test with small tensors
+        B, N, H, D = 2, 10, 8, 32
+        query = torch.randn(B, N, H, D, dtype=torch.bfloat16, device=test_device)
+        key = torch.randn(B, N, H, D, dtype=torch.bfloat16, device=test_device)
+        value = torch.randn(B, N, H, D, dtype=torch.bfloat16, device=test_device)
+        _ = memory_efficient_attention(query, key, value)
+        XFORMERS_AVAILABLE = True
+        logger.info("xFormers CUDA support verified and working!")
+    except Exception as e:
+        XFORMERS_AVAILABLE = False
+        logger.warning(f"xFormers test failed: {e}")
+        logger.warning("Falling back to standard attention")
+
 except ImportError:
     logger.warning("xFormers not available")
     XFORMERS_AVAILABLE = False

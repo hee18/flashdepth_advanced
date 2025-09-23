@@ -154,26 +154,47 @@ class CombinedDataset(Dataset):
                     continue  # Skip invalid pairs
                 elif not isinstance(pair, dict):
                     continue  # Skip non-dict pairs
-                image, _current_crop = _load_and_process_image(pair['image'], **self.reshape_list[dataset_idx])
-                depth = self.depth_read_list[dataset_idx](pair['depth'], is_inverse=True) # needed for scaling focal length, currently only for Spring
-                # don't resize depth; resize output to match gt instead in inference loop
-                # depth = _load_and_process_depth(depth, image.shape, _current_crop, **self.reshape_list[dataset_idx])
 
-                # if self.reshape_list[dataset_idx]['crop_type'] == 'center':
-                #     h, w = depth.shape
-                #     start_y, start_x, target_h, target_w = _current_crop
-                #     # Scale crop coordinates to original depth resolution
-                #     orig_start_y = int((start_y / image.shape[1]) * h)
-                #     orig_start_x = int((start_x / image.shape[2]) * w)
-                #     orig_target_h = int((target_h / image.shape[1]) * h)
-                #     orig_target_w = int((target_w / image.shape[2]) * w)
-                #     depth = depth[orig_start_y:orig_start_y + orig_target_h, 
-                #                 orig_start_x:orig_start_x + orig_target_w]
-        
-                images.append(image)
-                depths.append(torch.from_numpy(depth).float()) # not resizing depth, using original resolution
+                try:
+                    image, _current_crop = _load_and_process_image(pair['image'], **self.reshape_list[dataset_idx])
+                    depth = self.depth_read_list[dataset_idx](pair['depth'], is_inverse=False) # Using original depth for GSP training
+                    # don't resize depth; resize output to match gt instead in inference loop
+                    # depth = _load_and_process_depth(depth, image.shape, _current_crop, **self.reshape_list[dataset_idx])
+
+                    # if self.reshape_list[dataset_idx]['crop_type'] == 'center':
+                    #     h, w = depth.shape
+                    #     start_y, start_x, target_h, target_w = _current_crop
+                    #     # Scale crop coordinates to original depth resolution
+                    #     orig_start_y = int((start_y / image.shape[1]) * h)
+                    #     orig_start_x = int((start_x / image.shape[2]) * w)
+                    #     orig_target_h = int((target_h / image.shape[1]) * h)
+                    #     orig_target_w = int((target_w / image.shape[2]) * w)
+                    #     depth = depth[orig_start_y:orig_start_y + orig_target_h,
+                    #                 orig_start_x:orig_start_x + orig_target_w]
+
+                    images.append(image)
+                    depths.append(torch.from_numpy(depth).float()) # not resizing depth, using original resolution
+                except Exception as e:
+                    print(f"Error loading validation pair: {e}")
+                    continue
+
+            # Ensure we have at least one valid pair
+            if len(images) == 0:
+                # Create dummy data to avoid empty tensor error (use size divisible by 14)
+                dummy_image = torch.zeros(3, 266, 266)  # C, H, W (266 = 14 * 19)
+                dummy_depth = torch.zeros(266, 266)  # H, W
+                images.append(dummy_image)
+                depths.append(dummy_depth)
+                print(f"Warning: No valid pairs found for validation idx {idx}, using dummy data")
 
             return_name = dataset_idx
+
+            # Additional safety check before stacking
+            if len(images) == 0 or len(depths) == 0:
+                dummy_image = torch.zeros(3, 266, 266)  # Use size divisible by 14
+                dummy_depth = torch.zeros(266, 266)
+                return dummy_image.unsqueeze(0).float(), dummy_depth.unsqueeze(0).float(), return_name
+
             return torch.stack(images).float(), torch.stack(depths).float(), return_name
 
 
@@ -264,7 +285,7 @@ class CombinedDataset(Dataset):
                 raise e
             image, _current_crop = _load_and_process_image(pair['image'], **self.reshape_list[dataset_idx])
             print_depth_minmax = False #seq_i == 0
-            depth = self.depth_read_list[dataset_idx](pair['depth'], is_inverse=True,  print_minmax=print_depth_minmax) # needed for scaling focal length, currently only for Spring
+            depth = self.depth_read_list[dataset_idx](pair['depth'], is_inverse=False, print_minmax=print_depth_minmax) # Using original depth for GSP training
             depth = _load_and_process_depth(depth, image.shape, _current_crop, **self.reshape_list[dataset_idx])
             images.append(image)
             depths.append(depth)
@@ -273,7 +294,13 @@ class CombinedDataset(Dataset):
             images = torch.stack(images, dim=0)  # [T, C, H, W]
             depths = torch.stack(depths, dim=0) if self.split != 'test' else None  # [T, H, W]
         except Exception as e:
-            import ipdb; ipdb.set_trace()
+            print(f"Error stacking tensors in dataset {dataset_idx}: {e}")
+            print(f"Images length: {len(images)}")
+            if self.split != 'test':
+                print(f"Depths length: {len(depths)}")
+            print(f"Image shapes: {[img.shape if hasattr(img, 'shape') else type(img) for img in images]}")
+            if self.split != 'test' and len(depths) > 0:
+                print(f"Depth shapes: {[d.shape if hasattr(d, 'shape') else type(d) for d in depths]}")
             raise e
         
         return images.float(), depths, dataset_idx #, pair['scene_name']

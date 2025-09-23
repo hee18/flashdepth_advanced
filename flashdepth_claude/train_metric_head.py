@@ -14,7 +14,7 @@ from flashdepth.model import FlashDepth
 from flashdepth.heads import MetricDepthLoss
 from dataloaders.combined_dataset import CombinedDataset
 from utils.helpers import *
-from utils.eval_metrics.metrics import compute_depth_metrics
+from utils.metric_depth_metrics import MetricDepthMetrics
 try:
     from utils.metric_visualization import MetricDepthVisualizer
     VISUALIZATION_AVAILABLE = True
@@ -33,18 +33,16 @@ class MetricHeadTrainer:
     def __init__(self, config):
         self.config = config
 
-        # Multi-GPU setup
-        if torch.cuda.device_count() > 1:
-            available_gpus = list(range(min(3, torch.cuda.device_count())))  # Use GPU 0,1,2
-            self.device = f"cuda:{available_gpus[0]}"
-            self.gpu_ids = available_gpus
-            self.use_multi_gpu = True
-            logging.info(f"Using {len(available_gpus)} GPUs: {available_gpus}")
-        else:
-            self.device = "cuda:0"
-            self.gpu_ids = [0]
-            self.use_multi_gpu = False
-            logging.info("Using single GPU")
+        # Single GPU setup for GSP training
+        gpu_id = config.get('gpu', 0)
+
+        # Set CUDA_VISIBLE_DEVICES to make only the specified GPU visible
+        import os
+        os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
+
+        self.device = "cuda:0"  # Always cuda:0 since CUDA_VISIBLE_DEVICES maps the specified GPU
+        self.use_multi_gpu = False
+        logging.info("Using single GPU for GSP training")
 
         # Setup results directory
         self.results_dir = Path(config.get('results_dir', './train_results/results_1'))
@@ -101,25 +99,61 @@ class MetricHeadTrainer:
 
         model = FlashDepth(**model_config)
 
-        # Multi-GPU setup
-        if self.use_multi_gpu:
-            model = nn.DataParallel(model, device_ids=self.gpu_ids)
-            self.logger.info(f"Model wrapped with DataParallel for GPUs: {self.gpu_ids}")
+        # No DataParallel for single GPU training
 
         # Load pre-trained FlashDepth checkpoint
+        checkpoint_path = self.config.get('flashdepth_checkpoint')
+        if not checkpoint_path:
+            # Default checkpoint path
+            checkpoint_path = "configs/flashdepth-l/iter_10001.pth"
+            self.logger.info(f"No flashdepth_checkpoint specified, using default: {checkpoint_path}")
+
         if self.config.load and self.config.load != 'true':
+            # Override with explicit load path if provided
             checkpoint_path = self.config.load
+
+        if checkpoint_path:
             if os.path.exists(checkpoint_path):
                 self.logger.info(f"Loading FlashDepth checkpoint from {checkpoint_path}")
                 checkpoint = torch.load(checkpoint_path, map_location='cpu')
 
-                # Load only the base model weights (exclude GSP head)
+                # Extract state dict from checkpoint - handle different checkpoint formats
+                if isinstance(checkpoint, dict) and 'model' in checkpoint:
+                    state_dict = checkpoint['model']
+                elif isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
+                    state_dict = checkpoint['state_dict']
+                else:
+                    state_dict = checkpoint
+
+                self.logger.info(f"Checkpoint keys (first 10): {list(state_dict.keys())[:10]}")
+
+                # Get current model state dict (no DataParallel, so no module. prefix)
                 model_dict = model.state_dict()
-                pretrained_dict = {k: v for k, v in checkpoint.items()
-                                 if k in model_dict and not k.startswith('gsp_head')}
+
+                # Simple key mapping - just exclude GSP head keys
+                pretrained_dict = {}
+                loaded_keys = []
+                missing_keys = []
+
+                for checkpoint_key, checkpoint_value in state_dict.items():
+                    # Remove 'module.' prefix if present in checkpoint
+                    clean_key = checkpoint_key.replace('module.', '')
+
+                    # Load if key exists in model and not GSP head
+                    if clean_key in model_dict and not clean_key.startswith('gsp_head'):
+                        pretrained_dict[clean_key] = checkpoint_value
+                        loaded_keys.append(clean_key)
+                    elif not clean_key.startswith('gsp_head'):
+                        missing_keys.append(clean_key)
+
+                # Update model dict and load state
                 model_dict.update(pretrained_dict)
                 model.load_state_dict(model_dict)
+
                 self.logger.info(f"Loaded {len(pretrained_dict)} parameters from checkpoint")
+                self.logger.info(f"Successfully loaded keys (first 10): {loaded_keys[:10]}")
+                if missing_keys:
+                    self.logger.warning(f"Missing keys (first 10): {missing_keys[:10]}")
             else:
                 self.logger.warning(f"Checkpoint path {checkpoint_path} does not exist")
 
@@ -136,15 +170,13 @@ class MetricHeadTrainer:
         trainable_params = 0
 
         # Debug: Print all parameter names to see the structure
-        self.logger.info("All model parameters:")
-        for name, param in model.named_parameters():
-            self.logger.info(f"  {name} - {param.shape}")
+        # self.logger.info("All model parameters:")
+        # for name, param in model.named_parameters():
+        #     self.logger.info(f"  {name} - {param.shape}")
 
         for name, param in model.named_parameters():
-            # Handle DataParallel wrapper - parameters have 'module.' prefix
-            param_name = name.replace('module.', '') if name.startswith('module.') else name
-
-            if param_name.startswith('gsp_head'):
+            # No DataParallel, so no module. prefix handling needed
+            if name.startswith('gsp_head'):
                 param.requires_grad = True
                 trainable_params += param.numel()
                 self.logger.info(f"Trainable parameter: {name} - {param.shape}")
@@ -242,9 +274,10 @@ class MetricHeadTrainer:
 
         for batch_idx, batch in enumerate(pbar):
             try:
-                # Forward pass and loss computation
+                # Forward pass and loss computation with mixed precision
                 model_fn = self.model.module if self.use_multi_gpu else self.model
-                loss, metrics = model_fn.train_metric_head(batch, self.loss_fn)
+                with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+                    loss, metrics = model_fn.train_metric_head(batch, self.loss_fn)
 
                 # Backward pass
                 self.optimizer.zero_grad()
@@ -278,6 +311,27 @@ class MetricHeadTrainer:
                         'train/shift': metrics['mean_shift'],
                         'global_step': self.global_step
                     })
+
+                # Training visualization (every 250 steps)
+                vis_steps = [1, 10, 50, 100]
+                if (self.global_step in vis_steps or self.global_step % 250 == 0 ) and self.visualizer:
+                    try:
+                        # Create a simple visualization using current training batch
+                        self.model.eval()
+                        with torch.no_grad():
+                            model_fn = self.model.module if self.use_multi_gpu else self.model
+                            train_outputs = model_fn.forward_with_metric_head((batch[0].to(self.device), batch[1].to(self.device)))
+                            self.visualizer.create_validation_summary(
+                                (batch[0], batch[1], batch[2]), train_outputs, self.global_step, prefix="training"
+                            )
+                            self.logger.info(f"Training visualization saved at step {self.global_step}")
+                        self.model.train()
+                        # Keep only GSP head in training mode
+                        for name, module in self.model.named_modules():
+                            if not name.startswith('gsp_head') and not name == '':
+                                module.eval()
+                    except Exception as viz_e:
+                        self.logger.warning(f"Failed to save training visualization: {viz_e}")
 
                 # Validation (every val_freq steps)
                 if self.global_step % self.config.training.get('val_freq', 1000) == 0:
@@ -316,18 +370,22 @@ class MetricHeadTrainer:
             for batch_idx, batch in enumerate(pbar):
                 try:
                     video, gt_depth, dataset_name = batch
-                    video = video.to(self.device)
-                    gt_depth = gt_depth.to(self.device)
 
-                    # Forward pass
+                    # Forward pass with mixed precision
                     model_fn = self.model.module if self.use_multi_gpu else self.model
-                    outputs = model_fn.forward_with_metric_head((video, gt_depth))
+                    with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+                        outputs = model_fn.forward_with_metric_head((video, gt_depth))
                     pred_metric = outputs['metric_depth']
 
-                    # Compute loss
+                    # Compute loss (convert GT to metric depth space)
                     pred_flat = rearrange(pred_metric, 'b t h w -> (b t) h w')
                     gt_flat = rearrange(gt_depth, 'b t h w -> (b t) h w')
-                    valid_mask = gt_flat >= 0
+                    # For TartanAir: GT is already metric depth, no conversion needed
+
+                    # Create valid mask considering both GT and pred ranges
+                    gt_valid_mask = gt_flat > 0  # GT valid pixels
+                    pred_valid_mask = (pred_flat > 0) & (pred_flat < 1000.0)  # Pred in reasonable range
+                    valid_mask = gt_valid_mask & pred_valid_mask
 
                     loss = self.loss_fn(pred_flat, gt_flat, valid_mask)
                     total_loss += loss.item()
@@ -335,10 +393,16 @@ class MetricHeadTrainer:
 
                     # Compute depth metrics for first frame
                     if batch_idx == 0:  # Save computation time
-                        metrics = compute_depth_metrics(
-                            pred_metric[0, 0].cpu(),  # First batch, first frame
-                            gt_depth[0, 0].cpu(),
-                            valid_mask=gt_depth[0, 0].cpu() >= 0
+                        gt_metric = gt_depth[0, 0].cpu()
+                        pred_metric_cpu = pred_metric[0, 0].cpu()
+                        # Create valid mask considering both GT and pred ranges
+                        gt_valid_mask = gt_metric > 0  # GT valid pixels
+                        pred_valid_mask = (pred_metric_cpu > 0) & (pred_metric_cpu < 1000.0)  # Pred in reasonable range
+                        valid_mask = gt_valid_mask & pred_valid_mask
+                        metrics = MetricDepthMetrics.compute_metric_depth_metrics(
+                            pred_metric[0, 0].cpu(),  # First batch, first frame (already in metric depth)
+                            gt_metric,  
+                            valid_mask=valid_mask
                         )
                         all_errors.append(metrics)
 

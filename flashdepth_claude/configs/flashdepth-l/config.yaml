@@ -42,7 +42,7 @@ model:
   # ViT configuration
   vit_size: "vitl"
   patch_size: 14
-  attn_class: "Attention"
+  attn_class: "MemEffAttention"
 
   # Mamba configuration
   use_mamba: true

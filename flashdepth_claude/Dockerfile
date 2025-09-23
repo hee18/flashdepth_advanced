@@ -27,7 +27,7 @@ COPY mamba/ /app/mamba/
 RUN pip install torchvision==0.19.0
 
 # Install other dependencies
-RUN pip install xformers==0.0.27.post2
+RUN pip install xformers==0.0.27.post2+cu118 --index-url https://download.pytorch.org/whl/cu118
 RUN pip install ipdb tqdm wandb
 RUN pip install matplotlib einops scipy h5py OpenEXR seaborn pandas
 RUN pip install hydra-core

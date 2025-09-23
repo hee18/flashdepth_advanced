@@ -81,13 +81,16 @@ class FlashDepth(nn.Module):
             elif kwargs.get('use_transformer_rnn', False):
                 self.mamba = TransformerRNN(dpt_dim, **kwargs)
             else:
-                self.mamba = MambaModel(
-                    dpt_dim,
-                    kwargs['mamba_type'],
-                    kwargs['num_mamba_layers'],
-                    batch_size,
-                    **{k: v for k, v in kwargs.items() if k not in ['mamba_type', 'num_mamba_layers', 'batch_size']}
-                )
+                # Ensure required parameters are in kwargs
+                mamba_kwargs = kwargs.copy()
+                if 'mamba_type' not in mamba_kwargs:
+                    mamba_kwargs['mamba_type'] = 'add'  # Default from original
+                if 'num_mamba_layers' not in mamba_kwargs:
+                    mamba_kwargs['num_mamba_layers'] = 4  # Default for ViT-L from original
+                if 'batch_size' not in mamba_kwargs:
+                    mamba_kwargs['batch_size'] = batch_size  # From function parameter
+
+                self.mamba = MambaModel(dpt_dim, **mamba_kwargs)
             
             logging.info(f"downsample_mamba: {self.downsample_mamba}")
             logging.info(f"mamba_in_dpt_layer: {self.mamba_in_dpt_layer}")
@@ -266,16 +269,42 @@ class FlashDepth(nn.Module):
             dpt_features = self.get_dpt_features(video_flat, input_shape=(B, T, C, H, W))
             relative_depth = self.final_head(dpt_features, patch_h, patch_w)  # [BT, H, W]
 
+            # Debug: Check relative depth statistics
+            if torch.isnan(relative_depth).any():
+                print(f"WARNING: NaN values in relative depth!")
+            if torch.isinf(relative_depth).any():
+                print(f"WARNING: Inf values in relative depth!")
+
+            rel_min, rel_max = relative_depth.min().item(), relative_depth.max().item()
+            rel_mean, rel_std = relative_depth.mean().item(), relative_depth.std().item()
+            print(f"Relative depth stats - Min: {rel_min:.6f}, Max: {rel_max:.6f}, Mean: {rel_mean:.6f}, Std: {rel_std:.6f}")
+
         # Path B (Trainable): Get CLS tokens for GSP head
         cls_tokens = self.get_cls_token(video_flat)  # [BT, embed_dim]
 
+        # Debug: Check CLS token statistics
+        cls_min, cls_max = cls_tokens.min().item(), cls_tokens.max().item()
+        cls_mean, cls_std = cls_tokens.mean().item(), cls_tokens.std().item()
+        print(f"CLS token stats - Min: {cls_min:.6f}, Max: {cls_max:.6f}, Mean: {cls_mean:.6f}, Std: {cls_std:.6f}")
+
         # Predict global scale and shift parameters
         scale, shift = self.gsp_head(cls_tokens)  # Each: [BT, 1]
+
+        # Debug: Check scale and shift values
+        scale_mean, shift_mean = scale.mean().item(), shift.mean().item()
+        scale_std, shift_std = scale.std().item(), shift.std().item()
+        print(f"Scale - Mean: {scale_mean:.6f}, Std: {scale_std:.6f}")
+        print(f"Shift - Mean: {shift_mean:.6f}, Std: {shift_std:.6f}")
 
         # Convert relative depth to metric depth
         metric_depth = self.gsp_head.predict_metric_depth(
             relative_depth, scale, shift
         )  # [BT, H, W]
+
+        # Debug: Check metric depth statistics
+        metric_min, metric_max = metric_depth.min().item(), metric_depth.max().item()
+        metric_mean, metric_std = metric_depth.mean().item(), metric_depth.std().item()
+        print(f"Metric depth stats - Min: {metric_min:.6f}, Max: {metric_max:.6f}, Mean: {metric_mean:.6f}, Std: {metric_std:.6f}")
 
         # Reshape back to video format if needed
         relative_depth = rearrange(relative_depth, '(b t) h w -> b t h w', b=B, t=T)
@@ -318,11 +347,19 @@ class FlashDepth(nn.Module):
         pred_flat = rearrange(pred_metric_depth, 'b t h w -> (b t) h w')
         gt_flat = rearrange(gt_metric_depth, 'b t h w -> (b t) h w')
 
-        # Create valid mask (assuming negative values are invalid)
-        valid_mask = gt_flat >= 0
+        # For TartanAir: GT is already metric depth (meters)
+        # For other datasets: GT is inverse depth, need conversion
+        # TODO: Handle dataset-specific GT format in the future
+        # For now, assuming TartanAir (metric depth)
+        gt_metric_flat = gt_flat
 
-        # Compute loss
-        loss = loss_fn(pred_flat, gt_flat, valid_mask)
+        # Create valid mask considering both GT and pred ranges to prevent extreme values
+        gt_valid_mask = gt_flat > 0  # GT valid pixels
+        pred_valid_mask = (pred_flat > 0) & (pred_flat < 1000.0)  # Pred in reasonable range
+        valid_mask = gt_valid_mask & pred_valid_mask
+
+        # Compute loss in metric depth space
+        loss = loss_fn(pred_flat, gt_metric_flat, valid_mask)
 
         # Compute metrics for logging
         metrics = {

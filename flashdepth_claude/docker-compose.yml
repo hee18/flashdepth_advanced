@@ -7,24 +7,16 @@ services:
     container_name: flashdepth_training
     runtime: nvidia
     environment:
-      - NVIDIA_VISIBLE_DEVICES=0,1,2
-      - CUDA_VISIBLE_DEVICES=0,1,2
+      - NVIDIA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2}
+      - CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2}
       - PYTHONPATH=/app
       - TRITON_CACHE_DIR=/app/.triton_cache
       - TRITON_PRINT_AUTOTUNING=1
     volumes:
       # Mount datasets directory
       - /home/cvlab/hsy/Datasets:/data/datasets:ro
-      # Mount results directory (bidirectional for reading/writing)
-      - ./train_results:/app/train_results
-      # Mount configs for easy modification
-      - ./configs:/app/configs
-      # Mount source code for development (optional)
-      - ./flashdepth:/app/flashdepth
-      - ./dataloaders:/app/dataloaders
-      - ./utils:/app/utils
-      # Mount the updated train_metric_head.py
-      - ./train_metric_head.py:/app/train_metric_head.py
+      # Mount entire project directory for easy development
+      - .:/app
     working_dir: /app
     stdin_open: true
     tty: true
@@ -34,7 +26,7 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              device_ids: ['0', '1', '2']
+              count: all
               capabilities: [gpu]
 
     # Override default command for interactive development
@@ -50,4 +42,4 @@ services:
       dataset.val_datasets=[tartanair]
       training.batch_size=4
       training.workers=10
-      results_dir=train_results/results_1
+      results_dir=train_results/results_2

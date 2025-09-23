@@ -8,6 +8,7 @@ from pathlib import Path
 import cv2
 from PIL import Image
 import logging
+from .metric_depth_metrics import MetricDepthMetrics
 
 
 class MetricDepthVisualizer:
@@ -24,7 +25,7 @@ class MetricDepthVisualizer:
         plt.style.use('default')
         sns.set_palette("husl")
 
-    def create_validation_summary(self, sample_batch, model_outputs, step, save_name=None):
+    def create_validation_summary(self, sample_batch, model_outputs, step, save_name=None, prefix="validation", image_path=None):
         """
         Create a comprehensive validation summary visualization
 
@@ -33,6 +34,8 @@ class MetricDepthVisualizer:
             model_outputs: Model predictions dictionary
             step: Training step number
             save_name: Optional custom save name
+            prefix: Prefix for the visualization
+            image_path: Optional image file path for display
 
         Returns:
             fig: Matplotlib figure object
@@ -53,8 +56,24 @@ class MetricDepthVisualizer:
             # Normalize input image for display
             input_img = np.clip((input_img + 1) / 2, 0, 1)  # Assuming normalized input
 
-            # Create valid mask
-            valid_mask = gt_depth_frame >= 0
+            # Create valid mask considering both GT and pred ranges to prevent extreme values
+            gt_valid_mask = gt_depth_frame > 0  # GT valid pixels
+            pred_valid_mask = (pred_metric_frame > 0) & (pred_metric_frame < 1000.0)  # Pred in reasonable range
+            valid_mask = gt_valid_mask & pred_valid_mask
+
+            # Debug: Print statistics for troubleshooting
+            gt_valid = gt_depth_frame[valid_mask]
+            pred_valid = pred_metric_frame[valid_mask]
+            print(f"DEBUG Step {step}:")
+            print(f"  GT valid range: {gt_valid.min():.3f} - {gt_valid.max():.3f}")
+            print(f"  Pred valid range: {pred_valid.min():.3f} - {pred_valid.max():.3f}")
+            print(f"  GT invalid pixels: {(gt_depth_frame == -1).sum()}")
+            print(f"  Valid pixels: {valid_mask.sum()}")
+
+            # Check for extreme values that might cause issues
+            extreme_pred = pred_valid[pred_valid > 1000]
+            if len(extreme_pred) > 0:
+                print(f"  EXTREME pred values (>1000m): {len(extreme_pred)} pixels, max: {extreme_pred.max():.1f}")
 
             # Create figure with subplots
             fig = plt.figure(figsize=(20, 12))
@@ -63,12 +82,40 @@ class MetricDepthVisualizer:
             # 1. Input Image
             ax1 = fig.add_subplot(gs[0, 0])
             ax1.imshow(input_img)
+            # Main title with 14pt font
             ax1.set_title('Input Image', fontsize=14, fontweight='bold')
+
+            # Add file path info with smaller font (9pt) between title and image
+            # if image_path:
+            #     # Extract path after 'tartanair/' or similar dataset name
+            #     path_parts = image_path.split('/')
+            #     if 'tartanair' in path_parts:
+            #         tartanair_idx = path_parts.index('tartanair')
+            #         display_path = '/'.join(path_parts[tartanair_idx+1:])
+            #     elif any(dataset in path_parts for dataset in ['spring', 'pointodyssey', 'dynamicreplica', 'mvs_synth']):
+            #         # Find dataset name and start from next part
+            #         for i, part in enumerate(path_parts):
+            #             if part in ['spring', 'pointodyssey', 'dynamicreplica', 'mvs_synth']:
+            #                 display_path = '/'.join(path_parts[i+1:])
+            #                 break
+            #         else:
+            #             display_path = '/'.join(path_parts[-3:])  # Show last 3 parts as fallback
+            #     else:
+            #         display_path = '/'.join(path_parts[-3:])  # Show last 3 parts as fallback
+            # else:
+            #     # Fallback to dataset name if no image path
+            #     display_path = dataset_name[0] if isinstance(dataset_name, (list, tuple)) and len(dataset_name) > 0 else str(dataset_name)
+
+            # ax1.text(0.5, 0.95, f'{display_path}', fontsize=9, ha='center', va='top',
+            #         transform=ax1.transAxes, color='gray', style='italic')
             ax1.axis('off')
 
-            # 2. Ground Truth Depth
+            # 2. Ground Truth Depth (for TartanAir: already metric depth)
             ax2 = fig.add_subplot(gs[0, 1])
-            gt_display = np.where(valid_mask, gt_depth_frame, np.nan)
+            # For TartanAir, GT is already metric depth, no conversion needed
+            # For other datasets, would need: gt_metric_depth = 1.0 / (gt_depth_frame + 1e-8)
+            gt_metric_depth = gt_depth_frame  # Assuming TartanAir format
+            gt_display = np.where(valid_mask, gt_metric_depth, np.nan)
             vmin, vmax = np.nanpercentile(gt_display, [2, 98])
             im2 = ax2.imshow(gt_display, cmap='plasma', vmin=vmin, vmax=vmax)
             ax2.set_title('Ground Truth Depth (m)', fontsize=14, fontweight='bold')
@@ -83,23 +130,30 @@ class MetricDepthVisualizer:
             ax3.axis('off')
             plt.colorbar(im3, ax=ax3, fraction=0.046, pad=0.04)
 
-            # 4. Predicted Relative Depth
+            # 4. Predicted Relative Depth (display raw values from FlashDepth final head)
             ax4 = fig.add_subplot(gs[0, 3])
+            # Debug: Print relative depth statistics
+            rel_mean = np.mean(pred_relative_frame)
+            rel_std = np.std(pred_relative_frame)
+            rel_min, rel_max = pred_relative_frame.min(), pred_relative_frame.max()
+            print(f"DEBUG - Relative depth stats: mean={rel_mean:.4f}, std={rel_std:.4f}, min={rel_min:.4f}, max={rel_max:.4f}")
+
             rel_vmin, rel_vmax = np.nanpercentile(pred_relative_frame, [2, 98])
             im4 = ax4.imshow(pred_relative_frame, cmap='plasma', vmin=rel_vmin, vmax=rel_vmax)
-            ax4.set_title('Predicted Relative Depth', fontsize=14, fontweight='bold')
+            ax4.set_title(f'Relative Depth\nstd={rel_std:.3f}', fontsize=14, fontweight='bold')
             ax4.axis('off')
             plt.colorbar(im4, ax=ax4, fraction=0.046, pad=0.04)
 
             # 5. Valid Mask
             ax5 = fig.add_subplot(gs[1, 0])
-            ax5.imshow(valid_mask, cmap='gray')
+            # Use reversed colormap so valid pixels (True) show as black
+            ax5.imshow(valid_mask.astype(np.uint8), cmap='gray_r', vmin=0, vmax=1)
             ax5.set_title(f'Valid Mask\n({valid_mask.sum():,} pixels)', fontsize=14, fontweight='bold')
             ax5.axis('off')
 
-            # 6. Absolute Error Map
+            # 6. Absolute Error Map (both in metric depth space)
             ax6 = fig.add_subplot(gs[1, 1])
-            abs_error = np.abs(pred_metric_frame - gt_depth_frame)
+            abs_error = np.abs(pred_metric_frame - gt_metric_depth)  # Both in metric depth space
             abs_error_masked = np.where(valid_mask, abs_error, np.nan)
             error_vmax = np.nanpercentile(abs_error_masked, 95)
             im6 = ax6.imshow(abs_error_masked, cmap='hot', vmin=0, vmax=error_vmax)
@@ -108,16 +162,33 @@ class MetricDepthVisualizer:
             ax6.axis('off')
             plt.colorbar(im6, ax=ax6, fraction=0.046, pad=0.04)
 
-            # 7. Relative Error Map
+            # 7. Metric Evaluation (AbsRel and Delta_1)
             ax7 = fig.add_subplot(gs[1, 2])
-            rel_error = abs_error / (gt_depth_frame + 1e-8)
-            rel_error_masked = np.where(valid_mask, rel_error, np.nan)
-            rel_error_vmax = np.nanpercentile(rel_error_masked, 95)
-            im7 = ax7.imshow(rel_error_masked, cmap='hot', vmin=0, vmax=rel_error_vmax)
-            ax7.set_title(f'Relative Error\nMean: {np.nanmean(rel_error_masked):.3f}',
-                         fontsize=14, fontweight='bold')
+            # Convert to torch tensors for metric computation
+            pred_tensor = torch.from_numpy(pred_metric_frame).float()
+            gt_tensor = torch.from_numpy(gt_metric_depth).float()
+            valid_tensor = torch.from_numpy(valid_mask).bool()
+
+            # Compute metrics
+            metrics = MetricDepthMetrics.compute_metric_depth_metrics(
+                pred_tensor, gt_tensor, valid_tensor
+            )
+
+            # Display AbsRel and Delta metrics as text
+            ax7.text(0.1, 0.85, f'AbsRel: {metrics["abs_rel"]:.4f}', fontsize=14,
+                    transform=ax7.transAxes, bbox=dict(boxstyle="round", facecolor='lightcoral'))
+            ax7.text(0.1, 0.7, f'Delta_1: {metrics["a1"]:.4f}', fontsize=14,
+                    transform=ax7.transAxes, bbox=dict(boxstyle="round", facecolor='lightgreen'))
+            ax7.text(0.1, 0.55, f'Delta_2: {metrics["a2"]:.4f}', fontsize=14,
+                    transform=ax7.transAxes, bbox=dict(boxstyle="round", facecolor='lightgreen'))
+            ax7.text(0.1, 0.4, f'Delta_3: {metrics["a3"]:.4f}', fontsize=14,
+                    transform=ax7.transAxes, bbox=dict(boxstyle="round", facecolor='lightgreen'))
+            ax7.text(0.1, 0.25, f'RMSE: {metrics["rmse"]:.3f}m', fontsize=12,
+                    transform=ax7.transAxes, bbox=dict(boxstyle="round", facecolor='wheat'))
+            ax7.text(0.1, 0.1, f'Valid: {metrics.get("mae", 0):.3f}m MAE', fontsize=12,
+                    transform=ax7.transAxes, bbox=dict(boxstyle="round", facecolor='lightblue'))
+            ax7.set_title('Depth Metrics', fontsize=14, fontweight='bold')
             ax7.axis('off')
-            plt.colorbar(im7, ax=ax7, fraction=0.046, pad=0.04)
 
             # 8. Scale and Shift Info
             ax8 = fig.add_subplot(gs[1, 3])
@@ -125,15 +196,20 @@ class MetricDepthVisualizer:
                     transform=ax8.transAxes, bbox=dict(boxstyle="round", facecolor='wheat'))
             ax8.text(0.1, 0.6, f'Shift: {shift[0, 0].item():.4f}', fontsize=16,
                     transform=ax8.transAxes, bbox=dict(boxstyle="round", facecolor='lightblue'))
-            ax8.text(0.1, 0.4, f'Dataset: {dataset_name}', fontsize=14,
+            # Handle dataset name (could be list or tensor)
+            if isinstance(dataset_name, (list, tuple)):
+                dataset_str = dataset_name[0] if len(dataset_name) > 0 else 'unknown'
+            else:
+                dataset_str = str(dataset_name)
+            ax8.text(0.1, 0.4, f'Dataset: {dataset_str}', fontsize=14,
                     transform=ax8.transAxes)
             ax8.text(0.1, 0.2, f'Step: {step}', fontsize=14, transform=ax8.transAxes)
             ax8.set_title('Transformation Parameters', fontsize=14, fontweight='bold')
             ax8.axis('off')
 
-            # 9. Depth Distribution Histogram
+            # 9. Depth Distribution Histogram (both in metric depth space)
             ax9 = fig.add_subplot(gs[2, :2])
-            gt_valid = gt_depth_frame[valid_mask]
+            gt_valid = gt_metric_depth[valid_mask]  # Use converted metric GT depth
             pred_valid = pred_metric_frame[valid_mask]
 
             # Create histograms
@@ -150,7 +226,7 @@ class MetricDepthVisualizer:
             ax9.legend()
             ax9.grid(True, alpha=0.3)
 
-            # 10. Scatter Plot: GT vs Predicted
+            # 10. Scatter Plot: GT vs Predicted (both in metric depth space)
             ax10 = fig.add_subplot(gs[2, 2:])
             # Subsample for visualization if too many points
             if len(gt_valid) > 10000:
@@ -176,16 +252,16 @@ class MetricDepthVisualizer:
             ax10.grid(True, alpha=0.3)
 
             # Overall title
-            fig.suptitle(f'Metric Depth Estimation Validation - Step {step}',
+            fig.suptitle(f'Metric Depth Estimation {prefix.capitalize()} - Step {step}',
                         fontsize=16, fontweight='bold', y=0.98)
 
             # Save figure
             if save_name is None:
-                save_name = f'validation_step_{step}.png'
+                save_name = f'{prefix}_step_{step}.png'
 
             save_path = self.save_dir / save_name
             plt.savefig(save_path, dpi=150, bbox_inches='tight', facecolor='white')
-            self.logger.info(f"Validation visualization saved to {save_path}")
+            self.logger.info(f"{prefix.capitalize()} visualization saved to {save_path}")
 
             return fig
 
