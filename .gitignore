@@ -41,3 +41,10 @@ core.*
 *.pth
 ./FlashDepth
 FlashDepth/
+*.cubin
+*.llir
+*.ptx
+*.ttgir
+*.ttir
+flashdepth_claude/.triton_cache
+*.tar.gz
