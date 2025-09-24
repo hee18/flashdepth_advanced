@@ -38,3 +38,6 @@ wandb/
 *.distcp
 env/
 core.*
+*.pth
+./FlashDepth
+FlashDepth/

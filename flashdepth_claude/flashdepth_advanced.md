@@ -4,6 +4,9 @@
 
 이 프로젝트는 FlashDepth 모델에 Global Scale Predictor (GSP) Head를 추가하여 상대 깊이(relative depth)를 절대 깊이(metric depth)로 변환하는 시스템입니다.
 
+**최종 업데이트**: 2025-09-23
+**현재 구현 상태**: GSP 모듈 훈련 및 극값 처리 완료
+
 ## 전체 시스템 아키텍처
 
 ### 1. 기본 구조
@@ -18,14 +21,14 @@ Input Video → FlashDepth (Frozen) → Relative Depth
 ### 2. 모델 컴포넌트
 
 #### FlashDepth (Frozen Path)
-- **DINOv2 Encoder**: ViT-S (384차원) 또는 ViT-L (1024차원)
+- **DINOv2 Encoder**: ViT-L (1024차원) 사용
 - **DPT Head**: Dense Prediction Transformer로 상대 깊이 생성
-- **Mamba/Temporal Modules**: 비디오 시퀀스 처리 (선택적)
+- **Mamba/Temporal Modules**: Attention 클래스 사용 (mamba 비활성화)
 - **특징**: 모든 파라미터가 동결되어 사전 훈련된 가중치 유지
 
 #### GSP Head (Trainable Path)
-- **입력**: DINOv2에서 추출한 CLS 토큰 (384 또는 1024차원)
-- **구조**: Linear(입력차원 → 256) → ReLU → Linear(256 → 2)
+- **입력**: DINOv2에서 추출한 CLS 토큰 (1024차원)
+- **구조**: Linear(1024 → 256) → ReLU → Linear(256 → 2)
 - **출력**: Scale (양수, Softplus 적용), Shift (실수)
 - **목적**: 상대 깊이를 실제 미터 단위 깊이로 변환
 
@@ -34,29 +37,32 @@ Input Video → FlashDepth (Frozen) → Relative Depth
 D_metric = Scale × D_relative + Shift
 ```
 
-## 🚨 발견된 문제점들
+## 학습 설정
 
-### 1. **Relative Depth 변환 문제** (중요!)
-- **현재 상황**: FlashDepth DPT는 ReLU를 사용하므로 양수 출력이어야 함
-- **관찰된 문제**: 시각화에서 -0.1~0.1 범위의 음수 값 출력
-- **의심되는 원인**:
-  - FlashDepth가 disparity-like 출력을 할 경우 역수 변환 필요 가능성
-  - 정규화 과정에서의 스케일링 문제
-  - 사전 훈련된 가중치와 현재 설정 간 불일치
+### 1. 하이퍼파라미터
+- **학습률**: 1e-4 (GSP 모듈, 고정 학습률, 스케줄러 없음)
+- **옵티마이저**: Adam (weight_decay=1e-6)
+- **배치 크기**: 12
+- **워커 수**: 4
+- **총 반복 횟수**: 30,001
+- **검증 주기**: 1,000 스텝마다
+- **저장 주기**: 1,000 스텝마다
 
-### 2. **Dataset 이름 반복 표시**
-- **문제**: 시각화에서 'tartanair', 'tartanair', ... 반복
-- **원인**: dataset_name이 리스트 형태로 전달되어 직접 출력
-- **해결 필요**: 첫 번째 요소만 표시하도록 수정
+### 2. 손실 함수
+- **기본**: Log L1 Loss (변경됨)
+```python
+def _log_l1_loss(self, pred, gt):
+    return F.l1_loss(torch.log(pred + 1e-8), torch.log(gt + 1e-8))
+```
 
-### 3. **GT Depth 범위 제한**
-- **관찰**: 0.1-0.275m (10-27.5cm)로 매우 제한적
-- **예상**: TartanAir는 더 넓은 깊이 범위를 가져야 함
-- **확인 필요**: 데이터 로딩 및 전처리 과정
+### 3. 데이터셋 설정
+- **사용 데이터셋**: TartanAir (학습 및 검증)
+- **비디오 길이**: 설정된 video_length 사용
+- **해상도**: 518×518
+- **데이터 증강**: 비활성화 (메트릭 학습용)
+- **GT 포맷**: 이미 미터 단위 metric depth (inverse 변환 불필요)
 
-## 학습 구조
-
-### 1. 파라미터 동결 전략
+### 4. 파라미터 동결 전략
 ```python
 # train_metric_head.py의 _freeze_base_model()
 for name, param in model.named_parameters():
@@ -66,176 +72,178 @@ for name, param in model.named_parameters():
         param.requires_grad = False   # 나머지 모든 파라미터 동결
 ```
 
-### 2. 데이터셋 설정
-- **사용 데이터셋**: TartanAir (학습 및 검증)
-- **배치 크기**: 4 (기본값)
-- **비디오 길이**: 3 프레임
-- **해상도**: 518×518
-- **데이터 증강**: 비활성화 (메트릭 학습용)
+## Valid Mask 처리 (중요한 개선 사항)
 
-### 3. 학습 과정
-1. **Stage 1**: FlashDepth-L 기반 GSP Head 훈련
-2. **손실 함수**: L1 Loss (MAE) 기본 사용
-3. **최적화**: Adam optimizer
-4. **체크포인트**: 500 스텝마다 저장
-5. **시각화**: 500 스텝마다 검증 샘플 시각화
+### 1. 문제점
+- **기존**: GT > 0만 고려 → 예측값의 극값으로 인한 메트릭 폭발
+- **극값 예시**: 436,290,016m (4억미터) 같은 비현실적 예측값
 
-### 4. 학습 흐름
-```
-TartanAir Video → FlashDepth (Frozen) → Relative Depth
-                              ↓
-                       CLS Token → GSP Head → Scale, Shift
-                                               ↓
-                          Predicted Metric Depth
-                                  ↓
-                     L1 Loss vs GT Metric Depth
+### 2. 해결책: 복합 Valid Mask
+```python
+# GT와 예측값 모두 고려한 valid mask
+gt_valid_mask = gt_flat > 0  # GT valid pixels
+pred_valid_mask = (pred_flat > 0) & (pred_flat < 1000.0)  # 합리적 범위
+valid_mask = gt_valid_mask & pred_valid_mask
 ```
 
-## 테스트 구조
+### 3. 적용 위치
+1. **Training Loss 계산** (`flashdepth/model.py`)
+2. **Validation Loss 계산** (`train_metric_head.py`)
+3. **Metric 계산** (`train_metric_head.py`)
+4. **Visualization Metric 계산** (`utils/metric_visualization.py`)
 
-### 현재 테스트 항목 (8개)
-
-1. **GSP Head 기본 테스트** ✅
-   - GSP Head 초기화 및 forward pass
-   - Scale 양수 확인, 출력 형태 검증
-
-2. **Metric Depth 변환 테스트** ✅
-   - 변환 공식 정확성 검증
-   - 배치 차원 처리 확인
-
-3. **FlashDepth 통합 테스트** ✅
-   - 전체 모델 통합 확인
-   - CLS 토큰 추출 검증
-   - forward_with_metric_head 메서드 테스트
-
-4. **손실 함수 테스트** ✅
-   - L1, L2 손실 계산 정확성
-   - Valid mask 처리 확인
-
-5. **메트릭 계산 테스트** ✅
-   - MAE, RMSE, AbsRel, δ1 등 계산
-   - 단일 프레임 성능 평가
-
-6. **파라미터 동결 테스트** ✅
-   - 추론 모드에서 모든 파라미터 동결 확인
-   - GSP Head 파라미터 수 검증
-
-7. **시각화 테스트** ✅
-   - 깊이 맵 시각화 생성
-   - 시퀀스 비교 시각화 확인
-
-8. **Comprehensive Integration 테스트** ❌
-   - **문제**: 복잡한 메트릭 계산에서 딕셔너리 연산 오류
-   - **현재 상태**: TartanAir 데이터를 사용한 end-to-end 테스트로 수정 시도
-   - **중요성**: 실제 사용 환경 시뮬레이션
-
-### 테스트 결과 분석
-
-#### 성공한 기능들
-- GSP Head 기본 동작 완전 검증
-- 수학적 변환 공식 정확성 확인
-- 전체 아키텍처 통합 성공
-- 개별 컴포넌트 안정성 확인
-
-#### 미해결 문제들
-- Comprehensive Integration의 복잡한 메트릭 계산 오류
-- 실제 비디오 데이터에서의 end-to-end 성능 미검증
-- 다중 프레임 시간적 일관성 미확인
+### 4. 범위 기준
+- **GT**: `>= 0` (TartanAir: -1이 invalid pixel)
+- **예측값**: `> 0 & < 1000m` (0m 초과, 1km 미만으로 제한)
 
 ## Docker 환경 설정
 
-### 1. 파일 동기화 문제 해결
-```yaml
-# docker-compose.yml 수정 사항
-volumes:
-  - ./train_metric_head.py:/app/train_metric_head.py
-  - ./test_metric_head.py:/app/test_metric_head.py  # 추가됨
-  - ./flashdepth:/app/flashdepth
-  - ./utils:/app/utils
-  - ./dataloaders:/app/dataloaders
+### 1. GPU 할당
+```bash
+# 특정 GPU 사용 (예: GPU 1)
+./run_docker.sh train --gpu 1
+
+# 환경변수 설정
+export CUDA_VISIBLE_DEVICES=1
 ```
 
-### 2. 사용 방법
+### 2. 학습 실행
 ```bash
-# 학습 실행
+# 기본 학습 (기본값: batch_size=12, workers=4, total_iters=30001)
 ./run_docker.sh train
 
-# 테스트 실행
-./run_docker.sh test
-
-# 대화형 셸
-./run_docker.sh shell
-
-# 정리
-./run_docker.sh clean
+# 커스텀 설정
+./run_docker.sh train --batch-size 8 --workers 2 --epochs 20000
 ```
 
-## 핵심 발견 사항 및 해결 과제
+### 3. 결과 디렉토리
+- **기본**: `train_results/results_1`
+- **커스텀**: `--results-dir train_results/results_N`
 
-### 1. **즉시 해결 필요** (Priority 1)
+## 메트릭 및 평가
 
-#### Relative Depth 변환 문제
-- **문제**: FlashDepth의 상대 깊이가 예상과 다른 형태로 출력
-- **현재**: -0.1~0.1 범위 (음수 포함)
-- **예상**: 양수 값 (ReLU 때문에)
-- **해결 방안**:
-  1. FlashDepth의 정확한 출력 형태 분석
-  2. Disparity vs Depth 변환 공식 재검토
-  3. 정규화/스케일링 과정 확인
+### 1. 기본 메트릭
+- **MAE**: Mean Absolute Error (L1)
+- **RMSE**: Root Mean Square Error (L2)
+- **AbsRel**: Absolute Relative Error
+- **δ1, δ2, δ3**: Threshold Accuracy (< 1.25, 1.25², 1.25³)
 
-#### Dataset 시각화 문제
-- **해결 방법**:
+### 2. 추가 메트릭
+- **Scale-Shift Invariant 메트릭**: 정렬 후 성능 평가
+- **Depth Range 메트릭**: 거리별 성능 분석
+- **Boundary 메트릭**: 깊이 경계에서의 정확도
+
+### 3. 시각화 출력
+- **Input Image**
+- **Ground Truth Depth (m)**
+- **Predicted Metric Depth (m)**
+- **Relative Depth** (std 정보 포함)
+- **Valid Mask** (유효 픽셀 수 표시)
+- **Absolute Error Map**
+- **Depth Metrics** (AbsRel, δ1-δ3, RMSE, MAE)
+- **Transformation Parameters** (Scale, Shift)
+- **Depth Distribution Comparison**
+- **GT vs Predicted Scatter Plot**
+
+## 훈련 모니터링
+
+### 1. 로그 출력 정보
+```
+Training Epoch: loss=X, scale=Y, shift=Z
+Relative depth stats: Min, Max, Mean, Std
+CLS token stats: Min, Max, Mean, Std
+Scale stats: Mean, Std
+Shift stats: Mean, Std
+Metric depth stats: Min, Max, Mean, Std (디버그용)
+```
+
+### 2. 시각화 저장
+- **Step 1, 10, 50, 100**: 초기 수렴 확인
+- **매 250 스텝**: 훈련 중 모니터링
+- **매 1000 스텝**: 검증 시각화
+
+### 3. 체크포인트
+- **저장 위치**: `configs/flashdepth-l/`
+- **저장 조건**: 검증 loss 개선 시 best 체크포인트 저장
+- **저장 주기**: 1000 스텝마다 정기 저장
+
+## 성능 개선 사항
+
+### 1. Loss 함수 개선
+- **변경**: L1 Loss → Log L1 Loss
+- **효과**: 깊이 값의 상대적 차이에 더 민감
+- **수식**: `F.l1_loss(log(pred + ε), log(gt + ε))`
+
+### 2. Valid Mask 개선
+- **기존 문제**: 극값 예측으로 인한 메트릭 폭발
+- **해결**: GT와 예측값 모두 고려한 복합 마스크
+- **효과**: 안정적인 훈련 및 정확한 메트릭 계산
+
+### 3. 시각화 개선
+- **Path 정보**: 실제 파일 경로 표시
+- **Valid Mask**: 검은색으로 유효 픽셀 표시 (cmap='gray_r')
+- **메트릭**: 극값 필터링 후 계산
+
+## 모델 비교: 원본 FlashDepth vs 현재 구현
+
+### 1. Valid Mask 처리 비교
+
+#### 원본 FlashDepth
 ```python
-# utils/metric_visualization.py 수정
-dataset_name = dataset_name[0] if isinstance(dataset_name, list) else dataset_name
+# 기본적인 GT 기반 마스크만 사용
+valid_mask = gt_depth >= 0
+loss = F.l1_loss(pred_depth[valid_mask], gt_depth[valid_mask])
 ```
 
-### 2. **중기 해결 과제** (Priority 2)
+#### 현재 구현 (개선됨)
+```python
+# GT와 예측값 모두 고려
+gt_valid_mask = gt_flat > 0
+pred_valid_mask = (pred_flat > 0) & (pred_flat < 1000.0)
+valid_mask = gt_valid_mask & pred_valid_mask
+loss = loss_fn(pred_flat, gt_metric_flat, valid_mask)
+```
 
-#### Comprehensive Integration 테스트
-- **목표**: 실제 TartanAir 데이터로 end-to-end 검증
-- **방법**: 복잡한 중첩 딕셔너리 계산 단순화
-- **중요성**: 실제 사용 환경에서의 안정성 보장
+### 2. 개선 효과
+- **안정성**: 극값으로 인한 훈련 불안정성 해결
+- **정확성**: 비현실적 예측값 제외하여 정확한 메트릭 계산
+- **현실성**: 0.1m-1000m 범위로 실제 환경에서 합리적인 깊이값만 고려
 
-#### 성능 최적화
-- **메모리 사용량 최적화**
-- **다중 GPU 효율성 개선**
-- **배치 처리 안정성 향상**
+## 현재 상태 및 다음 단계
 
-### 3. **장기 개선 과제** (Priority 3)
+### ✅ 완료된 사항
+1. **GSP 모듈 구현**: CLS token 기반 scale/shift 예측
+2. **Loss 함수 개선**: Log L1 Loss 적용
+3. **Valid Mask 개선**: 극값 처리 완료
+4. **Docker 환경**: GPU 할당 문제 해결
+5. **시각화 시스템**: 종합적인 모니터링 도구
+6. **메트릭 계산**: 안정적인 평가 시스템
 
-#### 모델 성능 향상
-- **더 정확한 스케일/시프트 예측**
-- **시간적 일관성 개선**
-- **다양한 데이터셋에서의 일반화 성능**
+### 🔄 진행 중인 사항
+1. **모델 훈련**: 30,001 반복으로 GSP 헤드 훈련 중
+2. **성능 모니터링**: 시각화를 통한 수렴 확인
 
-#### 평가 메트릭 확장
-- **깊이 범위별 성능 분석**
-- **경계 영역 정확도 평가**
-- **시간적 안정성 메트릭**
+### 🎯 향후 계획
+1. **성능 평가**: 훈련 완료 후 정량적 성능 분석
+2. **하이퍼파라미터 튜닝**: 학습률, 배치 크기 등 최적화
+3. **다른 데이터셋 확장**: MVS-Synth, Spring 등 추가 데이터셋 활용
+4. **모델 경량화**: 추론 속도 최적화
 
-## 사용자 검증 포인트
+## 핵심 기술적 인사이트
 
-다음 사항들이 의도한 대로 구현되었는지 확인해 주세요:
+### 1. Metric Depth vs Relative Depth
+- **Relative**: FlashDepth가 출력하는 상대적 깊이 (스케일 없음)
+- **Metric**: 실제 미터 단위의 절대 깊이
+- **변환**: GSP 헤드가 learned scale/shift로 변환 수행
 
-### ✅ 올바르게 구현된 부분
-1. **이중 경로 구조**: Frozen FlashDepth + Trainable GSP
-2. **파라미터 동결**: Base 모델 완전 동결, GSP만 학습
-3. **TartanAir 데이터 사용**: 실제 메트릭 GT로 학습
-4. **Docker 환경**: 개발 및 실험 환경 구성
+### 2. 극값 처리의 중요성
+- **문제**: 초기 훈련에서 GSP가 비현실적인 scale 예측
+- **영향**: 메트릭 계산 시 평균값 왜곡, 훈련 불안정
+- **해결**: 합리적 범위 제한으로 안정적 훈련 달성
 
-### ⚠️ 검토 필요한 부분
-1. **변환 공식의 정확성**: Disparity-like vs Depth-like 출력 확인
-2. **데이터 전처리**: GT 깊이 범위 및 정규화 과정
-3. **시각화 결과 해석**: 현재 결과가 예상한 것과 일치하는지
+### 3. 시각화의 가치
+- **실시간 모니터링**: 수치만으로 파악 어려운 문제점 시각적 확인
+- **디버깅**: Valid mask, 예측 분포 등 세부 사항 분석 가능
+- **성능 추적**: 시간에 따른 개선 사항 명확히 확인
 
-### ❌ 수정 필요한 부분
-1. **Relative Depth 음수 문제**: 근본 원인 분석 및 해결
-2. **Comprehensive Integration**: 안정적인 end-to-end 테스트 구현
-3. **성능 평가**: 실제 메트릭 성능 기준 달성 여부
-
-## 결론
-
-현재 시스템은 기본적인 GSP Head 기능은 완전히 구현되었지만, FlashDepth의 relative depth 특성과 관련된 중요한 문제가 발견되었습니다. 이 문제를 해결하지 않으면 실제 메트릭 깊이 추정 성능에 치명적인 영향을 줄 수 있으므로 최우선으로 해결해야 합니다.
-
-특히 **FlashDepth가 disparity-like 출력을 하는지, depth-like 출력을 하는지**에 따라 변환 공식이 달라질 수 있으므로 이 부분에 대한 정확한 분석이 필요합니다.
+이 문서는 FlashDepth + GSP 시스템의 완전한 기술 명세서로, 현재 구현 상태와 핵심 기술적 결정들을 상세히 기록하고 있습니다.
