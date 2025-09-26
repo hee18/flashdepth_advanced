@@ -62,7 +62,7 @@ TOTAL_ITERS=30001
 GPU_ID=0
 RESULTS_DIR="train_results/results_1"
 FLASHDEPTH_CHECKPOINT="configs/flashdepth-l/iter_10001.pth"
-GSP_CHECKPOINT=""
+GSP_CHECKPOINT="train_results/results_4/best_metric_head.pth"
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -160,7 +160,7 @@ case $COMMAND in
         echo ""
 
         # Build test command with conditional parameters
-        TEST_CMD="python test_metric_head.py +results_dir=$RESULTS_DIR"
+        TEST_CMD="python test_metric_head.py +results_dir=$RESULTS_DIR +gpu=$GPU_ID"
 
         if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
             TEST_CMD="$TEST_CMD +flashdepth_checkpoint=$FLASHDEPTH_CHECKPOINT"

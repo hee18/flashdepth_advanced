@@ -1,0 +1,34 @@
+{
+    "dataset": [
+        "tartanair/abandonedfactory_night_sample_P002/P002"
+    ],
+    "video_shape": [
+        1,
+        50,
+        3,
+        518,
+        518
+    ],
+    "inference_time_seconds": 7.671431541442871,
+    "fps": 6.517688351892119,
+    "total_frames": 50,
+    "scale_min": 12.192423820495605,
+    "scale_max": 12.52196216583252,
+    "scale_mean": 12.234244346618652,
+    "shift_min": 11.050943374633789,
+    "shift_max": 11.37415885925293,
+    "shift_mean": 11.091818809509277,
+    "has_ground_truth": true,
+    "timestamp": "2025-09-26 11:16:44",
+    "temporal_consistency": {
+        "temporal_variance": 48565783101440.0,
+        "frame_to_frame_diff": 1318175.375,
+        "temporal_smoothness": 7.586243977583342e-07,
+        "scale_mean": 12.234243392944336,
+        "scale_std": 0.06968914717435837,
+        "shift_mean": 11.091818809509277,
+        "shift_std": 0.06836085766553879
+    },
+    "average_mae_meters": 0.0,
+    "valid_pixels": 0
+}

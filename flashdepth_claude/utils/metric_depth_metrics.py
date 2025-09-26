@@ -109,7 +109,7 @@ class MetricDepthMetrics:
         # Squared Relative Error
         sq_rel = torch.mean(((pred_valid - gt_valid) ** 2) / gt_valid)
 
-        print(f"@@@@@Pred Max {torch.max(pred_valid)} Min {torch.min(pred_valid)} Mean {torch.mean(pred_valid)}@@@@@")
+        # print(f"@@@@@Pred Max {torch.max(pred_valid)} Min {torch.min(pred_valid)} Mean {torch.mean(pred_valid)}@@@@@")
 
         # Log RMSE
         pred_log = torch.log(torch.clamp(pred_valid, min=1e-8))

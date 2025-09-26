@@ -88,12 +88,15 @@ class CombinedDataset(Dataset):
                     self.reshape_list[dataset]['crop_type'] = None
                     if dataset in ['eth3d', 'waymo']:
                         self.reshape_list[dataset]['resolution'] = (784,518)
-                    if dataset in ['sintel']:
+                    elif dataset in ['sintel']:
                         self.reshape_list[dataset]['resolution'] = (1022,434)
-                    if dataset in ['urbansyn']:
+                    elif dataset in ['urbansyn']:
                         self.reshape_list[dataset]['resolution'] = (1036,518)
-                    if dataset in ['unreal4k']:
-                        self.reshape_list[dataset]['resolution'] = (924,518) 
+                    elif dataset in ['unreal4k']:
+                        self.reshape_list[dataset]['resolution'] = (924,518)
+                    elif dataset in ['tartanair']:
+                        self.reshape_list[dataset]['resolution'] = (518, 518)
+                        self.reshape_list[dataset]['crop_type'] = 'center' 
 
 
         elif resolution == '2k':
@@ -178,38 +181,35 @@ class CombinedDataset(Dataset):
                     print(f"Error loading validation pair: {e}")
                     continue
 
-            # Ensure we have at least one valid pair
+            # Skip if no valid pairs found
             if len(images) == 0:
-                # Create dummy data to avoid empty tensor error (use size divisible by 14)
-                dummy_image = torch.zeros(3, 266, 266)  # C, H, W (266 = 14 * 19)
-                dummy_depth = torch.zeros(266, 266)  # H, W
-                images.append(dummy_image)
-                depths.append(dummy_depth)
-                print(f"Warning: No valid pairs found for validation idx {idx}, using dummy data")
+                print(f"Warning: No valid pairs found for validation idx {idx}, skipping")
+                return None
 
             return_name = dataset_idx
-
-            # Additional safety check before stacking
-            if len(images) == 0 or len(depths) == 0:
-                dummy_image = torch.zeros(3, 266, 266)  # Use size divisible by 14
-                dummy_depth = torch.zeros(266, 266)
-                return dummy_image.unsqueeze(0).float(), dummy_depth.unsqueeze(0).float(), return_name
-
             return torch.stack(images).float(), torch.stack(depths).float(), return_name
 
 
         elif self.split == 'test':
             dataset_idx, scene_idx = self.pairs[idx]
             scene = self.pairslist[dataset_idx][scene_idx]
-            
+
+            # Apply video_length limit for test split to prevent memory issues
+            if len(scene) > self.video_length:
+                # Take the first video_length frames
+                scene = scene[:self.video_length]
+
             images = []
+            depths = []
             for pair in scene:
                 image, _current_crop = _load_and_process_image(pair['image'], **self.reshape_list[dataset_idx])
-             
-                images.append(image)
+                depth = self.depth_read_list[dataset_idx](pair['depth'], is_inverse=False) # Using original depth for test evaluation
 
-            return_name = os.path.join(dataset_idx, pair['scene_name']) 
-            return torch.stack(images).float(), return_name
+                images.append(image)
+                depths.append(torch.from_numpy(depth).float()) # not resizing depth, using original resolution like train
+
+            return_name = os.path.join(dataset_idx, pair['scene_name'])
+            return torch.stack(images).float(), torch.stack(depths).float(), return_name
 
 
         # dataset_idx: i-th dataset; e.g. pointodyssey is 0, spring is 1...etc

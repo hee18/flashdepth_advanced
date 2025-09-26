@@ -9,6 +9,7 @@ import wandb
 from tqdm import tqdm
 import numpy as np
 from pathlib import Path
+from einops import rearrange
 
 from flashdepth.model import FlashDepth
 from flashdepth.heads import MetricDepthLoss
@@ -227,13 +228,27 @@ class MetricHeadTrainer:
             shuffle=False,
             num_workers=self.config.training.workers,
             pin_memory=True,
-            drop_last=False
+            drop_last=False,
+            collate_fn=self.collate_fn
         )
 
         self.logger.info(f"Train dataset size: {len(train_dataset)}")
         self.logger.info(f"Val dataset size: {len(val_dataset)}")
 
         return train_loader, val_loader
+
+    def collate_fn(self, batch):
+        """Custom collate function to filter out None values"""
+        # Filter out None values
+        batch = [item for item in batch if item is not None]
+
+        # If all items are None, return None
+        if len(batch) == 0:
+            return None
+
+        # Use default collate for non-None items
+        from torch.utils.data.dataloader import default_collate
+        return default_collate(batch)
 
     def _setup_optimizer(self):
         """Setup optimizer for GSP head parameters only"""
@@ -369,6 +384,10 @@ class MetricHeadTrainer:
 
             for batch_idx, batch in enumerate(pbar):
                 try:
+                    # Skip None batches (no valid pairs found)
+                    if batch is None:
+                        continue
+
                     video, gt_depth, dataset_name = batch
 
                     # Forward pass with mixed precision
@@ -468,9 +487,9 @@ class MetricHeadTrainer:
         # Save best checkpoint
         if val_loss < self.best_val_loss:
             self.best_val_loss = val_loss
-            best_path = checkpoint_dir / 'best_metric_head.pth'
+            best_path = checkpoint_dir / f'best_metric_head_step_{self.global_step}.pth'
             torch.save(checkpoint, best_path)
-            self.logger.info(f"New best model saved with val_loss: {val_loss:.4f}")
+            self.logger.info(f"New best model saved at step {self.global_step} with val_loss: {val_loss:.4f}")
 
         # Save periodic checkpoint
         if self.global_step % self.config.training.get('save_freq', 5000) == 0:
