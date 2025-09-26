@@ -838,6 +838,27 @@ def test_comprehensive_integration():
             vis_dir = Path(f"{globals().get('RESULTS_DIR', 'test_results/results_1')}/comprehensive")
             vis_dir.mkdir(parents=True, exist_ok=True)
 
+            # Create full depth sequence visualization if GT is available
+            if gt_depth is not None:
+                logger.info("Creating depth sequence visualization...")
+                # Generate a valid mask for the entire sequence for visualization
+                gt_valid_mask_seq = gt_depth > 0
+                pred_valid_mask_seq = (pred_metric > 0) & (pred_metric < 1000.0)
+                vis_mask_seq = (gt_valid_mask_seq & pred_valid_mask_seq)[0] # Use first batch item
+
+                try:
+                    vis_fig = create_sequence_visualization(
+                        images=video[0], # First batch item
+                        pred_depths=pred_metric[0],
+                        gt_depths=gt_depth[0],
+                        valid_masks=vis_mask_seq,
+                        save_path=vis_dir / "depth_sequence_visualization.png",
+                        title=f"Metric Depth Sequence - {dataset_name[0]}"
+                    )
+                    plt.close(vis_fig) # Close figure to save memory
+                except Exception as e:
+                    logger.warning(f"Could not generate sequence visualization: {e}")
+
             # Simple summary figure
             fig, ax = plt.subplots(1, 1, figsize=(10, 6))
 
