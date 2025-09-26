@@ -401,6 +401,24 @@ class MetricHeadTrainer:
                     gt_flat = rearrange(gt_depth, 'b t h w -> (b t) h w')
                     # For TartanAir: GT is already metric depth, no conversion needed
 
+                    # DEBUG: Check shapes for loss computation
+                    if batch_idx == 0:  # Only log first batch to avoid spam
+                        self.logger.info(f"DEBUG TRAIN LOSS - Pred flat shape: {pred_flat.shape}")
+                        self.logger.info(f"DEBUG TRAIN LOSS - GT flat shape: {gt_flat.shape}")
+
+                    # Handle shape mismatch for loss computation if needed
+                    if pred_flat.shape != gt_flat.shape:
+                        self.logger.warning(f"Loss computation shape mismatch! Pred: {pred_flat.shape}, GT: {gt_flat.shape}")
+                        # Resize pred to match GT for loss computation
+                        import torch.nn.functional as F
+                        pred_flat = F.interpolate(
+                            pred_flat.unsqueeze(1),  # Add channel dimension
+                            size=gt_flat.shape[-2:],
+                            mode='bilinear',
+                            align_corners=True
+                        ).squeeze(1)  # Remove channel dimension
+                        self.logger.info(f"Resized pred for loss to: {pred_flat.shape}")
+
                     # Create valid mask considering both GT and pred ranges
                     gt_valid_mask = gt_flat > 0  # GT valid pixels
                     pred_valid_mask = (pred_flat > 0) & (pred_flat < 1000.0)  # Pred in reasonable range
@@ -414,13 +432,31 @@ class MetricHeadTrainer:
                     if batch_idx == 0:  # Save computation time
                         gt_metric = gt_depth[0, 0].cpu()
                         pred_metric_cpu = pred_metric[0, 0].cpu()
+
                         # Create valid mask considering both GT and pred ranges
                         gt_valid_mask = gt_metric > 0  # GT valid pixels
                         pred_valid_mask = (pred_metric_cpu > 0) & (pred_metric_cpu < 1000.0)  # Pred in reasonable range
+
+                        # DEBUG: Check shapes before creating valid mask
+                        self.logger.info(f"DEBUG TRAIN - GT valid mask shape: {gt_valid_mask.shape}")
+                        self.logger.info(f"DEBUG TRAIN - Pred valid mask shape: {pred_valid_mask.shape}")
+
+                        # Handle shape mismatch if needed
+                        if gt_valid_mask.shape != pred_valid_mask.shape:
+                            self.logger.warning(f"Shape mismatch in train! GT: {gt_valid_mask.shape}, Pred: {pred_valid_mask.shape}")
+                            # Resize pred_valid_mask to match GT
+                            import torch.nn.functional as F
+                            pred_valid_mask = F.interpolate(
+                                pred_valid_mask.unsqueeze(0).unsqueeze(0).float(),
+                                size=gt_valid_mask.shape,
+                                mode='nearest'
+                            ).squeeze(0).squeeze(0).bool()
+                            self.logger.info(f"Resized pred valid mask to: {pred_valid_mask.shape}")
+
                         valid_mask = gt_valid_mask & pred_valid_mask
                         metrics = MetricDepthMetrics.compute_metric_depth_metrics(
                             pred_metric[0, 0].cpu(),  # First batch, first frame (already in metric depth)
-                            gt_metric,  
+                            gt_metric,
                             valid_mask=valid_mask
                         )
                         all_errors.append(metrics)

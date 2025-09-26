@@ -63,6 +63,7 @@ GPU_ID=0
 RESULTS_DIR="train_results/results_1"
 FLASHDEPTH_CHECKPOINT="configs/flashdepth-l/iter_10001.pth"
 GSP_CHECKPOINT="train_results/results_4/best_metric_head.pth"
+# GSP_CHECKPOINT="train_results/results_4/metric_head_step_25000.pth"
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do

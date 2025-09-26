@@ -113,7 +113,7 @@ export CUDA_VISIBLE_DEVICES=1
 ./run_docker.sh train
 
 # 커스텀 설정
-./run_docker.sh train --batch-size 8 --workers 2 --epochs 20000
+./run_docker.sh train --batch-size 12 --workers 4 --epochs 100
 ```
 
 ### 3. 결과 디렉토리
