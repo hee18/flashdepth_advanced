@@ -265,7 +265,8 @@ class FlashDepth(nn.Module):
         video_flat = rearrange(video, 'b t c h w -> (b t) c h w')
 
         # Path A (Frozen): Get relative depth through original FlashDepth pipeline
-        with torch.no_grad() if self.training else torch.enable_grad():
+        # Always use no_grad for backbone to ensure complete freeze
+        with torch.no_grad():
             dpt_features = self.get_dpt_features(video_flat, input_shape=(B, T, C, H, W))
             relative_depth = self.final_head(dpt_features, patch_h, patch_w)  # [BT, H, W]
 

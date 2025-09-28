@@ -78,6 +78,7 @@ class MetricHeadTrainer:
 
         # Setup optimizer and loss function
         self.optimizer = self._setup_optimizer()
+        self.scheduler = self._setup_scheduler()
         self.loss_fn = MetricDepthLoss(loss_type=config.training.get('loss_type', 'l1'))
 
         # Setup wandb if enabled
@@ -242,9 +243,9 @@ class MetricHeadTrainer:
         # Filter out None values
         batch = [item for item in batch if item is not None]
 
-        # If all items are None, return None
+        # If all items are None, raise error instead of creating dummy data
         if len(batch) == 0:
-            return None
+            raise RuntimeError("All items in batch are None! Cannot proceed without dummy data generation, which is disabled.")
 
         # Use default collate for non-None items
         from torch.utils.data.dataloader import default_collate
@@ -273,14 +274,48 @@ class MetricHeadTrainer:
         self.logger.info(f"Optimizer initialized with {len(gsp_params)} parameter groups")
         return optimizer
 
+    def _setup_scheduler(self):
+        """Setup learning rate scheduler optimized for log L1 loss"""
+        # For log L1 loss with GSP head fine-tuning, we want:
+        # 1. Initial high LR for quick convergence (first 20% of training)
+        # 2. Gradual decay for stable fine-tuning (middle 60%)
+        # 3. Very low LR for final refinement (last 20%)
+
+        total_steps = self.config.training.total_iters
+        warmup_steps = int(0.1 * total_steps)  # 10% warmup
+        decay_start = int(0.3 * total_steps)   # Start decay at 30%
+
+        def lr_lambda(step):
+            if step < warmup_steps:
+                # Warmup: linear increase from 0.1x to 1x
+                return 0.1 + 0.9 * (step / warmup_steps)
+            elif step < decay_start:
+                # Stable phase: keep at 1x
+                return 1.0
+            else:
+                # Decay phase: cosine decay to 0.01x
+                progress = (step - decay_start) / (total_steps - decay_start)
+                return 0.01 + 0.99 * 0.5 * (1 + np.cos(np.pi * progress))
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
+
+        self.logger.info("Learning rate scheduler initialized:")
+        self.logger.info(f"  Total steps: {total_steps}")
+        self.logger.info(f"  Warmup steps: {warmup_steps}")
+        self.logger.info(f"  Decay start: {decay_start}")
+        self.logger.info(f"  Initial LR: {self.config.training.lr.get('gsp', 1e-4)}")
+
+        return scheduler
+
     def train_epoch(self):
         """Train for one epoch"""
-        self.model.train()
+        # Set entire model to eval mode first
+        self.model.eval()
 
-        # Only GSP head should be in training mode
+        # Then set only GSP head to training mode
         for name, module in self.model.named_modules():
-            if not name.startswith('gsp_head') and not name == '':
-                module.eval()
+            if name.startswith('gsp_head'):
+                module.train()
 
         total_loss = 0.0
         total_samples = 0
@@ -305,15 +340,20 @@ class MetricHeadTrainer:
                 )
 
                 self.optimizer.step()
+                self.scheduler.step()  # Update learning rate
 
                 # Update statistics
                 total_loss += loss.item()
                 total_samples += 1
                 self.global_step += 1
 
+                # Get current learning rate for logging
+                current_lr = self.scheduler.get_last_lr()[0]
+
                 # Update progress bar
                 pbar.set_postfix({
                     'loss': f'{loss.item():.4f}',
+                    'lr': f'{current_lr:.2e}',
                     'scale': f'{metrics["mean_scale"]:.3f}',
                     'shift': f'{metrics["mean_shift"]:.3f}'
                 })
@@ -322,6 +362,7 @@ class MetricHeadTrainer:
                 if self.config.training.get('wandb', False):
                     wandb.log({
                         'train/loss': loss.item(),
+                        'train/lr': current_lr,
                         'train/scale': metrics['mean_scale'],
                         'train/shift': metrics['mean_shift'],
                         'global_step': self.global_step
@@ -409,15 +450,15 @@ class MetricHeadTrainer:
                     # Handle shape mismatch for loss computation if needed
                     if pred_flat.shape != gt_flat.shape:
                         self.logger.warning(f"Loss computation shape mismatch! Pred: {pred_flat.shape}, GT: {gt_flat.shape}")
-                        # Resize pred to match GT for loss computation
+                        # Resize GT to match pred for loss computation (more logical)
                         import torch.nn.functional as F
-                        pred_flat = F.interpolate(
-                            pred_flat.unsqueeze(1),  # Add channel dimension
-                            size=gt_flat.shape[-2:],
+                        gt_flat = F.interpolate(
+                            gt_flat.unsqueeze(1),  # Add channel dimension
+                            size=pred_flat.shape[-2:],
                             mode='bilinear',
                             align_corners=True
                         ).squeeze(1)  # Remove channel dimension
-                        self.logger.info(f"Resized pred for loss to: {pred_flat.shape}")
+                        self.logger.info(f"Resized GT for loss to: {gt_flat.shape}")
 
                     # Create valid mask considering both GT and pred ranges
                     gt_valid_mask = gt_flat > 0  # GT valid pixels
@@ -444,14 +485,17 @@ class MetricHeadTrainer:
                         # Handle shape mismatch if needed
                         if gt_valid_mask.shape != pred_valid_mask.shape:
                             self.logger.warning(f"Shape mismatch in train! GT: {gt_valid_mask.shape}, Pred: {pred_valid_mask.shape}")
-                            # Resize pred_valid_mask to match GT
+                            # Resize GT to match pred for metrics (more logical)
                             import torch.nn.functional as F
-                            pred_valid_mask = F.interpolate(
-                                pred_valid_mask.unsqueeze(0).unsqueeze(0).float(),
-                                size=gt_valid_mask.shape,
-                                mode='nearest'
-                            ).squeeze(0).squeeze(0).bool()
-                            self.logger.info(f"Resized pred valid mask to: {pred_valid_mask.shape}")
+                            gt_metric = F.interpolate(
+                                gt_metric.unsqueeze(0).unsqueeze(0),
+                                size=pred_valid_mask.shape,
+                                mode='bilinear',
+                                align_corners=True
+                            ).squeeze(0).squeeze(0)
+                            # Update GT valid mask to match resized GT
+                            gt_valid_mask = gt_metric > 0
+                            self.logger.info(f"Resized GT for metrics to: {gt_metric.shape}")
 
                         valid_mask = gt_valid_mask & pred_valid_mask
                         metrics = MetricDepthMetrics.compute_metric_depth_metrics(
@@ -508,10 +552,20 @@ class MetricHeadTrainer:
         # Get model state dict (handle DataParallel wrapper)
         model_state = self.model.module.state_dict() if self.use_multi_gpu else self.model.state_dict()
 
+        # Count parameters for verification
+        total_params = len(model_state)
+        gsp_params = sum(1 for key in model_state.keys() if key.startswith('gsp_head'))
+        flashdepth_params = total_params - gsp_params
+
+        self.logger.info(f"Saving checkpoint with {total_params} parameters:")
+        self.logger.info(f"  FlashDepth backbone: {flashdepth_params} parameters")
+        self.logger.info(f"  GSP head: {gsp_params} parameters")
+
         checkpoint = {
             'global_step': self.global_step,
             'model_state_dict': model_state,
             'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': self.scheduler.state_dict(),
             'val_loss': val_loss,
             'config': dict(self.config)
         }
