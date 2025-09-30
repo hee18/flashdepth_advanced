@@ -44,12 +44,15 @@ show_usage() {
     echo "  --results-dir PATH    Set results directory (default: train_results/results_1)"
     echo "  --flashdepth-checkpoint PATH  Set FlashDepth pretrained weights path"
     echo "  --gsp-checkpoint PATH Set GSP module weights path"
+    echo "  --frame-interval NUM  Set frame interval for sequence visualization (default: 1)"
+    echo "  --vid-len NUM         Set video sequence length for testing (default: 50)"
     echo ""
     echo "Examples:"
     echo "  $0 build                              # Build the image"
     echo "  $0 train                              # Start training with defaults"
     echo "  $0 train --batch-size 4 --gpu 1      # Train with custom settings"
     echo "  $0 test                               # Start testing with defaults"
+    echo "  $0 test --vid-len 25 --frame-interval 2  # Test with custom video length and frame interval"
     echo "  $0 train --results-dir train_results/results_2  # Custom results directory"
     echo "  $0 shell                              # Interactive development"
 }
@@ -62,8 +65,9 @@ TOTAL_ITERS=30001
 GPU_ID=0
 RESULTS_DIR="train_results/results_1"
 FLASHDEPTH_CHECKPOINT="configs/flashdepth-l/iter_10001.pth"
-GSP_CHECKPOINT="train_results/results_4/best_metric_head.pth"
-# GSP_CHECKPOINT="train_results/results_4/metric_head_step_25000.pth"
+GSP_CHECKPOINT="train_results/results_5/best_metric_head_step_21000.pth"
+FRAME_INTERVAL=1
+VID_LEN=50
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -98,6 +102,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --gsp-checkpoint)
             GSP_CHECKPOINT="$2"
+            shift 2
+            ;;
+        --frame-interval)
+            FRAME_INTERVAL="$2"
+            shift 2
+            ;;
+        --vid-len)
+            VID_LEN="$2"
             shift 2
             ;;
         -h|--help)
@@ -158,6 +170,8 @@ case $COMMAND in
         echo "Configuration:"
         echo "  - GPU: $GPU_ID"
         echo "  - Results directory: $RESULTS_DIR"
+        echo "  - Video length: $VID_LEN"
+        echo "  - Frame interval: $FRAME_INTERVAL"
         echo ""
 
         # Build test command with conditional parameters
@@ -170,6 +184,9 @@ case $COMMAND in
         if [ -n "$GSP_CHECKPOINT" ]; then
             TEST_CMD="$TEST_CMD +gsp_checkpoint=$GSP_CHECKPOINT"
         fi
+
+        # Add frame interval and video length options
+        TEST_CMD="$TEST_CMD +frame_interval=$FRAME_INTERVAL +vid_len=$VID_LEN"
 
         # Run test_metric_head.py with custom parameters
         docker compose run --rm flashdepth $TEST_CMD

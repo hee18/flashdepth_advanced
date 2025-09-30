@@ -261,27 +261,42 @@ class FlashDepth(nn.Module):
         B, T, C, H, W = video.shape
         patch_h, patch_w = H // self.patch_size, W // self.patch_size
 
-        # Reshape video for processing: [B, T, C, H, W] -> [BT, C, H, W]
-        video_flat = rearrange(video, 'b t c h w -> (b t) c h w')
+        # Use chunking for large videos to avoid INT_MAX tensor limit
+        chunk_size = 50  # Process 50 frames at a time
+        relative_depths = []
+        cls_tokens = []
 
-        # Path A (Frozen): Get relative depth through original FlashDepth pipeline
-        # Always use no_grad for backbone to ensure complete freeze
-        with torch.no_grad():
-            dpt_features = self.get_dpt_features(video_flat, input_shape=(B, T, C, H, W))
-            relative_depth = self.final_head(dpt_features, patch_h, patch_w)  # [BT, H, W]
+        for start_idx in range(0, T, chunk_size):
+            end_idx = min(start_idx + chunk_size, T)
+            video_chunk = video[:, start_idx:end_idx]  # [B, chunk_T, C, H, W]
+            chunk_T = video_chunk.shape[1]
 
-            # Debug: Check relative depth statistics
-            if torch.isnan(relative_depth).any():
-                print(f"WARNING: NaN values in relative depth!")
-            if torch.isinf(relative_depth).any():
-                print(f"WARNING: Inf values in relative depth!")
+            # Reshape chunk for processing: [B, chunk_T, C, H, W] -> [B*chunk_T, C, H, W]
+            video_chunk_flat = rearrange(video_chunk, 'b t c h w -> (b t) c h w')
 
-            rel_min, rel_max = relative_depth.min().item(), relative_depth.max().item()
-            rel_mean, rel_std = relative_depth.mean().item(), relative_depth.std().item()
-            print(f"Relative depth stats - Min: {rel_min:.6f}, Max: {rel_max:.6f}, Mean: {rel_mean:.6f}, Std: {rel_std:.6f}")
+            # Path A (Frozen): Get relative depth through original FlashDepth pipeline
+            with torch.no_grad():
+                dpt_features = self.get_dpt_features(video_chunk_flat, input_shape=(B, chunk_T, C, H, W))
+                relative_depth_chunk = self.final_head(dpt_features, patch_h, patch_w)  # [B*chunk_T, H, W]
+                relative_depths.append(relative_depth_chunk)
 
-        # Path B (Trainable): Get CLS tokens for GSP head
-        cls_tokens = self.get_cls_token(video_flat)  # [BT, embed_dim]
+            # Path B (Trainable): Get CLS tokens for GSP head
+            cls_tokens_chunk = self.get_cls_token(video_chunk_flat)  # [B*chunk_T, embed_dim]
+            cls_tokens.append(cls_tokens_chunk)
+
+        # Concatenate all chunks
+        relative_depth = torch.cat(relative_depths, dim=0)  # [BT, H, W]
+        cls_tokens = torch.cat(cls_tokens, dim=0)  # [BT, embed_dim]
+
+        # Debug: Check relative depth statistics
+        if torch.isnan(relative_depth).any():
+            print(f"WARNING: NaN values in relative depth!")
+        if torch.isinf(relative_depth).any():
+            print(f"WARNING: Inf values in relative depth!")
+
+        rel_min, rel_max = relative_depth.min().item(), relative_depth.max().item()
+        rel_mean, rel_std = relative_depth.mean().item(), relative_depth.std().item()
+        print(f"Relative depth stats - Min: {rel_min:.6f}, Max: {rel_max:.6f}, Mean: {rel_mean:.6f}, Std: {rel_std:.6f}")
 
         # Debug: Check CLS token statistics
         cls_min, cls_max = cls_tokens.min().item(), cls_tokens.max().item()
