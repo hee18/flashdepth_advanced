@@ -1,0 +1,75 @@
+# Gear3 Configuration - Feature-level Metric Depth Learning
+# Phase 1: Train on FlashDepth datasets
+# Phase 2: Fine-tune on nuScenes
+
+# General settings
+config_dir: null # overwrite by --config-path
+inference: false
+load: null  # path to FlashDepth checkpoint
+phase: 1  # Training phase (1 or 2)
+
+# Canonical space settings
+canonical_focal_length: 1000.0
+use_canonical_space: true
+
+# Dataset configuration
+dataset:
+  data_root: null # change data path
+  resolution: 'base'  # 518x518
+  video_length: 5
+
+# Training configuration
+training:
+  batch_size: 12
+  workers: 4
+  iterations: 60001  # Same as original FlashDepth
+  save_freq: 5000
+  val_freq: 1000
+  log_freq: 100
+  wandb: false
+  wandb_name: "gear3_phase1"
+
+  # Learning rates (Gear3 specific)
+  gear3_lr: 1.0e-4  # For new Gear3 modules
+  mamba_lr: 1.0e-4  # For Mamba (train from scratch, same LR as gear3)
+  weight_decay: 1.0e-6
+
+# Model configuration (same as FlashDepth-L)
+model:
+  # ViT configuration
+  vit_size: "vitl"
+  patch_size: 14
+  attn_class: "MemEffAttention"
+
+  # Mamba configuration
+  use_mamba: true
+  mamba_type: "add"
+  num_mamba_layers: 4
+  downsample_mamba: [0.1]
+  mamba_pos_embed: null
+  mamba_in_dpt_layer: [1]  # Mamba at DPT layer 1
+  mamba_d_conv: 4
+  mamba_d_state: 256
+  use_hydra: false
+  use_transformer_rnn: false
+  use_xlstm: false
+
+# Hybrid model (not used in Gear3)
+hybrid_configs:
+  use_hybrid: false
+
+# Evaluation configuration
+eval:
+  compile: false
+  metrics: true
+  save_grid: true
+  outfolder: "test_gear3"
+  test_datasets: [tartanair]
+  test_dataset_resolution: 'base'
+  random_input: null
+  out_video: true
+  out_mp4: true
+  save_res: 518
+  save_depth_npy: true
+  save_vis_map: true
+  dummy_timing: false

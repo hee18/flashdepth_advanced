@@ -36,7 +36,9 @@ class BaseDatasetPairs(Dataset):
             from .eth3d_dataset import Eth3dDepth as DepthDataset
         elif dataset_name.lower() == 'unreal4k':
             from .unreal4k_dataset import Unreal4kDepth as DepthDataset
-        
+        elif dataset_name.lower() == 'nuscenes':
+            from .nuscenes_dataset import NuScenesDepth as DepthDataset
+
         else:
             raise ValueError(f"Unknown dataset: {dataset_name}")
         return DepthDataset(root_dir=root_dir, split=split, load_cache=load_cache)
