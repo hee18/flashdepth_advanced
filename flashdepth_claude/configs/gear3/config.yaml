@@ -10,21 +10,23 @@ phase: 1  # Training phase (1 or 2)
 
 # Canonical space settings
 canonical_focal_length: 1000.0
-use_canonical_space: true
+use_canonical_space: false  # DISABLED - using raw inverse depth without canonicalization
 
 # Dataset configuration
 dataset:
   data_root: null # change data path
   resolution: 'base'  # 518x518
   video_length: 5
+  train_datasets: [mvs-synth, dynamicreplica, tartanair, pointodyssey, spring]  # Will be overridden by code
+  val_datasets: [sintel]  # Sintel has metric depth GT, separate from training datasets
 
 # Training configuration
 training:
-  batch_size: 12
-  workers: 4
+  batch_size: 22  # Per GPU (effective 44 with 2 GPUs in DDP) - optimized based on GPU memory
+  workers: 8      # Optimized for 96 CPU cores
   iterations: 60001  # Same as original FlashDepth
   save_freq: 5000
-  val_freq: 1000
+  val_freq: 1000  # Validation every 1k steps
   log_freq: 100
   wandb: false
   wandb_name: "gear3_phase1"

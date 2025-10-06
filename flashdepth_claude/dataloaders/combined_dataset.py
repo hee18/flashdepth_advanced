@@ -149,6 +149,10 @@ class CombinedDataset(Dataset):
             dataset_idx, scene_idx = self.pairs[idx]
             scene = self.pairslist[dataset_idx][scene_idx]
 
+            # Apply video_length limit for validation to ensure consistent batch sizes
+            if len(scene) > self.video_length:
+                scene = scene[:self.video_length]
+
             images = []
             depths = []
             for pair in scene:
@@ -160,23 +164,12 @@ class CombinedDataset(Dataset):
 
                 try:
                     image, _current_crop = _load_and_process_image(pair['image'], **self.reshape_list[dataset_idx])
-                    depth = self.depth_read_list[dataset_idx](pair['depth'], is_inverse=False) # Using original depth for GSP training
-                    # don't resize depth; resize output to match gt instead in inference loop
-                    # depth = _load_and_process_depth(depth, image.shape, _current_crop, **self.reshape_list[dataset_idx])
-
-                    # if self.reshape_list[dataset_idx]['crop_type'] == 'center':
-                    #     h, w = depth.shape
-                    #     start_y, start_x, target_h, target_w = _current_crop
-                    #     # Scale crop coordinates to original depth resolution
-                    #     orig_start_y = int((start_y / image.shape[1]) * h)
-                    #     orig_start_x = int((start_x / image.shape[2]) * w)
-                    #     orig_target_h = int((target_h / image.shape[1]) * h)
-                    #     orig_target_w = int((target_w / image.shape[2]) * w)
-                    #     depth = depth[orig_start_y:orig_start_y + orig_target_h,
-                    #                 orig_start_x:orig_start_x + orig_target_w]
+                    depth = self.depth_read_list[dataset_idx](pair['depth'], is_inverse=True) # Load inverse depth (1/m) for training
+                    # IMPORTANT: Resize depth to match image resolution for validation batching
+                    depth = _load_and_process_depth(depth, image.shape, _current_crop, **self.reshape_list[dataset_idx])
 
                     images.append(image)
-                    depths.append(torch.from_numpy(depth).float()) # not resizing depth, using original resolution
+                    depths.append(depth) # depth is now torch tensor from _load_and_process_depth
                 except Exception as e:
                     print(f"Error loading validation pair: {e}")
                     continue
@@ -203,7 +196,7 @@ class CombinedDataset(Dataset):
             depths = []
             for pair in scene:
                 image, _current_crop = _load_and_process_image(pair['image'], **self.reshape_list[dataset_idx])
-                depth = self.depth_read_list[dataset_idx](pair['depth'], is_inverse=False) # Using original depth for test evaluation
+                depth = self.depth_read_list[dataset_idx](pair['depth'], is_inverse=True) # Load inverse depth (1/m) for testing
 
                 images.append(image)
                 depths.append(torch.from_numpy(depth).float()) # not resizing depth, using original resolution like train
@@ -285,7 +278,7 @@ class CombinedDataset(Dataset):
                 raise e
             image, _current_crop = _load_and_process_image(pair['image'], **self.reshape_list[dataset_idx])
             print_depth_minmax = False #seq_i == 0
-            depth = self.depth_read_list[dataset_idx](pair['depth'], is_inverse=False, print_minmax=print_depth_minmax) # Using original depth for GSP training
+            depth = self.depth_read_list[dataset_idx](pair['depth'], is_inverse=True, print_minmax=print_depth_minmax) # Load inverse depth (1/m) for training
             depth = _load_and_process_depth(depth, image.shape, _current_crop, **self.reshape_list[dataset_idx])
             images.append(image)
             depths.append(depth)
@@ -303,5 +296,5 @@ class CombinedDataset(Dataset):
                 print(f"Depth shapes: {[d.shape if hasattr(d, 'shape') else type(d) for d in depths]}")
             raise e
         
-        return images.float(), depths, dataset_idx #, pair['scene_name']
+        return images.float(), depths, dataset_idx #, pair['scene_name'] #, pair['scene_name'] #, pair['scene_name']
        

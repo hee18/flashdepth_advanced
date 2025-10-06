@@ -55,5 +55,9 @@ RUN mkdir -p /data/datasets /app/train_results
 ENV PYTHONPATH=/app:$PYTHONPATH
 ENV CUDA_VISIBLE_DEVICES=0
 
+# Disable IPv6 to prevent socket connection issues with DDP
+ENV GLOO_SOCKET_IFNAME=eth0
+ENV NCCL_SOCKET_IFNAME=eth0
+
 # Default command to run train_metric_head.py (Stage 1: FlashDepth-L)
 CMD ["python", "train_metric_head.py", "--config-path", "configs/flashdepth-l", "dataset.data_root=/data/datasets"]

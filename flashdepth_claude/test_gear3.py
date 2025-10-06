@@ -35,7 +35,7 @@ from flashdepth.model import FlashDepth
 from flashdepth.gear3_modules import Gear3MetricHead
 from dataloaders.combined_dataset import CombinedDataset
 from utils.metric_depth_metrics import MetricDepthMetrics, format_metrics
-from train_gear3 import CanonicalSpaceNormalizer, InverseDepthLoss
+from train_gear3 import CanonicalSpaceNormalizer, LogL1Loss
 
 # Setup logging
 logging.basicConfig(
@@ -207,9 +207,10 @@ class Gear3Tester:
         B, T = images.shape[:2]
         assert B == 1, "Batch size must be 1 for testing"
 
-        # Canonicalize GT depth
-        gt_depth_canonical = self.canonical_normalizer.canonicalize(gt_depth, focal_length)
-        gt_depth_metric = 1.0 / (gt_depth_canonical + 1e-8)
+        # Canonicalize GT inverse depth (dataloader gives inverse depth 1/m)
+        # Apply canonicalization for inverse depth, then scale to 100/m
+        gt_depth_inverse_canonical = self.canonical_normalizer.canonicalize_inverse(gt_depth, focal_length)
+        gt_depth_inverse_100 = gt_depth_inverse_canonical * 100.0  # 100/m (training scale)
 
         # Storage for predictions
         pred_depths = []
@@ -218,7 +219,7 @@ class Gear3Tester:
         # Process each frame
         for t in range(T):
             img_t = images[0, t]  # [3, H, W]
-            gt_t = gt_depth_metric[0, t]  # [1, H, W]
+            gt_t_inverse = gt_depth_inverse_100[0, t]  # [1, H, W] in 100/m
 
             # Extract features
             features = self.model.pretrained(img_t.unsqueeze(0), is_training=False)
@@ -236,39 +237,43 @@ class Gear3Tester:
                 patch_tokens, attention_weights, dpt_features, patch_h, patch_w
             )
 
-            # Get depth prediction
+            # Get depth prediction (output is inverse depth in 100/m scale)
             path_1_modulated = modulated_dpt_features[-1]
             out = self.model.depth_head.scratch.output_conv1(path_1_modulated)
             out = F.interpolate(out, (h, w), mode="bilinear", align_corners=True)
             out = self.model.depth_head.scratch.output_conv2(out)  # [1, 1, H, W]
 
-            pred_depth = out[0]  # [1, H, W]
+            # Prediction is already positive (Softplus activation in output_conv2)
+            pred_depth_inverse_100 = out[0]  # [1, H, W] in 100/m
 
-            # De-canonicalize prediction
-            pred_depth_decanon = self.canonical_normalizer.decanonicalize(pred_depth, focal_length)
+            # Convert to metric depth: 100/m -> m
+            pred_depth_metric = 100.0 / (pred_depth_inverse_100 + 1e-8)
 
-            pred_depths.append(pred_depth_decanon)
+            # No need to de-canonicalize prediction (it's already in actual space)
+            # Model predicts in actual focal length space, not canonical
+
+            pred_depths.append(pred_depth_metric)
             importance_maps.append(importance_map[0])
 
         # Stack predictions
-        pred_depths = torch.stack(pred_depths, dim=0)  # [T, 1, H, W]
+        pred_depths = torch.stack(pred_depths, dim=0)  # [T, 1, H, W] in meters
         importance_maps = torch.stack(importance_maps, dim=0)  # [T, 1, patch_h, patch_w]
 
-        # De-canonicalize GT for final evaluation
-        gt_depth_decanon = self.canonical_normalizer.decanonicalize(gt_depth_metric[0], focal_length)
+        # Convert GT to metric depth for evaluation: 100/m -> m
+        gt_depth_metric = 100.0 / (gt_depth_inverse_100[0] + 1e-8)  # [T, 1, H, W] in meters
 
-        # Compute metrics
-        valid_mask = (gt_depth_decanon > 0).float()
+        # Compute metrics (both pred and GT are now in meters)
+        valid_mask = (gt_depth_metric > 0).float()
         metrics = self.metrics.compute_metrics(
-            pred_depths.squeeze(1),  # [T, H, W]
-            gt_depth_decanon.squeeze(1),  # [T, H, W]
+            pred_depths.squeeze(1),  # [T, H, W] in meters
+            gt_depth_metric.squeeze(1),  # [T, H, W] in meters
             valid_mask.squeeze(1)  # [T, H, W]
         )
 
         # Visualize
         if self.config.eval.get('save_grid', True):
             self._visualize_sequence(
-                images[0], pred_depths, gt_depth_decanon, importance_maps,
+                images[0], pred_depths, gt_depth_metric, importance_maps,
                 valid_mask, sequence_id, metrics
             )
 

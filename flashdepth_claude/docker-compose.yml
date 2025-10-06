@@ -20,7 +20,7 @@ services:
     working_dir: /app
     stdin_open: true
     tty: true
-    shm_size: '2gb'
+    shm_size: '16gb'  # Generous allocation (host has 252GB available)
     deploy:
       resources:
         reservations:

@@ -37,6 +37,11 @@ class ImportancePredictor(nn.Module):
         self.conv3 = nn.Conv2d(hidden_dim // 2, 1, kernel_size=1)
         self.sigmoid = nn.Sigmoid()
 
+        # Initialize last conv to zero for better training dynamics
+        # This makes importance map start at 0.5 (sigmoid(0)) but with gradient flow
+        nn.init.zeros_(self.conv3.weight)
+        nn.init.zeros_(self.conv3.bias)
+
         logging.info(f"ImportancePredictor initialized with {num_heads} heads")
 
     def forward(self, attention_weights, patch_h, patch_w):
@@ -82,6 +87,9 @@ class ForegroundBackgroundNetworks(nn.Module):
     def __init__(self, embed_dim=1024, feature_dim=256):
         super().__init__()
 
+        # Note: FG/BG features will be computed with importance-weighted pooling
+        # in forward(), not simple global average pooling
+        
         # Foreground network (focus on salient objects)
         self.fg_net = nn.Sequential(
             nn.Linear(embed_dim, feature_dim * 2),
@@ -109,7 +117,9 @@ class ForegroundBackgroundNetworks(nn.Module):
             fg_features: [B, feature_dim]
             bg_features: [B, feature_dim]
         """
-        # Global average pooling over patches
+        # Global average pooling over patches (Simple GAP)
+        # Same input goes to both networks, but they learn different features
+        # through gradient separation during modulation
         global_features = patch_tokens.mean(dim=1)  # [B, embed_dim]
 
         fg_features = self.fg_net(global_features)  # [B, feature_dim]
@@ -212,9 +222,12 @@ class FeatureModulator(nn.Module):
         bg_gamma = bg_gamma.view(B, C, 1, 1)
         bg_beta = bg_beta.view(B, C, 1, 1)
 
-        # Spatially-varying modulation parameters
-        gamma = importance_map * fg_gamma + (1 - importance_map) * bg_gamma  # [B, C, H, W]
-        beta = importance_map * fg_beta + (1 - importance_map) * bg_beta  # [B, C, H, W]
+        # Memory-efficient computation using torch.lerp (linear interpolation)
+        # gamma = (1 - importance_map) * bg_gamma + importance_map * fg_gamma
+        # Ensure importance_map matches dtype of gamma/beta (for BFloat16 compatibility)
+        importance_map = importance_map.to(bg_gamma.dtype)
+        gamma = torch.lerp(bg_gamma, fg_gamma, importance_map)  # [B, C, H, W]
+        beta = torch.lerp(bg_beta, fg_beta, importance_map)  # [B, C, H, W]
 
         # Apply FiLM modulation
         modulated_features = gamma * features + beta
@@ -264,7 +277,7 @@ class Gear3MetricHead(nn.Module):
         # 1. Predict importance map
         importance_map = self.importance_predictor(attention_weights, patch_h, patch_w)
 
-        # 2. Generate FG/BG features
+        # 2. Generate FG/BG features (Simple GAP - same input, different networks)
         fg_features, bg_features = self.fg_bg_networks(patch_tokens)
 
         # 3. Modulate each DPT layer
@@ -275,7 +288,7 @@ class Gear3MetricHead(nn.Module):
                 fg_features, bg_features, layer_idx
             )
 
-            # Apply modulation
+            # Apply modulation (importance map used here for spatial weighting)
             modulated = self.feature_modulator(
                 features, importance_map, fg_gamma, fg_beta, bg_gamma, bg_beta
             )

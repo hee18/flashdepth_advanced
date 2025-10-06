@@ -25,12 +25,9 @@ class SpringDepth(BaseDatasetPairs):
         # https://github.com/Junyi42/monst3r/blob/main/dust3r/datasets/pointodyssey.py#L183
         # https://spring-benchmark.org/faq --> compute depth from disparity
         # Z = fx * B / d; baseline = 0.065m; Z=depth, d=disparity, fx=focal length; d of sky is set to 0
-        # since I want inverse depth, directly calculate 1/Z = d / (fx * B) so I don't need to worry about dividing by 0
 
-        assert is_inverse, "Spring dataset only supports inverse depth"
-        
         SPRING_BASELINE = 0.065
-            
+
         with h5py.File(path, "r") as f:
             if "disparity" not in f.keys():
                 raise IOError(f"File {path} does not have a 'disparity' key. Is this a valid dsp5 file?")
@@ -51,24 +48,36 @@ class SpringDepth(BaseDatasetPairs):
         # does not change with cropping 
         fx = fx * resize_factor
 
-        inverse_depth = disparity / (fx * SPRING_BASELINE)
+        if is_inverse:
+            # For inverse depth: 1/Z = d / (fx * B)
+            inverse_depth = disparity / (fx * SPRING_BASELINE)
+            inverse_depth = np.where(np.isnan(inverse_depth), -1, inverse_depth)
+            inverse_depth = np.where(np.isinf(inverse_depth), -1, inverse_depth)
 
-        # check if there are any nans or infs
-        # if np.isnan(inverse_depth).any() or np.isinf(inverse_depth).any():
-        #     logging.info(f"nan or inf in inverse depth for {path}")
+            if kwargs.get('print_minmax', False):
+                logging.info(f"minmax inverse depth for {path}: {inverse_depth.min():.3f}, {inverse_depth.max():.3f}")
 
-        
-        inverse_depth = np.where(np.isnan(inverse_depth), -1, inverse_depth)
-        inverse_depth = np.where(np.isinf(inverse_depth), -1, inverse_depth)
+            if return_torch:
+                inverse_depth = torch.from_numpy(inverse_depth).float()
 
-        if kwargs.get('print_minmax', False):
-            logging.info(f"minmax depth for {path}: {inverse_depth.min():.3f}, {inverse_depth.max():.3f}")
+            return inverse_depth
+        else:
+            # For metric depth: Z = fx * B / d
+            # Handle disparity=0 (infinity depth) by masking
+            valid_mask = disparity > 0
+            depth = np.zeros_like(disparity, dtype=np.float32)
+            depth[valid_mask] = (fx * SPRING_BASELINE) / disparity[valid_mask]
+            depth[~valid_mask] = -1  # Invalid depth marked as -1
 
-      
-        if return_torch:
-            inverse_depth = torch.from_numpy(inverse_depth).float()
+            if kwargs.get('print_minmax', False):
+                valid_depth = depth[depth > 0]
+                if len(valid_depth) > 0:
+                    logging.info(f"minmax metric depth for {path}: {valid_depth.min():.3f}, {valid_depth.max():.3f}")
 
-        return inverse_depth
+            if return_torch:
+                depth = torch.from_numpy(depth).float()
+
+            return depth
 
     def get_cache_path(self, cache_dir):
         return os.path.join(cache_dir, f'spring_pairs_{self.split}.pkl')

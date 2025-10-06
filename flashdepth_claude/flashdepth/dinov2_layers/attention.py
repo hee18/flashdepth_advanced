@@ -64,6 +64,9 @@ class Attention(nn.Module):
         self.proj = nn.Linear(dim, dim, bias=proj_bias)
         self.proj_drop = nn.Dropout(proj_drop)
 
+        # Store attention weights for Gear3
+        self.attn_weights = None
+
     def forward(self, x: Tensor) -> Tensor:
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
@@ -74,6 +77,9 @@ class Attention(nn.Module):
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
 
+        # Store attention weights
+        self.attn_weights = attn.detach()
+
         x = (attn @ v).transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
@@ -81,6 +87,13 @@ class Attention(nn.Module):
 
 
 class MemEffAttention(Attention):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Gear3: Flag to control attention weights storage (default: disabled)
+        # Only last block needs to store attention weights for Gear3
+        self.store_attn_weights = False
+        self.attn_weights = None
+
     def forward(self, x: Tensor, attn_bias=None) -> Tensor:
         if not XFORMERS_AVAILABLE:
             assert attn_bias is None, "xFormers is required for nested tensors usage"
@@ -91,6 +104,16 @@ class MemEffAttention(Attention):
 
         q, k, v = unbind(qkv, 2)
 
+        # For Gear3: compute and store attention weights ONLY if enabled
+        # This saves ~11GB of memory by only storing last block's attention
+        if self.store_attn_weights:
+            q_t = q.transpose(1, 2) * self.scale
+            k_t = k.transpose(1, 2)
+            attn = q_t @ k_t.transpose(-2, -1)  # [B, num_heads, N, N]
+            attn = attn.softmax(dim=-1)
+            self.attn_weights = attn.detach()  # Store for Gear3
+
+        # Use xformers for efficient computation
         x = memory_efficient_attention(q, k, v, attn_bias=attn_bias)
         x = x.reshape([B, N, C])
 
