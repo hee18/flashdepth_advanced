@@ -40,7 +40,7 @@ show_usage() {
     echo "  logs        Show container logs"
     echo ""
     echo "Training Options:"
-    echo "  --batch-size SIZE     Set batch size per GPU (default: 22, effective 44 with DDP)"
+    echo "  --batch-size SIZE     Set batch size per GPU (default: 20, effective 40 with DDP)"
     echo "  --workers NUM         Set number of DataLoader workers (default: 8)"
     echo "  --epochs NUM          Set number of training iterations (default: 60001)"
     echo "  --gpu ID              Set GPU ID (default: 0)"
@@ -49,6 +49,9 @@ show_usage() {
     echo "  --gsp-checkpoint PATH Set GSP module weights path"
     echo "  --frame-interval NUM  Set frame interval for sequence visualization (default: 1)"
     echo "  --vid-len NUM         Set video sequence length for testing (default: 50)"
+    echo "  --entropy-loss BOOL   Enable/disable entropy loss (default: true)"
+    echo "  --entropy-weight NUM  Set entropy loss weight (default: 0.1)"
+    echo "  --measure-fps BOOL    Enable/disable FPS measurement (default: true)"
     echo ""
     echo "Examples:"
     echo "  $0 build                              # Build the image"
@@ -66,7 +69,7 @@ show_usage() {
 
 # Parse command line arguments - optimized for RTX A6000 (2x 48GB)
 COMMAND=""
-BATCH_SIZE=22  # Per GPU (effective 44 with 2 GPUs in DDP)
+BATCH_SIZE=20  # Per GPU (effective 40 with 2 GPUs in DDP)
 WORKERS=8      # Optimized for 96 CPU cores, prevents I/O bottleneck
 TOTAL_ITERS=60001
 GPU_ID=0
@@ -75,6 +78,9 @@ FLASHDEPTH_CHECKPOINT="configs/flashdepth-l/iter_10001.pth"
 GSP_CHECKPOINT="train_results/results_5/best_metric_head_step_21000.pth"
 FRAME_INTERVAL=1
 VID_LEN=50
+ENTROPY_LOSS="true"
+ENTROPY_WEIGHT="0.1"
+MEASURE_FPS="true"
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -117,6 +123,18 @@ while [[ $# -gt 0 ]]; do
             ;;
         --vid-len)
             VID_LEN="$2"
+            shift 2
+            ;;
+        --entropy-loss)
+            ENTROPY_LOSS="$2"
+            shift 2
+            ;;
+        --entropy-weight)
+            ENTROPY_WEIGHT="$2"
+            shift 2
+            ;;
+        --measure-fps)
+            MEASURE_FPS="$2"
             shift 2
             ;;
         -h|--help)
@@ -229,12 +247,14 @@ case $COMMAND in
     train_gear3_ddp)
         echo "Starting Gear3 training (Multi-GPU: 0,1)..."
         echo "Configuration:"
-        echo "  - Batch size: $BATCH_SIZE (per GPU)"
+        echo "  - Batch size per GPU: $BATCH_SIZE"
         echo "  - Effective batch size: $((BATCH_SIZE * 2))"
         echo "  - Workers: $WORKERS"
         echo "  - Total iterations: $TOTAL_ITERS"
         echo "  - GPUs: 0,1"
         echo "  - Results directory: $RESULTS_DIR"
+        echo "  - Entropy loss: $ENTROPY_LOSS (weight: $ENTROPY_WEIGHT)"
+        echo "  - FPS measurement: $MEASURE_FPS"
         echo ""
 
         # Build train_gear3 DDP command using --standalone for single-node multi-GPU
@@ -252,6 +272,9 @@ case $COMMAND in
             training.batch_size=$BATCH_SIZE \
             training.workers=$WORKERS \
             training.iterations=$TOTAL_ITERS \
+            training.use_entropy_loss=$ENTROPY_LOSS \
+            training.entropy_loss_weight=$ENTROPY_WEIGHT \
+            training.measure_fps=$MEASURE_FPS \
             +results_dir=$RESULTS_DIR"
 
         # Add checkpoint loading

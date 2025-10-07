@@ -187,6 +187,51 @@ class LogL1Loss(nn.Module):
         return loss
 
 
+class EntropyLoss(nn.Module):
+    """
+    Entropy regularization loss for importance maps.
+
+    Encourages spatial diversity by maximizing the entropy of the importance map distribution.
+    Based on information theory: H(p) = -∑ p(x) log p(x)
+
+    Uniform maps (low diversity) → Low entropy → High loss
+    Diverse maps (high diversity) → High entropy → Low loss
+
+    Reference: "Entropy-Guided Attention for Private LLMs" (2025)
+    """
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, importance_map):
+        """
+        Args:
+            importance_map: [B, 1, H, W] importance values in range [0, 1]
+
+        Returns:
+            loss: scalar (negative entropy, to be minimized)
+        """
+        B = importance_map.shape[0]
+
+        # Flatten spatial dimensions to treat as probability distribution
+        # [B, 1, H, W] -> [B, H*W]
+        p = importance_map.view(B, -1)
+
+        # Add epsilon for numerical stability
+        p = p + 1e-8
+
+        # Normalize to probability distribution (sum to 1)
+        p = p / p.sum(dim=1, keepdim=True)
+
+        # Compute Shannon entropy: H(p) = -∑ p(x) log p(x)
+        entropy = -(p * torch.log(p)).sum(dim=1)  # [B]
+
+        # Average over batch
+        avg_entropy = entropy.mean()
+
+        # Return negative entropy (we want to MAXIMIZE entropy, so MINIMIZE -entropy)
+        return -avg_entropy
+
+
 class Gear3Trainer:
     """
     Trainer for Gear3 metric depth learning.
@@ -217,13 +262,29 @@ class Gear3Trainer:
 
         # Setup logging (only rank 0)
         if rank == 0:
+            # Create file handler with immediate flushing
+            file_handler = logging.FileHandler(self.results_dir / 'training.log')
+            file_handler.setLevel(logging.INFO)
+            file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+
+            # Force immediate flush after each log
+            class FlushFileHandler(logging.FileHandler):
+                def emit(self, record):
+                    super().emit(record)
+                    self.flush()  # Flush immediately
+
+            file_handler = FlushFileHandler(self.results_dir / 'training.log')
+            file_handler.setLevel(logging.INFO)
+            file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+
+            stream_handler = logging.StreamHandler()
+            stream_handler.setLevel(logging.INFO)
+            stream_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+
             logging.basicConfig(
                 level=logging.INFO,
                 format='%(asctime)s - %(levelname)s - %(message)s',
-                handlers=[
-                    logging.FileHandler(self.results_dir / 'training.log'),
-                    logging.StreamHandler()
-                ]
+                handlers=[file_handler, stream_handler]
             )
         else:
             logging.basicConfig(level=logging.ERROR)  # Other ranks only show errors
@@ -253,6 +314,25 @@ class Gear3Trainer:
         self.optimizer = self._setup_optimizer()
         self.scheduler = self._setup_scheduler()
         self.loss_fn = LogL1Loss()
+        self.entropy_loss_fn = EntropyLoss()
+
+        # Entropy loss config
+        self.use_entropy_loss = config.training.get('use_entropy_loss', False)
+        self.entropy_loss_weight = config.training.get('entropy_loss_weight', 0.1)
+
+        if rank == 0:
+            if self.use_entropy_loss:
+                self.logger.info(f"Entropy loss enabled with weight: {self.entropy_loss_weight}")
+            else:
+                self.logger.info("Entropy loss disabled")
+
+        # FPS measurement config
+        self.measure_fps = config.training.get('measure_fps', False)
+        self.fps_log_freq = config.training.get('fps_log_freq', 100)
+        self.fps_buffer = []  # Store recent FPS measurements
+
+        if rank == 0 and self.measure_fps:
+            self.logger.info(f"FPS measurement enabled (log every {self.fps_log_freq} steps)")
 
         # Setup wandb
         if config.training.get('wandb', False):
@@ -267,6 +347,7 @@ class Gear3Trainer:
 
         self.global_step = 0
         self.best_val_loss = float('inf')
+        self.best_step = 0  # Track which step achieved best validation loss
 
     def _setup_model(self):
         """Initialize FlashDepth with Gear3 metric head"""
@@ -421,10 +502,9 @@ class Gear3Trainer:
     def _setup_data_loaders(self):
         """Setup phase-specific data loaders"""
         if self.phase == 1:
-            # Phase 1: Include all available datasets
-            train_datasets = ['mvs-synth', 'pointodyssey', 'spring']
-            # Validation: Use Spring val split (1/3 of scenes, separate from training)
-            val_datasets = ['spring']
+            # Phase 1: Use datasets from config (allow config override)
+            train_datasets = self.config.dataset.get('train_datasets', ['mvs-synth', 'tartanair', 'pointodyssey', 'spring'])
+            val_datasets = self.config.dataset.get('val_datasets', ['sintel', 'waymo'])
         else:
             # Phase 2: nuScenes only
             train_datasets = ['nuscenes']
@@ -605,15 +685,34 @@ class Gear3Trainer:
             lr_mamba = self.optimizer.param_groups[1]['lr']
 
             # Update progress bar (every step)
-            pbar.set_postfix({
+            postfix_dict = {
                 'loss': f'{loss_dict["loss"]:.4f}',
+                'depth': f'{loss_dict["depth_loss"]:.4f}',
                 'lr_g3': f'{lr_gear3:.2e}',
                 'lr_mb': f'{lr_mamba:.2e}'
-            })
+            }
+            if self.use_entropy_loss:
+                postfix_dict['entropy'] = f'{loss_dict["entropy_loss"]:.4f}'
+
+            # Add FPS to progress bar if available
+            if self.measure_fps and len(self.fps_buffer) > 0:
+                avg_fps = sum(self.fps_buffer[-20:]) / min(len(self.fps_buffer), 20)  # Last 20 samples
+                postfix_dict['fps'] = f'{avg_fps:.1f}'
+
+            pbar.set_postfix(postfix_dict)
+
+            # FPS logging (every fps_log_freq steps)
+            if self.measure_fps and step > 0 and step % self.fps_log_freq == 0 and len(self.fps_buffer) > 0:
+                avg_fps = sum(self.fps_buffer[-self.fps_log_freq:]) / min(len(self.fps_buffer), self.fps_log_freq)
+                if self.rank == 0:
+                    self.logger.info(f"Step {step}: Average FPS (forward pass only): {avg_fps:.2f}")
 
             # WandB logging (every step)
+            wandb_dict = {**loss_dict, 'lr_gear3': lr_gear3, 'lr_mamba': lr_mamba}
+            if self.measure_fps and len(self.fps_buffer) > 0:
+                wandb_dict['fps'] = sum(self.fps_buffer[-20:]) / min(len(self.fps_buffer), 20)
             if self.config.training.get('wandb', False):
-                wandb.log({**loss_dict, 'lr_gear3': lr_gear3, 'lr_mamba': lr_mamba}, step=step)
+                wandb.log(wandb_dict, step=step)
 
             # Training visualization (steps 0, 10, 50, 100, then every 250) - rank 0 only
             vis_steps = [0, 10, 50, 100]
@@ -683,8 +782,13 @@ class Gear3Trainer:
                             'importance_map': importance_map_resized[:1].cpu()  # [1, 1, H, W]
                         }
 
+                        # Get FPS for visualization
+                        current_fps = None
+                        if self.measure_fps and len(self.fps_buffer) > 0:
+                            current_fps = sum(self.fps_buffer[-20:]) / min(len(self.fps_buffer), 20)
+
                         self.visualizer.create_validation_summary(
-                            sample_batch, model_outputs_cpu, step, prefix="training"
+                            sample_batch, model_outputs_cpu, step, prefix="training", fps=current_fps
                         )
 
                     self._set_train_mode()
@@ -704,16 +808,18 @@ class Gear3Trainer:
                 # Save best model
                 if val_metrics['loss'] < self.best_val_loss:
                     self.best_val_loss = val_metrics['loss']
-                    self.save_checkpoint(f'best_phase{self.phase}.pth')
+                    self.best_step = step  # Track best step
+                    self.save_checkpoint(f'best.pth')
+                    self.logger.info(f"New best model at step {step}: val_loss={val_metrics['loss']:.4f}")
 
                 self._set_train_mode()
 
             # Save checkpoint
             if step % self.config.training.get('save_freq', 5000) == 0 and step > 0:
-                self.save_checkpoint(f'iter_{step}_phase{self.phase}.pth')
+                self.save_checkpoint(f'checkpoint_step{step}_phase{self.phase}.pth')
 
         # Final save
-        self.save_checkpoint(f'final_phase{self.phase}.pth')
+        self.save_checkpoint(f'final_step{step}_phase{self.phase}.pth')
         self.logger.info("Training completed!")
 
     def train_step(self, batch):
@@ -751,8 +857,15 @@ class Gear3Trainer:
 
         # Forward pass with BFloat16 autocast (like original FlashDepth)
         total_loss = 0
+        total_depth_loss = 0
+        total_entropy_loss = 0
         valid_frames = 0
-        
+
+        # FPS measurement (forward pass only)
+        if self.measure_fps:
+            torch.cuda.synchronize()  # Wait for GPU operations to finish
+            fps_start = time.perf_counter()
+
         for t in range(T):
             img_t = images[:, t]
             gt_t = gt_depth_inverse[:, t]
@@ -797,6 +910,16 @@ class Gear3Trainer:
                 # Prediction is already positive (Softplus activation in output_conv2)
                 pred_depth_inverse = out
 
+            # End forward pass timing HERE (before loss computation)
+            if self.measure_fps and t == T - 1:  # Only measure after last frame
+                torch.cuda.synchronize()  # Ensure all GPU operations complete
+                fps_end = time.perf_counter()
+                elapsed = fps_end - fps_start
+                fps = (B * T) / elapsed  # Total frames (batch_size * video_length) per second
+                self.fps_buffer.append(fps)
+
+            # Continue with loss computation (outside autocast for stability)
+            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
                 # DEBUG: Check prediction values in first few steps
                 if self.global_step < 5:
                     self.logger.info(f"DEBUG - Pred inverse depth: min={pred_depth_inverse.min():.4f}, max={pred_depth_inverse.max():.4f}, mean={pred_depth_inverse.mean():.4f}")
@@ -817,26 +940,38 @@ class Gear3Trainer:
                     continue
 
                 # Loss computation in BFloat16
-                loss_t = self.loss_fn(pred_depth_inverse, gt_t, valid_mask.float())
-            
+                depth_loss_t = self.loss_fn(pred_depth_inverse, gt_t, valid_mask.float())
+
+                # Entropy regularization loss (if enabled)
+                entropy_loss_t = torch.tensor(0.0, device=depth_loss_t.device)
+                if self.use_entropy_loss:
+                    entropy_loss_t = self.entropy_loss_fn(importance_map)
+                    loss_t = depth_loss_t + self.entropy_loss_weight * entropy_loss_t
+                else:
+                    loss_t = depth_loss_t
+
             # Safety check: skip if loss is NaN or too large
             if torch.isnan(loss_t) or torch.isinf(loss_t):
                 self.logger.warning(f"Skipping frame {t} due to NaN/Inf loss")
                 continue
-            
+
             if loss_t > 1e6:
                 self.logger.warning(f"Skipping frame {t} due to abnormal loss: {loss_t.item():.2f}")
                 continue
-                
+
             total_loss += loss_t
+            total_depth_loss += depth_loss_t
+            total_entropy_loss += entropy_loss_t
             valid_frames += 1
 
         # Average loss over valid frames
         if valid_frames == 0:
             self.logger.error("No valid frames in batch!")
-            return {'loss': 0.0}
-            
+            return {'loss': 0.0, 'depth_loss': 0.0, 'entropy_loss': 0.0}
+
         loss = total_loss / valid_frames
+        avg_depth_loss = total_depth_loss / valid_frames
+        avg_entropy_loss = total_entropy_loss / valid_frames
 
         # Backward pass (outside autocast for numerical stability)
         self.optimizer.zero_grad()
@@ -845,7 +980,11 @@ class Gear3Trainer:
         self.optimizer.step()
         self.scheduler.step()
 
-        return {'loss': loss.item()}
+        return {
+            'loss': loss.item(),
+            'depth_loss': avg_depth_loss.item(),
+            'entropy_loss': avg_entropy_loss.item() if self.use_entropy_loss else 0.0
+        }
 
     @torch.no_grad()
     def validate(self):
@@ -959,8 +1098,13 @@ class Gear3Trainer:
                                 dataset_idx
                             )
                             
+                            # Get FPS for visualization
+                            current_fps = None
+                            if self.measure_fps and len(self.fps_buffer) > 0:
+                                current_fps = sum(self.fps_buffer[-20:]) / min(len(self.fps_buffer), 20)
+
                             self.visualizer.create_validation_summary(
-                                sample_batch, model_outputs, self.global_step
+                                sample_batch, model_outputs, self.global_step, fps=current_fps
                             )
                             first_batch_saved = True
                         except Exception as e:
@@ -1008,6 +1152,7 @@ class Gear3Trainer:
             'optimizer': self.optimizer.state_dict(),
             'scheduler': self.scheduler.state_dict(),
             'best_val_loss': self.best_val_loss,
+            'best_step': self.best_step,  # Save which step was best
             'config': OmegaConf.to_container(self.config, resolve=True),
             'phase': self.phase
         }

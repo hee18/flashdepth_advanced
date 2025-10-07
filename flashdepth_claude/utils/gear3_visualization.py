@@ -25,7 +25,7 @@ class Gear3Visualizer:
         plt.style.use('default')
         sns.set_palette("husl")
 
-    def create_validation_summary(self, sample_batch, model_outputs, step, save_name=None, prefix="validation"):
+    def create_validation_summary(self, sample_batch, model_outputs, step, save_name=None, prefix="validation", fps=None):
         """
         Create a comprehensive validation summary for Gear3
 
@@ -35,6 +35,7 @@ class Gear3Visualizer:
             step: Training step number
             save_name: Optional custom save name
             prefix: Prefix for the visualization
+            fps: Forward pass FPS (optional)
 
         Returns:
             fig: Matplotlib figure object
@@ -218,8 +219,15 @@ class Gear3Visualizer:
 
             ax8.text(0.1, 0.6, f'Dataset: {dataset_str}', fontsize=14,
                     transform=ax8.transAxes)
-            ax8.text(0.1, 0.4, f'Importance mean: {imp_mean:.3f}', fontsize=12,
-                    transform=ax8.transAxes, bbox=dict(boxstyle="round", facecolor='lightblue'))
+
+            # Show FPS if available, otherwise show importance mean
+            if fps is not None:
+                ax8.text(0.1, 0.4, f'FPS: {fps:.1f}', fontsize=12,
+                        transform=ax8.transAxes, bbox=dict(boxstyle="round", facecolor='lightgreen'))
+            else:
+                ax8.text(0.1, 0.4, f'Importance mean: {imp_mean:.3f}', fontsize=12,
+                        transform=ax8.transAxes, bbox=dict(boxstyle="round", facecolor='lightblue'))
+
             ax8.set_title('Training Info', fontsize=14, fontweight='bold')
             ax8.axis('off')
 

@@ -31,16 +31,37 @@ class TartanairDepth(BaseDatasetPairs):
                 continue
             scene_full_path = os.path.join(scenes_path, scene_name)
 
-            # Look for P*** directories (like P001, P002, etc.)
-            p_dirs = [d for d in os.listdir(scene_full_path)
-                     if d.startswith('P') and os.path.isdir(os.path.join(scene_full_path, d))]
+            # Check for difficulty levels (Easy/Hard) or direct P*** directories
+            subdirs = os.listdir(scene_full_path)
 
-            for p_dir in p_dirs:
-                p_path = os.path.join(scene_full_path, p_dir)
-                # Check if this P directory has image_left and depth_left
-                if (os.path.isdir(os.path.join(p_path, 'image_left')) and
-                    os.path.isdir(os.path.join(p_path, 'depth_left'))):
-                    all_scenes.append(os.path.join(scene_name, p_dir))
+            # Check if there are difficulty subdirectories (Easy, Hard)
+            difficulty_dirs = [d for d in subdirs if d in ['Easy', 'Hard'] and
+                             os.path.isdir(os.path.join(scene_full_path, d))]
+
+            if difficulty_dirs:
+                # Structure: scene_name/Easy/P001 or scene_name/Hard/P001
+                for diff_dir in difficulty_dirs:
+                    diff_path = os.path.join(scene_full_path, diff_dir)
+                    p_dirs = [d for d in os.listdir(diff_path)
+                             if d.startswith('P') and os.path.isdir(os.path.join(diff_path, d))]
+
+                    for p_dir in p_dirs:
+                        p_path = os.path.join(diff_path, p_dir)
+                        # Check if this P directory has image_left and depth_left
+                        if (os.path.isdir(os.path.join(p_path, 'image_left')) and
+                            os.path.isdir(os.path.join(p_path, 'depth_left'))):
+                            all_scenes.append(os.path.join(scene_name, diff_dir, p_dir))
+            else:
+                # Structure: scene_name/P001 (old sample format)
+                p_dirs = [d for d in subdirs
+                         if d.startswith('P') and os.path.isdir(os.path.join(scene_full_path, d))]
+
+                for p_dir in p_dirs:
+                    p_path = os.path.join(scene_full_path, p_dir)
+                    # Check if this P directory has image_left and depth_left
+                    if (os.path.isdir(os.path.join(p_path, 'image_left')) and
+                        os.path.isdir(os.path.join(p_path, 'depth_left'))):
+                        all_scenes.append(os.path.join(scene_name, p_dir))
 
         return sorted(all_scenes)
 

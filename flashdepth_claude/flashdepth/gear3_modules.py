@@ -81,15 +81,17 @@ class ForegroundBackgroundNetworks(nn.Module):
     """
     Generates foreground and background semantic features from patch tokens.
 
-    Input: Patch tokens [B, num_patches, embed_dim]
+    Option 3: Attention-based Pooling
+    - Uses CLS→patch attention to distinguish important (FG) vs context (BG) regions
+    - Top attention patches → FG network
+    - Bottom attention patches → BG network
+
+    Input: Patch tokens [B, num_patches, embed_dim], Attention weights
     Output: FG features [B, feature_dim], BG features [B, feature_dim]
     """
     def __init__(self, embed_dim=1024, feature_dim=256):
         super().__init__()
 
-        # Note: FG/BG features will be computed with importance-weighted pooling
-        # in forward(), not simple global average pooling
-        
         # Foreground network (focus on salient objects)
         self.fg_net = nn.Sequential(
             nn.Linear(embed_dim, feature_dim * 2),
@@ -106,24 +108,51 @@ class ForegroundBackgroundNetworks(nn.Module):
             nn.ReLU(inplace=True)
         )
 
-        logging.info(f"FG/BG Networks initialized: {embed_dim} -> {feature_dim}")
+        logging.info(f"FG/BG Networks (Attention-based Pooling): {embed_dim} -> {feature_dim}")
 
-    def forward(self, patch_tokens):
+    def forward(self, patch_tokens, attention_weights):
         """
         Args:
             patch_tokens: [B, num_patches, embed_dim]
+            attention_weights: [B, num_heads, num_patches+1, num_patches+1]
+                              (from last DINOv2 block)
 
         Returns:
-            fg_features: [B, feature_dim]
-            bg_features: [B, feature_dim]
+            fg_features: [B, feature_dim] - Weighted by high attention
+            bg_features: [B, feature_dim] - Weighted by low attention
         """
-        # Global average pooling over patches (Simple GAP)
-        # Same input goes to both networks, but they learn different features
-        # through gradient separation during modulation
-        global_features = patch_tokens.mean(dim=1)  # [B, embed_dim]
+        B, num_patches, embed_dim = patch_tokens.shape
 
-        fg_features = self.fg_net(global_features)  # [B, feature_dim]
-        bg_features = self.bg_net(global_features)  # [B, feature_dim]
+        # Extract CLS→patch attention (semantic importance from DINOv2)
+        # attention_weights: [B, num_heads, num_patches+1, num_patches+1]
+        # Index 0 is CLS token, 1: are patch tokens
+        cls_to_patch_attn = attention_weights[:, :, 0, 1:]  # [B, num_heads, num_patches]
+
+        # Average over attention heads
+        attn_scores = cls_to_patch_attn.mean(dim=1)  # [B, num_patches]
+
+        # Compute median for FG/BG split
+        attn_median = attn_scores.median(dim=1, keepdim=True).values  # [B, 1]
+
+        # Create masks (top attention = FG, bottom attention = BG)
+        fg_mask = (attn_scores > attn_median).float()  # [B, num_patches]
+        bg_mask = (attn_scores <= attn_median).float()  # [B, num_patches]
+
+        # Weighted pooling (attention-weighted average)
+        fg_weights = attn_scores * fg_mask  # [B, num_patches]
+        bg_weights = (1.0 - attn_scores) * bg_mask  # Inverse for BG
+
+        # Normalize weights
+        fg_weights = fg_weights / (fg_weights.sum(dim=1, keepdim=True) + 1e-8)  # [B, num_patches]
+        bg_weights = bg_weights / (bg_weights.sum(dim=1, keepdim=True) + 1e-8)
+
+        # Weighted sum
+        fg_pooled = (patch_tokens * fg_weights.unsqueeze(-1)).sum(dim=1)  # [B, embed_dim]
+        bg_pooled = (patch_tokens * bg_weights.unsqueeze(-1)).sum(dim=1)  # [B, embed_dim]
+
+        # Pass through networks
+        fg_features = self.fg_net(fg_pooled)  # [B, feature_dim]
+        bg_features = self.bg_net(bg_pooled)  # [B, feature_dim]
 
         return fg_features, bg_features
 
@@ -277,8 +306,9 @@ class Gear3MetricHead(nn.Module):
         # 1. Predict importance map
         importance_map = self.importance_predictor(attention_weights, patch_h, patch_w)
 
-        # 2. Generate FG/BG features (Simple GAP - same input, different networks)
-        fg_features, bg_features = self.fg_bg_networks(patch_tokens)
+        # 2. Generate FG/BG features (Attention-based Pooling)
+        # Uses CLS→patch attention to separate high-attention (FG) vs low-attention (BG) regions
+        fg_features, bg_features = self.fg_bg_networks(patch_tokens, attention_weights)
 
         # 3. Modulate each DPT layer
         modulated_dpt_features = []

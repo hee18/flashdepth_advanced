@@ -17,12 +17,12 @@ dataset:
   data_root: null # change data path
   resolution: 'base'  # 518x518
   video_length: 5
-  train_datasets: [mvs-synth, dynamicreplica, tartanair, pointodyssey, spring]  # Will be overridden by code
-  val_datasets: [sintel]  # Sintel has metric depth GT, separate from training datasets
+  train_datasets: [mvs-synth, tartanair, pointodyssey, spring]  # Removed dynamicreplica
+  val_datasets: [sintel, waymo]  # Removed spring, added waymo
 
 # Training configuration
 training:
-  batch_size: 22  # Per GPU (effective 44 with 2 GPUs in DDP) - optimized based on GPU memory
+  batch_size: 20  # Per GPU (effective 40 with 2 GPUs in DDP) - optimized based on GPU memory
   workers: 8      # Optimized for 96 CPU cores
   iterations: 60001  # Same as original FlashDepth
   save_freq: 5000
@@ -35,6 +35,14 @@ training:
   gear3_lr: 1.0e-4  # For new Gear3 modules
   mamba_lr: 1.0e-4  # For Mamba (train from scratch, same LR as gear3)
   weight_decay: 1.0e-6
+
+  # Regularization losses
+  use_entropy_loss: true  # Enable entropy regularization for importance map diversity
+  entropy_loss_weight: 0.1  # Weight for entropy loss (0.05-0.2 recommended)
+
+  # FPS measurement
+  measure_fps: true  # Measure forward pass FPS (inference speed)
+  fps_log_freq: 100  # Log FPS every N steps
 
 # Model configuration (same as FlashDepth-L)
 model:

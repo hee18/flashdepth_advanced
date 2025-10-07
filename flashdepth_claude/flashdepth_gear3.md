@@ -22,16 +22,17 @@
 
 ## 개요
 
-Gear3는 FlashDepth에 **Feature-level Metric Injection**을 적용하여 metric depth 추정 성능을 향상시킵니다. 기존 GSP(Global Scale Predictor)와 달리, **DPT feature에 직접 FiLM-style modulation**을 적용합니다.
+Gear3는 FlashDepth에 **Feature-level Metric Injection**을 적용하여 metric depth 추정 성능을 향상시킵니다.
+기존 GSP(Global Scale Predictor)와 달리, **DPT feature에 직접 FiLM-style modulation**을 적용합니다.
 
 ### 기존 방식 vs Gear3
 
-| 방식 | GSP (기존) | Gear3 (현재) |
-|------|-----------|-------------|
+| 방식            | GSP (기존)              | Gear3 (현재)                  |
+|----------------|------------------------|-------------------------------|
 | **Metric 주입** | Depth map에 scale/shift | **DPT features에 modulation** |
-| **공간 변화** | 전역 균일 | **Importance map 기반 spatial modulation** |
-| **FG/BG 구분** | 없음 | **Separate FG/BG modulation** |
-| **학습 파라미터** | ~0.5M | **~9.2M** (Gear3 + Mamba + output_conv) |
+|  **공간 변화**   |  전역 균일               | **Importance map 기반 spatial modulation** |
+| **FG/BG 구분**  |  없음                   | **Separate FG/BG modulation** |
+| **학습 파라미터** |  ~0.5M                 | **~9.2M** (Gear3 + Mamba + output_conv) |
 
 ---
 
@@ -85,11 +86,11 @@ Video Frame → DINOv2-L (frozen) → Patch Tokens + Last Block Attention
                                       ↓
                     ┌─────────────────┴─────────────────┐
                     ↓                                   ↓
-         ImportancePredictor              ForegroundBackgroundNetworks
-         (zero init last layer)                  (Simple GAP)
+         ImportancePredictor         ForegroundBackgroundNetworks
+         (zero init last layer)      (Attention-based Pooling)
                     ↓                                   ↓
          Importance Map [B,1,H,W]          FG/BG Features [B,256]
-                    ↓                                   ↓
+                    ↓                   (Top attn → FG, Low attn → BG)
                     └─────────────────┬─────────────────┘
                                       ↓
                             ModulationNetworks (×4 layers)
@@ -128,16 +129,228 @@ class ImportancePredictor(nn.Module):
 
 #### 2. ForegroundBackgroundNetworks
 
-**Simple Global Average Pooling (GAP)**:
+**Option 3: Attention-based Pooling** (현재 사용):
 ```python
-def forward(self, patch_tokens):
-    global_features = patch_tokens.mean(dim=1)  # [B, embed_dim]
-    fg_features = self.fg_net(global_features)  # [B, 256]
-    bg_features = self.bg_net(global_features)  # [B, 256]
+def forward(self, patch_tokens, attention_weights):
+    # Extract CLS→patch attention (semantic importance)
+    cls_to_patch_attn = attention_weights[:, :, 0, 1:]  # [B, num_heads, num_patches]
+    attn_scores = cls_to_patch_attn.mean(dim=1)  # [B, num_patches]
+
+    # Split by median: top 50% = FG, bottom 50% = BG
+    median = attn_scores.median(dim=1, keepdim=True).values
+    fg_mask = (attn_scores > median).float()
+    bg_mask = (attn_scores <= median).float()
+
+    # Attention-weighted pooling
+    fg_weights = attn_scores * fg_mask
+    bg_weights = (1.0 - attn_scores) * bg_mask
+    fg_pooled = (patch_tokens * fg_weights.unsqueeze(-1)).sum(dim=1)  # [B, 1024]
+    bg_pooled = (patch_tokens * bg_weights.unsqueeze(-1)).sum(dim=1)  # [B, 1024]
+
+    # Pass through separate networks
+    fg_features = self.fg_net(fg_pooled)  # [B, 256]
+    bg_features = self.bg_net(bg_pooled)  # [B, 256]
     return fg_features, bg_features
 ```
 
-**Note**: Importance-weighted pooling 대신 simple GAP 사용 (gradient separation이 더 중요)
+**핵심**:
+- **DINOv2의 검증된 semantic attention 활용** (frozen but powerful)
+- Top attention patches → FG (semantic objects)
+- Bottom attention patches → BG (context)
+- **FG ≠ BG 자동 보장** → Importance map gradient flow 가능
+
+### 차원 흐름도 (Complete Forward Pass)
+
+**ViT-L 기준, 입력 해상도 518×518**
+
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. INPUT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Input Image:                    [B, 3, 518, 518]
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. DINOv2 ENCODER (Frozen)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Patch Embedding (14×14 patches):
+  → num_patches = 518÷14 × 518÷14 = 37 × 37 = 1369
+  → Total tokens = 1369 + 1 (CLS) = 1370
+
+Encoder Output (24 layers):
+  → Intermediate layers [4, 11, 17, 23]:
+      Layer 4:                  [B, 1370, 1024]  ← Early features
+      Layer 11:                 [B, 1370, 1024]  ← Mid features
+      Layer 17:                 [B, 1370, 1024]  ← Late-mid features
+      Layer 23:                 [B, 1370, 1024]  ← Late features (사용)
+
+  → Last Block Attention Weights:
+      attention_weights:        [B, 16, 1370, 1370]
+                                   ↑ num_heads
+      CLS→Patch attention:      [B, 16, 1369]  ← Extract [:, :, 0, 1:]
+
+  → Patch Tokens (without CLS): [B, 1369, 1024]
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. DPT FEATURE EXTRACTION (Frozen)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DPT Head processes 4 intermediate layers:
+
+  Path 4 (from Layer 4):        [B, 256, 37, 37]
+  Path 3 (from Layer 11):       [B, 256, 37, 37]
+  Path 2 (from Layer 17):       [B, 256, 37, 37]
+  Path 1 (from Layer 23):       [B, 256, 37, 37]  ← Will be modulated
+
+  dpt_features = [path_4, path_3, path_2, path_1]
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. GEAR3 HEAD - Importance Prediction (Trainable)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ImportancePredictor:
+  Input:  attention_weights     [B, 16, 1369]
+
+  Reshape:                      [B, 16, 37, 37]
+
+  Conv1 + BN + ReLU:            [B, 128, 37, 37]  ← hidden_dim
+  Conv2 + BN + ReLU:            [B, 64, 37, 37]   ← hidden_dim//2
+  Conv3 (zero init):            [B, 1, 37, 37]
+  Sigmoid:                      [B, 1, 37, 37]    ← Importance map (0~1)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. GEAR3 HEAD - FG/BG Feature Extraction (Trainable)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ForegroundBackgroundNetworks (Option 3: Attention-based Pooling):
+
+  Input:
+    patch_tokens:               [B, 1369, 1024]
+    attention_weights:          [B, 16, 1369]  ← CLS→patch attention
+
+  Average over heads:           [B, 1369]  ← attn_scores
+
+  Median split:
+    fg_mask (top 50%):          [B, 1369]  ← High attention patches
+    bg_mask (bottom 50%):       [B, 1369]  ← Low attention patches
+
+  Weighted pooling:
+    fg_pooled:                  [B, 1024]  ← Attention-weighted sum
+    bg_pooled:                  [B, 1024]  ← Inverse attention-weighted sum
+
+  FG Network (MLP):
+    fg_pooled → Linear(1024→512) → ReLU → Linear(512→256) → ReLU
+    fg_features:                [B, 256]   ← FG semantic features
+
+  BG Network (MLP):
+    bg_pooled → Linear(1024→512) → ReLU → Linear(512→256) → ReLU
+    bg_features:                [B, 256]   ← BG context features
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. GEAR3 HEAD - Modulation Parameters (Trainable)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ModulationNetworks (for each DPT layer, layer_idx ∈ {0,1,2,3}):
+
+  Input:
+    fg_features:                [B, 256]
+    bg_features:                [B, 256]
+
+  FG Modulation Network:
+    fg_features → Linear(256→512) → ReLU → Linear(512→512)
+    fg_params:                  [B, 512]
+    Split:
+      fg_gamma:                 [B, 256]  ← First half
+      fg_beta:                  [B, 256]  ← Second half
+
+  BG Modulation Network:
+    bg_features → Linear(256→512) → ReLU → Linear(512→512)
+    bg_params:                  [B, 512]
+    Split:
+      bg_gamma:                 [B, 256]
+      bg_beta:                  [B, 256]
+
+  Output per layer: (fg_gamma, fg_beta, bg_gamma, bg_beta)
+                    각각 [B, 256]
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. FEATURE MODULATION (Trainable)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FeatureModulator (for each DPT layer):
+
+  Input:
+    features:                   [B, 256, 37, 37]  ← DPT path features
+    importance_map:             [B, 1, 37, 37]
+    fg_gamma, fg_beta:          [B, 256]
+    bg_gamma, bg_beta:          [B, 256]
+
+  Resize importance_map:        [B, 1, 37, 37]  ← Bilinear interpolation
+
+  Expand modulation params:
+    fg_gamma:                   [B, 256, 1, 1]  → Broadcast
+    fg_beta:                    [B, 256, 1, 1]  → Broadcast
+    bg_gamma:                   [B, 256, 1, 1]  → Broadcast
+    bg_beta:                    [B, 256, 1, 1]  → Broadcast
+
+  Compute spatial-adaptive params:
+    gamma[b,c,h,w] = importance[b,0,h,w] × fg_gamma[b,c,0,0]
+                   + (1 - importance[b,0,h,w]) × bg_gamma[b,c,0,0]
+    beta[b,c,h,w]  = importance[b,0,h,w] × fg_beta[b,c,0,0]
+                   + (1 - importance[b,0,h,w]) × bg_beta[b,c,0,0]
+
+    gamma:                      [B, 256, 37, 37]
+    beta:                       [B, 256, 37, 37]
+
+  Apply FiLM modulation:
+    modulated_features:         [B, 256, 37, 37]
+                                = gamma ⊙ features + beta
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+8. DPT OUTPUT HEAD (Trainable from scratch)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Use modulated path_1:           [B, 256, 37, 37]
+
+output_conv1 (Conv 3×3):        [B, 256, 37, 37]
+                                  ↓ ReLU
+
+Interpolate to input size:      [B, 256, 518, 518]  ← Bilinear upsampling
+
+output_conv2 (Conv 3×3):        [B, 1, 518, 518]
+                                  ↓ Softplus (positive)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+9. FINAL OUTPUT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Predicted Inverse Depth:        [B, 1, 518, 518]
+  (in 100/meters scale, canonicalized)
+
+Ground Truth (for training):    [B, 1, 518, 518]
+  (in 100/meters scale, canonicalized)
+
+Valid Mask:                     [B, 1, 518, 518]
+  (inverse_depth > 0.5, i.e., depth < 200m)
+```
+
+### 메모리 사용량 분석 (Batch=20, BFloat16)
+
+| Component | Shape | Memory | Notes |
+|-----------|-------|--------|-------|
+| **Encoder outputs** | [20, 1370, 1024] × 4 | ~432MB | 4 intermediate layers |
+| **Attention weights** | [20, 16, 1370, 1370] | ~1.0GB | Only last block |
+| **DPT features** | [20, 256, 37, 37] × 4 | ~1.0MB | 4 DPT paths |
+| **Importance map** | [20, 1, 37, 37] | ~0.06MB | Spatial importance |
+| **Modulation params** | [20, 256] × 4 × 4 | ~0.16MB | FG/BG γ/β per layer |
+| **Output** | [20, 1, 518, 518] | ~10.5MB | Final depth |
+| **Total (forward)** | - | **~1.7GB** | Per GPU |
+
+**Peak Memory (training)**:
+- Forward: ~1.7GB
+- Gradients: ~1.7GB (trainable params only)
+- Optimizer states: ~3.4GB (Adam: 2× gradients)
+- Activations (gradient checkpointing): ~5GB
+- **Total per GPU**: ~34GB / 48GB ✅
 
 ---
 
@@ -164,7 +377,7 @@ def forward(self, patch_tokens):
 ```yaml
 # configs/gear3/config.yaml
 training:
-  batch_size: 22        # Per GPU (effective 44 with DDP)
+  batch_size: 20        # Per GPU (effective 40 with DDP)
   workers: 8            # Optimized for 96 cores
   iterations: 60001
 
@@ -194,7 +407,7 @@ torchrun \
     --config-path configs/gear3 \
     dataset.data_root=/data/datasets \
     phase=1 \
-    training.batch_size=22 \
+    training.batch_size=20 \
     training.workers=8 \
     +results_dir=train_results/results_7 \
     load=configs/flashdepth-l/iter_10001.pth
@@ -268,14 +481,14 @@ bash train_gear3_ddp.sh \
   --config-path configs/gear3 \
   dataset.data_root=/data/datasets \
   phase=1 \
-  training.batch_size=22 \
+  training.batch_size=20 \
   training.workers=8 \
   +results_dir=train_results/results_7 \
   load=configs/flashdepth-l/iter_10001.pth
 
 # Docker
 ./run_docker.sh train_gear3_ddp \
-  --batch-size 22 \
+  --batch-size 20 \
   --workers 8 \
   --results-dir train_results/results_7
 ```
@@ -327,9 +540,9 @@ python test_gear3.py \
 
 ### GPU 메모리 사용량
 
-**Current (batch_size=22 per GPU)**:
-- GPU 0: ~45GB / 48GB (**3GB 여유**)
-- GPU 1: ~36GB / 48GB (12GB 여유)
+**Current (batch_size=20 per GPU)**:
+- GPU 0: ~41GB / 48GB (**7GB 여유**)
+- GPU 1: ~33GB / 48GB (15GB 여유)
 - GPU utilization: **100%** ✅
 
 **가능한 최대**: batch_size=24 (GPU 0 기준 ~46GB)
@@ -406,9 +619,9 @@ Step X:
 **이전 (batch 8, single GPU)**:
 - Training time: ~140시간
 
-**현재 (batch 22×2, DDP)**:
-- Effective batch: **44** (5.5배!)
-- Training time: **~25시간** (83% 감소)
+**현재 (batch 20×2, DDP)**:
+- Effective batch: **40** (5배!)
+- Training time: **~28시간** (80% 감소)
 
 ### 2. 메모리 효율
 
@@ -466,7 +679,7 @@ flashdepth_claude/
 │   ├── combined_dataset.py       # Multi-dataset loader
 │   └── spring_dataset.py         # Validation dataset
 ├── configs/gear3/
-│   └── config.yaml               # Gear3 설정 (batch 22, workers 8)
+│   └── config.yaml               # Gear3 설정 (batch 20, workers 8)
 ├── train_gear3.py                # Main training script
 ├── train_gear3_ddp.sh            # DDP launch script
 ├── run_docker.sh                 # Docker runner
