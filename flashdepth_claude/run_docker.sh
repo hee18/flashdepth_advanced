@@ -49,8 +49,12 @@ show_usage() {
     echo "  --gsp-checkpoint PATH Set GSP module weights path"
     echo "  --frame-interval NUM  Set frame interval for sequence visualization (default: 1)"
     echo "  --vid-len NUM         Set video sequence length for testing (default: 50)"
-    echo "  --entropy-loss BOOL   Enable/disable entropy loss (default: true)"
-    echo "  --entropy-weight NUM  Set entropy loss weight (default: 0.1)"
+    echo "  --bimodal-loss BOOL   Enable/disable bimodal loss (default: true)"
+    echo "  --bimodal-weight NUM  Set bimodal loss weight (default: 0.5)"
+    echo "  --edge-aware-loss BOOL Enable/disable edge-aware loss (default: true)"
+    echo "  --edge-aware-weight NUM Set edge-aware loss weight (default: 0.3)"
+    echo "  --contrastive-loss BOOL Enable/disable contrastive FG/BG loss (default: false)"
+    echo "  --contrastive-weight NUM Set contrastive loss weight (default: 1.0)"
     echo "  --measure-fps BOOL    Enable/disable FPS measurement (default: true)"
     echo ""
     echo "Examples:"
@@ -78,8 +82,12 @@ FLASHDEPTH_CHECKPOINT="configs/flashdepth-l/iter_10001.pth"
 GSP_CHECKPOINT="train_results/results_5/best_metric_head_step_21000.pth"
 FRAME_INTERVAL=1
 VID_LEN=50
-ENTROPY_LOSS="true"
-ENTROPY_WEIGHT="0.1"
+BIMODAL_LOSS="true"
+BIMODAL_WEIGHT="0.5"
+EDGE_AWARE_LOSS="true"
+EDGE_AWARE_WEIGHT="0.3"
+CONTRASTIVE_LOSS="false"
+CONTRASTIVE_WEIGHT="1.0"
 MEASURE_FPS="true"
 
 # Parse arguments
@@ -125,12 +133,28 @@ while [[ $# -gt 0 ]]; do
             VID_LEN="$2"
             shift 2
             ;;
-        --entropy-loss)
-            ENTROPY_LOSS="$2"
+        --bimodal-loss)
+            BIMODAL_LOSS="$2"
             shift 2
             ;;
-        --entropy-weight)
-            ENTROPY_WEIGHT="$2"
+        --bimodal-weight)
+            BIMODAL_WEIGHT="$2"
+            shift 2
+            ;;
+        --edge-aware-loss)
+            EDGE_AWARE_LOSS="$2"
+            shift 2
+            ;;
+        --edge-aware-weight)
+            EDGE_AWARE_WEIGHT="$2"
+            shift 2
+            ;;
+        --contrastive-loss)
+            CONTRASTIVE_LOSS="$2"
+            shift 2
+            ;;
+        --contrastive-weight)
+            CONTRASTIVE_WEIGHT="$2"
             shift 2
             ;;
         --measure-fps)
@@ -253,7 +277,9 @@ case $COMMAND in
         echo "  - Total iterations: $TOTAL_ITERS"
         echo "  - GPUs: 0,1"
         echo "  - Results directory: $RESULTS_DIR"
-        echo "  - Entropy loss: $ENTROPY_LOSS (weight: $ENTROPY_WEIGHT)"
+        echo "  - Bimodal loss: $BIMODAL_LOSS (weight: $BIMODAL_WEIGHT)"
+        echo "  - Edge-aware loss: $EDGE_AWARE_LOSS (weight: $EDGE_AWARE_WEIGHT)"
+        echo "  - Contrastive FG/BG loss: $CONTRASTIVE_LOSS (weight: $CONTRASTIVE_WEIGHT)"
         echo "  - FPS measurement: $MEASURE_FPS"
         echo ""
 
@@ -272,8 +298,12 @@ case $COMMAND in
             training.batch_size=$BATCH_SIZE \
             training.workers=$WORKERS \
             training.iterations=$TOTAL_ITERS \
-            training.use_entropy_loss=$ENTROPY_LOSS \
-            training.entropy_loss_weight=$ENTROPY_WEIGHT \
+            training.use_bimodal_loss=$BIMODAL_LOSS \
+            training.bimodal_loss_weight=$BIMODAL_WEIGHT \
+            training.use_edge_aware_loss=$EDGE_AWARE_LOSS \
+            training.edge_aware_loss_weight=$EDGE_AWARE_WEIGHT \
+            training.use_contrastive_fgbg_loss=$CONTRASTIVE_LOSS \
+            training.contrastive_fgbg_loss_weight=$CONTRASTIVE_WEIGHT \
             training.measure_fps=$MEASURE_FPS \
             +results_dir=$RESULTS_DIR"
 

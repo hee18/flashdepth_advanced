@@ -17,7 +17,7 @@ dataset:
   data_root: null # change data path
   resolution: 'base'  # 518x518
   video_length: 5
-  train_datasets: [mvs-synth, tartanair, pointodyssey, spring]  # Removed dynamicreplica
+  train_datasets: [mvs-synth, tartanair, pointodyssey, spring, dynamicreplica]
   val_datasets: [sintel, waymo]  # Removed spring, added waymo
 
 # Training configuration
@@ -36,9 +36,15 @@ training:
   mamba_lr: 1.0e-4  # For Mamba (train from scratch, same LR as gear3)
   weight_decay: 1.0e-6
 
-  # Regularization losses
-  use_entropy_loss: true  # Enable entropy regularization for importance map diversity
-  entropy_loss_weight: 0.1  # Weight for entropy loss (0.05-0.2 recommended)
+  # Regularization losses (importance map)
+  use_bimodal_loss: true  # Enable bimodal loss to push importance values to 0 or 1
+  bimodal_loss_weight: 0.5  # Weight for bimodal loss (0.3-1.0 recommended)
+
+  use_edge_aware_loss: true  # Enable edge-aware loss to align importance with depth edges
+  edge_aware_loss_weight: 0.3  # Weight for edge-aware loss (0.1-0.5 recommended)
+
+  use_contrastive_fgbg_loss: false  # Enable contrastive FG/BG loss (experimental, for future use)
+  contrastive_fgbg_loss_weight: 1.0  # Weight for contrastive loss (0.5-2.0 recommended)
 
   # FPS measurement
   measure_fps: true  # Measure forward pass FPS (inference speed)

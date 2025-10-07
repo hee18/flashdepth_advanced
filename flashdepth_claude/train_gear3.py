@@ -187,17 +187,19 @@ class LogL1Loss(nn.Module):
         return loss
 
 
-class EntropyLoss(nn.Module):
+class BimodalLoss(nn.Module):
     """
-    Entropy regularization loss for importance maps.
+    Bimodal regularization loss for importance maps.
 
-    Encourages spatial diversity by maximizing the entropy of the importance map distribution.
-    Based on information theory: H(p) = -∑ p(x) log p(x)
+    Encourages importance values to be close to 0 or 1 (binary/bimodal distribution).
+    This creates clear distinction between foreground and background regions.
 
-    Uniform maps (low diversity) → Low entropy → High loss
-    Diverse maps (high diversity) → High entropy → Low loss
+    Loss = mean(min(p, 1-p)) where p is importance value
 
-    Reference: "Entropy-Guided Attention for Private LLMs" (2025)
+    - Uniform (p ≈ 0.5): Distance = 0.5 → High loss ❌
+    - Bimodal (p ≈ 0 or 1): Distance ≈ 0 → Low loss ✅
+
+    Reference: "Entropy-Driven Sampling and Training Scheme" (ECCV 2024)
     """
     def __init__(self):
         super().__init__()
@@ -208,28 +210,117 @@ class EntropyLoss(nn.Module):
             importance_map: [B, 1, H, W] importance values in range [0, 1]
 
         Returns:
-            loss: scalar (negative entropy, to be minimized)
+            loss: scalar (distance from {0, 1}, to be minimized)
         """
-        B = importance_map.shape[0]
+        # Distance to nearest extreme value (0 or 1)
+        dist_to_extreme = torch.min(importance_map, 1.0 - importance_map)
 
-        # Flatten spatial dimensions to treat as probability distribution
-        # [B, 1, H, W] -> [B, H*W]
-        p = importance_map.view(B, -1)
+        # Average over all spatial locations and batch
+        return dist_to_extreme.mean()
 
-        # Add epsilon for numerical stability
-        p = p + 1e-8
 
-        # Normalize to probability distribution (sum to 1)
-        p = p / p.sum(dim=1, keepdim=True)
+class EdgeAwareLoss(nn.Module):
+    """
+    Edge-aware loss for importance maps.
 
-        # Compute Shannon entropy: H(p) = -∑ p(x) log p(x)
-        entropy = -(p * torch.log(p)).sum(dim=1)  # [B]
+    Aligns importance map edges with depth edges, ensuring that:
+    - FG/BG boundaries coincide with depth discontinuities
+    - Interior regions remain smooth
+    - Prevents noisy importance maps
+
+    Uses Sobel filter to compute gradients.
+
+    Reference: "Edge-Guided Depth Estimation" (CVPR 2024)
+    """
+    def __init__(self):
+        super().__init__()
+
+        # Sobel kernels for edge detection (fixed, non-trainable)
+        sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32)
+        sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32)
+
+        self.register_buffer('sobel_x', sobel_x.view(1, 1, 3, 3))
+        self.register_buffer('sobel_y', sobel_y.view(1, 1, 3, 3))
+
+    def compute_edges(self, tensor):
+        """
+        Compute edge magnitude using Sobel filter.
+
+        Args:
+            tensor: [B, 1, H, W]
+
+        Returns:
+            edges: [B, 1, H, W] edge magnitude
+        """
+        grad_x = F.conv2d(tensor, self.sobel_x, padding=1)
+        grad_y = F.conv2d(tensor, self.sobel_y, padding=1)
+
+        # Edge magnitude
+        edges = torch.sqrt(grad_x ** 2 + grad_y ** 2 + 1e-8)
+        return edges
+
+    def forward(self, importance_map, depth_map):
+        """
+        Args:
+            importance_map: [B, 1, H, W] importance values in range [0, 1]
+            depth_map: [B, 1, H, W] depth values (inverse depth in 100/m scale)
+
+        Returns:
+            loss: scalar (L1 distance between edges)
+        """
+        # Compute edges
+        importance_edges = self.compute_edges(importance_map)
+        depth_edges = self.compute_edges(depth_map)
+
+        # Normalize edges to [0, 1] for fair comparison
+        importance_edges = importance_edges / (importance_edges.max() + 1e-8)
+        depth_edges = depth_edges / (depth_edges.max() + 1e-8)
+
+        # L1 loss between edge maps
+        return F.l1_loss(importance_edges, depth_edges)
+
+
+class ContrastiveFGBGLoss(nn.Module):
+    """
+    Contrastive loss for FG/BG features.
+
+    Encourages FG and BG features to be different in embedding space.
+    Based on InfoNCE loss: maximize distance between FG and BG features.
+
+    This ensures that modulation parameters (γ_fg, β_fg, γ_bg, β_bg) are distinct,
+    leading to effective spatial modulation.
+
+    Reference: "Foreground-Aware Feature Contrast (FAC++)" (CVPR 2024)
+    """
+    def __init__(self, temperature=0.07):
+        super().__init__()
+        self.temperature = temperature
+
+    def forward(self, fg_features, bg_features):
+        """
+        Args:
+            fg_features: [B, feature_dim] foreground features
+            bg_features: [B, feature_dim] background features
+
+        Returns:
+            loss: scalar (negative cosine similarity, to maximize distance)
+        """
+        B = fg_features.shape[0]
+
+        # Normalize features to unit sphere
+        fg_norm = F.normalize(fg_features, dim=1)  # [B, feature_dim]
+        bg_norm = F.normalize(bg_features, dim=1)  # [B, feature_dim]
+
+        # Compute cosine similarity for same batch indices
+        # We want FG[i] and BG[i] to be DIFFERENT (low similarity)
+        similarity = (fg_norm * bg_norm).sum(dim=1)  # [B]
 
         # Average over batch
-        avg_entropy = entropy.mean()
+        avg_similarity = similarity.mean()
 
-        # Return negative entropy (we want to MAXIMIZE entropy, so MINIMIZE -entropy)
-        return -avg_entropy
+        # Maximize distance = minimize similarity
+        # Add temperature scaling for numerical stability
+        return avg_similarity / self.temperature
 
 
 class Gear3Trainer:
@@ -314,17 +405,38 @@ class Gear3Trainer:
         self.optimizer = self._setup_optimizer()
         self.scheduler = self._setup_scheduler()
         self.loss_fn = LogL1Loss()
-        self.entropy_loss_fn = EntropyLoss()
 
-        # Entropy loss config
-        self.use_entropy_loss = config.training.get('use_entropy_loss', False)
-        self.entropy_loss_weight = config.training.get('entropy_loss_weight', 0.1)
+        # Regularization losses (importance map)
+        self.bimodal_loss_fn = BimodalLoss()
+        self.edge_aware_loss_fn = EdgeAwareLoss()
+        self.contrastive_fgbg_loss_fn = ContrastiveFGBGLoss(temperature=0.07)
+
+        # Loss configs with defaults
+        self.use_bimodal_loss = config.training.get('use_bimodal_loss', True)  # Default: enabled
+        self.bimodal_loss_weight = config.training.get('bimodal_loss_weight', 0.5)
+
+        self.use_edge_aware_loss = config.training.get('use_edge_aware_loss', True)  # Default: enabled
+        self.edge_aware_loss_weight = config.training.get('edge_aware_loss_weight', 0.3)
+
+        self.use_contrastive_fgbg_loss = config.training.get('use_contrastive_fgbg_loss', False)  # Default: disabled
+        self.contrastive_fgbg_loss_weight = config.training.get('contrastive_fgbg_loss_weight', 1.0)
 
         if rank == 0:
-            if self.use_entropy_loss:
-                self.logger.info(f"Entropy loss enabled with weight: {self.entropy_loss_weight}")
+            self.logger.info("=== Regularization Losses ===")
+            if self.use_bimodal_loss:
+                self.logger.info(f"✓ BimodalLoss enabled (weight: {self.bimodal_loss_weight})")
             else:
-                self.logger.info("Entropy loss disabled")
+                self.logger.info("✗ BimodalLoss disabled")
+
+            if self.use_edge_aware_loss:
+                self.logger.info(f"✓ EdgeAwareLoss enabled (weight: {self.edge_aware_loss_weight})")
+            else:
+                self.logger.info("✗ EdgeAwareLoss disabled")
+
+            if self.use_contrastive_fgbg_loss:
+                self.logger.info(f"✓ ContrastiveFGBGLoss enabled (weight: {self.contrastive_fgbg_loss_weight})")
+            else:
+                self.logger.info("✗ ContrastiveFGBGLoss disabled")
 
         # FPS measurement config
         self.measure_fps = config.training.get('measure_fps', False)
@@ -691,8 +803,10 @@ class Gear3Trainer:
                 'lr_g3': f'{lr_gear3:.2e}',
                 'lr_mb': f'{lr_mamba:.2e}'
             }
-            if self.use_entropy_loss:
-                postfix_dict['entropy'] = f'{loss_dict["entropy_loss"]:.4f}'
+            if self.use_bimodal_loss:
+                postfix_dict['bimodal'] = f'{loss_dict["bimodal_loss"]:.4f}'
+            if self.use_edge_aware_loss:
+                postfix_dict['edge'] = f'{loss_dict["edge_aware_loss"]:.4f}'
 
             # Add FPS to progress bar if available
             if self.measure_fps and len(self.fps_buffer) > 0:
@@ -858,7 +972,8 @@ class Gear3Trainer:
         # Forward pass with BFloat16 autocast (like original FlashDepth)
         total_loss = 0
         total_depth_loss = 0
-        total_entropy_loss = 0
+        total_bimodal_loss = 0
+        total_edge_aware_loss = 0
         valid_frames = 0
 
         # FPS measurement (forward pass only)
@@ -942,13 +1057,20 @@ class Gear3Trainer:
                 # Loss computation in BFloat16
                 depth_loss_t = self.loss_fn(pred_depth_inverse, gt_t, valid_mask.float())
 
-                # Entropy regularization loss (if enabled)
-                entropy_loss_t = torch.tensor(0.0, device=depth_loss_t.device)
-                if self.use_entropy_loss:
-                    entropy_loss_t = self.entropy_loss_fn(importance_map)
-                    loss_t = depth_loss_t + self.entropy_loss_weight * entropy_loss_t
-                else:
-                    loss_t = depth_loss_t
+                # Regularization losses (if enabled)
+                bimodal_loss_t = torch.tensor(0.0, device=depth_loss_t.device)
+                edge_aware_loss_t = torch.tensor(0.0, device=depth_loss_t.device)
+
+                if self.use_bimodal_loss:
+                    bimodal_loss_t = self.bimodal_loss_fn(importance_map)
+
+                if self.use_edge_aware_loss:
+                    edge_aware_loss_t = self.edge_aware_loss_fn(importance_map, gt_t)
+
+                # Total loss
+                loss_t = depth_loss_t + \
+                         self.bimodal_loss_weight * bimodal_loss_t + \
+                         self.edge_aware_loss_weight * edge_aware_loss_t
 
             # Safety check: skip if loss is NaN or too large
             if torch.isnan(loss_t) or torch.isinf(loss_t):
@@ -961,17 +1083,19 @@ class Gear3Trainer:
 
             total_loss += loss_t
             total_depth_loss += depth_loss_t
-            total_entropy_loss += entropy_loss_t
+            total_bimodal_loss += bimodal_loss_t
+            total_edge_aware_loss += edge_aware_loss_t
             valid_frames += 1
 
         # Average loss over valid frames
         if valid_frames == 0:
             self.logger.error("No valid frames in batch!")
-            return {'loss': 0.0, 'depth_loss': 0.0, 'entropy_loss': 0.0}
+            return {'loss': 0.0, 'depth_loss': 0.0, 'bimodal_loss': 0.0, 'edge_aware_loss': 0.0}
 
         loss = total_loss / valid_frames
         avg_depth_loss = total_depth_loss / valid_frames
-        avg_entropy_loss = total_entropy_loss / valid_frames
+        avg_bimodal_loss = total_bimodal_loss / valid_frames
+        avg_edge_aware_loss = total_edge_aware_loss / valid_frames
 
         # Backward pass (outside autocast for numerical stability)
         self.optimizer.zero_grad()
@@ -983,7 +1107,8 @@ class Gear3Trainer:
         return {
             'loss': loss.item(),
             'depth_loss': avg_depth_loss.item(),
-            'entropy_loss': avg_entropy_loss.item() if self.use_entropy_loss else 0.0
+            'bimodal_loss': avg_bimodal_loss.item() if self.use_bimodal_loss else 0.0,
+            'edge_aware_loss': avg_edge_aware_loss.item() if self.use_edge_aware_loss else 0.0
         }
 
     @torch.no_grad()
@@ -999,7 +1124,7 @@ class Gear3Trainer:
 
         total_loss = 0
         num_batches = 0
-        first_batch_saved = False
+        saved_datasets = set()  # Track which datasets we've visualized
 
         for batch_idx, batch in enumerate(tqdm(self.val_loader, desc="Validation", disable=(self.rank != 0))):
             # Skip None batches (all items were invalid)
@@ -1072,8 +1197,18 @@ class Gear3Trainer:
                         loss_t = self.loss_fn(pred_depth_inverse, gt_t_inverse, valid_mask)
                         frame_losses.append(loss_t.float())  # Convert to Float32 for accumulation
 
-                    # Save visualization for first batch, first frame only (rank 0 only)
-                    if batch_idx == 0 and t == 0 and not first_batch_saved and self.visualizer and self.rank == 0:
+                    # Get dataset name for this batch
+                    if isinstance(dataset_idx, str):
+                        current_dataset = dataset_idx
+                    elif isinstance(dataset_idx, (list, tuple)):
+                        current_dataset = str(dataset_idx[0])
+                    elif torch.is_tensor(dataset_idx):
+                        current_dataset = str(dataset_idx[0].item() if dataset_idx.dim() > 0 else dataset_idx.item())
+                    else:
+                        current_dataset = str(dataset_idx)
+
+                    # Save visualization for first occurrence of each dataset (rank 0 only)
+                    if t == 0 and current_dataset not in saved_datasets and self.visualizer and self.rank == 0:
                         try:
                             # Convert to metric depth for visualization: 100/m -> m
                             # Convert to Float32 for CPU operations
@@ -1103,13 +1238,17 @@ class Gear3Trainer:
                             if self.measure_fps and len(self.fps_buffer) > 0:
                                 current_fps = sum(self.fps_buffer[-20:]) / min(len(self.fps_buffer), 20)
 
+                            # Save with dataset-specific name
+                            save_name = f"validation_{current_dataset}_step_{self.global_step:06d}"
                             self.visualizer.create_validation_summary(
-                                sample_batch, model_outputs, self.global_step, fps=current_fps
+                                sample_batch, model_outputs, self.global_step,
+                                save_name=save_name, fps=current_fps
                             )
-                            first_batch_saved = True
+                            saved_datasets.add(current_dataset)
+                            self.logger.info(f"Saved validation visualization for dataset: {current_dataset}")
                         except Exception as e:
                             if self.rank == 0:
-                                self.logger.warning(f"Failed to save validation visualization: {e}")
+                                self.logger.warning(f"Failed to save validation visualization for {current_dataset}: {e}")
 
                     # Clear intermediate tensors to free memory after each frame
                     del encoder_features, attention_weights, patch_tokens, dpt_features
