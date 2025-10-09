@@ -252,8 +252,12 @@ class EdgeAwareLoss(nn.Module):
         Returns:
             edges: [B, 1, H, W] edge magnitude
         """
-        grad_x = F.conv2d(tensor, self.sobel_x, padding=1)
-        grad_y = F.conv2d(tensor, self.sobel_y, padding=1)
+        # Match dtype and device of input tensor (handles BFloat16)
+        sobel_x = self.sobel_x.to(dtype=tensor.dtype, device=tensor.device)
+        sobel_y = self.sobel_y.to(dtype=tensor.dtype, device=tensor.device)
+
+        grad_x = F.conv2d(tensor, sobel_x, padding=1)
+        grad_y = F.conv2d(tensor, sobel_y, padding=1)
 
         # Edge magnitude
         edges = torch.sqrt(grad_x ** 2 + grad_y ** 2 + 1e-8)
@@ -520,8 +524,7 @@ class Gear3Trainer:
         model.gear3_head = Gear3MetricHead(
             embed_dim=embed_dim,
             dpt_dim=dpt_dim,
-            num_heads=num_heads,
-            num_dpt_layers=4
+            num_heads=num_heads
         )
 
         # Enable attention weights storage ONLY for last block (saves ~11GB memory)
@@ -710,13 +713,13 @@ class Gear3Trainer:
         return torch.utils.data.dataloader.default_collate(batch)
 
     def _setup_optimizer(self):
-        """Setup optimizer - same LR for Mamba and Gear3 (both train from scratch)"""
-        mamba_lr = self.config.training.get('mamba_lr', 1e-4)  # Same as gear3_lr
-        gear3_lr = self.config.training.get('gear3_lr', 1e-4)
+        """Setup optimizer - same LR for all trainable modules (all train from scratch)"""
+        base_lr = self.config.training.get('gear3_lr', 1e-4)  # Use same LR for all
 
-        # Separate parameter groups (for monitoring, both use same LR)
+        # Separate parameter groups (for monitoring and potential future tuning)
         mamba_params = []
         gear3_params = []
+        output_conv_params = []
 
         for name, param in self.model.named_parameters():
             if param.requires_grad:
@@ -724,10 +727,16 @@ class Gear3Trainer:
                     gear3_params.append(param)
                 elif 'mamba' in name:
                     mamba_params.append(param)
+                elif 'output_conv' in name:
+                    output_conv_params.append(param)
+                else:
+                    # Fallback: should not happen, but log for debugging
+                    self.logger.warning(f"Trainable parameter not in any group: {name}")
 
         param_groups = [
-            {'params': gear3_params, 'lr': gear3_lr, 'name': 'gear3'},
-            {'params': mamba_params, 'lr': mamba_lr, 'name': 'mamba'}
+            {'params': gear3_params, 'lr': base_lr, 'name': 'gear3'},
+            {'params': mamba_params, 'lr': base_lr, 'name': 'mamba'},
+            {'params': output_conv_params, 'lr': base_lr, 'name': 'output_conv'}
         ]
 
         optimizer = torch.optim.Adam(
@@ -735,7 +744,10 @@ class Gear3Trainer:
             weight_decay=self.config.training.get('weight_decay', 1e-6)
         )
 
-        self.logger.info(f"Optimizer: Gear3 LR={gear3_lr}, Mamba LR={mamba_lr} (both from scratch)")
+        self.logger.info(f"Optimizer setup:")
+        self.logger.info(f"  Gear3: {len(gear3_params)} params, LR={base_lr}")
+        self.logger.info(f"  Mamba: {len(mamba_params)} params, LR={base_lr}")
+        self.logger.info(f"  Output_conv: {len(output_conv_params)} params, LR={base_lr}")
 
         return optimizer
 
@@ -807,6 +819,8 @@ class Gear3Trainer:
                 postfix_dict['bimodal'] = f'{loss_dict["bimodal_loss"]:.4f}'
             if self.use_edge_aware_loss:
                 postfix_dict['edge'] = f'{loss_dict["edge_aware_loss"]:.4f}'
+            if self.use_contrastive_fgbg_loss:
+                postfix_dict['contrast'] = f'{loss_dict["contrastive_fgbg_loss"]:.4f}'
 
             # Add FPS to progress bar if available
             if self.measure_fps and len(self.fps_buffer) > 0:
@@ -867,11 +881,10 @@ class Gear3Trainer:
                         patch_h, patch_w = h // model.patch_size, w // model.patch_size
                         dpt_features = model.depth_head.get_forward_features(encoder_features, patch_h, patch_w)
 
-                        modulated_dpt_features, importance_map = model.gear3_head(
+                        path_1_modulated, importance_map, fg_features, bg_features = model.gear3_head(
                             patch_tokens, attention_weights, dpt_features, patch_h, patch_w
                         )
 
-                        path_1_modulated = modulated_dpt_features[-1]
                         out = model.depth_head.scratch.output_conv1(path_1_modulated)
                         out = F.interpolate(out, (h, w), mode="bilinear", align_corners=True)
                         out = model.depth_head.scratch.output_conv2(out)
@@ -974,6 +987,7 @@ class Gear3Trainer:
         total_depth_loss = 0
         total_bimodal_loss = 0
         total_edge_aware_loss = 0
+        total_contrastive_fgbg_loss = 0
         valid_frames = 0
 
         # FPS measurement (forward pass only)
@@ -1009,13 +1023,10 @@ class Gear3Trainer:
                         encoder_features, patch_h, patch_w
                     )
 
-                # Apply Gear3 modulation (trainable)
-                modulated_dpt_features, importance_map = model.gear3_head(
+                # Apply Gear3 modulation (trainable) - only path_1 is modulated
+                path_1_modulated, importance_map, fg_features, bg_features = model.gear3_head(
                     patch_tokens, attention_weights, dpt_features, patch_h, patch_w
                 )
-
-                # Use modulated path_1 for depth prediction
-                path_1_modulated = modulated_dpt_features[-1]
 
                 # Pass through DPT output head (trainable)
                 out = model.depth_head.scratch.output_conv1(path_1_modulated)
@@ -1060,17 +1071,27 @@ class Gear3Trainer:
                 # Regularization losses (if enabled)
                 bimodal_loss_t = torch.tensor(0.0, device=depth_loss_t.device)
                 edge_aware_loss_t = torch.tensor(0.0, device=depth_loss_t.device)
+                contrastive_fgbg_loss_t = torch.tensor(0.0, device=depth_loss_t.device)
 
                 if self.use_bimodal_loss:
                     bimodal_loss_t = self.bimodal_loss_fn(importance_map)
 
                 if self.use_edge_aware_loss:
-                    edge_aware_loss_t = self.edge_aware_loss_fn(importance_map, gt_t)
+                    # Upsample importance_map to match depth resolution
+                    importance_map_upsampled = F.interpolate(
+                        importance_map, size=(h, w), mode='bilinear', align_corners=True
+                    )
+                    edge_aware_loss_t = self.edge_aware_loss_fn(importance_map_upsampled, gt_t)
+
+                if self.use_contrastive_fgbg_loss:
+                    # Contrastive loss to separate FG and BG features in embedding space
+                    contrastive_fgbg_loss_t = self.contrastive_fgbg_loss_fn(fg_features, bg_features)
 
                 # Total loss
                 loss_t = depth_loss_t + \
                          self.bimodal_loss_weight * bimodal_loss_t + \
-                         self.edge_aware_loss_weight * edge_aware_loss_t
+                         self.edge_aware_loss_weight * edge_aware_loss_t + \
+                         self.contrastive_fgbg_loss_weight * contrastive_fgbg_loss_t
 
             # Safety check: skip if loss is NaN or too large
             if torch.isnan(loss_t) or torch.isinf(loss_t):
@@ -1085,17 +1106,19 @@ class Gear3Trainer:
             total_depth_loss += depth_loss_t
             total_bimodal_loss += bimodal_loss_t
             total_edge_aware_loss += edge_aware_loss_t
+            total_contrastive_fgbg_loss += contrastive_fgbg_loss_t
             valid_frames += 1
 
         # Average loss over valid frames
         if valid_frames == 0:
             self.logger.error("No valid frames in batch!")
-            return {'loss': 0.0, 'depth_loss': 0.0, 'bimodal_loss': 0.0, 'edge_aware_loss': 0.0}
+            return {'loss': 0.0, 'depth_loss': 0.0, 'bimodal_loss': 0.0, 'edge_aware_loss': 0.0, 'contrastive_fgbg_loss': 0.0}
 
         loss = total_loss / valid_frames
         avg_depth_loss = total_depth_loss / valid_frames
         avg_bimodal_loss = total_bimodal_loss / valid_frames
         avg_edge_aware_loss = total_edge_aware_loss / valid_frames
+        avg_contrastive_fgbg_loss = total_contrastive_fgbg_loss / valid_frames
 
         # Backward pass (outside autocast for numerical stability)
         self.optimizer.zero_grad()
@@ -1108,7 +1131,8 @@ class Gear3Trainer:
             'loss': loss.item(),
             'depth_loss': avg_depth_loss.item(),
             'bimodal_loss': avg_bimodal_loss.item() if self.use_bimodal_loss else 0.0,
-            'edge_aware_loss': avg_edge_aware_loss.item() if self.use_edge_aware_loss else 0.0
+            'edge_aware_loss': avg_edge_aware_loss.item() if self.use_edge_aware_loss else 0.0,
+            'contrastive_fgbg_loss': avg_contrastive_fgbg_loss.item() if self.use_contrastive_fgbg_loss else 0.0
         }
 
     @torch.no_grad()
@@ -1173,24 +1197,28 @@ class Gear3Trainer:
                     patch_h, patch_w = h // model.patch_size, w // model.patch_size
                     dpt_features = model.depth_head.get_forward_features(encoder_features, patch_h, patch_w)
 
-                    # Apply modulation and get importance map
-                    modulated_dpt_features, importance_map = model.gear3_head(
+                    # Apply modulation and get importance map (only path_1 is modulated)
+                    path_1_modulated, importance_map, fg_features, bg_features = model.gear3_head(
                         patch_tokens, attention_weights, dpt_features, patch_h, patch_w
                     )
 
-                    # Get depth
-                    path_1_modulated = modulated_dpt_features[-1]
+                    # Get depth (at model resolution)
                     out = model.depth_head.scratch.output_conv1(path_1_modulated)
                     out = F.interpolate(out, (h, w), mode="bilinear", align_corners=True)
                     out = model.depth_head.scratch.output_conv2(out)
 
-                    pred_depth_inverse = out
+                    pred_depth_inverse = out  # [B, 1, h, w] at model resolution
+
+                    # Interpolate prediction to GT resolution (like original FlashDepth)
+                    gt_t_shape = gt_t_inverse.shape[-2:]  # GT original resolution
+                    if pred_depth_inverse.shape[-2:] != gt_t_shape:
+                        pred_depth_inverse = F.interpolate(
+                            pred_depth_inverse, size=gt_t_shape, mode="bilinear", align_corners=True
+                        )
 
                     # Compute loss in inverse depth space (100/m)
-                    # Filter out invalid inverse depths (same as training)
-                    # Max 200m depth = 0.5 in 100/m inverse depth scale
-                    MIN_INVERSE_DEPTH = 0.5  # 100/200m
-                    gt_valid_mask = (gt_t_inverse > MIN_INVERSE_DEPTH)
+                    # Filter out invalid inverse depths (valid_mask: >= 0 for original FlashDepth)
+                    gt_valid_mask = (gt_t_inverse >= 0)  # -1 means invalid
                     valid_mask = gt_valid_mask.float()
                     
                     if valid_mask.sum() > 0:
@@ -1215,21 +1243,29 @@ class Gear3Trainer:
                             pred_depth_metric = (100.0 / (pred_depth_inverse.float() + 1e-8)).cpu()
                             gt_depth_metric = (100.0 / (gt_t_inverse.float() + 1e-8)).cpu()
 
-                            # Resize importance map to match image resolution
+                            # Get GT resolution for visualization
+                            gt_h, gt_w = gt_t_inverse.shape[-2:]
+
+                            # Resize importance map to GT resolution
                             importance_map_resized = F.interpolate(
-                                importance_map, size=(h, w), mode='bilinear', align_corners=True
+                                importance_map, size=(gt_h, gt_w), mode='bilinear', align_corners=True
+                            )
+
+                            # Resize images to GT resolution (for visualization consistency)
+                            img_t_resized = F.interpolate(
+                                img_t, size=(gt_h, gt_w), mode='bilinear', align_corners=True
                             )
 
                             model_outputs = {
-                                'pred_depth': pred_depth_metric,  # [B, 1, H, W]
-                                'importance_map': importance_map_resized.float().cpu()  # [B, 1, H, W]
+                                'pred_depth': pred_depth_metric,  # [B, 1, gt_h, gt_w] at GT resolution
+                                'importance_map': importance_map_resized.float().cpu()  # [B, 1, gt_h, gt_w]
                             }
 
                             # For visualization, we need [B, T, ...] format like training
                             # But we only have one frame (t=0), so unsqueeze T dimension
                             sample_batch = (
-                                images[:, :1].float().cpu(),  # [B, 1, C, H, W] - first frame only
-                                gt_depth_metric.unsqueeze(1),  # [B, 1, H, W]
+                                img_t_resized.unsqueeze(1).float().cpu(),  # [B, 1, C, gt_h, gt_w] at GT resolution
+                                gt_depth_metric.unsqueeze(1),  # [B, 1, gt_h, gt_w]
                                 dataset_idx
                             )
                             
@@ -1252,7 +1288,7 @@ class Gear3Trainer:
 
                     # Clear intermediate tensors to free memory after each frame
                     del encoder_features, attention_weights, patch_tokens, dpt_features
-                    del modulated_dpt_features, importance_map, pred_depth_inverse
+                    del path_1_modulated, importance_map, fg_features, bg_features, pred_depth_inverse
                     if t > 0:  # Don't delete on first frame if we need it for visualization
                         torch.cuda.empty_cache()
 

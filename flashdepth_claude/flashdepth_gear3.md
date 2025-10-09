@@ -1,9 +1,15 @@
 # FlashDepth Gear3: Feature-level Metric Depth Learning
 
 **작성일**: 2025-10-02
-**최종 업데이트**: 2025-10-06
+**최종 업데이트**: 2025-10-07
 **브랜치**: gear3
 **목적**: Feature-level FiLM modulation을 통한 metric depth 학습
+
+**주요 변경사항 (2025-10-07)**:
+- ❌ EntropyLoss 제거 (설계 오류: uniform distribution 장려)
+- ✅ BimodalLoss + EdgeAwareLoss 추가 (importance map diversity 개선)
+- ✅ Validation 시각화 개선 (각 dataset별 저장)
+- ✅ Loss 옵션 command-line 지원
 
 ---
 
@@ -197,12 +203,12 @@ Encoder Output (24 layers):
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 DPT Head processes 4 intermediate layers:
 
-  Path 4 (from Layer 4):        [B, 256, 37, 37]
-  Path 3 (from Layer 11):       [B, 256, 37, 37]
-  Path 2 (from Layer 17):       [B, 256, 37, 37]
-  Path 1 (from Layer 23):       [B, 256, 37, 37]  ← Will be modulated
+  Path 4 (from Layer 4):        [B, 256, 37, 37]  ← Will be modulated
+  Path 3 (from Layer 11):       [B, 256, 37, 37]  ← Will be modulated
+  Path 2 (from Layer 17):       [B, 256, 37, 37]  ← Will be modulated
+  Path 1 (from Layer 23):       [B, 256, 37, 37]  ← Will be modulated 
 
-  dpt_features = [path_4, path_3, path_2, path_1]
+  dpt_features = [path_4, path_3, path_2, path_1] 
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -285,7 +291,7 @@ FeatureModulator (for each DPT layer):
     fg_gamma, fg_beta:          [B, 256]
     bg_gamma, bg_beta:          [B, 256]
 
-  Resize importance_map:        [B, 1, 37, 37]  ← Bilinear interpolation
+  Resize importance_map (해상도 달라질 경우):        [B, 1, 37, 37]  ← Bilinear interpolation
 
   Expand modulation params:
     fg_gamma:                   [B, 256, 1, 1]  → Broadcast
@@ -422,7 +428,7 @@ torchrun \
 
 ## 손실 함수 및 Valid Depth Range
 
-### Inverse Depth Loss (100/m scale)
+### Primary Loss: Inverse Depth Loss (100/m scale)
 
 ```python
 # Training loop
@@ -433,8 +439,86 @@ gt_depth_inverse = gt_depth_inverse_canonical * 100.0  # Scale to 100/m
 MIN_INVERSE_DEPTH = 0.5  # 100/200m = 0.5
 valid_mask = (gt_inverse > MIN_INVERSE_DEPTH)
 
-loss = L1(pred_inverse, gt_inverse, valid_mask)
+depth_loss = LogL1Loss(pred_inverse, gt_inverse, valid_mask)
 ```
+
+### Regularization Losses (Importance Map)
+
+**문제 발견**: EntropyLoss가 잘못 설계됨
+- Shannon entropy maximization → **Uniform distribution 장려** ❌
+- Importance map이 std=0.001로 균일하게 수렴
+- 결과: FG/BG 구분 실패, spatial modulation 효과 없음
+
+**해결책**: 3가지 새로운 loss 도입
+
+#### 1. BimodalLoss (기본 활성화) ⭐⭐⭐
+
+```python
+class BimodalLoss(nn.Module):
+    """
+    Importance 값을 0 또는 1로 push (binary distribution)
+
+    Loss = mean(min(p, 1-p))
+    - Uniform (p ≈ 0.5): Distance = 0.5 → High loss ❌
+    - Bimodal (p ≈ 0 or 1): Distance ≈ 0 → Low loss ✅
+    """
+    def forward(self, importance_map):
+        dist_to_extreme = torch.min(importance_map, 1.0 - importance_map)
+        return dist_to_extreme.mean()
+```
+
+**효과**: Importance map의 spatial diversity 증가 (std: 0.001 → 0.3+ 예상)
+
+#### 2. EdgeAwareLoss (기본 활성화) ⭐⭐⭐
+
+```python
+class EdgeAwareLoss(nn.Module):
+    """
+    Importance map edge를 depth edge와 align
+    - FG/BG 경계가 depth discontinuity와 일치
+    - 내부 영역은 smooth 유지
+    """
+    def forward(self, importance_map, depth_map):
+        # Sobel filter로 edge 계산
+        importance_edges = compute_sobel(importance_map)
+        depth_edges = compute_sobel(depth_map)
+
+        # Normalize and compare
+        return F.l1_loss(importance_edges, depth_edges)
+```
+
+**효과**: FG 경계가 부드러워짐 (depth discontinuity와 일치)
+
+#### 3. ContrastiveFGBGLoss (실험용, 기본 비활성화) ⭐⭐
+
+```python
+class ContrastiveFGBGLoss(nn.Module):
+    """
+    FG/BG features를 embedding space에서 분리
+    - FG features와 BG features의 cosine similarity 최소화
+    """
+    def forward(self, fg_features, bg_features):
+        fg_norm = F.normalize(fg_features, dim=1)
+        bg_norm = F.normalize(bg_features, dim=1)
+
+        similarity = (fg_norm * bg_norm).sum(dim=1)
+        return similarity.mean() / temperature
+```
+
+**효과**: Modulation parameters (γ_fg, β_fg, γ_bg, β_bg) 차이 증가
+
+### Total Loss
+
+```python
+total_loss = depth_loss + \
+             bimodal_weight * bimodal_loss + \
+             edge_aware_weight * edge_aware_loss
+```
+
+**Default weights** (config.yaml):
+- `bimodal_loss_weight: 0.5` (0.3-1.0 권장)
+- `edge_aware_loss_weight: 0.3` (0.1-0.5 권장)
+- `contrastive_fgbg_loss_weight: 1.0` (0.5-2.0 권장, 비활성화됨)
 
 ### Valid Depth Range: **200m 이하**
 
@@ -493,14 +577,14 @@ bash train_gear3_ddp.sh \
   --results-dir train_results/results_7
 ```
 
-**Datasets (Phase 1)**:
-- mvs-synth
-- pointodyssey
-- spring (train split)
-- tartanair
-- dynamicreplica
+**Datasets (Phase 1)** (순서: 원본 FlashDepth-L과 동일):
+1. mvs-synth
+2. dynamicreplica
+3. tartanair
+4. pointodyssey
+5. spring
 
-**Validation**: spring (val split, 12 sequences)
+**Validation**: sintel, waymo (각 dataset에서 1개씩 시각화)
 
 ### Phase 2 학습 (nuScenes)
 
@@ -522,6 +606,33 @@ bash train_gear3_ddp.sh \
 
 # Results directory
 --results-dir train_results/custom
+
+# Loss 옵션 (기본값: bimodal + edge-aware 활성화)
+--bimodal-loss true          # BimodalLoss 활성화/비활성화
+--bimodal-weight 0.5         # BimodalLoss weight (0.3-1.0 권장)
+
+--edge-aware-loss true       # EdgeAwareLoss 활성화/비활성화
+--edge-aware-weight 0.3      # EdgeAwareLoss weight (0.1-0.5 권장)
+
+--contrastive-loss false     # ContrastiveFGBGLoss 활성화/비활성화 (실험용)
+--contrastive-weight 1.0     # ContrastiveFGBGLoss weight (0.5-2.0 권장)
+```
+
+**Loss 실험 예시**:
+
+```bash
+# 모든 loss 사용 (ContrastiveFGBGLoss 포함)
+./run_docker.sh train_gear3_ddp \
+  --bimodal-loss true \
+  --edge-aware-loss true \
+  --contrastive-loss true \
+  --results-dir train_results/results_all_losses
+
+# Weight 조정
+./run_docker.sh train_gear3_ddp \
+  --bimodal-weight 1.0 \
+  --edge-aware-weight 0.5 \
+  --results-dir train_results/results_high_weight
 ```
 
 ### 테스트
@@ -567,8 +678,16 @@ python test_gear3.py \
 2. ✅ Frame-by-frame tensor deletion
 3. ✅ Attention weights 초기화 (last block만 사용)
 4. ✅ Cache clearing before/after validation
+5. ✅ **각 dataset별 시각화** (sintel, waymo 각각 1개)
 
-**Validation 시간**: ~32초 (6 sequences, video_length=5)
+**Validation 시간**: ~32초 (전체 dataset)
+
+**시각화 개선**:
+- **이전**: `validation_step_005000.png` (항상 첫 번째 batch, sintel만)
+- **현재**:
+  - `validation_sintel_step_005000.png` (sintel 첫 번째 batch)
+  - `validation_waymo_step_005000.png` (waymo 첫 번째 batch)
+- **장점**: 각 dataset의 학습 진행 상황을 개별적으로 추적 가능
 
 ---
 
@@ -639,15 +758,44 @@ Step X:
 
 ## 주요 버그 수정 이력
 
+### 2025-10-07
+
+1. **EntropyLoss 설계 오류 발견 및 수정** ⭐⭐⭐
+   - 문제: Shannon entropy maximization → Uniform distribution 장려
+   - 결과: Importance map std=0.001, FG/BG 구분 실패
+   - 분석:
+     - Uniform (p≈0.5): H=log(HW)=6.93 → Loss=-6.93 (Best!) ❌
+     - Bimodal (p≈0 or 1): H=log(HW/2)=6.24 → Loss=-6.24 (Worse) ❌
+   - 해결: 3가지 새로운 loss 도입
+     - **BimodalLoss**: min(p, 1-p) → 0 또는 1로 push
+     - **EdgeAwareLoss**: Depth edge와 importance edge align
+     - **ContrastiveFGBGLoss**: FG/BG features embedding space 분리
+
+2. **Validation 시각화 개선**
+   - 문제: 항상 동일한 dataset (sintel)만 시각화
+   - 해결: 각 dataset (sintel, waymo)에서 1개씩 시각화
+   - 파일명: `validation_{dataset}_step_{step:06d}.png`
+
+3. **Dataset 순서 원본과 통일**
+   - 변경: 원본 FlashDepth-L과 동일한 순서로 정렬
+   - 순서: `[mvs-synth, dynamicreplica, tartanair, pointodyssey, spring]`
+
+4. **Command-line loss 옵션 추가**
+   - Docker script에 모든 loss toggle 추가
+   - `--bimodal-loss`, `--bimodal-weight`
+   - `--edge-aware-loss`, `--edge-aware-weight`
+   - `--contrastive-loss`, `--contrastive-weight`
+
 ### 2025-10-06
 
 1. **Attention weights 메모리 누수**
    - 문제: 24 blocks × 11.5GB = OOM
    - 해결: Last block만 저장 (`store_attn_weights` flag)
 
-2. **Importance map uniform 문제**
+2. **Importance map uniform 문제 (초기 발견)**
    - 문제: std=0.000 (모든 픽셀 동일)
-   - 해결: Zero initialization (gradient flow 확보)
+   - 임시 해결: Zero initialization (gradient flow 확보)
+   - 근본 원인: EntropyLoss 설계 오류 (2025-10-07 발견)
 
 3. **Shared memory 부족**
    - 문제: 2GB → Bus error (batch 16+)
@@ -697,6 +845,6 @@ flashdepth_claude/
 
 ---
 
-**Last Update**: 2025-10-06
+**Last Update**: 2025-10-07
 **Branch**: gear3
 **Developer**: hsy

@@ -159,41 +159,37 @@ class ForegroundBackgroundNetworks(nn.Module):
 
 class ModulationNetworks(nn.Module):
     """
-    Generates gamma and beta for FiLM-style modulation for each DPT layer.
+    Generates gamma and beta for FiLM-style modulation for path_1 (Layer 23 features).
 
     Input: FG/BG features [B, feature_dim]
     Output: Gamma [B, dpt_dim], Beta [B, dpt_dim] for FG and BG separately
     """
-    def __init__(self, feature_dim=256, dpt_dim=256, num_dpt_layers=4):
+    def __init__(self, feature_dim=256, dpt_dim=256):
         super().__init__()
-        self.num_dpt_layers = num_dpt_layers
         self.dpt_dim = dpt_dim
 
-        # Separate modulation networks for each DPT layer
-        self.fg_modulation = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(feature_dim, dpt_dim * 2),
-                nn.ReLU(inplace=True),
-                nn.Linear(dpt_dim * 2, dpt_dim * 2)  # First half: gamma, second half: beta
-            ) for _ in range(num_dpt_layers)
-        ])
+        # Single modulation network for path_1 (Layer 23)
+        # FG modulation: Layer 23 features → gamma, beta
+        self.fg_modulation = nn.Sequential(
+            nn.Linear(feature_dim, dpt_dim * 2),
+            nn.ReLU(inplace=True),
+            nn.Linear(dpt_dim * 2, dpt_dim * 2)  # First half: gamma, second half: beta
+        )
 
-        self.bg_modulation = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(feature_dim, dpt_dim * 2),
-                nn.ReLU(inplace=True),
-                nn.Linear(dpt_dim * 2, dpt_dim * 2)  # First half: gamma, second half: beta
-            ) for _ in range(num_dpt_layers)
-        ])
+        # BG modulation: Layer 23 features → gamma, beta
+        self.bg_modulation = nn.Sequential(
+            nn.Linear(feature_dim, dpt_dim * 2),
+            nn.ReLU(inplace=True),
+            nn.Linear(dpt_dim * 2, dpt_dim * 2)  # First half: gamma, second half: beta
+        )
 
-        logging.info(f"Modulation Networks initialized for {num_dpt_layers} DPT layers")
+        logging.info("Modulation Networks initialized for path_1 (Layer 23) only")
 
-    def forward(self, fg_features, bg_features, layer_idx):
+    def forward(self, fg_features, bg_features):
         """
         Args:
             fg_features: [B, feature_dim]
             bg_features: [B, feature_dim]
-            layer_idx: Which DPT layer (0-3)
 
         Returns:
             fg_gamma: [B, dpt_dim]
@@ -202,12 +198,12 @@ class ModulationNetworks(nn.Module):
             bg_beta: [B, dpt_dim]
         """
         # FG modulation
-        fg_params = self.fg_modulation[layer_idx](fg_features)  # [B, dpt_dim * 2]
+        fg_params = self.fg_modulation(fg_features)  # [B, dpt_dim * 2]
         fg_gamma = fg_params[:, :self.dpt_dim]
         fg_beta = fg_params[:, self.dpt_dim:]
 
         # BG modulation
-        bg_params = self.bg_modulation[layer_idx](bg_features)  # [B, dpt_dim * 2]
+        bg_params = self.bg_modulation(bg_features)  # [B, dpt_dim * 2]
         bg_gamma = bg_params[:, :self.dpt_dim]
         bg_beta = bg_params[:, self.dpt_dim:]
 
@@ -271,10 +267,10 @@ class Gear3MetricHead(nn.Module):
     Architecture:
         1. ImportancePredictor: attention -> importance map
         2. FG/BG Networks: patch tokens -> FG/BG features
-        3. Modulation Networks: FG/BG features -> gamma/beta for each layer
-        4. Feature Modulator: Apply modulation to DPT layer features
+        3. Modulation Networks: FG/BG features -> gamma/beta for path_1
+        4. Feature Modulator: Apply modulation to path_1 (Layer 23 features)
     """
-    def __init__(self, embed_dim=1024, dpt_dim=256, num_heads=16, num_dpt_layers=4):
+    def __init__(self, embed_dim=1024, dpt_dim=256, num_heads=16):
         super().__init__()
 
         self.importance_predictor = ImportancePredictor(num_heads=num_heads)
@@ -282,7 +278,7 @@ class Gear3MetricHead(nn.Module):
             embed_dim=embed_dim, feature_dim=256
         )
         self.modulation_networks = ModulationNetworks(
-            feature_dim=256, dpt_dim=dpt_dim, num_dpt_layers=num_dpt_layers
+            feature_dim=256, dpt_dim=dpt_dim
         )
         self.feature_modulator = FeatureModulator()
 
@@ -294,34 +290,34 @@ class Gear3MetricHead(nn.Module):
     def forward(self, patch_tokens, attention_weights, dpt_features, patch_h, patch_w):
         """
         Args:
-            patch_tokens: [B, num_patches, embed_dim]
-            attention_weights: [B, num_heads, num_patches+1, num_patches+1]
+            patch_tokens: [B, num_patches, embed_dim] from Layer 23
+            attention_weights: [B, num_heads, num_patches+1, num_patches+1] from Layer 23
             dpt_features: List of [B, dpt_dim, H, W] for 4 DPT layers
             patch_h, patch_w: Spatial dimensions
 
         Returns:
-            modulated_dpt_features: List of modulated DPT features
+            path_1_modulated: [B, dpt_dim, H, W] modulated path_1 features
             importance_map: [B, 1, patch_h, patch_w] for visualization
+            fg_features: [B, 256] foreground features (for ContrastiveFGBGLoss)
+            bg_features: [B, 256] background features (for ContrastiveFGBGLoss)
         """
-        # 1. Predict importance map
+        # 1. Predict importance map (from Layer 23 attention)
         importance_map = self.importance_predictor(attention_weights, patch_h, patch_w)
 
-        # 2. Generate FG/BG features (Attention-based Pooling)
+        # 2. Generate FG/BG features (from Layer 23 patch tokens)
         # Uses CLS→patch attention to separate high-attention (FG) vs low-attention (BG) regions
         fg_features, bg_features = self.fg_bg_networks(patch_tokens, attention_weights)
 
-        # 3. Modulate each DPT layer
-        modulated_dpt_features = []
-        for layer_idx, features in enumerate(dpt_features):
-            # Get modulation parameters for this layer
-            fg_gamma, fg_beta, bg_gamma, bg_beta = self.modulation_networks(
-                fg_features, bg_features, layer_idx
-            )
+        # 3. Get modulation parameters for path_1 (Layer 23 → path_1)
+        fg_gamma, fg_beta, bg_gamma, bg_beta = self.modulation_networks(
+            fg_features, bg_features
+        )
 
-            # Apply modulation (importance map used here for spatial weighting)
-            modulated = self.feature_modulator(
-                features, importance_map, fg_gamma, fg_beta, bg_gamma, bg_beta
-            )
-            modulated_dpt_features.append(modulated)
+        # 4. Modulate ONLY path_1 (last element, from Layer 23)
+        # Other paths (from Layer 4, 11, 17) are NOT modulated - semantic mismatch
+        path_1 = dpt_features[-1]
+        path_1_modulated = self.feature_modulator(
+            path_1, importance_map, fg_gamma, fg_beta, bg_gamma, bg_beta
+        )
 
-        return modulated_dpt_features, importance_map
+        return path_1_modulated, importance_map, fg_features, bg_features

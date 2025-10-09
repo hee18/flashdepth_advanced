@@ -17,8 +17,8 @@ dataset:
   data_root: null # change data path
   resolution: 'base'  # 518x518
   video_length: 5
-  train_datasets: [mvs-synth, tartanair, pointodyssey, spring, dynamicreplica]
-  val_datasets: [sintel, waymo]  # Removed spring, added waymo
+  train_datasets: [mvs-synth, dynamicreplica, tartanair, pointodyssey, spring]
+  val_datasets: [sintel, waymo]
 
 # Training configuration
 training:
@@ -37,14 +37,14 @@ training:
   weight_decay: 1.0e-6
 
   # Regularization losses (importance map)
-  use_bimodal_loss: true  # Enable bimodal loss to push importance values to 0 or 1
+  use_bimodal_loss: false  # Disabled: encourages uniform (all 0 or all 1), no spatial diversity
   bimodal_loss_weight: 0.5  # Weight for bimodal loss (0.3-1.0 recommended)
 
   use_edge_aware_loss: true  # Enable edge-aware loss to align importance with depth edges
-  edge_aware_loss_weight: 0.3  # Weight for edge-aware loss (0.1-0.5 recommended)
+  edge_aware_loss_weight: 0.5  # Increased from 0.3: strengthens boundary alignment (loss scale ~0.3)
 
-  use_contrastive_fgbg_loss: false  # Enable contrastive FG/BG loss (experimental, for future use)
-  contrastive_fgbg_loss_weight: 1.0  # Weight for contrastive loss (0.5-2.0 recommended)
+  use_contrastive_fgbg_loss: true  # CRITICAL: Forces FG ≠ BG, enables importance map diversity
+  contrastive_fgbg_loss_weight: 0.1  # Weight adjusted for loss scale [-14.3, 14.3] (temp=0.07)
 
   # FPS measurement
   measure_fps: true  # Measure forward pass FPS (inference speed)

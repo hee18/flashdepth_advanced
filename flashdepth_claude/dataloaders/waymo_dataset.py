@@ -17,30 +17,30 @@ class WaymoDepth(BaseDatasetPairs):
 
     def depth_read(self, path, return_torch=False, **kwargs):
         h, w = 1280, 1920
-        
+
         # Load the sparse depth points (N,3)
         depth_points = np.load(path)
-        
-        # Initialize depth map with -1
+
+        # Initialize depth map with -1 (original FlashDepth approach)
         depth_map = np.full((h, w), -1, dtype=np.float32)
-        
+
         # Extract coordinates and depths
         x_coords = depth_points[:, 0].astype(np.int32)
         y_coords = depth_points[:, 1].astype(np.int32)
         depths = depth_points[:, 2]
-        
+
         # Filter valid coordinates (within image bounds)
         valid_mask = (x_coords >= 0) & (x_coords < w) & (y_coords >= 0) & (y_coords < h)
         x_coords = x_coords[valid_mask]
         y_coords = y_coords[valid_mask]
         depths = depths[valid_mask]
-        
+
         # Place depths in the depth map
         depth_map[y_coords, x_coords] = depths
-        
+
         # Create inverse depth map (keeping -1 for invalid pixels)
         inverse_depth = np.where(depth_map > 0, 1.0 / depth_map, -1)
-        
+
         return inverse_depth
 
     def get_cache_path(self, cache_dir):

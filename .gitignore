@@ -50,3 +50,4 @@ flashdepth_claude/.triton_cache
 *.tar.gz
 flashdepth_claude/train_results/
 flashdepth_claude/test_results/
+*.log

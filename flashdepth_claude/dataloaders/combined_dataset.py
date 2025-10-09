@@ -165,11 +165,11 @@ class CombinedDataset(Dataset):
                 try:
                     image, _current_crop = _load_and_process_image(pair['image'], **self.reshape_list[dataset_idx])
                     depth = self.depth_read_list[dataset_idx](pair['depth'], is_inverse=True) # Load inverse depth (1/m) for training
-                    # IMPORTANT: Resize depth to match image resolution for validation batching
-                    depth = _load_and_process_depth(depth, image.shape, _current_crop, **self.reshape_list[dataset_idx])
+                    # Keep GT at ORIGINAL resolution (like original FlashDepth)
+                    # Prediction will be interpolated to GT resolution during validation
 
                     images.append(image)
-                    depths.append(depth) # depth is now torch tensor from _load_and_process_depth
+                    depths.append(torch.from_numpy(depth).float()) # Keep original resolution
                 except Exception as e:
                     print(f"Error loading validation pair: {e}")
                     continue

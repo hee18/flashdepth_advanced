@@ -49,12 +49,12 @@ show_usage() {
     echo "  --gsp-checkpoint PATH Set GSP module weights path"
     echo "  --frame-interval NUM  Set frame interval for sequence visualization (default: 1)"
     echo "  --vid-len NUM         Set video sequence length for testing (default: 50)"
-    echo "  --bimodal-loss BOOL   Enable/disable bimodal loss (default: true)"
+    echo "  --bimodal-loss BOOL   Enable/disable bimodal loss (default: false)"
     echo "  --bimodal-weight NUM  Set bimodal loss weight (default: 0.5)"
     echo "  --edge-aware-loss BOOL Enable/disable edge-aware loss (default: true)"
-    echo "  --edge-aware-weight NUM Set edge-aware loss weight (default: 0.3)"
-    echo "  --contrastive-loss BOOL Enable/disable contrastive FG/BG loss (default: false)"
-    echo "  --contrastive-weight NUM Set contrastive loss weight (default: 1.0)"
+    echo "  --edge-aware-weight NUM Set edge-aware loss weight (default: 0.5)"
+    echo "  --contrastive-loss BOOL Enable/disable contrastive FG/BG loss (default: true)"
+    echo "  --contrastive-weight NUM Set contrastive loss weight (default: 0.1)"
     echo "  --measure-fps BOOL    Enable/disable FPS measurement (default: true)"
     echo ""
     echo "Examples:"
@@ -82,12 +82,12 @@ FLASHDEPTH_CHECKPOINT="configs/flashdepth-l/iter_10001.pth"
 GSP_CHECKPOINT="train_results/results_5/best_metric_head_step_21000.pth"
 FRAME_INTERVAL=1
 VID_LEN=50
-BIMODAL_LOSS="true"
+BIMODAL_LOSS="false"   # Disabled: encourages uniform distribution (all 0 or all 1)
 BIMODAL_WEIGHT="0.5"
 EDGE_AWARE_LOSS="true"
-EDGE_AWARE_WEIGHT="0.3"
-CONTRASTIVE_LOSS="false"
-CONTRASTIVE_WEIGHT="1.0"
+EDGE_AWARE_WEIGHT="0.5"  # Increased from 0.3: strengthens boundary alignment with depth edges
+CONTRASTIVE_LOSS="true"  # Enabled: forces FG ≠ BG, critical for importance map diversity
+CONTRASTIVE_WEIGHT="0.1"  # Reduced from 1.0 (loss scale [-14.3, 14.3] with temp=0.07)
 MEASURE_FPS="true"
 
 # Parse arguments

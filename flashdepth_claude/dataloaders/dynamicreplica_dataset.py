@@ -15,7 +15,7 @@ from .base_dataset_pairs import BaseDatasetPairs
 
 class DynamicReplicaDepth(BaseDatasetPairs):
     def __init__(self, root_dir, split, load_cache=None):
-        self.root_dir = os.path.join(root_dir, 'dynamic_replica/train')
+        self.root_dir = os.path.join(root_dir, 'dynamicreplica/train')
         super().__init__(dataset_name='dynamicreplica', root_dir=self.root_dir, split=split, load_cache=load_cache)
         # Set default parameters
         self.reshape_list['resolution'] = (1280,720)
