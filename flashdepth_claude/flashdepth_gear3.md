@@ -1,15 +1,26 @@
 # FlashDepth Gear3: Feature-level Metric Depth Learning
 
 **작성일**: 2025-10-02
-**최종 업데이트**: 2025-10-07
+**최종 업데이트**: 2025-10-13
 **브랜치**: gear3
 **목적**: Feature-level FiLM modulation을 통한 metric depth 학습
 
-**주요 변경사항 (2025-10-07)**:
-- ❌ EntropyLoss 제거 (설계 오류: uniform distribution 장려)
-- ✅ BimodalLoss + EdgeAwareLoss 추가 (importance map diversity 개선)
-- ✅ Validation 시각화 개선 (각 dataset별 저장)
-- ✅ Loss 옵션 command-line 지원
+**학습 가능 파라미터**: **9.2M / 329M (2.81%)** ⭐
+- Gear3 modules: 4.6M
+- Mamba: 4.3M
+- output_conv: 0.3M
+
+**주요 변경사항 (2025-10-13)**:
+- ❌ **Canonicalization 완전 제거** (불필요, raw inverse depth로 충분)
+- ✅ **Importance map: Raw attention weights 직접 사용** (학습 불필요)
+- ❌ **모든 regularization losses 제거** (importance map 학습 안함)
+- ✅ **DPT output_conv만 학습**: Modulated features → depth 변환
+
+**이전 변경사항 (2025-10-09)**:
+- ✅ DepthVariancePseudoLabelLoss 추가 (GT depth variance → importance map pseudo-label)
+- ❌ BimodalLoss 완전 제거 (continuous modulation 방해: binary 강제 → variance supervision과 충돌)
+- ⚠️ EdgeAwareLoss 기본 비활성화 (variance supervision으로 충분)
+- ✅ ContrastiveFGBGLoss weight 증가: 0.1 → 0.3 (FG/BG feature separation 강화)
 
 ---
 
@@ -53,33 +64,29 @@ beta[x,y] = importance[x,y] × β_fg + (1 - importance[x,y]) × β_bg
 modulated_feature[x,y] = gamma[x,y] ⊙ feature[x,y] + beta[x,y]
 ```
 
-### 2. Attention-based Importance Prediction
+### 2. Attention-based Importance Map (학습 불필요!)
 
-**입력**: DINOv2 **last block의 CLS attention weights만** 사용 (메모리 최적화)
-- 이전: 24 blocks × 480MB = **11.5GB** 낭비
-- 현재: 1 block × 480MB = **0.5GB** ✅
+**핵심 변경**: ImportancePredictor 제거, **DINOv2 attention weights를 직접 importance map으로 사용**
 
 ```python
-# flashdepth/dinov2_layers/attention.py
-class MemEffAttention(Attention):
-    def __init__(self):
-        self.store_attn_weights = False  # Default: 저장 안 함
+# gear3_modules.py - Gear3MetricHead
+def forward(self, patch_tokens, attention_weights, dpt_features, patch_h, patch_w):
+    # CLS→patch attention (semantic importance)
+    cls_to_patch = attention_weights[:, :, 0, 1:]  # [B, num_heads, num_patches]
 
-# train_gear3.py - Last block만 활성화
-for i, block in enumerate(model.pretrained.blocks):
-    if i == len(model.pretrained.blocks) - 1:
-        block.attn.store_attn_weights = True
+    # Average over heads and reshape to spatial map
+    importance_map = cls_to_patch.mean(dim=1)  # [B, num_patches]
+    importance_map = importance_map.view(B, 1, patch_h, patch_w)  # [B, 1, H, W]
+
+    # No learning needed - raw attention already provides semantic importance!
+    return modulated_features, importance_map
 ```
 
-### 3. Zero Initialization for Gradient Flow
-
-```python
-# gear3_modules.py - ImportancePredictor
-nn.init.zeros_(self.conv3.weight)  # 마지막 layer zero init
-nn.init.zeros_(self.conv3.bias)    # sigmoid(0) = 0.5 시작
-```
-
-**이유**: Random init → sigmoid saturation → no gradient flow → uniform importance map
+**장점**:
+- ❌ **ImportancePredictor 제거**: ~1.2M params 절약
+- ✅ **DINOv2의 검증된 semantic attention 활용**: 추가 학습 불필요
+- ✅ **Gradient flow 자동 보장**: No zero init tricks needed
+- ✅ **메모리 효율**: Last block만 저장 (~11GB 절약)
 
 ---
 
@@ -92,10 +99,10 @@ Video Frame → DINOv2-L (frozen) → Patch Tokens + Last Block Attention
                                       ↓
                     ┌─────────────────┴─────────────────┐
                     ↓                                   ↓
-         ImportancePredictor         ForegroundBackgroundNetworks
-         (zero init last layer)      (Attention-based Pooling)
+         Raw Attention → Importance Map    ForegroundBackgroundNetworks
+         (No learning!)    [B,1,H,W]      (Attention-based Pooling)
                     ↓                                   ↓
-         Importance Map [B,1,H,W]          FG/BG Features [B,256]
+                    ↓                      FG/BG Features [B,256]
                     ↓                   (Top attn → FG, Low attn → BG)
                     └─────────────────┬─────────────────┘
                                       ↓
@@ -105,33 +112,26 @@ Video Frame → DINOv2-L (frozen) → Patch Tokens + Last Block Attention
                                       ↓
          DPT-L Features → FeatureModulator → Modulated Features
                                       ↓
-                      DPT Refinement + Mamba (trainable)
+                      DPT Refinement (frozen) + Mamba (trainable)
                                       ↓
                      output_conv1/2 (trainable from scratch)
                                       ↓
-                            Metric Depth (직접 출력)
+                            Inverse Depth (100/m, 직접 출력)
 ```
 
 ### 주요 모듈
 
-#### 1. ImportancePredictor
+#### 1. ~~ImportancePredictor~~ (제거됨!)
 
+**변경**: Raw attention weights를 직접 importance map으로 사용
 ```python
-class ImportancePredictor(nn.Module):
-    def __init__(self, num_heads=16, hidden_dim=128):
-        self.conv1 = nn.Conv2d(num_heads, hidden_dim, 3, padding=1)
-        self.bn1 = nn.BatchNorm2d(hidden_dim)
-
-        self.conv2 = nn.Conv2d(hidden_dim, hidden_dim//2, 3, padding=1)
-        self.bn2 = nn.BatchNorm2d(hidden_dim//2)
-
-        self.conv3 = nn.Conv2d(hidden_dim//2, 1, 1)
-        self.sigmoid = nn.Sigmoid()
-
-        # Zero init for gradient flow
-        nn.init.zeros_(self.conv3.weight)
-        nn.init.zeros_(self.conv3.bias)
+# gear3_modules.py - Gear3MetricHead.forward()
+cls_to_patch = attention_weights[:, :, 0, 1:]  # [B, 16, num_patches]
+importance_map = cls_to_patch.mean(dim=1)  # [B, num_patches]
+importance_map = importance_map.view(B, 1, patch_h, patch_w)  # [B, 1, H, W]
 ```
+
+**장점**: 학습 불필요, DINOv2 semantic attention 활용
 
 #### 2. ForegroundBackgroundNetworks
 
@@ -212,17 +212,18 @@ DPT Head processes 4 intermediate layers:
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-4. GEAR3 HEAD - Importance Prediction (Trainable)
+4. GEAR3 HEAD - Importance Map (No Learning!)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-ImportancePredictor:
-  Input:  attention_weights     [B, 16, 1369]
+Raw Attention → Importance Map:
+  Input:  attention_weights     [B, 16, 1370, 1370]
 
-  Reshape:                      [B, 16, 37, 37]
+  Extract CLS→patch:            [B, 16, 1369]  ← [:, :, 0, 1:]
 
-  Conv1 + BN + ReLU:            [B, 128, 37, 37]  ← hidden_dim
-  Conv2 + BN + ReLU:            [B, 64, 37, 37]   ← hidden_dim//2
-  Conv3 (zero init):            [B, 1, 37, 37]
-  Sigmoid:                      [B, 1, 37, 37]    ← Importance map (0~1)
+  Average over heads:           [B, 1369]
+
+  Reshape to spatial:           [B, 1, 37, 37]  ← Importance map
+
+  **No trainable parameters!**  DINOv2 attention provides semantic importance
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -236,13 +237,13 @@ ForegroundBackgroundNetworks (Option 3: Attention-based Pooling):
 
   Average over heads:           [B, 1369]  ← attn_scores
 
-  Median split:
-    fg_mask (top 50%):          [B, 1369]  ← High attention patches
-    bg_mask (bottom 50%):       [B, 1369]  ← Low attention patches
+  Median split (binary masks):
+    fg_mask (top 50%):          [B, 1369]  ← Binary: 1 if attn > median, 0 otherwise (~685 ones)
+    bg_mask (bottom 50%):       [B, 1369]  ← Binary: 1 if attn ≤ median, 0 otherwise (~684 ones)
 
   Weighted pooling:
-    fg_pooled:                  [B, 1024]  ← Attention-weighted sum
-    bg_pooled:                  [B, 1024]  ← Inverse attention-weighted sum
+    fg_pooled:                  [B, 1024]  ← Sum over FG patches only (masked sum)
+    bg_pooled:                  [B, 1024]  ← Sum over BG patches only (masked sum)
 
   FG Network (MLP):
     fg_pooled → Linear(1024→512) → ReLU → Linear(512→256) → ReLU
@@ -330,10 +331,10 @@ output_conv2 (Conv 3×3):        [B, 1, 518, 518]
 9. FINAL OUTPUT
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Predicted Inverse Depth:        [B, 1, 518, 518]
-  (in 100/meters scale, canonicalized)
+  (in 100/meters scale, NO canonicalization)
 
 Ground Truth (for training):    [B, 1, 518, 518]
-  (in 100/meters scale, canonicalized)
+  (in 100/meters scale, NO canonicalization)
 
 Valid Mask:                     [B, 1, 518, 518]
   (inverse_depth > 0.5, i.e., depth < 200m)
@@ -431,9 +432,8 @@ torchrun \
 ### Primary Loss: Inverse Depth Loss (100/m scale)
 
 ```python
-# Training loop
-gt_depth_inverse_canonical = canonicalize_inverse(gt_depth, focal_length)
-gt_depth_inverse = gt_depth_inverse_canonical * 100.0  # Scale to 100/m
+# Training loop (NO canonicalization!)
+gt_depth_inverse = gt_depth * 100.0  # Dataloader gives 1/m, scale to 100/m
 
 # Valid mask: 0.5 < inverse_depth (i.e., depth < 200m)
 MIN_INVERSE_DEPTH = 0.5  # 100/200m = 0.5
@@ -442,83 +442,61 @@ valid_mask = (gt_inverse > MIN_INVERSE_DEPTH)
 depth_loss = LogL1Loss(pred_inverse, gt_inverse, valid_mask)
 ```
 
-### Regularization Losses (Importance Map)
+### Regularization Losses: **모두 제거됨!** ❌
 
-**문제 발견**: EntropyLoss가 잘못 설계됨
-- Shannon entropy maximization → **Uniform distribution 장려** ❌
-- Importance map이 std=0.001로 균일하게 수렴
-- 결과: FG/BG 구분 실패, spatial modulation 효과 없음
+**핵심 변경 (2025-10-13)**:
+- ✅ **Importance map = Raw attention weights** (학습 불필요)
+- ❌ **모든 regularization losses 제거**:
+  - DepthVariancePseudoLabelLoss ❌
+  - EdgeAwareLoss ❌
+  - ContrastiveFGBGLoss ❌
 
-**해결책**: 3가지 새로운 loss 도입
+**이유**:
+- Importance map은 DINOv2 attention weights를 직접 사용 → **학습 파라미터 없음**
+- Regularization은 importance map 학습을 위한 것 → **불필요**
+- FG/BG networks와 modulation networks만 학습
 
-#### 1. BimodalLoss (기본 활성화) ⭐⭐⭐
+**이전 시도 (참고용)**:
+1. EntropyLoss (2025-10-07): Uniform 장려 → 제거
+2. BimodalLoss (2025-10-09): Binary 강제 → 제거
+3. DepthVarianceLoss (2025-10-09): Variance supervision → 제거 (importance map 학습 안함)
+4. ContrastiveFGBGLoss (2025-10-09): FG/BG separation → 제거 (modulation만으로 충분)
 
-```python
-class BimodalLoss(nn.Module):
-    """
-    Importance 값을 0 또는 1로 push (binary distribution)
-
-    Loss = mean(min(p, 1-p))
-    - Uniform (p ≈ 0.5): Distance = 0.5 → High loss ❌
-    - Bimodal (p ≈ 0 or 1): Distance ≈ 0 → Low loss ✅
-    """
-    def forward(self, importance_map):
-        dist_to_extreme = torch.min(importance_map, 1.0 - importance_map)
-        return dist_to_extreme.mean()
-```
-
-**효과**: Importance map의 spatial diversity 증가 (std: 0.001 → 0.3+ 예상)
-
-#### 2. EdgeAwareLoss (기본 활성화) ⭐⭐⭐
+### Total Loss (현재)
 
 ```python
-class EdgeAwareLoss(nn.Module):
-    """
-    Importance map edge를 depth edge와 align
-    - FG/BG 경계가 depth discontinuity와 일치
-    - 내부 영역은 smooth 유지
-    """
-    def forward(self, importance_map, depth_map):
-        # Sobel filter로 edge 계산
-        importance_edges = compute_sobel(importance_map)
-        depth_edges = compute_sobel(depth_map)
+# 현재 (2025-10-13): Depth loss만 사용!
+total_loss = depth_loss  # Log L1 loss on inverse depth
 
-        # Normalize and compare
-        return F.l1_loss(importance_edges, depth_edges)
+# Regularization losses 모두 제거됨
 ```
 
-**효과**: FG 경계가 부드러워짐 (depth discontinuity와 일치)
+**핵심 단순화**:
+- ✅ Depth loss만으로 학습
+- ❌ Importance map regularization 불필요 (raw attention 사용)
+- ❌ FG/BG contrastive loss 불필요 (modulation만으로 충분)
 
-#### 3. ContrastiveFGBGLoss (실험용, 기본 비활성화) ⭐⭐
+---
 
-```python
-class ContrastiveFGBGLoss(nn.Module):
-    """
-    FG/BG features를 embedding space에서 분리
-    - FG features와 BG features의 cosine similarity 최소화
-    """
-    def forward(self, fg_features, bg_features):
-        fg_norm = F.normalize(fg_features, dim=1)
-        bg_norm = F.normalize(bg_features, dim=1)
+### 이전 Loss (참고용 - 더 이상 사용 안 함)
 
-        similarity = (fg_norm * bg_norm).sum(dim=1)
-        return similarity.mean() / temperature
-```
+<details>
+<summary><b>DepthVariancePseudoLabelLoss</b> (제거됨)</summary>
 
-**효과**: Modulation parameters (γ_fg, β_fg, γ_bg, β_bg) 차이 증가
+Importance map 학습을 위한 loss였으나, raw attention 사용으로 불필요해짐.
+</details>
 
-### Total Loss
+<details>
+<summary><b>EdgeAwareLoss</b> (제거됨)</summary>
 
-```python
-total_loss = depth_loss + \
-             bimodal_weight * bimodal_loss + \
-             edge_aware_weight * edge_aware_loss
-```
+Depth edge alignment을 위한 loss였으나, importance map 학습 안 함.
+</details>
 
-**Default weights** (config.yaml):
-- `bimodal_loss_weight: 0.5` (0.3-1.0 권장)
-- `edge_aware_loss_weight: 0.3` (0.1-0.5 권장)
-- `contrastive_fgbg_loss_weight: 1.0` (0.5-2.0 권장, 비활성화됨)
+<details>
+<summary><b>ContrastiveFGBGLoss</b> (제거됨)</summary>
+
+FG/BG feature separation을 위한 loss였으나, modulation 학습만으로 충분.
+</details>
 
 ### Valid Depth Range: **200m 이하**
 
@@ -543,15 +521,14 @@ MAX_DEPTH = 200.0  # meters
 gt_valid_mask = (gt_depth > 0) & (gt_depth < MAX_DEPTH)
 ```
 
-### Canonical Space (현재 비활성화)
+### ~~Canonical Space~~ (완전 제거)
 
-```yaml
-# configs/gear3/config.yaml
-use_canonical_space: false  # 사용 안 함
-canonical_focal_length: 1000.0
-```
+**변경 (2025-10-13)**: Canonicalization 로직 완전 제거
+- ❌ `CanonicalSpaceNormalizer` 제거
+- ❌ `canonicalize_inverse()` 제거
+- ✅ **Raw inverse depth 직접 사용**: `gt_depth * 100.0`
 
-**이유**: Raw inverse depth로 충분히 학습 가능
+**이유**: Focal length 정규화 불필요, 학습 간단화
 
 ---
 
@@ -607,32 +584,42 @@ bash train_gear3_ddp.sh \
 # Results directory
 --results-dir train_results/custom
 
-# Loss 옵션 (기본값: bimodal + edge-aware 활성화)
---bimodal-loss true          # BimodalLoss 활성화/비활성화
---bimodal-weight 0.5         # BimodalLoss weight (0.3-1.0 권장)
+# Loss 옵션 (기본값: depth-variance + contrastive 활성화, edge-aware 비활성화)
+--depth-variance-loss true   # DepthVariancePseudoLabelLoss 활성화/비활성화
+--depth-variance-weight 0.5  # DepthVarianceLoss weight (0.3-1.0 권장)
+--variance-kernel-size 15    # Gaussian kernel size on GT resolution (7-21 권장)
 
---edge-aware-loss true       # EdgeAwareLoss 활성화/비활성화
+--edge-aware-loss false      # EdgeAwareLoss 활성화/비활성화 (기본 비활성화)
 --edge-aware-weight 0.3      # EdgeAwareLoss weight (0.1-0.5 권장)
 
---contrastive-loss false     # ContrastiveFGBGLoss 활성화/비활성화 (실험용)
---contrastive-weight 1.0     # ContrastiveFGBGLoss weight (0.5-2.0 권장)
+--contrastive-loss true      # ContrastiveFGBGLoss 활성화/비활성화
+--contrastive-weight 0.3     # ContrastiveFGBGLoss weight (0.1-0.5 권장)
 ```
 
 **Loss 실험 예시**:
 
 ```bash
-# 모든 loss 사용 (ContrastiveFGBGLoss 포함)
+# 기본 설정 (variance + contrastive)
 ./run_docker.sh train_gear3_ddp \
-  --bimodal-loss true \
+  --results-dir train_results/results_default
+
+# 모든 loss 사용 (EdgeAwareLoss 포함)
+./run_docker.sh train_gear3_ddp \
+  --depth-variance-loss true \
   --edge-aware-loss true \
   --contrastive-loss true \
   --results-dir train_results/results_all_losses
 
 # Weight 조정
 ./run_docker.sh train_gear3_ddp \
-  --bimodal-weight 1.0 \
-  --edge-aware-weight 0.5 \
+  --depth-variance-weight 0.7 \
+  --contrastive-weight 0.5 \
   --results-dir train_results/results_high_weight
+
+# Kernel size 실험
+./run_docker.sh train_gear3_ddp \
+  --variance-kernel-size 21 \
+  --results-dir train_results/results_kernel21
 ```
 
 ### 테스트
@@ -758,6 +745,73 @@ Step X:
 
 ## 주요 버그 수정 이력
 
+### 2025-10-13 ⭐⭐⭐⭐⭐
+
+1. **Importance map 학습 완전 제거** ⭐⭐⭐⭐⭐
+   - 변경: ImportancePredictor 제거 → **Raw attention weights 직접 사용**
+   - 구현:
+     ```python
+     cls_to_patch = attention_weights[:, :, 0, 1:]
+     importance_map = cls_to_patch.mean(dim=1).view(B, 1, H, W)
+     ```
+   - 효과:
+     - ~1.2M params 절약
+     - DINOv2 semantic attention 활용
+     - Gradient flow 자동 보장 (zero init tricks 불필요)
+
+2. **모든 regularization losses 제거** ⭐⭐⭐⭐
+   - 제거됨:
+     - DepthVariancePseudoLabelLoss ❌
+     - EdgeAwareLoss ❌
+     - ContrastiveFGBGLoss ❌
+   - 이유: Importance map 학습 안 함 → Regularization 불필요
+   - 결과: **Depth loss만 사용** (학습 단순화)
+
+3. **Canonicalization 완전 제거** ⭐⭐⭐
+   - 제거됨:
+     - `CanonicalSpaceNormalizer` class
+     - `canonicalize_inverse()` / `decanonicalize_inverse()`
+   - 변경: `gt_depth * 100.0` (직접 스케일링)
+   - 이유: Focal length 정규화 불필요, raw inverse depth로 충분
+
+4. **학습 가능 파라미터 정리**
+   - 총 9.2M / 329M (2.81%)
+   - Gear3 modules: 4.6M
+   - Mamba: 4.3M
+   - output_conv: 0.3M
+
+### 2025-10-09
+
+1. **BimodalLoss 설계 오류 발견 및 완전 제거** ⭐⭐⭐⭐
+   - 문제: Binary 0/1 강제 → Continuous spatial modulation 이점 상실
+   - 분석:
+     - BimodalLoss는 importance map을 segmentation mask처럼 만듦
+     - FiLM modulation의 핵심인 continuous spatial adaptation을 방해
+     - Variance supervision과 근본적으로 충돌 (binary vs continuous)
+   - 해결: **완전 제거** (no replacement needed, variance supervision is sufficient)
+
+2. **DepthVariancePseudoLabelLoss 도입** (→ 2025-10-13에 제거됨)
+   - 아이디어: GT depth의 local variance를 importance map의 pseudo-label로 사용
+   - 구현:
+     - Gaussian-weighted variance computation (kernel_size=15, sigma=3.0)
+     - **CRITICAL**: `torch.no_grad()` for GT depth to prevent gradient flow
+     - L1 loss between importance_map and normalized variance
+   - 효과: Continuous spatial modulation, natural edge/object emphasis
+   - Weight: 0.5 (main supervision for importance map)
+   - **상태**: 제거됨 (importance map 학습 안 함)
+
+3. **ContrastiveFGBGLoss weight 증가** (→ 2025-10-13에 제거됨)
+   - 변경: 0.1 → 0.3
+   - 이유: Loss range [-14.3, 14.3] with temp=0.07 → depth loss 대비 약함
+   - 효과: FG/BG feature separation 강화, modulation parameters 차이 증가
+   - **상태**: 제거됨 (modulation만으로 충분)
+
+4. **EdgeAwareLoss 기본 비활성화** (→ 2025-10-13에 완전 제거됨)
+   - 이유: Variance loss가 edge 정보를 암묵적으로 제공
+   - 상태: Optional (재활성화 가능하지만 기본적으로 불필요)
+   - Weight: 0.3 (활성화 시)
+   - **상태**: 제거됨
+
 ### 2025-10-07
 
 1. **EntropyLoss 설계 오류 발견 및 수정** ⭐⭐⭐
@@ -766,10 +820,10 @@ Step X:
    - 분석:
      - Uniform (p≈0.5): H=log(HW)=6.93 → Loss=-6.93 (Best!) ❌
      - Bimodal (p≈0 or 1): H=log(HW/2)=6.24 → Loss=-6.24 (Worse) ❌
-   - 해결: 3가지 새로운 loss 도입
-     - **BimodalLoss**: min(p, 1-p) → 0 또는 1로 push
-     - **EdgeAwareLoss**: Depth edge와 importance edge align
-     - **ContrastiveFGBGLoss**: FG/BG features embedding space 분리
+   - 해결: 3가지 새로운 loss 도입 (BimodalLoss는 2025-10-09에 제거됨)
+     - ~~**BimodalLoss**~~: min(p, 1-p) → 0 또는 1로 push (제거됨)
+     - **EdgeAwareLoss**: Depth edge와 importance edge align (기본 비활성화)
+     - **ContrastiveFGBGLoss**: FG/BG features embedding space 분리 (weight 증가)
 
 2. **Validation 시각화 개선**
    - 문제: 항상 동일한 dataset (sintel)만 시각화
@@ -782,9 +836,7 @@ Step X:
 
 4. **Command-line loss 옵션 추가**
    - Docker script에 모든 loss toggle 추가
-   - `--bimodal-loss`, `--bimodal-weight`
-   - `--edge-aware-loss`, `--edge-aware-weight`
-   - `--contrastive-loss`, `--contrastive-weight`
+   - 2025-10-09 업데이트: bimodal → depth-variance 교체
 
 ### 2025-10-06
 
@@ -845,6 +897,34 @@ flashdepth_claude/
 
 ---
 
-**Last Update**: 2025-10-07
+## 요약
+
+### 최종 아키텍처 (2025-10-13)
+
+```
+DINOv2 (frozen) → Attention → Raw Importance Map (no learning!)
+                           ↓
+                   FG/BG Networks (trainable)
+                           ↓
+               Modulation Networks (trainable)
+                           ↓
+         DPT Features → Feature Modulator
+                           ↓
+           Mamba (trainable) + DPT Refinement (frozen)
+                           ↓
+                output_conv1/2 (trainable)
+                           ↓
+              Inverse Depth (100/m scale)
+```
+
+**핵심**:
+- ✅ **Importance map = Raw attention** (학습 불필요)
+- ✅ **Depth loss만 사용** (regularization 제거)
+- ✅ **Canonicalization 제거** (raw inverse depth)
+- ✅ **학습 파라미터: 9.2M / 329M (2.81%)**
+
+---
+
+**Last Update**: 2025-10-13
 **Branch**: gear3
 **Developer**: hsy

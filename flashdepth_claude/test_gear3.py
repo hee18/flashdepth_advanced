@@ -35,7 +35,7 @@ from flashdepth.model import FlashDepth
 from flashdepth.gear3_modules import Gear3MetricHead
 from dataloaders.combined_dataset import CombinedDataset
 from utils.metric_depth_metrics import MetricDepthMetrics, format_metrics
-from train_gear3 import CanonicalSpaceNormalizer, LogL1Loss
+from utils.helpers import save_gifs_as_grid, save_grid_to_mp4, depth_to_np_arr, torch_batch_to_np_arr
 
 # Setup logging
 logging.basicConfig(
@@ -62,12 +62,6 @@ class Gear3Tester:
         self.save_dir = Path(config.eval.outfolder)
         self.save_dir.mkdir(parents=True, exist_ok=True)
         logger.info(f"Save directory: {self.save_dir}")
-
-        # Setup canonical space normalizer
-        self.canonical_normalizer = CanonicalSpaceNormalizer(
-            focal_canonical=config.get('canonical_focal_length', 1000.0),
-            enable=config.get('use_canonical_space', True)
-        )
 
         # Initialize model
         self.model = self._setup_model()
@@ -202,15 +196,12 @@ class Gear3Tester:
         """Test on a single sequence"""
         images = batch['image'].to(self.device)  # [1, T, 3, H, W]
         gt_depth = batch['depth'].to(self.device)  # [1, T, 1, H, W]
-        focal_length = batch.get('focal_length', 1000.0)
 
         B, T = images.shape[:2]
         assert B == 1, "Batch size must be 1 for testing"
 
-        # Canonicalize GT inverse depth (dataloader gives inverse depth 1/m)
-        # Apply canonicalization for inverse depth, then scale to 100/m
-        gt_depth_inverse_canonical = self.canonical_normalizer.canonicalize_inverse(gt_depth, focal_length)
-        gt_depth_inverse_100 = gt_depth_inverse_canonical * 100.0  # 100/m (training scale)
+        # Dataloader gives inverse depth (1/m), scale to 100/m for training
+        gt_depth_inverse_100 = gt_depth * 100.0  # [1, T, 1, H, W] in 100/m
 
         # Storage for predictions
         pred_depths = []
@@ -249,9 +240,6 @@ class Gear3Tester:
             # Convert to metric depth: 100/m -> m
             pred_depth_metric = 100.0 / (pred_depth_inverse_100 + 1e-8)
 
-            # No need to de-canonicalize prediction (it's already in actual space)
-            # Model predicts in actual focal length space, not canonical
-
             pred_depths.append(pred_depth_metric)
             importance_maps.append(importance_map[0])
 
@@ -275,6 +263,12 @@ class Gear3Tester:
             self._visualize_sequence(
                 images[0], pred_depths, gt_depth_metric, importance_maps,
                 valid_mask, sequence_id, metrics
+            )
+
+        # Save video (GIF or MP4)
+        if self.config.eval.get('out_video', True):
+            self._save_video(
+                images[0], pred_depths, gt_depth_metric, valid_mask, sequence_id
             )
 
         return metrics
@@ -331,9 +325,9 @@ class Gear3Tester:
             axes[2, col].set_title(f'GT (m)')
             axes[2, col].axis('off')
 
-            # Row 3: Importance map
+            # Row 3: Importance map (matches train_gear3.py visualization)
             importance = importance_maps[t, 0].cpu().numpy()
-            axes[3, col].imshow(importance, cmap='hot', vmin=0, vmax=1)
+            axes[3, col].imshow(importance, cmap='jet', vmin=0, vmax=1)
             axes[3, col].set_title(f'Importance')
             axes[3, col].axis('off')
 
@@ -352,6 +346,60 @@ class Gear3Tester:
         plt.close(fig)
 
         logger.info(f"Saved visualization: {save_path}")
+
+    def _save_video(self, images, pred_depths, gt_depths, valid_mask, sequence_id):
+        """
+        Create video files (GIF/MP4) similar to FlashDepth validation.
+
+        Args:
+            images: [T, 3, H, W] - RGB images
+            pred_depths: [T, 1, H, W] - Predicted metric depth
+            gt_depths: [T, 1, H, W] - GT metric depth
+            valid_mask: [T, 1, H, W] - Valid mask
+            sequence_id: int - Sequence index
+        """
+        T = images.shape[0]
+
+        # Convert to numpy arrays for video creation
+        video_frames = torch_batch_to_np_arr(images)  # [T, H, W, 3]
+
+        # Convert depth to colorized numpy arrays
+        pred_frames = depth_to_np_arr(pred_depths.squeeze(1))  # [T, H, W, 3]
+        gt_frames = depth_to_np_arr(gt_depths.squeeze(1))  # [T, H, W, 3]
+
+        # Generate video paths
+        base_name = f"sequence_{sequence_id:04d}"
+        gif_path = self.save_dir / f"{base_name}.gif"
+        mp4_path = self.save_dir / f"{base_name}.mp4"
+
+        # Save based on config
+        if self.config.eval.get('out_mp4', False):
+            # Save as MP4 (with separate pred-only video)
+            logger.info(f"Saving MP4 videos for sequence {sequence_id}...")
+            grid = save_grid_to_mp4(
+                video_frames,
+                gt_frames,
+                pred_frames,
+                output_path=str(mp4_path),
+                fixed_height=self.config.eval.get('save_res', 256),
+                fps=self.config.eval.get('video_fps', 10)
+            )
+            logger.info(f"Saved: {mp4_path}")
+            logger.info(f"Saved: {grid['pred_video_path']}")
+        else:
+            # Save as GIF (default)
+            logger.info(f"Saving GIF for sequence {sequence_id}...")
+            grid = save_gifs_as_grid(
+                video_frames,
+                gt_frames,
+                pred_frames,
+                output_path=str(gif_path),
+                fixed_height=self.config.eval.get('save_res', 256),
+                duration=self.config.eval.get('gif_duration', 110)
+            )
+            logger.info(f"Saved: {gif_path}")
+
+        return grid
 
     def _aggregate_metrics(self, all_metrics):
         """Aggregate metrics across sequences"""

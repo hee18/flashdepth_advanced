@@ -36,15 +36,18 @@ training:
   mamba_lr: 1.0e-4  # For Mamba (train from scratch, same LR as gear3)
   weight_decay: 1.0e-6
 
-  # Regularization losses (importance map)
-  use_bimodal_loss: false  # Disabled: encourages uniform (all 0 or all 1), no spatial diversity
-  bimodal_loss_weight: 0.5  # Weight for bimodal loss (0.3-1.0 recommended)
+  # Regularization losses - ALL DEPRECATED (importance map now uses raw attention, frozen)
+  # Importance map has no learnable parameters, so no regularization needed
+  use_depth_variance_loss: false  # DEPRECATED: importance map frozen
+  depth_variance_loss_weight: 0.5  # DEPRECATED
+  variance_kernel_size: 15  # DEPRECATED
+  variance_sigma: 3.0  # DEPRECATED
 
-  use_edge_aware_loss: true  # Enable edge-aware loss to align importance with depth edges
-  edge_aware_loss_weight: 0.5  # Increased from 0.3: strengthens boundary alignment (loss scale ~0.3)
+  use_edge_aware_loss: false  # DEPRECATED: importance map frozen
+  edge_aware_loss_weight: 0.3  # DEPRECATED
 
-  use_contrastive_fgbg_loss: true  # CRITICAL: Forces FG ≠ BG, enables importance map diversity
-  contrastive_fgbg_loss_weight: 0.1  # Weight adjusted for loss scale [-14.3, 14.3] (temp=0.07)
+  use_contrastive_fgbg_loss: false  # DEPRECATED: importance map frozen
+  contrastive_fgbg_loss_weight: 0.3  # DEPRECATED
 
   # FPS measurement
   measure_fps: true  # Measure forward pass FPS (inference speed)
@@ -80,12 +83,14 @@ eval:
   metrics: true
   save_grid: true
   outfolder: "test_gear3"
-  test_datasets: [tartanair]
+  test_datasets: [sintel]
   test_dataset_resolution: 'base'
   random_input: null
-  out_video: true
-  out_mp4: true
-  save_res: 518
-  save_depth_npy: true
-  save_vis_map: true
+  out_video: true  # Enable video/GIF saving
+  out_mp4: true    # false=GIF, true=MP4
+  save_res: 518    # Video height (original resolution, matches test resolution)
+  video_fps: 24    # Frames per second for MP4 (FlashDepth default)
+  gif_duration: 110  # Duration per frame in milliseconds for GIF
+  save_depth_npy: false  # Save raw depth as .npy files
+  save_vis_map: false    # Save colorized depth as .png files
   dummy_timing: false

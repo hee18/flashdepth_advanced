@@ -25,7 +25,7 @@ class Gear3Visualizer:
         plt.style.use('default')
         sns.set_palette("husl")
 
-    def create_validation_summary(self, sample_batch, model_outputs, step, save_name=None, prefix="validation", fps=None):
+    def create_validation_summary(self, sample_batch, model_outputs, step, save_name=None, prefix="validation", fps=None, loss_dict=None):
         """
         Create a comprehensive validation summary for Gear3
 
@@ -36,6 +36,11 @@ class Gear3Visualizer:
             save_name: Optional custom save name
             prefix: Prefix for the visualization
             fps: Forward pass FPS (optional)
+            loss_dict: Dictionary with loss values (optional)
+                - 'depth_loss': Depth loss value
+                - 'depth_variance_loss': Variance loss value (if enabled)
+                - 'edge_aware_loss': Edge-aware loss value (if enabled)
+                - 'contrastive_fgbg_loss': Contrastive FG/BG loss value (if enabled)
 
         Returns:
             fig: Matplotlib figure object
@@ -204,8 +209,11 @@ class Gear3Visualizer:
 
             # 8. Training Info
             ax8 = fig.add_subplot(gs[1, 3])
-            ax8.text(0.1, 0.8, f'Step: {step}', fontsize=16,
+            y_pos = 0.9  # Start from top
+
+            ax8.text(0.1, y_pos, f'Step: {step}', fontsize=16,
                     transform=ax8.transAxes, bbox=dict(boxstyle="round", facecolor='wheat'))
+            y_pos -= 0.15
 
             # Handle dataset_idx (can be string or tensor)
             if isinstance(dataset_idx, str):
@@ -217,16 +225,47 @@ class Gear3Visualizer:
             else:
                 dataset_str = str(dataset_idx)
 
-            ax8.text(0.1, 0.6, f'Dataset: {dataset_str}', fontsize=14,
-                    transform=ax8.transAxes)
+            ax8.text(0.1, y_pos, f'Dataset: {dataset_str}', fontsize=14, transform=ax8.transAxes)
+            y_pos -= 0.12
 
-            # Show FPS if available, otherwise show importance mean
+            # Show FG:BG ratio based on importance map mean
+            fg_ratio = (importance_frame >= imp_mean).sum() / importance_frame.size * 100
+            bg_ratio = 100.0 - fg_ratio
+            ax8.text(0.1, y_pos, f'FG:BG = {fg_ratio:.1f}:{bg_ratio:.1f}', fontsize=12,
+                    transform=ax8.transAxes, bbox=dict(boxstyle="round", facecolor='lightcyan'))
+            y_pos -= 0.12
+
+            # Show FPS if available
             if fps is not None:
-                ax8.text(0.1, 0.4, f'FPS: {fps:.1f}', fontsize=12,
+                ax8.text(0.1, y_pos, f'FPS: {fps:.1f}', fontsize=12,
                         transform=ax8.transAxes, bbox=dict(boxstyle="round", facecolor='lightgreen'))
-            else:
-                ax8.text(0.1, 0.4, f'Importance mean: {imp_mean:.3f}', fontsize=12,
-                        transform=ax8.transAxes, bbox=dict(boxstyle="round", facecolor='lightblue'))
+                y_pos -= 0.12
+
+            # Show loss values if available
+            if loss_dict is not None:
+                # Depth loss (always present)
+                if 'depth_loss' in loss_dict:
+                    ax8.text(0.1, y_pos, f'Log L1 Loss: {loss_dict["depth_loss"]:.4f}', fontsize=11,
+                            transform=ax8.transAxes, bbox=dict(boxstyle="round", facecolor='lightcoral'))
+                    y_pos -= 0.10
+
+                # Variance loss (if enabled)
+                if 'depth_variance_loss' in loss_dict and loss_dict['depth_variance_loss'] > 0:
+                    ax8.text(0.1, y_pos, f'Variance: {loss_dict["depth_variance_loss"]:.4f}', fontsize=11,
+                            transform=ax8.transAxes, bbox=dict(boxstyle="round", facecolor='lightyellow'))
+                    y_pos -= 0.10
+
+                # Edge-aware loss (if enabled)
+                if 'edge_aware_loss' in loss_dict and loss_dict['edge_aware_loss'] > 0:
+                    ax8.text(0.1, y_pos, f'Edge: {loss_dict["edge_aware_loss"]:.4f}', fontsize=11,
+                            transform=ax8.transAxes, bbox=dict(boxstyle="round", facecolor='lightblue'))
+                    y_pos -= 0.10
+
+                # Contrastive FG/BG loss (if enabled)
+                if 'contrastive_fgbg_loss' in loss_dict and loss_dict['contrastive_fgbg_loss'] > 0:
+                    ax8.text(0.1, y_pos, f'Contrast: {loss_dict["contrastive_fgbg_loss"]:.4f}', fontsize=11,
+                            transform=ax8.transAxes, bbox=dict(boxstyle="round", facecolor='lightgreen'))
+                    y_pos -= 0.10
 
             ax8.set_title('Training Info', fontsize=14, fontweight='bold')
             ax8.axis('off')

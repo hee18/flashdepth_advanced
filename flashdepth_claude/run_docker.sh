@@ -49,13 +49,16 @@ show_usage() {
     echo "  --gsp-checkpoint PATH Set GSP module weights path"
     echo "  --frame-interval NUM  Set frame interval for sequence visualization (default: 1)"
     echo "  --vid-len NUM         Set video sequence length for testing (default: 50)"
-    echo "  --bimodal-loss BOOL   Enable/disable bimodal loss (default: false)"
-    echo "  --bimodal-weight NUM  Set bimodal loss weight (default: 0.5)"
-    echo "  --edge-aware-loss BOOL Enable/disable edge-aware loss (default: true)"
-    echo "  --edge-aware-weight NUM Set edge-aware loss weight (default: 0.5)"
-    echo "  --contrastive-loss BOOL Enable/disable contrastive FG/BG loss (default: true)"
-    echo "  --contrastive-weight NUM Set contrastive loss weight (default: 0.1)"
+    echo "  --depth-variance-loss BOOL [DEPRECATED] Enable/disable depth variance loss (default: false)"
+    echo "  --depth-variance-weight NUM [DEPRECATED] Set depth variance loss weight (default: 0.5)"
+    echo "  --variance-kernel-size NUM [DEPRECATED] Set variance kernel size (default: 15)"
+    echo "  --edge-aware-loss BOOL [DEPRECATED] Enable/disable edge-aware loss (default: false)"
+    echo "  --edge-aware-weight NUM [DEPRECATED] Set edge-aware loss weight (default: 0.3)"
+    echo "  --contrastive-loss BOOL [DEPRECATED] Enable/disable contrastive FG/BG loss (default: false)"
+    echo "  --contrastive-weight NUM [DEPRECATED] Set contrastive loss weight (default: 0.3)"
     echo "  --measure-fps BOOL    Enable/disable FPS measurement (default: true)"
+    echo ""
+    echo "Note: Regularization losses are deprecated. Importance map now uses raw DINOv2 attention (frozen)."
     echo ""
     echo "Examples:"
     echo "  $0 build                              # Build the image"
@@ -82,12 +85,13 @@ FLASHDEPTH_CHECKPOINT="configs/flashdepth-l/iter_10001.pth"
 GSP_CHECKPOINT="train_results/results_5/best_metric_head_step_21000.pth"
 FRAME_INTERVAL=1
 VID_LEN=50
-BIMODAL_LOSS="false"   # Disabled: encourages uniform distribution (all 0 or all 1)
-BIMODAL_WEIGHT="0.5"
-EDGE_AWARE_LOSS="true"
-EDGE_AWARE_WEIGHT="0.5"  # Increased from 0.3: strengthens boundary alignment with depth edges
-CONTRASTIVE_LOSS="true"  # Enabled: forces FG ≠ BG, critical for importance map diversity
-CONTRASTIVE_WEIGHT="0.1"  # Reduced from 1.0 (loss scale [-14.3, 14.3] with temp=0.07)
+DEPTH_VARIANCE_LOSS="false"  # Disabled: importance map now uses raw attention (no learnable params)
+DEPTH_VARIANCE_WEIGHT="0.5"  # (Deprecated - importance map frozen)
+VARIANCE_KERNEL_SIZE="15"  # (Deprecated - importance map frozen)
+EDGE_AWARE_LOSS="false"  # Disabled: importance map now uses raw attention (no learnable params)
+EDGE_AWARE_WEIGHT="0.3"  # (Deprecated - importance map frozen)
+CONTRASTIVE_LOSS="false"  # Disabled: importance map now uses raw attention (no learnable params)
+CONTRASTIVE_WEIGHT="0.3"  # (Deprecated - importance map frozen)
 MEASURE_FPS="true"
 
 # Parse arguments
@@ -133,12 +137,16 @@ while [[ $# -gt 0 ]]; do
             VID_LEN="$2"
             shift 2
             ;;
-        --bimodal-loss)
-            BIMODAL_LOSS="$2"
+        --depth-variance-loss)
+            DEPTH_VARIANCE_LOSS="$2"
             shift 2
             ;;
-        --bimodal-weight)
-            BIMODAL_WEIGHT="$2"
+        --depth-variance-weight)
+            DEPTH_VARIANCE_WEIGHT="$2"
+            shift 2
+            ;;
+        --variance-kernel-size)
+            VARIANCE_KERNEL_SIZE="$2"
             shift 2
             ;;
         --edge-aware-loss)
@@ -277,7 +285,7 @@ case $COMMAND in
         echo "  - Total iterations: $TOTAL_ITERS"
         echo "  - GPUs: 0,1"
         echo "  - Results directory: $RESULTS_DIR"
-        echo "  - Bimodal loss: $BIMODAL_LOSS (weight: $BIMODAL_WEIGHT)"
+        echo "  - Depth variance loss: $DEPTH_VARIANCE_LOSS (weight: $DEPTH_VARIANCE_WEIGHT, kernel: $VARIANCE_KERNEL_SIZE)"
         echo "  - Edge-aware loss: $EDGE_AWARE_LOSS (weight: $EDGE_AWARE_WEIGHT)"
         echo "  - Contrastive FG/BG loss: $CONTRASTIVE_LOSS (weight: $CONTRASTIVE_WEIGHT)"
         echo "  - FPS measurement: $MEASURE_FPS"
@@ -298,8 +306,9 @@ case $COMMAND in
             training.batch_size=$BATCH_SIZE \
             training.workers=$WORKERS \
             training.iterations=$TOTAL_ITERS \
-            training.use_bimodal_loss=$BIMODAL_LOSS \
-            training.bimodal_loss_weight=$BIMODAL_WEIGHT \
+            training.use_depth_variance_loss=$DEPTH_VARIANCE_LOSS \
+            training.depth_variance_loss_weight=$DEPTH_VARIANCE_WEIGHT \
+            training.variance_kernel_size=$VARIANCE_KERNEL_SIZE \
             training.use_edge_aware_loss=$EDGE_AWARE_LOSS \
             training.edge_aware_loss_weight=$EDGE_AWARE_WEIGHT \
             training.use_contrastive_fgbg_loss=$CONTRASTIVE_LOSS \

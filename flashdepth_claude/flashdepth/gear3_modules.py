@@ -2,10 +2,16 @@
 Gear3 Modules: Feature-level Metric Injection via FiLM-style Modulation
 
 This module implements the following architecture:
-1. ImportancePredictor: Predicts spatial importance map from attention weights
+1. [REMOVED] ImportancePredictor: Now uses raw attention directly
 2. ForegroundBackgroundNetworks: Generates FG/BG semantic features
 3. ModulationNetworks: Generates gamma and beta for FiLM-style modulation
 4. FeatureModulator: Applies hierarchical modulation to DPT features
+
+Key Changes:
+- Importance map = DINOv2 CLS→patch attention (averaged over heads)
+- Register token (highest attention patch) removed via 3×3 inpainting
+- Percentile normalization (1-99) to [0,1] for robustness
+- FG/BG split uses mean (adaptive) instead of median (fixed 50:50)
 """
 
 import torch
@@ -15,66 +21,69 @@ from einops import rearrange
 import logging
 
 
-class ImportancePredictor(nn.Module):
+def process_attention_to_importance(attention_weights, patch_h, patch_w, remove_outliers=True):
     """
-    Predicts spatial importance map (0~1) from DINOv2 attention weights.
+    Convert raw attention weights to importance map.
 
-    Input: Attention weights from DINOv2 multi-head attention [B, num_heads, num_patches+1, num_patches+1]
-    Output: Importance map [B, 1, H, W] (0~1, higher = foreground/important)
+    Steps:
+    1. Extract CLS→patch attention
+    2. Average over heads
+    3. Remove register token (highest attention patch)
+    4. Percentile normalization (1-99 percentile) to [0, 1]
+
+    Args:
+        attention_weights: [B, num_heads, num_patches+1, num_patches+1]
+        patch_h, patch_w: Spatial dimensions
+        remove_outliers: Whether to remove register token (default: True)
+
+    Returns:
+        importance_map: [B, 1, patch_h, patch_w] in range [0, 1]
     """
-    def __init__(self, num_heads=16, hidden_dim=128):
-        super().__init__()
-        self.num_heads = num_heads
+    B = attention_weights.shape[0]
 
-        # Process attention weights to spatial importance
-        self.conv1 = nn.Conv2d(num_heads, hidden_dim, kernel_size=3, padding=1)
-        self.bn1 = nn.BatchNorm2d(hidden_dim)
-        self.relu = nn.ReLU(inplace=True)
+    # Extract CLS→patch attention
+    cls_to_patches = attention_weights[:, :, 0, 1:]  # [B, num_heads, num_patches]
 
-        self.conv2 = nn.Conv2d(hidden_dim, hidden_dim // 2, kernel_size=3, padding=1)
-        self.bn2 = nn.BatchNorm2d(hidden_dim // 2)
+    # Average over heads
+    attn_scores = cls_to_patches.mean(dim=1)  # [B, num_patches]
 
-        self.conv3 = nn.Conv2d(hidden_dim // 2, 1, kernel_size=1)
-        self.sigmoid = nn.Sigmoid()
+    # Reshape to spatial
+    attn_map = attn_scores.reshape(B, 1, patch_h, patch_w)  # [B, 1, patch_h, patch_w]
 
-        # Initialize last conv to zero for better training dynamics
-        # This makes importance map start at 0.5 (sigmoid(0)) but with gradient flow
-        nn.init.zeros_(self.conv3.weight)
-        nn.init.zeros_(self.conv3.bias)
+    if remove_outliers:
+        # Remove register token (single highest attention patch)
+        # Based on empirical observation: DINOv2 has 1 register token with extremely high attention
+        for b in range(B):
+            attn_2d = attn_map[b, 0]  # [patch_h, patch_w]
 
-        logging.info(f"ImportancePredictor initialized with {num_heads} heads")
+            # Find the patch with maximum attention (register token)
+            max_val = attn_2d.max()
+            outlier_mask = (attn_2d == max_val)  # Only the single highest patch
 
-    def forward(self, attention_weights, patch_h, patch_w):
-        """
-        Args:
-            attention_weights: [B, num_heads, num_patches+1, num_patches+1]
-            patch_h, patch_w: Spatial dimensions of patches
+            # Inpaint with local average (3×3 box filter at patch level)
+            # Replace register token with average of surrounding 8 patches
+            kernel = torch.ones(1, 1, 3, 3, device=attn_map.device) / 9
+            attn_smoothed = F.conv2d(
+                attn_map[b:b+1], kernel, padding=1
+            )
+            attn_map[b, 0] = torch.where(
+                outlier_mask,
+                attn_smoothed[0, 0],
+                attn_map[b, 0]
+            )
 
-        Returns:
-            importance_map: [B, 1, patch_h, patch_w] in range [0, 1]
-        """
-        B = attention_weights.shape[0]
+    # Percentile-based normalization to [0, 1] (1-99 percentile)
+    # More robust than min-max: reduces sensitivity to remaining outliers
+    for b in range(B):
+        attn_flat = attn_map[b].flatten()
+        attn_p1 = torch.quantile(attn_flat, 0.01)   # 1st percentile
+        attn_p99 = torch.quantile(attn_flat, 0.99)  # 99th percentile
 
-        # Extract patch-to-patch attention (exclude CLS token)
-        # Average over CLS attention to patches: [B, num_heads, num_patches]
-        cls_to_patches = attention_weights[:, :, 0, 1:]  # [B, num_heads, num_patches]
+        # Normalize to [0, 1] and clip
+        attn_map[b] = (attn_map[b] - attn_p1) / (attn_p99 - attn_p1 + 1e-8)
+        attn_map[b] = torch.clamp(attn_map[b], 0.0, 1.0)  # Clip outliers to [0, 1]
 
-        # Reshape to spatial: [B, num_heads, patch_h, patch_w]
-        attn_spatial = cls_to_patches.reshape(B, self.num_heads, patch_h, patch_w)
-
-        # Process through conv layers
-        x = self.conv1(attn_spatial)
-        x = self.bn1(x)
-        x = self.relu(x)
-
-        x = self.conv2(x)
-        x = self.bn2(x)
-        x = self.relu(x)
-
-        x = self.conv3(x)
-        importance_map = self.sigmoid(x)  # [B, 1, patch_h, patch_w]
-
-        return importance_map
+    return attn_map
 
 
 class ForegroundBackgroundNetworks(nn.Module):
@@ -110,12 +119,14 @@ class ForegroundBackgroundNetworks(nn.Module):
 
         logging.info(f"FG/BG Networks (Attention-based Pooling): {embed_dim} -> {feature_dim}")
 
-    def forward(self, patch_tokens, attention_weights):
+    def forward(self, patch_tokens, attention_weights, importance_map):
         """
         Args:
             patch_tokens: [B, num_patches, embed_dim]
             attention_weights: [B, num_heads, num_patches+1, num_patches+1]
                               (from last DINOv2 block)
+            importance_map: [B, 1, patch_h, patch_w] - Processed attention
+                           (outliers removed, min-max normalized)
 
         Returns:
             fg_features: [B, feature_dim] - Weighted by high attention
@@ -123,20 +134,17 @@ class ForegroundBackgroundNetworks(nn.Module):
         """
         B, num_patches, embed_dim = patch_tokens.shape
 
-        # Extract CLS→patch attention (semantic importance from DINOv2)
-        # attention_weights: [B, num_heads, num_patches+1, num_patches+1]
-        # Index 0 is CLS token, 1: are patch tokens
-        cls_to_patch_attn = attention_weights[:, :, 0, 1:]  # [B, num_heads, num_patches]
+        # Use processed importance map (outliers removed, normalized [0,1])
+        # Flatten spatial dimensions to match patch_tokens shape
+        attn_scores = importance_map.flatten(2).squeeze(1)  # [B, num_patches]
 
-        # Average over attention heads
-        attn_scores = cls_to_patch_attn.mean(dim=1)  # [B, num_patches]
-
-        # Compute median for FG/BG split
-        attn_median = attn_scores.median(dim=1, keepdim=True).values  # [B, 1]
+        # Compute mean for FG/BG split from CLEANED attention (adaptive, not fixed 50:50)
+        # Register patches are already removed, so mean is not distorted by outliers
+        attn_mean = attn_scores.mean(dim=1, keepdim=True)  # [B, 1]
 
         # Create masks (top attention = FG, bottom attention = BG)
-        fg_mask = (attn_scores > attn_median).float()  # [B, num_patches]
-        bg_mask = (attn_scores <= attn_median).float()  # [B, num_patches]
+        fg_mask = (attn_scores > attn_mean).float()  # [B, num_patches]
+        bg_mask = (attn_scores <= attn_mean).float()  # [B, num_patches]
 
         # Weighted pooling (attention-weighted average)
         fg_weights = attn_scores * fg_mask  # [B, num_patches]
@@ -265,7 +273,7 @@ class Gear3MetricHead(nn.Module):
     Complete Gear3 metric depth head combining all modules.
 
     Architecture:
-        1. ImportancePredictor: attention -> importance map
+        1. Attention-based importance map: DINOv2 attention -> importance map (no learnable params)
         2. FG/BG Networks: patch tokens -> FG/BG features
         3. Modulation Networks: FG/BG features -> gamma/beta for path_1
         4. Feature Modulator: Apply modulation to path_1 (Layer 23 features)
@@ -273,7 +281,7 @@ class Gear3MetricHead(nn.Module):
     def __init__(self, embed_dim=1024, dpt_dim=256, num_heads=16):
         super().__init__()
 
-        self.importance_predictor = ImportancePredictor(num_heads=num_heads)
+        # No ImportancePredictor - use raw attention directly
         self.fg_bg_networks = ForegroundBackgroundNetworks(
             embed_dim=embed_dim, feature_dim=256
         )
@@ -301,12 +309,13 @@ class Gear3MetricHead(nn.Module):
             fg_features: [B, 256] foreground features (for ContrastiveFGBGLoss)
             bg_features: [B, 256] background features (for ContrastiveFGBGLoss)
         """
-        # 1. Predict importance map (from Layer 23 attention)
-        importance_map = self.importance_predictor(attention_weights, patch_h, patch_w)
+        # 1. Convert raw attention to importance map (no learnable params)
+        # Register patches removed, min-max normalized to [0,1]
+        importance_map = process_attention_to_importance(attention_weights, patch_h, patch_w)
 
         # 2. Generate FG/BG features (from Layer 23 patch tokens)
-        # Uses CLS→patch attention to separate high-attention (FG) vs low-attention (BG) regions
-        fg_features, bg_features = self.fg_bg_networks(patch_tokens, attention_weights)
+        # Uses PROCESSED importance map (outliers removed) to separate FG vs BG regions
+        fg_features, bg_features = self.fg_bg_networks(patch_tokens, attention_weights, importance_map)
 
         # 3. Get modulation parameters for path_1 (Layer 23 → path_1)
         fg_gamma, fg_beta, bg_gamma, bg_beta = self.modulation_networks(

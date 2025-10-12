@@ -187,36 +187,111 @@ class LogL1Loss(nn.Module):
         return loss
 
 
-class BimodalLoss(nn.Module):
+class DepthVariancePseudoLabelLoss(nn.Module):
     """
-    Bimodal regularization loss for importance maps.
+    Depth Variance Pseudo-Label Loss for importance maps.
 
-    Encourages importance values to be close to 0 or 1 (binary/bimodal distribution).
-    This creates clear distinction between foreground and background regions.
+    Uses local depth variance as pseudo-label (supervision) for importance map.
 
-    Loss = mean(min(p, 1-p)) where p is importance value
+    High variance regions (complex geometry) → High importance
+    Low variance regions (flat surfaces) → Low importance
 
-    - Uniform (p ≈ 0.5): Distance = 0.5 → High loss ❌
-    - Bimodal (p ≈ 0 or 1): Distance ≈ 0 → Low loss ✅
+    This encourages importance map to have spatial diversity (high std).
 
-    Reference: "Entropy-Driven Sampling and Training Scheme" (ECCV 2024)
+    **CRITICAL**: GT depth variance is computed with torch.no_grad() to prevent gradient flow.
     """
-    def __init__(self):
+    def __init__(self, kernel_size=15, sigma=3.0):
         super().__init__()
+        self.kernel_size = kernel_size
+        self.sigma = sigma
 
-    def forward(self, importance_map):
+        # Create Gaussian kernel for weighted variance computation
+        self.register_buffer('gaussian_kernel', self._create_gaussian_kernel(kernel_size, sigma))
+
+    def _create_gaussian_kernel(self, kernel_size, sigma):
+        """Create 2D Gaussian kernel for weighted variance"""
+        # Create 1D Gaussian
+        ax = torch.arange(-kernel_size // 2 + 1., kernel_size // 2 + 1.)
+        xx, yy = torch.meshgrid(ax, ax, indexing='ij')
+        kernel = torch.exp(-(xx**2 + yy**2) / (2. * sigma**2))
+
+        # Normalize to sum to 1
+        kernel = kernel / kernel.sum()
+
+        # Reshape for conv2d: [1, 1, kernel_size, kernel_size]
+        return kernel.view(1, 1, kernel_size, kernel_size)
+
+    def compute_local_variance(self, depth_map):
         """
+        Compute local variance using Gaussian-weighted window.
+
+        Variance = E[x²] - E[x]²
+
         Args:
-            importance_map: [B, 1, H, W] importance values in range [0, 1]
+            depth_map: [B, 1, H, W] depth values (inverse depth in 100/m scale)
 
         Returns:
-            loss: scalar (distance from {0, 1}, to be minimized)
+            variance: [B, 1, H, W] local variance map
         """
-        # Distance to nearest extreme value (0 or 1)
-        dist_to_extreme = torch.min(importance_map, 1.0 - importance_map)
+        # Match dtype and device
+        kernel = self.gaussian_kernel.to(dtype=depth_map.dtype, device=depth_map.device)
+        padding = self.kernel_size // 2
 
-        # Average over all spatial locations and batch
-        return dist_to_extreme.mean()
+        # E[x] (local mean)
+        local_mean = F.conv2d(depth_map, kernel, padding=padding)
+
+        # E[x²] (local mean of squares)
+        local_mean_sq = F.conv2d(depth_map**2, kernel, padding=padding)
+
+        # Variance = E[x²] - E[x]²
+        variance = local_mean_sq - local_mean**2
+
+        # Clamp to avoid negative values due to numerical errors
+        return variance.clamp(min=0)
+
+    def forward(self, importance_map, depth_map, valid_mask=None):
+        """
+        Args:
+            importance_map: [B, 1, H, W] predicted importance in range [0, 1]
+            depth_map: [B, 1, H, W] GT depth (inverse depth in 100/m scale)
+            valid_mask: [B, 1, H, W] valid pixels (optional)
+
+        Returns:
+            loss: scalar L1 distance between importance and normalized variance
+        """
+        # CRITICAL: Compute variance WITHOUT gradient to GT depth
+        with torch.no_grad():
+            # Compute local variance from GT depth
+            variance = self.compute_local_variance(depth_map)  # [B, 1, H, W]
+
+            # Normalize to [0, 1] range (min-max normalization)
+            if valid_mask is not None:
+                # Only consider valid pixels for normalization
+                variance_valid = variance[valid_mask.bool()]
+                if len(variance_valid) > 0:
+                    var_min = variance_valid.min()
+                    var_max = variance_valid.max()
+                else:
+                    var_min = variance.min()
+                    var_max = variance.max()
+            else:
+                var_min = variance.min()
+                var_max = variance.max()
+
+            # Avoid division by zero
+            variance_range = var_max - var_min + 1e-8
+            variance_norm = (variance - var_min) / variance_range  # [0, 1]
+
+        # L1 loss: importance_map (trainable) vs variance_norm (pseudo-label)
+        if valid_mask is not None:
+            loss = F.l1_loss(
+                importance_map[valid_mask.bool()],
+                variance_norm[valid_mask.bool()]
+            )
+        else:
+            loss = F.l1_loss(importance_map, variance_norm)
+
+        return loss
 
 
 class EdgeAwareLoss(nn.Module):
@@ -410,37 +485,16 @@ class Gear3Trainer:
         self.scheduler = self._setup_scheduler()
         self.loss_fn = LogL1Loss()
 
-        # Regularization losses (importance map)
-        self.bimodal_loss_fn = BimodalLoss()
-        self.edge_aware_loss_fn = EdgeAwareLoss()
-        self.contrastive_fgbg_loss_fn = ContrastiveFGBGLoss(temperature=0.07)
-
-        # Loss configs with defaults
-        self.use_bimodal_loss = config.training.get('use_bimodal_loss', True)  # Default: enabled
-        self.bimodal_loss_weight = config.training.get('bimodal_loss_weight', 0.5)
-
-        self.use_edge_aware_loss = config.training.get('use_edge_aware_loss', True)  # Default: enabled
-        self.edge_aware_loss_weight = config.training.get('edge_aware_loss_weight', 0.3)
-
-        self.use_contrastive_fgbg_loss = config.training.get('use_contrastive_fgbg_loss', False)  # Default: disabled
-        self.contrastive_fgbg_loss_weight = config.training.get('contrastive_fgbg_loss_weight', 1.0)
+        # Regularization losses - ALL DISABLED
+        # Importance map now uses raw attention directly (no trainable parameters)
+        # Therefore no regularization is needed
+        self.use_depth_variance_loss = False
+        self.use_edge_aware_loss = False
+        self.use_contrastive_fgbg_loss = False
 
         if rank == 0:
             self.logger.info("=== Regularization Losses ===")
-            if self.use_bimodal_loss:
-                self.logger.info(f"✓ BimodalLoss enabled (weight: {self.bimodal_loss_weight})")
-            else:
-                self.logger.info("✗ BimodalLoss disabled")
-
-            if self.use_edge_aware_loss:
-                self.logger.info(f"✓ EdgeAwareLoss enabled (weight: {self.edge_aware_loss_weight})")
-            else:
-                self.logger.info("✗ EdgeAwareLoss disabled")
-
-            if self.use_contrastive_fgbg_loss:
-                self.logger.info(f"✓ ContrastiveFGBGLoss enabled (weight: {self.contrastive_fgbg_loss_weight})")
-            else:
-                self.logger.info("✗ ContrastiveFGBGLoss disabled")
+            self.logger.info("✗ ALL regularization losses disabled (importance map uses raw attention)")
 
         # FPS measurement config
         self.measure_fps = config.training.get('measure_fps', False)
@@ -458,12 +512,19 @@ class Gear3Trainer:
                 config=dict(config)
             )
 
-        # Setup visualizer
-        self.visualizer = Gear3Visualizer(save_dir=self.results_dir / "visualizations")
+        # Setup visualizer with separate folders
+        self.train_visualizer = Gear3Visualizer(save_dir=self.results_dir / "visualizations" / "train")
+        self.val_visualizer = Gear3Visualizer(save_dir=self.results_dir / "visualizations" / "valid")
 
         self.global_step = 0
         self.best_val_loss = float('inf')
         self.best_step = 0  # Track which step achieved best validation loss
+
+        # Validation visualization config: track which sequences to visualize
+        self.val_vis_config = {
+            'sintel': {'count': 3, 'interval': 5, 'saved': []},
+            'waymo': {'count': 8, 'interval': 5, 'saved': []}
+        }
 
     def _setup_model(self):
         """Initialize FlashDepth with Gear3 metric head"""
@@ -739,8 +800,9 @@ class Gear3Trainer:
             {'params': output_conv_params, 'lr': base_lr, 'name': 'output_conv'}
         ]
 
-        optimizer = torch.optim.Adam(
+        optimizer = torch.optim.AdamW(
             param_groups,
+            betas=[0.9, 0.95],  # Same as original FlashDepth
             weight_decay=self.config.training.get('weight_decay', 1e-6)
         )
 
@@ -754,7 +816,7 @@ class Gear3Trainer:
     def _setup_scheduler(self):
         """Setup cosine annealing scheduler with warmup"""
         total_steps = self.config.training.iterations
-        warmup_steps = int(total_steps * 0.1)  # 10% warmup
+        warmup_steps = 1000  # Same as original FlashDepth
         decay_start = int(total_steps * 0.3)  # Start decay at 30%
 
         def lr_lambda(step):
@@ -815,12 +877,6 @@ class Gear3Trainer:
                 'lr_g3': f'{lr_gear3:.2e}',
                 'lr_mb': f'{lr_mamba:.2e}'
             }
-            if self.use_bimodal_loss:
-                postfix_dict['bimodal'] = f'{loss_dict["bimodal_loss"]:.4f}'
-            if self.use_edge_aware_loss:
-                postfix_dict['edge'] = f'{loss_dict["edge_aware_loss"]:.4f}'
-            if self.use_contrastive_fgbg_loss:
-                postfix_dict['contrast'] = f'{loss_dict["contrastive_fgbg_loss"]:.4f}'
 
             # Add FPS to progress bar if available
             if self.measure_fps and len(self.fps_buffer) > 0:
@@ -844,7 +900,7 @@ class Gear3Trainer:
 
             # Training visualization (steps 0, 10, 50, 100, then every 250) - rank 0 only
             vis_steps = [0, 10, 50, 100]
-            if (step in vis_steps or step % 250 == 0) and self.visualizer and self.rank == 0:
+            if (step in vis_steps or step % 250 == 0) and self.train_visualizer and self.rank == 0:
                 try:
                     # Use current training batch for visualization
                     self.model.eval()
@@ -914,8 +970,9 @@ class Gear3Trainer:
                         if self.measure_fps and len(self.fps_buffer) > 0:
                             current_fps = sum(self.fps_buffer[-20:]) / min(len(self.fps_buffer), 20)
 
-                        self.visualizer.create_validation_summary(
-                            sample_batch, model_outputs_cpu, step, prefix="training", fps=current_fps
+                        # Pass loss_dict for visualization
+                        self.train_visualizer.create_validation_summary(
+                            sample_batch, model_outputs_cpu, step, prefix="training", fps=current_fps, loss_dict=loss_dict
                         )
 
                     self._set_train_mode()
@@ -985,9 +1042,6 @@ class Gear3Trainer:
         # Forward pass with BFloat16 autocast (like original FlashDepth)
         total_loss = 0
         total_depth_loss = 0
-        total_bimodal_loss = 0
-        total_edge_aware_loss = 0
-        total_contrastive_fgbg_loss = 0
         valid_frames = 0
 
         # FPS measurement (forward pass only)
@@ -1068,30 +1122,8 @@ class Gear3Trainer:
                 # Loss computation in BFloat16
                 depth_loss_t = self.loss_fn(pred_depth_inverse, gt_t, valid_mask.float())
 
-                # Regularization losses (if enabled)
-                bimodal_loss_t = torch.tensor(0.0, device=depth_loss_t.device)
-                edge_aware_loss_t = torch.tensor(0.0, device=depth_loss_t.device)
-                contrastive_fgbg_loss_t = torch.tensor(0.0, device=depth_loss_t.device)
-
-                if self.use_bimodal_loss:
-                    bimodal_loss_t = self.bimodal_loss_fn(importance_map)
-
-                if self.use_edge_aware_loss:
-                    # Upsample importance_map to match depth resolution
-                    importance_map_upsampled = F.interpolate(
-                        importance_map, size=(h, w), mode='bilinear', align_corners=True
-                    )
-                    edge_aware_loss_t = self.edge_aware_loss_fn(importance_map_upsampled, gt_t)
-
-                if self.use_contrastive_fgbg_loss:
-                    # Contrastive loss to separate FG and BG features in embedding space
-                    contrastive_fgbg_loss_t = self.contrastive_fgbg_loss_fn(fg_features, bg_features)
-
-                # Total loss
-                loss_t = depth_loss_t + \
-                         self.bimodal_loss_weight * bimodal_loss_t + \
-                         self.edge_aware_loss_weight * edge_aware_loss_t + \
-                         self.contrastive_fgbg_loss_weight * contrastive_fgbg_loss_t
+                # No regularization losses - importance map uses raw attention
+                loss_t = depth_loss_t
 
             # Safety check: skip if loss is NaN or too large
             if torch.isnan(loss_t) or torch.isinf(loss_t):
@@ -1104,21 +1136,15 @@ class Gear3Trainer:
 
             total_loss += loss_t
             total_depth_loss += depth_loss_t
-            total_bimodal_loss += bimodal_loss_t
-            total_edge_aware_loss += edge_aware_loss_t
-            total_contrastive_fgbg_loss += contrastive_fgbg_loss_t
             valid_frames += 1
 
         # Average loss over valid frames
         if valid_frames == 0:
             self.logger.error("No valid frames in batch!")
-            return {'loss': 0.0, 'depth_loss': 0.0, 'bimodal_loss': 0.0, 'edge_aware_loss': 0.0, 'contrastive_fgbg_loss': 0.0}
+            return {'loss': 0.0, 'depth_loss': 0.0}
 
         loss = total_loss / valid_frames
         avg_depth_loss = total_depth_loss / valid_frames
-        avg_bimodal_loss = total_bimodal_loss / valid_frames
-        avg_edge_aware_loss = total_edge_aware_loss / valid_frames
-        avg_contrastive_fgbg_loss = total_contrastive_fgbg_loss / valid_frames
 
         # Backward pass (outside autocast for numerical stability)
         self.optimizer.zero_grad()
@@ -1129,10 +1155,7 @@ class Gear3Trainer:
 
         return {
             'loss': loss.item(),
-            'depth_loss': avg_depth_loss.item(),
-            'bimodal_loss': avg_bimodal_loss.item() if self.use_bimodal_loss else 0.0,
-            'edge_aware_loss': avg_edge_aware_loss.item() if self.use_edge_aware_loss else 0.0,
-            'contrastive_fgbg_loss': avg_contrastive_fgbg_loss.item() if self.use_contrastive_fgbg_loss else 0.0
+            'depth_loss': avg_depth_loss.item()
         }
 
     @torch.no_grad()
@@ -1148,7 +1171,14 @@ class Gear3Trainer:
 
         total_loss = 0
         num_batches = 0
-        saved_datasets = set()  # Track which datasets we've visualized
+
+        # Reset visualization tracking for this validation run
+        # This ensures we save visualizations at EVERY validation step
+        for dataset_name in self.val_vis_config:
+            self.val_vis_config[dataset_name]['saved'] = []
+
+        # Track dataset-specific sequence counters for visualization
+        dataset_sequence_counters = {'sintel': 0, 'waymo': 0}
 
         for batch_idx, batch in enumerate(tqdm(self.val_loader, desc="Validation", disable=(self.rank != 0))):
             # Skip None batches (all items were invalid)
@@ -1235,56 +1265,71 @@ class Gear3Trainer:
                     else:
                         current_dataset = str(dataset_idx)
 
-                    # Save visualization for first occurrence of each dataset (rank 0 only)
-                    if t == 0 and current_dataset not in saved_datasets and self.visualizer and self.rank == 0:
-                        try:
-                            # Convert to metric depth for visualization: 100/m -> m
-                            # Convert to Float32 for CPU operations
-                            pred_depth_metric = (100.0 / (pred_depth_inverse.float() + 1e-8)).cpu()
-                            gt_depth_metric = (100.0 / (gt_t_inverse.float() + 1e-8)).cpu()
+                    # Validation visualization: save multiple sequences per dataset (rank 0 only)
+                    # Sintel: 3 samples (sequence 0, 5, 10)
+                    # Waymo: 8 samples (sequence 0, 5, 10, 15, 20, 25, 30, 35)
+                    if t == 0 and self.val_visualizer and self.rank == 0:
+                        # Check if this dataset is in our visualization config
+                        if current_dataset in self.val_vis_config:
+                            config = self.val_vis_config[current_dataset]
+                            seq_num = dataset_sequence_counters[current_dataset]
 
-                            # Get GT resolution for visualization
-                            gt_h, gt_w = gt_t_inverse.shape[-2:]
-
-                            # Resize importance map to GT resolution
-                            importance_map_resized = F.interpolate(
-                                importance_map, size=(gt_h, gt_w), mode='bilinear', align_corners=True
+                            # Check if we should save this sequence
+                            # Save at intervals: 0, interval, 2*interval, ... until count is reached
+                            should_save = (
+                                len(config['saved']) < config['count'] and
+                                seq_num % config['interval'] == 0
                             )
 
-                            # Resize images to GT resolution (for visualization consistency)
-                            img_t_resized = F.interpolate(
-                                img_t, size=(gt_h, gt_w), mode='bilinear', align_corners=True
-                            )
+                            if should_save:
+                                try:
+                                    # Convert to metric depth for visualization: 100/m -> m
+                                    # Convert to Float32 for CPU operations
+                                    pred_depth_metric = (100.0 / (pred_depth_inverse.float() + 1e-8)).cpu()
+                                    gt_depth_metric = (100.0 / (gt_t_inverse.float() + 1e-8)).cpu()
 
-                            model_outputs = {
-                                'pred_depth': pred_depth_metric,  # [B, 1, gt_h, gt_w] at GT resolution
-                                'importance_map': importance_map_resized.float().cpu()  # [B, 1, gt_h, gt_w]
-                            }
+                                    # Get GT resolution for visualization
+                                    gt_h, gt_w = gt_t_inverse.shape[-2:]
 
-                            # For visualization, we need [B, T, ...] format like training
-                            # But we only have one frame (t=0), so unsqueeze T dimension
-                            sample_batch = (
-                                img_t_resized.unsqueeze(1).float().cpu(),  # [B, 1, C, gt_h, gt_w] at GT resolution
-                                gt_depth_metric.unsqueeze(1),  # [B, 1, gt_h, gt_w]
-                                dataset_idx
-                            )
-                            
-                            # Get FPS for visualization
-                            current_fps = None
-                            if self.measure_fps and len(self.fps_buffer) > 0:
-                                current_fps = sum(self.fps_buffer[-20:]) / min(len(self.fps_buffer), 20)
+                                    # Resize importance map to GT resolution
+                                    importance_map_resized = F.interpolate(
+                                        importance_map, size=(gt_h, gt_w), mode='bilinear', align_corners=True
+                                    )
 
-                            # Save with dataset-specific name
-                            save_name = f"validation_{current_dataset}_step_{self.global_step:06d}"
-                            self.visualizer.create_validation_summary(
-                                sample_batch, model_outputs, self.global_step,
-                                save_name=save_name, fps=current_fps
-                            )
-                            saved_datasets.add(current_dataset)
-                            self.logger.info(f"Saved validation visualization for dataset: {current_dataset}")
-                        except Exception as e:
-                            if self.rank == 0:
-                                self.logger.warning(f"Failed to save validation visualization for {current_dataset}: {e}")
+                                    # Resize images to GT resolution (for visualization consistency)
+                                    img_t_resized = F.interpolate(
+                                        img_t, size=(gt_h, gt_w), mode='bilinear', align_corners=True
+                                    )
+
+                                    model_outputs = {
+                                        'pred_depth': pred_depth_metric,  # [B, 1, gt_h, gt_w] at GT resolution
+                                        'importance_map': importance_map_resized.float().cpu()  # [B, 1, gt_h, gt_w]
+                                    }
+
+                                    # For visualization, we need [B, T, ...] format like training
+                                    # But we only have one frame (t=0), so unsqueeze T dimension
+                                    sample_batch = (
+                                        img_t_resized.unsqueeze(1).float().cpu(),  # [B, 1, C, gt_h, gt_w] at GT resolution
+                                        gt_depth_metric.unsqueeze(1),  # [B, 1, gt_h, gt_w]
+                                        dataset_idx
+                                    )
+
+                                    # Get FPS for visualization
+                                    current_fps = None
+                                    if self.measure_fps and len(self.fps_buffer) > 0:
+                                        current_fps = sum(self.fps_buffer[-20:]) / min(len(self.fps_buffer), 20)
+
+                                    # Save with dataset and sequence-specific name
+                                    save_name = f"validation_{current_dataset}_seq{seq_num:03d}_step_{self.global_step:06d}"
+                                    self.val_visualizer.create_validation_summary(
+                                        sample_batch, model_outputs, self.global_step,
+                                        save_name=save_name, fps=current_fps
+                                    )
+                                    config['saved'].append(seq_num)
+                                    self.logger.info(f"Saved validation visualization: {current_dataset} sequence {seq_num} ({len(config['saved'])}/{config['count']})")
+                                except Exception as e:
+                                    if self.rank == 0:
+                                        self.logger.warning(f"Failed to save validation visualization for {current_dataset} seq {seq_num}: {e}")
 
                     # Clear intermediate tensors to free memory after each frame
                     del encoder_features, attention_weights, patch_tokens, dpt_features
@@ -1297,6 +1342,10 @@ class Gear3Trainer:
                     avg_loss = sum(frame_losses) / len(frame_losses)
                     total_loss += avg_loss.item()
                     num_batches += 1
+
+            # Increment sequence counter for this dataset
+            if current_dataset in dataset_sequence_counters:
+                dataset_sequence_counters[current_dataset] += 1
 
             # Clear batch memory
             del images, gt_depth, gt_depth_inverse
