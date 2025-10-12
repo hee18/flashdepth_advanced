@@ -57,6 +57,8 @@ Gear3는 FlashDepth에 **Feature-level Metric Injection**을 적용하여 metric
 
 ### 1. FiLM-style Feature Modulation
 
+**현재 구현**: DPT의 **path_1만 modulate** (모든 layers fused)
+
 ```python
 # Spatial-adaptive modulation
 gamma[x,y] = importance[x,y] × γ_fg + (1 - importance[x,y]) × γ_bg
@@ -64,27 +66,50 @@ beta[x,y] = importance[x,y] × β_fg + (1 - importance[x,y]) × β_bg
 modulated_feature[x,y] = gamma[x,y] ⊙ feature[x,y] + beta[x,y]
 ```
 
+**왜 path_1만?**
+- **path_1 = ALL layers fused** (Layer 23+17+11+4) → 가장 완전한 feature
+  - Layer 23: High-level semantic (deepest)
+  - Layer 17, 11: Mid-level features
+  - Layer 4: Low-level spatial details
+- **path_4, 3, 2**: Incomplete fusion (Layer 23만 또는 일부만 포함)
+- **Modulation은 완전한 representation 필요** → path_1이 최적
+
 ### 2. Attention-based Importance Map (학습 불필요!)
 
 **핵심 변경**: ImportancePredictor 제거, **DINOv2 attention weights를 직접 importance map으로 사용**
 
 ```python
-# gear3_modules.py - Gear3MetricHead
-def forward(self, patch_tokens, attention_weights, dpt_features, patch_h, patch_w):
-    # CLS→patch attention (semantic importance)
+# gear3_modules.py - process_attention_to_importance()
+def process_attention_to_importance(attention_weights, patch_h, patch_w):
+    # 1. CLS→patch attention (semantic importance)
     cls_to_patch = attention_weights[:, :, 0, 1:]  # [B, num_heads, num_patches]
 
-    # Average over heads and reshape to spatial map
-    importance_map = cls_to_patch.mean(dim=1)  # [B, num_patches]
-    importance_map = importance_map.view(B, 1, patch_h, patch_w)  # [B, 1, H, W]
+    # 2. Average over heads
+    attn_scores = cls_to_patch.mean(dim=1)  # [B, num_patches]
+    attn_map = attn_scores.reshape(B, 1, patch_h, patch_w)
 
-    # No learning needed - raw attention already provides semantic importance!
-    return modulated_features, importance_map
+    # 3. Remove register token (highest attention patch)
+    # DINOv2 has 1 register patch with extreme attention - remove via 3×3 inpainting
+    max_val = attn_map.max()
+    outlier_mask = (attn_map == max_val)
+    attn_smoothed = F.conv2d(attn_map, kernel_3x3, padding=1)  # Local average
+    attn_map = torch.where(outlier_mask, attn_smoothed, attn_map)
+
+    # 4. Percentile normalization (1-99) to [0, 1]
+    # More robust than min-max: reduces sensitivity to outliers
+    attn_p1 = torch.quantile(attn_map, 0.01)
+    attn_p99 = torch.quantile(attn_map, 0.99)
+    importance_map = (attn_map - attn_p1) / (attn_p99 - attn_p1 + 1e-8)
+    importance_map = torch.clamp(importance_map, 0.0, 1.0)
+
+    return importance_map  # [B, 1, H, W], range [0, 1]
 ```
 
 **장점**:
 - ❌ **ImportancePredictor 제거**: ~1.2M params 절약
 - ✅ **DINOv2의 검증된 semantic attention 활용**: 추가 학습 불필요
+- ✅ **Register token 제거**: Outlier 영향 최소화 (3×3 local inpainting)
+- ✅ **Percentile normalization**: Min-max보다 robust (1-99 percentile)
 - ✅ **Gradient flow 자동 보장**: No zero init tricks needed
 - ✅ **메모리 효율**: Last block만 저장 (~11GB 절약)
 
@@ -137,33 +162,42 @@ importance_map = importance_map.view(B, 1, patch_h, patch_w)  # [B, 1, H, W]
 
 **Option 3: Attention-based Pooling** (현재 사용):
 ```python
-def forward(self, patch_tokens, attention_weights):
-    # Extract CLS→patch attention (semantic importance)
-    cls_to_patch_attn = attention_weights[:, :, 0, 1:]  # [B, num_heads, num_patches]
-    attn_scores = cls_to_patch_attn.mean(dim=1)  # [B, num_patches]
+def forward(self, patch_tokens, attention_weights, importance_map):
+    # Use PROCESSED importance map (register removed, normalized)
+    attn_scores = importance_map.flatten(2).squeeze(1)  # [B, num_patches]
 
-    # Split by median: top 50% = FG, bottom 50% = BG
-    median = attn_scores.median(dim=1, keepdim=True).values
-    fg_mask = (attn_scores > median).float()
-    bg_mask = (attn_scores <= median).float()
+    # Split by MEAN (adaptive, not fixed 50:50)
+    # Register patches already removed, so mean is not distorted by outliers
+    attn_mean = attn_scores.mean(dim=1, keepdim=True)  # [B, 1]
+    fg_mask = (attn_scores > attn_mean).float()  # Adaptive split
+    bg_mask = (attn_scores <= attn_mean).float()
 
     # Attention-weighted pooling
-    fg_weights = attn_scores * fg_mask
-    bg_weights = (1.0 - attn_scores) * bg_mask
+    fg_weights = attn_scores * fg_mask  # [B, num_patches]
+    bg_weights = (1.0 - attn_scores) * bg_mask  # Inverse for BG
+
+    # Normalize weights and weighted sum
+    fg_weights = fg_weights / (fg_weights.sum(dim=1, keepdim=True) + 1e-8)
+    bg_weights = bg_weights / (bg_weights.sum(dim=1, keepdim=True) + 1e-8)
     fg_pooled = (patch_tokens * fg_weights.unsqueeze(-1)).sum(dim=1)  # [B, 1024]
     bg_pooled = (patch_tokens * bg_weights.unsqueeze(-1)).sum(dim=1)  # [B, 1024]
 
-    # Pass through separate networks
+    # Pass through separate networks (1024 → 512 → 256)
     fg_features = self.fg_net(fg_pooled)  # [B, 256]
     bg_features = self.bg_net(bg_pooled)  # [B, 256]
     return fg_features, bg_features
 ```
 
 **핵심**:
+- **Mean 기준 분리** (adaptive): Register token 제거 후 mean 계산 → Outlier 영향 없음
 - **DINOv2의 검증된 semantic attention 활용** (frozen but powerful)
 - Top attention patches → FG (semantic objects)
 - Bottom attention patches → BG (context)
-- **FG ≠ BG 자동 보장** → Importance map gradient flow 가능
+- **FG ≠ BG 자동 보장**: Disjoint masks로 이미 완전 분리됨
+- **2-stage MLP (1024→512→256)**: 표현력 향상 (단순 1024→256보다 복잡한 transformation 가능)
+  - More non-linearity (intermediate ReLU)
+  - Gradual compression (정보 손실 최소화)
+  - Better gradient flow
 
 ### 차원 흐름도 (Complete Forward Pass)
 
@@ -199,16 +233,24 @@ Encoder Output (24 layers):
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-3. DPT FEATURE EXTRACTION (Frozen)
+3. DPT FEATURE EXTRACTION (Frozen) - Progressive Fusion
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-DPT Head processes 4 intermediate layers:
+DPT Head processes 4 intermediate layers with progressive fusion:
 
-  Path 4 (from Layer 4):        [B, 256, 37, 37]  ← Will be modulated
-  Path 3 (from Layer 11):       [B, 256, 37, 37]  ← Will be modulated
-  Path 2 (from Layer 17):       [B, 256, 37, 37]  ← Will be modulated
-  Path 1 (from Layer 23):       [B, 256, 37, 37]  ← Will be modulated 
+  Encoder Features:
+    Layer 4, 11, 17, 23 → [B, 1024, 37, 37] each
+    ↓
+  Projects + Resize → layer_1_rn, layer_2_rn, layer_3_rn, layer_4_rn
 
-  dpt_features = [path_4, path_3, path_2, path_1] 
+  Progressive Fusion (Deep → Shallow):
+    path_4 = refinenet4(layer_4_rn)                    [B, 256, 37, 37]  ← Layer 23 ONLY
+    path_3 = refinenet3(path_4, layer_3_rn)            [B, 256, 37, 37]  ← Layer 23 + 17
+    path_2 = refinenet2(path_3, layer_2_rn)            [B, 256, 37, 37]  ← Layer 23 + 17 + 11
+    path_1 = refinenet1(path_2, layer_1_rn)            [B, 256, 37, 37]  ← Layer 23 + 17 + 11 + 4 (ALL FUSED) ⭐
+
+  dpt_features = [path_4, path_3, path_2, path_1]
+
+  **Gear3 modulates path_1** (가장 완전한 multi-scale feature) 
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -233,52 +275,65 @@ ForegroundBackgroundNetworks (Option 3: Attention-based Pooling):
 
   Input:
     patch_tokens:               [B, 1369, 1024]
-    attention_weights:          [B, 16, 1369]  ← CLS→patch attention
+    importance_map:             [B, 1, 37, 37]  ← Processed attention (register removed)
 
-  Average over heads:           [B, 1369]  ← attn_scores
+  Flatten importance map:       [B, 1369]  ← attn_scores
 
-  Median split (binary masks):
-    fg_mask (top 50%):          [B, 1369]  ← Binary: 1 if attn > median, 0 otherwise (~685 ones)
-    bg_mask (bottom 50%):       [B, 1369]  ← Binary: 1 if attn ≤ median, 0 otherwise (~684 ones)
+  MEAN split (adaptive, not fixed 50:50):
+    attn_mean:                  [B, 1]  ← Adaptive threshold (register already removed)
+    fg_mask:                    [B, 1369]  ← Binary: 1 if attn > mean, 0 otherwise
+    bg_mask:                    [B, 1369]  ← Binary: 1 if attn ≤ mean, 0 otherwise
 
   Weighted pooling:
-    fg_pooled:                  [B, 1024]  ← Sum over FG patches only (masked sum)
-    bg_pooled:                  [B, 1024]  ← Sum over BG patches only (masked sum)
+    fg_weights:                 [B, 1369]  ← Normalized attention weights for FG
+    bg_weights:                 [B, 1369]  ← Normalized inverse weights for BG
+    fg_pooled:                  [B, 1024]  ← Weighted sum over FG patches
+    bg_pooled:                  [B, 1024]  ← Weighted sum over BG patches
 
-  FG Network (MLP):
+  FG Network (2-stage MLP, 1024→512→256):
     fg_pooled → Linear(1024→512) → ReLU → Linear(512→256) → ReLU
-    fg_features:                [B, 256]   ← FG semantic features
+    fg_features:                [B, 256]   ← FG semantic embedding
 
-  BG Network (MLP):
+  BG Network (2-stage MLP, 1024→512→256):
     bg_pooled → Linear(1024→512) → ReLU → Linear(512→256) → ReLU
-    bg_features:                [B, 256]   ← BG context features
+    bg_features:                [B, 256]   ← BG context embedding
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 6. GEAR3 HEAD - Modulation Parameters (Trainable)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-ModulationNetworks (for each DPT layer, layer_idx ∈ {0,1,2,3}):
+ModulationNetworks (ONLY for path_1, Layer 23 features):
 
   Input:
-    fg_features:                [B, 256]
-    bg_features:                [B, 256]
+    fg_features:                [B, 256]  ← From FG semantic embedding
+    bg_features:                [B, 256]  ← From BG context embedding
 
-  FG Modulation Network:
+  FG Modulation Network (256→512→512, then split):
     fg_features → Linear(256→512) → ReLU → Linear(512→512)
     fg_params:                  [B, 512]
     Split:
-      fg_gamma:                 [B, 256]  ← First half
-      fg_beta:                  [B, 256]  ← Second half
+      fg_gamma:                 [B, 256]  ← First half (scale)
+      fg_beta:                  [B, 256]  ← Second half (shift)
 
-  BG Modulation Network:
+  BG Modulation Network (256→512→512, then split):
     bg_features → Linear(256→512) → ReLU → Linear(512→512)
     bg_params:                  [B, 512]
     Split:
-      bg_gamma:                 [B, 256]
-      bg_beta:                  [B, 256]
+      bg_gamma:                 [B, 256]  ← First half (scale)
+      bg_beta:                  [B, 256]  ← Second half (shift)
 
-  Output per layer: (fg_gamma, fg_beta, bg_gamma, bg_beta)
-                    각각 [B, 256]
+  Output: (fg_gamma, fg_beta, bg_gamma, bg_beta) - 각각 [B, 256]
+
+  **왜 2-stage MLP (1024→512→256, 그 다음 256→512→512)?**
+    1. **FG/BG Networks (1024→512→256)**:
+       - Disjoint masks로 이미 완전 분리됨 (embedding 분리는 자동)
+       - 2-stage로 더 복잡한 semantic feature 추출
+       - Gradual compression으로 정보 손실 최소화
+
+    2. **Modulation Networks (256→512→512)**:
+       - 256-dim semantic embedding → 512-dim modulation space (확장)
+       - 모듈화: FG/BG Networks와 독립적으로 학습
+       - Intermediate ReLU로 non-linearity 추가
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -889,11 +944,83 @@ flashdepth_claude/
 
 ---
 
+## DPT 아키텍처 및 Hybrid Fusion 구조
+
+### DPT Path 생성 순서 (Refinement Networks)
+
+DPT는 4개의 encoder layer features를 progressive fusion을 통해 refinement합니다:
+
+```python
+# original_dpt.py - get_forward_features()
+# 1. Encoder features → DPT layers
+layer_4_rn = scratch.layer4_rn(encoder_layer_23)  # From Layer 23
+layer_3_rn = scratch.layer3_rn(encoder_layer_17)  # From Layer 17
+layer_2_rn = scratch.layer2_rn(encoder_layer_11)  # From Layer 11
+layer_1_rn = scratch.layer1_rn(encoder_layer_4)   # From Layer 4
+
+# 2. Progressive fusion (bottom-up)
+path_4 = refinenet4(layer_4_rn)                    # [B, 256, 37, 37]
+path_3 = refinenet3(path_4, layer_3_rn)            # Fuse path_4 + layer_3
+path_2 = refinenet2(path_3, layer_2_rn)            # Fuse path_3 + layer_2
+path_1 = refinenet1(path_2, layer_1_rn)            # Fuse path_2 + layer_1
+```
+
+### Hybrid Fusion: Cross Attention 적용 위치
+
+**Cross Attention은 path_4 생성 이후에 적용됩니다**:
+
+```python
+# original_dpt.py - get_path4() (Cross Attn 전)
+# Layer 17, 23만 사용
+for i in range(2, 4):  # indices 2, 3만
+    x = encoder_features[i]  # Layer 17, 23
+layer_3, layer_4 = out  # Layer 17, 23
+path_4 = refinenet4(layer_4_rn)  # Layer 23 기반 path_4 생성
+
+# model.py - Hybrid fusion
+teacher_path4 = teacher_model.depth_head.get_path4(...)  # Teacher path_4
+student_path4 = depth_head.get_path4(...)                # Student path_4
+fused_path4 = hybrid_fusion(student_path4, teacher_path4)  # ← Cross Attn HERE
+
+# original_dpt.py - forward_with_mamba() (Cross Attn 후)
+# 1. Fused path_4 사용
+path_4 = fused_path4
+
+# 2. Mamba (temporal) - optional
+if 0 in temporal_layer:
+    path_4 = mamba_fn(path_4, in_dpt_layer=0)
+
+# 3. Continue progressive fusion (Layer 11, 4 추가)
+path_3 = refinenet3(path_4, layer_3_rn)  # + Layer 17
+path_2 = refinenet2(path_3, layer_2_rn)  # + Layer 11
+path_1 = refinenet1(path_2, layer_1_rn)  # + Layer 4 = ALL FUSED
+```
+
+**정리**:
+
+| Stage | 작업 | Input Layers | Cross Attention | Mamba | Gear3 Modulation |
+|-------|-----|-------------|----------------|-------|------------------|
+| **Path 4** | refinenet4(layer_4_rn) → path_4 | Layer 23 ONLY | ✅ **After** (hybrid only) | ✅ After | ❌ |
+| **Path 3** | refinenet3(path_4 + layer_3_rn) → path_3 | Layer 23 + 17 | ❌ | ✅ After | ❌ |
+| **Path 2** | refinenet2(path_3 + layer_2_rn) → path_2 | Layer 23 + 17 + 11 | ❌ | ✅ After | ❌ |
+| **Path 1** | refinenet1(path_2 + layer_1_rn) → path_1 | Layer 23 + 17 + 11 + 4 | ❌ | ✅ After | ✅ **ONLY HERE** |
+
+**핵심**:
+- **refinenet**: Feature Fusion Block (add + conv), NOT Cross Attention
+- **Cross Attention (fuse_fn)**:
+  - **Before**: `get_path4()` - Layer 17, 23만 사용 → path_4 생성
+  - **After**: `forward_with_mamba()` - Fused path_4 + Layer 11, 4 → path_3,2,1 생성
+- **Mamba**: 각 path 생성 **이후** 선택적 적용 (temporal modeling)
+- **Gear3 Modulation**: **path_1에만 적용** (ALL layers fused, 가장 완전한 multi-scale feature)
+
+---
+
 ## 참고 문헌
 
 1. **FiLM (2018)**: "FiLM: Visual Reasoning with a General Conditioning Layer"
 2. **FlashDepth (2024)**: DINOv2 + DPT + Mamba 기반 아키텍처
-3. **PyTorch DDP**: Distributed Data Parallel 공식 문서
+3. **DPT (2021)**: "Vision Transformers for Dense Prediction" - Refinement networks
+4. **PyTorch DDP**: Distributed Data Parallel 공식 문서
 
 ---
 
@@ -902,25 +1029,36 @@ flashdepth_claude/
 ### 최종 아키텍처 (2025-10-13)
 
 ```
-DINOv2 (frozen) → Attention → Raw Importance Map (no learning!)
+DINOv2 (frozen) → Layer 4, 11, 17, 23
+                           ↓
+              DPT Progressive Fusion (frozen):
+                path_4 = Layer 23 ONLY
+                path_3 = Layer 23 + 17
+                path_2 = Layer 23 + 17 + 11
+                path_1 = Layer 23 + 17 + 11 + 4 (ALL FUSED) ⭐
+                           ↓
+              Last Block Attention → Raw Importance Map (no learning!)
                            ↓
                    FG/BG Networks (trainable)
+                   - Disjoint masks로 FG/BG 분리
+                   - 2-stage MLP: 1024→512→256
                            ↓
                Modulation Networks (trainable)
+                   - 256→512→512 (split to gamma/beta)
                            ↓
-         DPT Features → Feature Modulator
+         path_1 ONLY → Feature Modulator (FiLM)
                            ↓
-           Mamba (trainable) + DPT Refinement (frozen)
+           Mamba (trainable) + output_conv1/2 (trainable)
                            ↓
-                output_conv1/2 (trainable)
-                           ↓
-              Inverse Depth (100/m scale)
+              Inverse Depth (100/m scale, no canonicalization)
 ```
 
 **핵심**:
-- ✅ **Importance map = Raw attention** (학습 불필요)
+- ✅ **path_1만 modulate** (ALL layers fused, 가장 완전한 multi-scale feature)
+- ✅ **Importance map = Raw attention** (학습 불필요, register token 제거)
+- ✅ **FG/BG 분리 = Disjoint masks** (mean 기준, adaptive)
+- ✅ **2-stage MLP**: 표현력 향상 (1024→512→256→512)
 - ✅ **Depth loss만 사용** (regularization 제거)
-- ✅ **Canonicalization 제거** (raw inverse depth)
 - ✅ **학습 파라미터: 9.2M / 329M (2.81%)**
 
 ---
