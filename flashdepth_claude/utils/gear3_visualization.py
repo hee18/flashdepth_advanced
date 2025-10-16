@@ -243,7 +243,13 @@ class Gear3Visualizer:
 
             # Show loss values if available
             if loss_dict is not None:
-                # Depth loss (always present)
+                # Validation loss (for validation visualization)
+                if 'val_loss' in loss_dict:
+                    ax8.text(0.1, y_pos, f'Val Loss: {loss_dict["val_loss"]:.4f}', fontsize=11,
+                            transform=ax8.transAxes, bbox=dict(boxstyle="round", facecolor='lightcoral'))
+                    y_pos -= 0.10
+
+                # Depth loss (for training visualization)
                 if 'depth_loss' in loss_dict:
                     ax8.text(0.1, y_pos, f'Log L1 Loss: {loss_dict["depth_loss"]:.4f}', fontsize=11,
                             transform=ax8.transAxes, bbox=dict(boxstyle="round", facecolor='lightcoral'))

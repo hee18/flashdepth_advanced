@@ -87,7 +87,7 @@ eval:
   test_dataset_resolution: 'base'
   random_input: null
   out_video: true  # Enable video/GIF saving
-  out_mp4: true    # false=GIF, true=MP4
+  out_mp4: false   # false=GIF, true=MP4 (MP4 encoder not available, use GIF)
   save_res: 518    # Video height (original resolution, matches test resolution)
   video_fps: 24    # Frames per second for MP4 (FlashDepth default)
   gif_duration: 110  # Duration per frame in milliseconds for GIF

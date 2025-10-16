@@ -461,16 +461,38 @@ def save_grid_to_mp4(video_frames, gt_frames, pred_frames, output_path, fixed_he
     # Calculate total width needed
     total_width = sum(img.width for img in frame_images) + spacing * (len(frame_images) - 1)
     
-    # Initialize video writer
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    video_writer = cv2.VideoWriter(output_path, fourcc, fps, (total_width, fixed_height))
+    # Initialize video writer with H.264 codec (more compatible than mp4v)
+    # Try multiple codec options for better compatibility
+    fourcc_options = [
+        cv2.VideoWriter_fourcc(*'avc1'),  # H.264 (most compatible)
+        cv2.VideoWriter_fourcc(*'H264'),  # H.264 alternative
+        cv2.VideoWriter_fourcc(*'X264'),  # x264 encoder
+        cv2.VideoWriter_fourcc(*'mp4v'),  # MPEG-4 fallback
+    ]
+    
+    video_writer = None
+    for fourcc in fourcc_options:
+        video_writer = cv2.VideoWriter(output_path, fourcc, fps, (total_width, fixed_height))
+        if video_writer.isOpened():
+            break
+    
+    if video_writer is None or not video_writer.isOpened():
+        raise RuntimeError(f"Failed to create video writer for {output_path}")
     
     # Create a second video writer for predictions-only
     pred_output_path = output_path.rsplit('.', 1)[0] + '_pred.mp4'
     pred_img = Image.fromarray(pred_frames[0])
     aspect_ratio = pred_img.width / pred_img.height
     pred_width = int(fixed_height * aspect_ratio)
-    pred_writer = cv2.VideoWriter(pred_output_path, fourcc, fps, (pred_width, fixed_height))
+    
+    pred_writer = None
+    for fourcc in fourcc_options:
+        pred_writer = cv2.VideoWriter(pred_output_path, fourcc, fps, (pred_width, fixed_height))
+        if pred_writer.isOpened():
+            break
+    
+    if pred_writer is None or not pred_writer.isOpened():
+        raise RuntimeError(f"Failed to create video writer for {pred_output_path}")
     
     # Process all frames
     for i in range(n_frames):

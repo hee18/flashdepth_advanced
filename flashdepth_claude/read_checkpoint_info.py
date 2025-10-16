@@ -35,6 +35,7 @@ def read_checkpoint_step(checkpoint_path):
         'best_step': checkpoint.get('best_step', 'Unknown'),
         'epoch': checkpoint.get('epoch', 'Unknown'),
         'best_val_loss': checkpoint.get('best_val_loss', 'Unknown'),
+        'current_val_loss': checkpoint.get('val_loss', checkpoint.get('current_val_loss', 'Unknown')),
         'phase': checkpoint.get('phase', 'Unknown'),
     }
 
@@ -63,6 +64,7 @@ def main():
         print(f"Checkpoint: {info['checkpoint_path']}")
         print(f"{'='*60}")
         print(f"Current Step: {info['step']}")
+        print(f"Current Val Loss: {info['current_val_loss']}")
         print(f"Best Step: {info['best_step']}")
         print(f"Best Val Loss: {info['best_val_loss']}")
         print(f"Phase: {info['phase']}")

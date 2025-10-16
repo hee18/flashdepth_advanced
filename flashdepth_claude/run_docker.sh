@@ -49,6 +49,7 @@ show_usage() {
     echo "  --gsp-checkpoint PATH Set GSP module weights path"
     echo "  --frame-interval NUM  Set frame interval for sequence visualization (default: 1)"
     echo "  --vid-len NUM         Set video sequence length for testing (default: 50)"
+    echo "  --single-sequence PATH Test on a single sequence directory (e.g., /path/to/dynamicreplica/seq)"
     echo "  --depth-variance-loss BOOL [DEPRECATED] Enable/disable depth variance loss (default: false)"
     echo "  --depth-variance-weight NUM [DEPRECATED] Set depth variance loss weight (default: 0.5)"
     echo "  --variance-kernel-size NUM [DEPRECATED] Set variance kernel size (default: 15)"
@@ -70,6 +71,7 @@ show_usage() {
     echo "  $0 train_gear3 --batch-size 8 --gpu 1 # Train Gear3 with custom settings"
     echo "  $0 test_gear3                         # Start Gear3 testing with defaults"
     echo "  $0 test_gear3 --vid-len 25 --gpu 1    # Test Gear3 with custom settings"
+    echo "  $0 test_gear3 --single-sequence /data/datasets/dynamicreplica/train/0b10c6-3_obj_source_left  # Test single sequence"
     echo "  $0 train --results-dir train_results/results_2  # Custom results directory"
     echo "  $0 shell                              # Interactive development"
 }
@@ -81,10 +83,11 @@ WORKERS=8      # Optimized for 96 CPU cores, prevents I/O bottleneck
 TOTAL_ITERS=60001
 GPU_ID=0
 RESULTS_DIR="train_results/results_1"
-FLASHDEPTH_CHECKPOINT="configs/flashdepth-l/iter_10001.pth"
-GSP_CHECKPOINT="train_results/results_5/best_metric_head_step_21000.pth"
+FLASHDEPTH_CHECKPOINT="train_results/results_13/checkpoint_step40000_phase1.pth"
+GSP_CHECKPOINT="train_results/results_5/best_metric_head_step_21000.pth"  # Only used for old test script
 FRAME_INTERVAL=1
 VID_LEN=50
+SINGLE_SEQUENCE=""  # Path to single sequence directory (optional)
 DEPTH_VARIANCE_LOSS="false"  # Disabled: importance map now uses raw attention (no learnable params)
 DEPTH_VARIANCE_WEIGHT="0.5"  # (Deprecated - importance map frozen)
 VARIANCE_KERNEL_SIZE="15"  # (Deprecated - importance map frozen)
@@ -135,6 +138,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --vid-len)
             VID_LEN="$2"
+            shift 2
+            ;;
+        --single-sequence)
+            SINGLE_SEQUENCE="$2"
             shift 2
             ;;
         --depth-variance-loss)
@@ -331,24 +338,29 @@ case $COMMAND in
         echo "  - Results directory: $RESULTS_DIR"
         echo "  - Video length: $VID_LEN"
         echo "  - Frame interval: $FRAME_INTERVAL"
+        if [ -n "$SINGLE_SEQUENCE" ]; then
+            echo "  - Single sequence: $SINGLE_SEQUENCE"
+        fi
         echo ""
 
-        # Build test_gear3 command
-        TEST_CMD="python test_gear3.py --config-path configs/gear3 +results_dir=$RESULTS_DIR +gpu=$GPU_ID"
+        # Build test_gear3 command (uses single checkpoint with all weights)
+        TEST_CMD="python test_gear3.py --config-path configs/gear3 dataset.data_root=/data/datasets +results_dir=$RESULTS_DIR +gpu=$GPU_ID"
 
+        # Use --checkpoint option for the unified checkpoint
         if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
-            TEST_CMD="$TEST_CMD +flashdepth_checkpoint=$FLASHDEPTH_CHECKPOINT"
-        fi
-
-        if [ -n "$GSP_CHECKPOINT" ]; then
-            TEST_CMD="$TEST_CMD +gsp_checkpoint=$GSP_CHECKPOINT"
+            TEST_CMD="$TEST_CMD load=$FLASHDEPTH_CHECKPOINT"
         fi
 
         # Add frame interval and video length options
         TEST_CMD="$TEST_CMD +frame_interval=$FRAME_INTERVAL +vid_len=$VID_LEN"
 
-        # Run test_gear3.py with custom parameters
-        docker compose run --rm flashdepth $TEST_CMD
+        # Add single sequence path if specified
+        if [ -n "$SINGLE_SEQUENCE" ]; then
+            TEST_CMD="$TEST_CMD +single_sequence=$SINGLE_SEQUENCE"
+        fi
+
+        # Run test_gear3.py with custom parameters (with GPU selection)
+        CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm flashdepth $TEST_CMD
         ;;
 
     shell)

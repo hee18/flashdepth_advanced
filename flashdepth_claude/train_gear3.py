@@ -519,6 +519,7 @@ class Gear3Trainer:
         self.global_step = 0
         self.best_val_loss = float('inf')
         self.best_step = 0  # Track which step achieved best validation loss
+        self.current_val_loss = None  # Track current validation loss for checkpoint
 
         # Validation visualization config: track which sequences to visualize
         self.val_vis_config = {
@@ -986,6 +987,9 @@ class Gear3Trainer:
                 val_metrics = self.validate()
                 self.logger.info(f"Validation at step {step}: {val_metrics}")
 
+                # Update current validation loss for checkpoint
+                self.current_val_loss = val_metrics['loss']
+
                 if self.config.training.get('wandb', False):
                     wandb.log({f'val/{k}': v for k, v in val_metrics.items()}, step=step)
 
@@ -1276,9 +1280,12 @@ class Gear3Trainer:
 
                             # Check if we should save this sequence
                             # Save at intervals: 0, interval, 2*interval, ... until count is reached
+                            # seq_num % interval == 0 gives us sequences 0, 5, 10, 15, 20, ...
+                            # We only save if this seq_num hasn't been saved yet in THIS validation run
                             should_save = (
-                                len(config['saved']) < config['count'] and
-                                seq_num % config['interval'] == 0
+                                seq_num % config['interval'] == 0 and
+                                seq_num not in config['saved'] and
+                                len(config['saved']) < config['count']
                             )
 
                             if should_save:
@@ -1319,11 +1326,16 @@ class Gear3Trainer:
                                     if self.measure_fps and len(self.fps_buffer) > 0:
                                         current_fps = sum(self.fps_buffer[-20:]) / min(len(self.fps_buffer), 20)
 
+                                    # Create loss_dict with current frame loss (for visualization)
+                                    val_loss_dict = {
+                                        'val_loss': loss_t.item() if len(frame_losses) > 0 else 0.0
+                                    }
+
                                     # Save with dataset and sequence-specific name
                                     save_name = f"validation_{current_dataset}_seq{seq_num:03d}_step_{self.global_step:06d}"
                                     self.val_visualizer.create_validation_summary(
                                         sample_batch, model_outputs, self.global_step,
-                                        save_name=save_name, fps=current_fps
+                                        save_name=save_name, fps=current_fps, loss_dict=val_loss_dict
                                     )
                                     config['saved'].append(seq_num)
                                     self.logger.info(f"Saved validation visualization: {current_dataset} sequence {seq_num} ({len(config['saved'])}/{config['count']})")
@@ -1377,6 +1389,7 @@ class Gear3Trainer:
             'scheduler': self.scheduler.state_dict(),
             'best_val_loss': self.best_val_loss,
             'best_step': self.best_step,  # Save which step was best
+            'current_val_loss': self.current_val_loss,  # Save current validation loss
             'config': OmegaConf.to_container(self.config, resolve=True),
             'phase': self.phase
         }
