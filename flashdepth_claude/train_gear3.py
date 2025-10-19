@@ -1113,10 +1113,10 @@ class Gear3Trainer:
 
                 # Compute loss with valid mask (GT only, like original FlashDepth)
                 # Filter out invalid inverse depths: should be in reasonable range
-                # Max 200m depth = 100/200 = 0.5 in (100/m) inverse depth
-                # So inverse depth should be > 0.5 (i.e., depth < 200m)
-                MIN_INVERSE_DEPTH = 0.5  # 100/200m = 0.5 in 100/m scale (max 200m depth)
-                gt_valid_mask = (gt_t > MIN_INVERSE_DEPTH)  # Filter out >200m depths and invalid values
+                # Max 70m depth = 100/70 = 1.43 in (100/m) inverse depth
+                # So inverse depth should be > 1.43 (i.e., depth < 70m)
+                MIN_INVERSE_DEPTH = 100.0 / 70.0  # 100/70m = 1.43 in 100/m scale (max 70m depth)
+                gt_valid_mask = (gt_t > MIN_INVERSE_DEPTH)  # Filter out >70m depths and invalid values
                 valid_mask = gt_valid_mask
 
                 if valid_mask.sum() == 0:

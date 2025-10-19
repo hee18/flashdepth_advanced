@@ -454,8 +454,8 @@ class Gear3Tester:
             gt_frame = gt_depth_metric_cpu[t, 0]  # [H, W]
 
             # Create valid mask for this frame (like train_gear3 validation)
-            # Use same MAX_DEPTH as Gear3Visualizer (200m)
-            MAX_DEPTH = 200.0
+            # Use same MAX_DEPTH as Gear3Visualizer (70m)
+            MAX_DEPTH = 70.0
             gt_valid_mask = (gt_frame > 0) & (gt_frame < MAX_DEPTH)  # GT valid pixels
             pred_valid_mask = (pred_frame > 0) & (pred_frame < MAX_DEPTH)  # Filter extreme values
             valid_mask = gt_valid_mask & pred_valid_mask  # [H, W] bool tensor
@@ -490,12 +490,41 @@ class Gear3Tester:
         # Average metrics across frames
         if len(frame_metrics) == 0:
             logger.warning(f"No valid frames for sequence {sequence_id}")
-            return {k: 0.0 for k in ["mae", "rmse", "abs_rel", "a1"]}
+            return {k: 0.0 for k in ["mae", "rmse", "abs_rel", "a1", "tae"]}
 
         metrics = {}
         for key in frame_metrics[0].keys():
             values = [m[key] for m in frame_metrics]
             metrics[key] = np.mean(values)
+
+        # Compute TAE (Temporal Alignment Error) - sequence-level metric
+        # TAE measures frame-to-frame consistency
+        if len(pred_depths) > 1:
+            tae_errors = []
+            for t in range(len(pred_depths) - 1):
+                pred_t = pred_depths_cpu[t, 0]  # [H, W]
+                pred_t_next = pred_depths_cpu[t + 1, 0]  # [H, W]
+                gt_t = gt_depth_metric_cpu[t, 0]  # [H, W]
+                gt_t_next = gt_depth_metric_cpu[t + 1, 0]  # [H, W]
+
+                # Valid mask for both frames
+                MAX_DEPTH = 70.0
+                valid_t = (gt_t > 0) & (gt_t < MAX_DEPTH) & (pred_t > 0) & (pred_t < MAX_DEPTH)
+                valid_t_next = (gt_t_next > 0) & (gt_t_next < MAX_DEPTH) & (pred_t_next > 0) & (pred_t_next < MAX_DEPTH)
+                valid_both = valid_t & valid_t_next  # [H, W]
+
+                if valid_both.sum() > 0:
+                    # Compute depth change (temporal derivative)
+                    pred_change = pred_t_next - pred_t  # [H, W]
+                    gt_change = gt_t_next - gt_t  # [H, W]
+
+                    # TAE: mean absolute error in temporal change
+                    tae = torch.abs(pred_change[valid_both] - gt_change[valid_both]).mean()
+                    tae_errors.append(tae.item())
+
+            metrics['tae'] = np.mean(tae_errors) if len(tae_errors) > 0 else 0.0
+        else:
+            metrics['tae'] = 0.0
 
         # Recreate valid_mask on GPU for visualization
         valid_mask = (gt_depth_metric > 0)  # [T, 1, H, W] on GPU
@@ -591,9 +620,14 @@ class Gear3Tester:
             axes[2, col].set_title(f'GT (m)')
             axes[2, col].axis('off')
 
-            # Row 3: Importance map (matches train_gear3.py visualization)
-            importance = importance_maps[t, 0].cpu().numpy()
-            axes[3, col].imshow(importance, cmap='jet', vmin=0, vmax=1)
+            # Row 3: Importance map (upsampled to image resolution for smooth visualization)
+            importance_patch = importance_maps[t]  # [1, patch_h, patch_w]
+            img_h, img_w = images[t].shape[1:]
+            importance_upsampled = F.interpolate(
+                importance_patch.unsqueeze(0), size=(img_h, img_w),
+                mode='bilinear', align_corners=True
+            ).squeeze().cpu().numpy()  # [H, W]
+            axes[3, col].imshow(importance_upsampled, cmap='jet', vmin=0, vmax=1)
             axes[3, col].set_title(f'Importance')
             axes[3, col].axis('off')
 
@@ -602,7 +636,7 @@ class Gear3Tester:
             f"Sequence {sequence_id} | "
             f"TAE: {metrics.get('tae', 0):.4f} | "
             f"AbsRel: {metrics.get('abs_rel', 0):.4f} | "
-            f"δ1: {metrics.get('delta_1', 0):.4f}",
+            f"δ1: {metrics.get('a1', 0):.4f}",
             fontsize=14
         )
 
@@ -696,137 +730,147 @@ class Gear3Tester:
     def _save_best_frame_visualizations(self, image, pred_depth, gt_depth, importance_map,
                                         fg_features, bg_features, sequence_id, frame_idx, abs_rel):
         """
-        Save best frame visualizations following visualize_attention_weights.py style.
-        
-        Creates 6 separate PNG files:
-            1. best_frame_image.png - Original input image
-            2. best_frame_gt.png - Ground truth depth
-            3. best_frame_pred.png - Predicted depth
-            4. best_frame_importance.png - Importance map (colorized)
-            5. best_frame_fg.png - Foreground mask overlay
-            6. best_frame_bg.png - Background mask overlay
-        
+        Save best frame visualization similar to test_metric_head.py
+
+        Creates a single combined visualization PNG file with format:
+            best_frame_seq{N}_{frame_idx}_absrel_{abs_rel:.4f}.png
+
         Args:
             image: [3, H, W] - RGB image
             pred_depth: [H, W] - Predicted metric depth
             gt_depth: [H, W] - Ground truth metric depth
             importance_map: [patch_h, patch_w] - Importance map (0-1 normalized)
-            fg_features: [C, patch_h, patch_w] - Foreground features (not used for mask, just for reference)
-            bg_features: [C, patch_h, patch_w] - Background features (not used for mask, just for reference)
+            fg_features: [C, patch_h, patch_w] - Foreground features (not used)
+            bg_features: [C, patch_h, patch_w] - Background features (not used)
             sequence_id: int - Sequence index
             frame_idx: int - Frame index within sequence
             abs_rel: float - AbsRel metric for this frame
         """
-        # Create output directory for best frames
-        best_frame_dir = self.save_dir / f"seq{sequence_id:04d}_best_frame"
-        best_frame_dir.mkdir(parents=True, exist_ok=True)
-        
         # Convert tensors to numpy and move to CPU
-        image_np = image.permute(1, 2, 0).cpu().numpy()  # [H, W, 3]
-        pred_depth_np = pred_depth.cpu().numpy()  # [H, W]
-        gt_depth_np = gt_depth.cpu().numpy()  # [H, W]
-        importance_map_np = importance_map.cpu().numpy()  # [patch_h, patch_w]
+        if isinstance(image, torch.Tensor):
+            if image.shape[0] == 3:  # [3, H, W]
+                image = image.permute(1, 2, 0)  # [H, W, 3]
+            image = image.float().cpu().numpy()
+
+        if isinstance(pred_depth, torch.Tensor):
+            pred_depth = pred_depth.float().cpu().numpy()
+        if isinstance(gt_depth, torch.Tensor):
+            gt_depth = gt_depth.float().cpu().numpy()
+        if isinstance(importance_map, torch.Tensor):
+            importance_map = importance_map.float().cpu().numpy()
 
         # Denormalize ImageNet normalization for image
         mean = np.array([0.485, 0.456, 0.406])
         std = np.array([0.229, 0.224, 0.225])
-        image_np = image_np * std + mean  # Reverse normalization
+        image_np = image * std + mean  # Reverse normalization
         image_np = np.clip(image_np, 0, 1)  # Clip to valid range
 
         # Get image size
         img_h, img_w = image_np.shape[:2]
 
-        # 1. Save original image
-        img_path = best_frame_dir / "best_frame_image.png"
-        img_uint8 = (image_np * 255).astype(np.uint8)
-        Image.fromarray(img_uint8).save(img_path)
-        logger.info(f"  Saved best frame image: {img_path}")
-        
-        # 2. Save GT depth (colorized)
-        gt_path = best_frame_dir / "best_frame_gt.png"
-        gt_valid = gt_depth_np > 0
+        # Create figure with 5 subplots: Input, GT, Pred, Importance, Metrics
+        fig = plt.figure(figsize=(25, 5))
+        gs = gridspec.GridSpec(1, 10, hspace=0.2, wspace=0.1,
+                              width_ratios=[1, 1, 1, 0.05, 0.1, 1, 0.05, 0.15, 1.2, 0.1])
+
+        # 1. Input Image
+        ax1 = fig.add_subplot(gs[0, 0])
+        ax1.imshow(image_np, aspect='equal')
+        ax1.set_title('Input Image', fontsize=12, fontweight='bold')
+        ax1.axis('off')
+
+        # 2. Ground Truth Depth
+        ax2 = fig.add_subplot(gs[0, 1])
+        gt_valid = gt_depth > 0
+        gt_display = np.where(gt_valid, gt_depth, np.nan)
         if gt_valid.sum() > 0:
-            gt_vmin, gt_vmax = np.percentile(gt_depth_np[gt_valid], [2, 98])
-            gt_display = np.clip((gt_depth_np - gt_vmin) / (gt_vmax - gt_vmin + 1e-8), 0, 1)
-            gt_display[~gt_valid] = 0
+            gt_vmin, gt_vmax = np.nanpercentile(gt_display, [2, 98])
         else:
-            gt_display = np.zeros_like(gt_depth_np)
-        
-        gt_colored = (plt.cm.plasma(gt_display)[:, :, :3] * 255).astype(np.uint8)
-        Image.fromarray(gt_colored).save(gt_path)
-        logger.info(f"  Saved GT depth: {gt_path}")
-        
-        # 3. Save predicted depth (colorized)
-        pred_path = best_frame_dir / "best_frame_pred.png"
-        pred_valid = (pred_depth_np > 0) & (pred_depth_np < 1000)
+            gt_vmin, gt_vmax = 0, 1
+        im2 = ax2.imshow(gt_display, cmap='plasma', vmin=gt_vmin, vmax=gt_vmax, aspect='equal')
+        ax2.set_title('Ground Truth Depth', fontsize=12, fontweight='bold')
+        ax2.axis('off')
+
+        # 3. Predicted Metric Depth
+        ax3 = fig.add_subplot(gs[0, 2])
+        pred_valid = (pred_depth > 0) & (pred_depth < 1000)
+        pred_display = np.where(pred_valid, pred_depth, np.nan)
         if pred_valid.sum() > 0:
-            pred_vmin, pred_vmax = np.percentile(pred_depth_np[pred_valid], [2, 98])
-            pred_display = np.clip((pred_depth_np - pred_vmin) / (pred_vmax - pred_vmin + 1e-8), 0, 1)
-            pred_display[~pred_valid] = 0
+            pred_vmin, pred_vmax = np.nanpercentile(pred_display, [2, 98])
         else:
-            pred_display = np.zeros_like(pred_depth_np)
-        
-        pred_colored = (plt.cm.plasma(pred_display)[:, :, :3] * 255).astype(np.uint8)
-        Image.fromarray(pred_colored).save(pred_path)
-        logger.info(f"  Saved predicted depth: {pred_path}")
-        
-        # 4. Save importance map (colorized, upsampled to image resolution)
-        importance_path = best_frame_dir / "best_frame_importance.png"
+            pred_vmin, pred_vmax = 0, 1
+        im3 = ax3.imshow(pred_display, cmap='plasma', vmin=pred_vmin, vmax=pred_vmax, aspect='equal')
+        ax3.set_title('Predicted Metric Depth', fontsize=12, fontweight='bold')
+        ax3.axis('off')
+
+        # Add depth colorbar
+        cbar_ax_depth = fig.add_subplot(gs[0, 3])
+        depth_vmin = min(gt_vmin, pred_vmin)
+        depth_vmax = max(gt_vmax, pred_vmax)
+        plt.colorbar(im2, cax=cbar_ax_depth, label='Depth (m)')
+
+        # 4. Importance Map (upsampled to image resolution)
+        ax4 = fig.add_subplot(gs[0, 5])
         importance_upsampled = F.interpolate(
-            torch.from_numpy(importance_map_np).unsqueeze(0).unsqueeze(0),
+            torch.from_numpy(importance_map).unsqueeze(0).unsqueeze(0),
             size=(img_h, img_w),
             mode='bilinear',
             align_corners=True
         ).squeeze().numpy()
-        
-        importance_colored = (plt.cm.jet(importance_upsampled)[:, :, :3] * 255).astype(np.uint8)
-        Image.fromarray(importance_colored).save(importance_path)
-        logger.info(f"  Saved importance map: {importance_path}")
-        
-        # 5. Save FG mask overlay (red overlay on original image)
-        fg_path = best_frame_dir / "best_frame_fg.png"
-        mean_val = importance_map_np.mean()
-        fg_mask = (importance_map_np > mean_val).astype(np.float32)
-        
-        # Upsample FG mask to image resolution
-        fg_mask_upsampled = F.interpolate(
-            torch.from_numpy(fg_mask).unsqueeze(0).unsqueeze(0),
-            size=(img_h, img_w),
-            mode='nearest'
-        ).squeeze().numpy()
-        
-        # Create red overlay
-        fg_overlay = img_uint8.copy()
-        red_mask = np.zeros_like(fg_overlay)
-        red_mask[:, :, 0] = (fg_mask_upsampled * 255).astype(np.uint8)  # Red channel
-        fg_overlay = cv2.addWeighted(fg_overlay, 0.5, red_mask, 0.5, 0)
-        
-        Image.fromarray(fg_overlay).save(fg_path)
-        fg_ratio = fg_mask.sum() / fg_mask.size * 100
-        logger.info(f"  Saved FG mask (>{mean_val:.3f}): {fg_ratio:.1f}% - {fg_path}")
-        
-        # 6. Save BG mask overlay (blue overlay on original image)
-        bg_path = best_frame_dir / "best_frame_bg.png"
-        bg_mask = (importance_map_np <= mean_val).astype(np.float32)
-        
-        # Upsample BG mask to image resolution
-        bg_mask_upsampled = F.interpolate(
-            torch.from_numpy(bg_mask).unsqueeze(0).unsqueeze(0),
-            size=(img_h, img_w),
-            mode='nearest'
-        ).squeeze().numpy()
-        
-        # Create blue overlay
-        bg_overlay = img_uint8.copy()
-        blue_mask = np.zeros_like(bg_overlay)
-        blue_mask[:, :, 2] = (bg_mask_upsampled * 255).astype(np.uint8)  # Blue channel
-        bg_overlay = cv2.addWeighted(bg_overlay, 0.5, blue_mask, 0.5, 0)
-        
-        Image.fromarray(bg_overlay).save(bg_path)
-        bg_ratio = bg_mask.sum() / bg_mask.size * 100
-        logger.info(f"  Saved BG mask (≤{mean_val:.3f}): {bg_ratio:.1f}% - {bg_path}")
-        
-        logger.info(f"Saved all best frame visualizations to: {best_frame_dir}")
+
+        im4 = ax4.imshow(importance_upsampled, cmap='jet', vmin=0, vmax=1, aspect='equal')
+        ax4.set_title('Importance Map', fontsize=12, fontweight='bold')
+        ax4.axis('off')
+
+        # Importance map colorbar
+        cbar_ax_importance = fig.add_subplot(gs[0, 6])
+        plt.colorbar(im4, cax=cbar_ax_importance, label='Importance')
+
+        # 5. Metrics and Info
+        ax5 = fig.add_subplot(gs[0, 8])
+
+        # Compute additional metrics if possible
+        valid_mask = gt_valid & pred_valid
+        if valid_mask.sum() > 0:
+            valid_gt = torch.from_numpy(gt_depth[valid_mask])
+            valid_pred = torch.from_numpy(pred_depth[valid_mask])
+
+            rmse = torch.sqrt(torch.mean((valid_pred - valid_gt) ** 2))
+            mae = torch.mean(torch.abs(valid_pred - valid_gt))
+
+            # Compute Delta metrics
+            threshold = 1.25
+            max_ratio = torch.max(valid_pred / valid_gt, valid_gt / valid_pred)
+            delta_1 = (max_ratio < threshold).float().mean()
+            delta_2 = (max_ratio < threshold ** 2).float().mean()
+            delta_3 = (max_ratio < threshold ** 3).float().mean()
+
+            # Display metrics in organized layout
+            ax5.text(0.05, 0.85, f'AbsRel: {abs_rel:.4f}', fontsize=14,
+                    transform=ax5.transAxes, bbox=dict(boxstyle="round", facecolor='lightcoral'))
+            ax5.text(0.05, 0.70, f'δ₁: {delta_1:.3f}', fontsize=14,
+                    transform=ax5.transAxes, bbox=dict(boxstyle="round", facecolor='lightgreen'))
+            ax5.text(0.05, 0.55, f'δ₂: {delta_2:.3f}', fontsize=14,
+                    transform=ax5.transAxes, bbox=dict(boxstyle="round", facecolor='lightgreen'))
+            ax5.text(0.05, 0.40, f'δ₃: {delta_3:.3f}', fontsize=14,
+                    transform=ax5.transAxes, bbox=dict(boxstyle="round", facecolor='lightgreen'))
+            ax5.text(0.05, 0.25, f'RMSE: {rmse:.3f}m', fontsize=14,
+                    transform=ax5.transAxes, bbox=dict(boxstyle="round", facecolor='wheat'))
+            ax5.text(0.05, 0.10, f'MAE: {mae:.3f}m', fontsize=14,
+                    transform=ax5.transAxes, bbox=dict(boxstyle="round", facecolor='lightblue'))
+
+        ax5.set_title('Depth Metrics', fontsize=12, fontweight='bold')
+        ax5.axis('off')
+
+        # Overall title
+        plt.suptitle(f'Sequence {sequence_id+1} Best Frame {frame_idx}', fontsize=16, fontweight='bold')
+
+        # Save with test_metric_head.py naming convention
+        save_path = self.save_dir / f"best_frame_seq{sequence_id+1}_{frame_idx}_absrel_{abs_rel:.4f}.png"
+        plt.savefig(save_path, dpi=150, bbox_inches='tight', facecolor='white')
+        plt.close(fig)
+
+        logger.info(f"Saved best frame visualization: {save_path}")
 
     def _aggregate_metrics(self, all_metrics):
         """Aggregate metrics across sequences"""
