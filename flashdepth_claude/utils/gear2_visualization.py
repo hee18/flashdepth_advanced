@@ -12,9 +12,9 @@ from .metric_depth_metrics import MetricDepthMetrics
 from .sparse_depth_visualization import create_dual_sparse_depth_vis
 
 
-class Gear3Visualizer:
+class Gear2Visualizer:
     """
-    Visualization utilities for Gear3 training
+    Visualization utilities for Gear2 training (Ablation: No FG/BG separation)
     """
 
     def __init__(self, save_dir="./visualizations"):
@@ -28,20 +28,17 @@ class Gear3Visualizer:
 
     def create_validation_summary(self, sample_batch, model_outputs, step, save_name=None, prefix="validation", fps=None, loss_dict=None):
         """
-        Create a comprehensive validation summary for Gear3
+        Create a comprehensive validation summary for Gear2
 
         Args:
             sample_batch: Validation batch (images, gt_depth, dataset_idx)
-            model_outputs: Dictionary with 'pred_depth' and 'importance_map'
+            model_outputs: Dictionary with 'pred_depth' and 'importance_map' (importance_map will be None for Gear2)
             step: Training step number
             save_name: Optional custom save name
             prefix: Prefix for the visualization
             fps: Forward pass FPS (optional)
             loss_dict: Dictionary with loss values (optional)
                 - 'depth_loss': Depth loss value
-                - 'depth_variance_loss': Variance loss value (if enabled)
-                - 'edge_aware_loss': Edge-aware loss value (if enabled)
-                - 'contrastive_fgbg_loss': Contrastive FG/BG loss value (if enabled)
 
         Returns:
             fig: Matplotlib figure object
@@ -49,7 +46,7 @@ class Gear3Visualizer:
         try:
             images, gt_depth, dataset_idx = sample_batch
             pred_depth = model_outputs['pred_depth']
-            importance_map = model_outputs['importance_map']
+            importance_map = model_outputs.get('importance_map', None)  # Will be None for Gear2
 
             # Debug shapes
             if not hasattr(images, 'cpu'):
@@ -58,8 +55,6 @@ class Gear3Visualizer:
                 gt_depth = torch.from_numpy(gt_depth) if isinstance(gt_depth, np.ndarray) else gt_depth
             if not hasattr(pred_depth, 'cpu'):
                 pred_depth = torch.from_numpy(pred_depth) if isinstance(pred_depth, np.ndarray) else pred_depth
-            if not hasattr(importance_map, 'cpu'):
-                importance_map = torch.from_numpy(importance_map) if isinstance(importance_map, np.ndarray) else importance_map
 
             # Use first batch and first frame for visualization
             # Handle both [B, T, ...] and [B, ...] formats
@@ -78,55 +73,25 @@ class Gear3Visualizer:
             else:  # [B, H, W]
                 pred_depth_frame = pred_depth[0].cpu().numpy()  # [H, W]
 
-            if importance_map.ndim == 4:  # [B, T, H, W] or [B, 1, H, W]
-                importance_frame = importance_map[0, 0].cpu().numpy()  # [H, W]
-            else:  # [B, H, W]
-                importance_frame = importance_map[0].cpu().numpy()  # [H, W]
-
             # Normalize input image for display
             input_img = np.clip((input_img + 1) / 2, 0, 1)  # Assuming normalized input
-
-            # Debug: Check final shapes
-            print(f"DEBUG Visualization shapes:")
-            print(f"  input_img: {input_img.shape}")
-            print(f"  gt_depth_frame: {gt_depth_frame.shape}")
-            print(f"  pred_depth_frame: {pred_depth_frame.shape}")
-            print(f"  importance_frame: {importance_frame.shape}")
 
             # Ensure all frames are 2D
             while gt_depth_frame.ndim > 2:
                 gt_depth_frame = gt_depth_frame[0]
             while pred_depth_frame.ndim > 2:
                 pred_depth_frame = pred_depth_frame[0]
-            while importance_frame.ndim > 2:
-                importance_frame = importance_frame[0]
-
-            print(f"DEBUG After squeeze:")
-            print(f"  gt_depth_frame: {gt_depth_frame.shape}")
-            print(f"  pred_depth_frame: {pred_depth_frame.shape}")
-            print(f"  importance_frame: {importance_frame.shape}")
 
             # Create valid mask
             # Filter out invalid depths: GT and pred must be in [0, 200m] range
-            # 200m is a compromise: wider than standard benchmarks (70-80m) but removes
-            # extreme outliers (infinity, 10 billion). Suitable for TartanAir, Spring datasets.
             MAX_DEPTH = 200.0  # Maximum valid depth in meters
             gt_valid_mask = (gt_depth_frame > 0) & (gt_depth_frame < MAX_DEPTH)
             pred_valid_mask = (pred_depth_frame > 0) & (pred_depth_frame < MAX_DEPTH)
             valid_mask = gt_valid_mask & pred_valid_mask
 
-            # Debug: Print statistics
-            print(f"DEBUG Step {step}:")
-            print(f"  GT raw range: {gt_depth_frame.min():.3f} - {gt_depth_frame.max():.3f}")
-            print(f"  Pred raw range: {pred_depth_frame.min():.3f} - {pred_depth_frame.max():.3f}")
-            print(f"  Invalid GT pixels (>200m or <0): {((gt_depth_frame <= 0) | (gt_depth_frame >= MAX_DEPTH)).sum()}")
-
             if valid_mask.sum() > 0:
                 gt_valid = gt_depth_frame[valid_mask]
                 pred_valid = pred_depth_frame[valid_mask]
-                print(f"  GT valid range: {gt_valid.min():.3f} - {gt_valid.max():.3f}")
-                print(f"  Pred valid range: {pred_valid.min():.3f} - {pred_valid.max():.3f}")
-                print(f"  Valid pixels: {valid_mask.sum()} / {gt_depth_frame.size}")
 
             # Create figure with subplots
             fig = plt.figure(figsize=(20, 12))
@@ -186,15 +151,14 @@ class Gear3Visualizer:
             ax3.axis('off')
             plt.colorbar(im3, ax=ax3, fraction=0.046, pad=0.04)
 
-            # 4. Importance Map (NEW!)
+            # 4. Importance Map → N/A for Gear2
             ax4 = fig.add_subplot(gs[0, 3])
-            im4 = ax4.imshow(importance_frame, cmap='jet', vmin=0, vmax=1)
-            imp_mean = importance_frame.mean()
-            imp_std = importance_frame.std()
-            ax4.set_title(f'Importance Map\nmean={imp_mean:.3f}, std={imp_std:.3f}',
-                         fontsize=14, fontweight='bold')
+            ax4.text(0.5, 0.5, 'No Importance Map\n\nUniform Modulation',
+                    ha='center', va='center', transform=ax4.transAxes,
+                    fontsize=16, fontweight='bold',
+                    bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.8))
+            ax4.set_title('Importance Map (N/A)', fontsize=14, fontweight='bold')
             ax4.axis('off')
-            plt.colorbar(im4, ax=ax4, fraction=0.046, pad=0.04)
 
             # 5. Valid Mask
             ax5 = fig.add_subplot(gs[1, 0])
@@ -259,11 +223,9 @@ class Gear3Visualizer:
             ax8.text(0.1, y_pos, f'Dataset: {dataset_str}', fontsize=14, transform=ax8.transAxes)
             y_pos -= 0.12
 
-            # Show FG:BG ratio based on importance map mean
-            fg_ratio = (importance_frame >= imp_mean).sum() / importance_frame.size * 100
-            bg_ratio = 100.0 - fg_ratio
-            ax8.text(0.1, y_pos, f'FG:BG = {fg_ratio:.1f}:{bg_ratio:.1f}', fontsize=12,
-                    transform=ax8.transAxes, bbox=dict(boxstyle="round", facecolor='lightcyan'))
+            # FG:BG → N/A for Gear2
+            ax8.text(0.1, y_pos, f'FG:BG = N/A', fontsize=12,
+                    transform=ax8.transAxes, bbox=dict(boxstyle="round", facecolor='lightgray'))
             y_pos -= 0.12
 
             # Show FPS if available
@@ -284,24 +246,6 @@ class Gear3Visualizer:
                 if 'depth_loss' in loss_dict:
                     ax8.text(0.1, y_pos, f'Log L1 Loss: {loss_dict["depth_loss"]:.4f}', fontsize=11,
                             transform=ax8.transAxes, bbox=dict(boxstyle="round", facecolor='lightcoral'))
-                    y_pos -= 0.10
-
-                # Variance loss (if enabled)
-                if 'depth_variance_loss' in loss_dict and loss_dict['depth_variance_loss'] > 0:
-                    ax8.text(0.1, y_pos, f'Variance: {loss_dict["depth_variance_loss"]:.4f}', fontsize=11,
-                            transform=ax8.transAxes, bbox=dict(boxstyle="round", facecolor='lightyellow'))
-                    y_pos -= 0.10
-
-                # Edge-aware loss (if enabled)
-                if 'edge_aware_loss' in loss_dict and loss_dict['edge_aware_loss'] > 0:
-                    ax8.text(0.1, y_pos, f'Edge: {loss_dict["edge_aware_loss"]:.4f}', fontsize=11,
-                            transform=ax8.transAxes, bbox=dict(boxstyle="round", facecolor='lightblue'))
-                    y_pos -= 0.10
-
-                # Contrastive FG/BG loss (if enabled)
-                if 'contrastive_fgbg_loss' in loss_dict and loss_dict['contrastive_fgbg_loss'] > 0:
-                    ax8.text(0.1, y_pos, f'Contrast: {loss_dict["contrastive_fgbg_loss"]:.4f}', fontsize=11,
-                            transform=ax8.transAxes, bbox=dict(boxstyle="round", facecolor='lightgreen'))
                     y_pos -= 0.10
 
             ax8.set_title('Training Info', fontsize=14, fontweight='bold')
@@ -326,30 +270,14 @@ class Gear3Visualizer:
                 ax9.legend(fontsize=12)
                 ax9.grid(True, alpha=0.3)
 
-            # 10. Importance Distribution
+            # 10. Importance Distribution → N/A for Gear2
             ax10 = fig.add_subplot(gs[2, 2:])
-            importance_flat = importance_frame.flatten()
-
-            # Handle case where all values are identical (std=0)
-            if imp_std < 1e-6:
-                # Just show a vertical line at the constant value
-                ax10.axvline(imp_mean, color='purple', linestyle='-', linewidth=3,
-                            label=f'Constant: {imp_mean:.3f}')
-                ax10.set_xlim(max(0, imp_mean - 0.1), min(1, imp_mean + 0.1))
-                ax10.text(0.5, 0.5, f'All pixels = {imp_mean:.3f}\n(std = {imp_std:.6f})',
-                         ha='center', va='center', transform=ax10.transAxes,
-                         fontsize=14, bbox=dict(boxstyle='round', facecolor='yellow', alpha=0.5))
-            else:
-                # Normal histogram
-                ax10.hist(importance_flat, bins=50, alpha=0.7, color='purple', density=True)
-                ax10.axvline(imp_mean, color='red', linestyle='--', linewidth=2,
-                            label=f'Mean: {imp_mean:.3f}')
-
-            ax10.set_xlabel('Importance Value', fontsize=12)
-            ax10.set_ylabel('Density', fontsize=12)
-            ax10.set_title('Importance Map Distribution', fontsize=14, fontweight='bold')
-            ax10.legend(fontsize=12)
-            ax10.grid(True, alpha=0.3)
+            ax10.text(0.5, 0.5, 'No Importance Map\n\nUniform Modulation Applied\n(Same gamma/beta for all pixels)',
+                     ha='center', va='center', transform=ax10.transAxes,
+                     fontsize=14, fontweight='bold',
+                     bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.8))
+            ax10.set_title('Importance Map Distribution (N/A)', fontsize=14, fontweight='bold')
+            ax10.axis('off')
 
             # Save figure
             if save_name:

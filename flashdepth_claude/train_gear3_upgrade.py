@@ -1,16 +1,20 @@
 """
-Gear3 Training Script: Feature-level Metric Depth Learning
+Gear3 Upgrade Training Script: Enhanced FG/BG Separation Methods
 
 Three-phase training:
     Phase 1: Train on 5 datasets (518×518)
     Phase 2: Train on mvs-synth, spring (2K resolution)
     Phase 3: Fine-tune on nuScenes (2K resolution)
 
-Key differences from baseline:
-    - No scale/shift operation on depth map
+Key features:
+    - 3 FG/BG separation options:
+        1. CLS-based light segmentation (~1-2ms overhead)
+        2. Differentiable K-means clustering (~5-10ms overhead)
+        3. Multi-layer attention fusion (~3ms overhead)
     - Feature-level modulation using FiLM
     - Canonical space normalization (focal_length=1000)
     - Loss on inverse depth: loss(100/pred, 100/gt)
+    - Enhanced visualization with FG/BG masks
 """
 
 import os
@@ -34,8 +38,8 @@ import time
 from datetime import timedelta
 
 from flashdepth.model import FlashDepth
-from utils.gear3_visualization import Gear3Visualizer
-from flashdepth.gear3_modules import Gear3MetricHead
+from utils.gear3_upgrade_visualization import Gear3UpgradeVisualizer
+from flashdepth.gear3_upgrade_modules import Gear3UpgradeMetricHead
 from dataloaders.combined_dataset import CombinedDataset
 from utils.helpers import *
 from utils.metric_depth_metrics import MetricDepthMetrics
@@ -190,7 +194,7 @@ class LogL1Loss(nn.Module):
 
 
 
-class Gear3Trainer:
+class Gear3UpgradeTrainer:
     """
     Trainer for Gear3 metric depth learning.
 
@@ -285,8 +289,8 @@ class Gear3Trainer:
             )
 
         # Setup visualizer with separate folders
-        self.train_visualizer = Gear3Visualizer(save_dir=self.results_dir / "visualizations" / "train")
-        self.val_visualizer = Gear3Visualizer(save_dir=self.results_dir / "visualizations" / "valid")
+        self.train_visualizer = Gear3UpgradeVisualizer(save_dir=self.results_dir / "visualizations" / "train")
+        self.val_visualizer = Gear3UpgradeVisualizer(save_dir=self.results_dir / "visualizations" / "valid")
 
         self.global_step = 0
         self.best_val_loss = float('inf')
@@ -373,14 +377,20 @@ class Gear3Trainer:
             else:
                 self.logger.warning(f"Checkpoint {checkpoint_path} not found")
 
-        # Add Gear3 metric head
+        # Add Gear3 Upgrade metric head
         embed_dim = 1024 if model.encoder == 'vitl' else 384
         dpt_dim = 256 if model.encoder == 'vitl' else 64
         num_heads = 16 if model.encoder == 'vitl' else 6
 
-        model.gear3_head = Gear3MetricHead(
+        # Get separation method from config (default: 'cls_seg')
+        separation_method = self.config.get('separation_method', 'cls_seg')
+        self.separation_method = separation_method
+        self.logger.info(f"Using FG/BG separation method: {separation_method}")
+
+        model.gear3_head = Gear3UpgradeMetricHead(
             embed_dim=embed_dim,
             dpt_dim=dpt_dim,
+            separation_method=separation_method,
             num_heads=num_heads
         )
 
@@ -401,14 +411,20 @@ class Gear3Trainer:
             self.logger.info(f"Phase {self.phase}: Loaded ALL parameters from Phase 1 checkpoint")
             self.logger.info(f"  - DINOv2, DPT, Mamba, output_conv, Gear3: ✓")
 
-        # Enable attention weights storage ONLY for last block (saves ~11GB memory)
-        # Gear3 only uses last block's attention for importance prediction
+        # Enable attention weights storage
+        # - 'multi_layer': Enable for blocks 3, 10, 16, 22 (layers 4, 11, 17, 23)
+        # - Others: Enable ONLY for last block (saves memory)
+        target_blocks = [3, 10, 16, 22] if separation_method == 'multi_layer' else [len(model.pretrained.blocks) - 1]
+
         for i, block in enumerate(model.pretrained.blocks):
-            if i == len(model.pretrained.blocks) - 1:
+            if i in target_blocks:
                 block.attn.store_attn_weights = True
-                self.logger.info(f"Enabled attention weights storage for block {i} (last block)")
+                self.logger.info(f"Enabled attention weights storage for block {i}")
             else:
                 block.attn.store_attn_weights = False
+
+        if separation_method == 'multi_layer':
+            self.logger.info(f"Multi-layer attention fusion: storing attention from blocks {target_blocks}")
 
         model = model.to(self.device)
 
@@ -743,8 +759,22 @@ class Gear3Trainer:
                         patch_h, patch_w = h // model.patch_size, w // model.patch_size
                         dpt_features = model.depth_head.get_forward_features(encoder_features, patch_h, patch_w)
 
-                        path_1_modulated, importance_map, fg_features, bg_features = model.gear3_head(
-                            patch_tokens, attention_weights, dpt_features, patch_h, patch_w
+                        # Prepare inputs based on separation_method
+                        attention_weights_multi_layer = None
+                        cls_token = None
+
+                        if self.separation_method == 'multi_layer':
+                            attention_weights_multi_layer = [
+                                model.pretrained.blocks[i].attn.attn_weights
+                                for i in [3, 10, 16, 22]
+                            ]
+                        elif self.separation_method == 'cls_seg':
+                            cls_token = encoder_features[-1][:, 0]  # [B, embed_dim]
+
+                        path_1_modulated, importance_map, fg_features, bg_features, fg_mask, bg_mask = model.gear3_head(
+                            patch_tokens, attention_weights, dpt_features, patch_h, patch_w,
+                            attention_weights_multi_layer=attention_weights_multi_layer,
+                            cls_token=cls_token
                         )
 
                         out = model.depth_head.scratch.output_conv1(path_1_modulated)
@@ -759,6 +789,12 @@ class Gear3Trainer:
                         importance_map_resized = F.interpolate(
                             importance_map, size=(h, w), mode='bilinear', align_corners=True
                         )
+                        fg_mask_resized = F.interpolate(
+                            fg_mask, size=(h, w), mode='bilinear', align_corners=True
+                        )
+                        bg_mask_resized = F.interpolate(
+                            bg_mask, size=(h, w), mode='bilinear', align_corners=True
+                        )
 
                         # Move tensors to CPU for visualization (only first batch, first frame)
                         sample_batch = (
@@ -768,7 +804,9 @@ class Gear3Trainer:
                         )
                         model_outputs_cpu = {
                             'pred_depth': pred_depth_metric[:1].cpu(),  # [1, 1, H, W]
-                            'importance_map': importance_map_resized[:1].cpu()  # [1, 1, H, W]
+                            'importance_map': importance_map_resized[:1].cpu(),  # [1, 1, H, W]
+                            'fg_mask': fg_mask_resized[:1].cpu(),  # [1, 1, H, W]
+                            'bg_mask': bg_mask_resized[:1].cpu()   # [1, 1, H, W]
                         }
 
                         # FPS removed from training (only measured in test_gear3.py)
@@ -880,9 +918,25 @@ class Gear3Trainer:
                         encoder_features, patch_h, patch_w
                     )
 
-                # Apply Gear3 modulation (trainable) - only path_1 is modulated
-                path_1_modulated, importance_map, fg_features, bg_features = model.gear3_head(
-                    patch_tokens, attention_weights, dpt_features, patch_h, patch_w
+                # Prepare inputs based on separation_method
+                attention_weights_multi_layer = None
+                cls_token = None
+
+                if self.separation_method == 'multi_layer':
+                    with torch.no_grad():
+                        attention_weights_multi_layer = [
+                            model.pretrained.blocks[i].attn.attn_weights
+                            for i in [3, 10, 16, 22]
+                        ]
+                elif self.separation_method == 'cls_seg':
+                    with torch.no_grad():
+                        cls_token = patch_tokens[:, 0]  # [B, embed_dim]
+
+                # Apply Gear3 Upgrade modulation (trainable) - only path_1 is modulated
+                path_1_modulated, importance_map, fg_features, bg_features, fg_mask, bg_mask = model.gear3_head(
+                    patch_tokens, attention_weights, dpt_features, patch_h, patch_w,
+                    attention_weights_multi_layer=attention_weights_multi_layer,
+                    cls_token=cls_token
                 )
 
                 # Pass through DPT output head (trainable)
@@ -1028,9 +1082,25 @@ class Gear3Trainer:
                     patch_h, patch_w = h // model.patch_size, w // model.patch_size
                     dpt_features = model.depth_head.get_forward_features(encoder_features, patch_h, patch_w)
 
+                    # Prepare inputs based on separation_method
+                    attention_weights_multi_layer = None
+                    cls_token = None
+
+                    if self.separation_method == 'multi_layer':
+                        with torch.no_grad():
+                            attention_weights_multi_layer = [
+                                model.pretrained.blocks[i].attn.attn_weights
+                                for i in [3, 10, 16, 22]
+                            ]
+                    elif self.separation_method == 'cls_seg':
+                        with torch.no_grad():
+                            cls_token = patch_tokens[:, 0]  # [B, embed_dim]
+
                     # Apply modulation and get importance map (only path_1 is modulated)
-                    path_1_modulated, importance_map, fg_features, bg_features = model.gear3_head(
-                        patch_tokens, attention_weights, dpt_features, patch_h, patch_w
+                    path_1_modulated, importance_map, fg_features, bg_features, fg_mask, bg_mask = model.gear3_head(
+                        patch_tokens, attention_weights, dpt_features, patch_h, patch_w,
+                        attention_weights_multi_layer=attention_weights_multi_layer,
+                        cls_token=cls_token
                     )
 
                     # Get depth (at model resolution)
@@ -1104,6 +1174,14 @@ class Gear3Trainer:
                                         importance_map, size=(gt_h, gt_w), mode='bilinear', align_corners=True
                                     )
 
+                                    # Resize FG/BG masks to GT resolution
+                                    fg_mask_resized = F.interpolate(
+                                        fg_mask, size=(gt_h, gt_w), mode='bilinear', align_corners=True
+                                    )
+                                    bg_mask_resized = F.interpolate(
+                                        bg_mask, size=(gt_h, gt_w), mode='bilinear', align_corners=True
+                                    )
+
                                     # Resize images to GT resolution (for visualization consistency)
                                     img_t_resized = F.interpolate(
                                         img_t, size=(gt_h, gt_w), mode='bilinear', align_corners=True
@@ -1111,7 +1189,9 @@ class Gear3Trainer:
 
                                     model_outputs = {
                                         'pred_depth': pred_depth_metric,  # [B, 1, gt_h, gt_w] at GT resolution
-                                        'importance_map': importance_map_resized.float().cpu()  # [B, 1, gt_h, gt_w]
+                                        'importance_map': importance_map_resized.float().cpu(),  # [B, 1, gt_h, gt_w]
+                                        'fg_mask': fg_mask_resized.float().cpu(),  # [B, 1, gt_h, gt_w]
+                                        'bg_mask': bg_mask_resized.float().cpu()   # [B, 1, gt_h, gt_w]
                                     }
 
                                     # For visualization, we need [B, T, ...] format like training
@@ -1144,7 +1224,7 @@ class Gear3Trainer:
 
                     # Clear intermediate tensors to free memory after each frame
                     del encoder_features, attention_weights, patch_tokens, dpt_features
-                    del path_1_modulated, importance_map, fg_features, bg_features, pred_depth_inverse
+                    del path_1_modulated, importance_map, fg_features, bg_features, fg_mask, bg_mask, pred_depth_inverse
                     # Always clear cache after each frame to prevent OOM during validation
                     torch.cuda.empty_cache()
 
@@ -1245,7 +1325,7 @@ def main(config: DictConfig):
     rank, world_size, local_rank = init_distributed()
 
     # Create trainer
-    trainer = Gear3Trainer(config, rank, world_size, local_rank)
+    trainer = Gear3UpgradeTrainer(config, rank, world_size, local_rank)
     trainer.train()
 
     # Cleanup

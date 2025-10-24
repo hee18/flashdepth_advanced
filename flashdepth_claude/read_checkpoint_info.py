@@ -39,6 +39,10 @@ def read_checkpoint_step(checkpoint_path):
         'phase': checkpoint.get('phase', 'Unknown'),
     }
 
+    # Extract per-dataset validation losses (new in Gear2/Gear3)
+    info['dataset_losses'] = checkpoint.get('dataset_losses', None)
+    info['num_sequences'] = checkpoint.get('num_sequences', None)
+
     # Check for optimizer state (indicates if full checkpoint or just model)
     info['has_optimizer'] = 'optimizer_state_dict' in checkpoint
     info['has_scheduler'] = 'scheduler_state_dict' in checkpoint
@@ -68,6 +72,13 @@ def main():
         print(f"Best Step: {info['best_step']}")
         print(f"Best Val Loss: {info['best_val_loss']}")
         print(f"Phase: {info['phase']}")
+
+        # Show per-dataset validation losses if available
+        if info['dataset_losses'] is not None:
+            print(f"\nPer-Dataset Validation Losses:")
+            for dataset_name, loss in info['dataset_losses'].items():
+                num_seqs = info['num_sequences'].get(dataset_name, 'Unknown') if info['num_sequences'] else 'Unknown'
+                print(f"  [{dataset_name}] {num_seqs} sequences | Loss: {loss:.4f}")
 
         # Only show if resumable checkpoint
         if info['has_optimizer'] or info['has_scheduler']:

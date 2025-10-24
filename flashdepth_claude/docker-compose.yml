@@ -17,6 +17,8 @@ services:
       - /home/cvlab/hsy/Datasets:/data/datasets:ro
       # Mount entire project directory for easy development
       - .:/app
+      # Mount original FlashDepth directory for comparison
+      - ../FlashDepth:/FlashDepth
     working_dir: /app
     stdin_open: true
     tty: true

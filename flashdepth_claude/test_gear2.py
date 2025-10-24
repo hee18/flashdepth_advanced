@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Test script for Gear3: Feature-level Metric Depth Learning
+Test script for Gear2: Ablation Study (No FG/BG Separation)
 
 Key differences from baseline:
     - No relative depth visualization (features are modulated)
@@ -32,7 +32,7 @@ project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
 
 from flashdepth.model import FlashDepth
-from flashdepth.gear3_modules import Gear3MetricHead
+from flashdepth.gear2_modules import Gear2MetricHead
 from dataloaders.combined_dataset import CombinedDataset
 from utils.metric_depth_metrics import MetricDepthMetrics, format_metrics
 from utils.helpers import save_gifs_as_grid, save_grid_to_mp4, depth_to_np_arr, torch_batch_to_np_arr
@@ -45,9 +45,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-class Gear3Tester:
+class Gear2Tester:
     """
-    Test harness for Gear3 model.
+    Test harness for Gear2 model.
 
     Evaluates on:
         - Inverse depth metrics (TAE, AbsRel, δ1/δ2/δ3)
@@ -74,7 +74,7 @@ class Gear3Tester:
         self.metrics = MetricDepthMetrics()
 
     def _setup_model(self):
-        """Load trained Gear3 model"""
+        """Load trained Gear2 model"""
         # Create base FlashDepth model
         model_config = dict(self.config.model)
         model_config['batch_size'] = 1
@@ -82,18 +82,16 @@ class Gear3Tester:
 
         model = FlashDepth(**model_config)
 
-        # Add Gear3 metric head
+        # Add Gear2 metric head
         embed_dim = 1024 if model.encoder == 'vitl' else 384
         dpt_dim = 256 if model.encoder == 'vitl' else 64
-        num_heads = 16 if model.encoder == 'vitl' else 6
 
-        model.gear3_head = Gear3MetricHead(
+        model.gear2_head = Gear2MetricHead(
             embed_dim=embed_dim,
-            dpt_dim=dpt_dim,
-            num_heads=num_heads
+            dpt_dim=dpt_dim
         )
 
-        # Enable attention weights storage ONLY for last block (like train_gear3)
+        # Enable attention weights storage ONLY for last block (like train_gear2)
         for i, block in enumerate(model.pretrained.blocks):
             if i == len(model.pretrained.blocks) - 1:
                 block.attn.store_attn_weights = True
@@ -396,7 +394,7 @@ class Gear3Tester:
             patch_h_warmup = h_warmup // self.model.patch_size
             patch_w_warmup = w_warmup // self.model.patch_size
             dpt_features_warmup = self.model.depth_head.get_forward_features(encoder_features_warmup, patch_h_warmup, patch_w_warmup)
-            path_1_warmup, _, _, _ = self.model.gear3_head(
+            path_1_warmup, _, _, _ = self.model.gear2_head(
                 patch_tokens_warmup, attention_weights_warmup, dpt_features_warmup, patch_h_warmup, patch_w_warmup
             )
             out_warmup = self.model.depth_head.scratch.output_conv1(path_1_warmup)
@@ -421,7 +419,7 @@ class Gear3Tester:
             img_t = images[0, t]  # [3, H, W]
             gt_t_inverse = gt_depth_inverse_100[0, t]  # [1, H, W] in 100/m
 
-            # Use BFloat16 for forward pass (same as train_gear3.py)
+            # Use BFloat16 for forward pass (same as train_gear2.py)
             with torch.amp.autocast('cuda', dtype=torch.bfloat16):
                 # Extract features from DINOv2
                 encoder_features = self.model.pretrained.get_intermediate_layers(
@@ -440,8 +438,8 @@ class Gear3Tester:
                 patch_h, patch_w = h // self.model.patch_size, w // self.model.patch_size
                 dpt_features = self.model.depth_head.get_forward_features(encoder_features, patch_h, patch_w)
 
-                # Apply Gear3 modulation
-                path_1_modulated, importance_map, fg_features, bg_features = self.model.gear3_head(
+                # Apply Gear2 modulation (returns None for importance_map, fg_features, bg_features)
+                path_1_modulated, importance_map, fg_features, bg_features = self.model.gear2_head(
                     patch_tokens, attention_weights, dpt_features, patch_h, patch_w
                 )
 
@@ -454,7 +452,7 @@ class Gear3Tester:
                 # Prediction is already positive (Softplus activation in output_conv2)
                 pred_depth_inverse_100 = out  # [1, 1, H, W] in 100/m
 
-                # Interpolate prediction to GT resolution (like train_gear3.py validation)
+                # Interpolate prediction to GT resolution (like train_gear2.py validation)
                 gt_t_shape = gt_t_inverse.shape[-2:]  # GT original resolution
                 if pred_depth_inverse_100.shape[-2:] != gt_t_shape:
                     pred_depth_inverse_100 = F.interpolate(
@@ -471,9 +469,11 @@ class Gear3Tester:
 
             # List append for visualization (outside FPS measurement)
             pred_depths.append(pred_depth_metric)
-            importance_maps.append(importance_map[0])
-            fg_features_list.append(fg_features[0])
-            bg_features_list.append(bg_features[0])
+            # Gear2 returns None for importance_map, fg_features, bg_features
+            if importance_map is not None:
+                importance_maps.append(importance_map[0])
+                fg_features_list.append(fg_features[0])
+                bg_features_list.append(bg_features[0])
 
         # Calculate FPS (like original FlashDepth: exclude warmup frames)
         if start_time is not None:
@@ -488,9 +488,10 @@ class Gear3Tester:
 
         # Stack predictions
         pred_depths = torch.stack(pred_depths, dim=0)  # [T, 1, H, W] in meters
-        importance_maps = torch.stack(importance_maps, dim=0)  # [T, 1, patch_h, patch_w]
-        fg_features_all = torch.stack(fg_features_list, dim=0)  # [T, C, patch_h, patch_w]
-        bg_features_all = torch.stack(bg_features_list, dim=0)  # [T, C, patch_h, patch_w]
+        # Gear2 doesn't produce importance maps (returns None)
+        importance_maps = torch.stack(importance_maps, dim=0) if importance_maps else None
+        fg_features_all = torch.stack(fg_features_list, dim=0) if fg_features_list else None
+        bg_features_all = torch.stack(bg_features_list, dim=0) if bg_features_list else None
 
         # Convert GT to metric depth for evaluation: 100/m -> m
         gt_depth_metric = 100.0 / (gt_depth_inverse_100[0] + 1e-8)  # [T, 1, H, W] in meters
@@ -506,8 +507,8 @@ class Gear3Tester:
             pred_frame = pred_depths_cpu[t, 0]  # [H, W]
             gt_frame = gt_depth_metric_cpu[t, 0]  # [H, W]
 
-            # Create valid mask for this frame (like train_gear3 validation)
-            # Use same MAX_DEPTH as Gear3Visualizer (70m)
+            # Create valid mask for this frame (like train_gear2 validation)
+            # Use same MAX_DEPTH as Gear2Visualizer (70m)
             MAX_DEPTH = 70.0
             gt_valid_mask = (gt_frame > 0) & (gt_frame < MAX_DEPTH)  # GT valid pixels
             pred_valid_mask = (pred_frame > 0) & (pred_frame < MAX_DEPTH)  # Filter extreme values
@@ -606,13 +607,18 @@ class Gear3Tester:
         # Save best frame visualizations
         if len(frame_metrics) > 0:
             logger.info(f"Best frame for sequence {sequence_id}: Frame {best_frame_idx} (AbsRel={best_frame_abs_rel:.4f})")
+            # Extract features if available (None for Gear2)
+            importance_map_frame = importance_maps[best_frame_idx, 0] if importance_maps is not None else None
+            fg_features_frame = fg_features_all[best_frame_idx] if fg_features_all is not None else None
+            bg_features_frame = bg_features_all[best_frame_idx] if bg_features_all is not None else None
+
             self._save_best_frame_visualizations(
                 images[0, best_frame_idx],  # [3, H, W]
                 pred_depths[best_frame_idx, 0],  # [H, W]
                 gt_depth_metric[best_frame_idx, 0],  # [H, W]
-                importance_maps[best_frame_idx, 0],  # [patch_h, patch_w]
-                fg_features_all[best_frame_idx],  # [C, patch_h, patch_w]
-                bg_features_all[best_frame_idx],  # [C, patch_h, patch_w]
+                importance_map_frame,  # [patch_h, patch_w] or None
+                fg_features_frame,  # [C, patch_h, patch_w] or None
+                bg_features_frame,  # [C, patch_h, patch_w] or None
                 sequence_id,
                 best_frame_idx,
                 best_frame_abs_rel,
@@ -677,15 +683,21 @@ class Gear3Tester:
             axes[2, col].set_title(f'GT (m)')
             axes[2, col].axis('off')
 
-            # Row 3: Importance map (upsampled to image resolution for smooth visualization)
-            importance_patch = importance_maps[t]  # [1, patch_h, patch_w]
-            img_h, img_w = images[t].shape[1:]
-            importance_upsampled = F.interpolate(
-                importance_patch.unsqueeze(0), size=(img_h, img_w),
-                mode='bilinear', align_corners=True
-            ).squeeze().cpu().numpy()  # [H, W]
-            axes[3, col].imshow(importance_upsampled, cmap='jet', vmin=0, vmax=1)
-            axes[3, col].set_title(f'Importance')
+            # Row 3: Importance map (N/A for Gear2, which uses uniform modulation)
+            if importance_maps is not None:
+                importance_patch = importance_maps[t]  # [1, patch_h, patch_w]
+                img_h, img_w = images[t].shape[1:]
+                importance_upsampled = F.interpolate(
+                    importance_patch.unsqueeze(0), size=(img_h, img_w),
+                    mode='bilinear', align_corners=True
+                ).squeeze().cpu().numpy()  # [H, W]
+                axes[3, col].imshow(importance_upsampled, cmap='jet', vmin=0, vmax=1)
+                axes[3, col].set_title(f'Importance')
+            else:
+                # Gear2 doesn't produce importance maps
+                axes[3, col].text(0.5, 0.5, 'N/A\n(Uniform Modulation)',
+                                ha='center', va='center', fontsize=14, color='gray')
+                axes[3, col].set_title(f'Importance')
             axes[3, col].axis('off')
 
         # Add overall title with metrics
@@ -869,22 +881,34 @@ class Gear3Tester:
         depth_vmax = max(gt_vmax, pred_vmax)
         plt.colorbar(im2, cax=cbar_ax_depth, label='Depth (m)')
 
-        # 4. Importance Map (upsampled to image resolution)
+        # 4. Importance Map (N/A for Gear2, which uses uniform modulation)
         ax4 = fig.add_subplot(gs[0, 5])
-        importance_upsampled = F.interpolate(
-            torch.from_numpy(importance_map).unsqueeze(0).unsqueeze(0),
-            size=(img_h, img_w),
-            mode='bilinear',
-            align_corners=True
-        ).squeeze().numpy()
+        if importance_map is not None:
+            importance_upsampled = F.interpolate(
+                torch.from_numpy(importance_map).unsqueeze(0).unsqueeze(0),
+                size=(img_h, img_w),
+                mode='bilinear',
+                align_corners=True
+            ).squeeze().numpy()
 
-        im4 = ax4.imshow(importance_upsampled, cmap='jet', vmin=0, vmax=1, aspect='equal')
-        ax4.set_title('Importance Map', fontsize=12, fontweight='bold')
-        ax4.axis('off')
+            im4 = ax4.imshow(importance_upsampled, cmap='jet', vmin=0, vmax=1, aspect='equal')
+            ax4.set_title('Importance Map', fontsize=12, fontweight='bold')
+            ax4.axis('off')
 
-        # Importance map colorbar
-        cbar_ax_importance = fig.add_subplot(gs[0, 6])
-        plt.colorbar(im4, cax=cbar_ax_importance, label='Importance')
+            # Importance map colorbar
+            cbar_ax_importance = fig.add_subplot(gs[0, 6])
+            plt.colorbar(im4, cax=cbar_ax_importance, label='Importance')
+        else:
+            # Gear2 doesn't produce importance maps
+            ax4.text(0.5, 0.5, 'N/A\n(Uniform Modulation)',
+                    ha='center', va='center', fontsize=16, color='gray',
+                    transform=ax4.transAxes)
+            ax4.set_title('Importance Map', fontsize=12, fontweight='bold')
+            ax4.axis('off')
+
+            # Empty colorbar space for layout consistency
+            cbar_ax_importance = fig.add_subplot(gs[0, 6])
+            cbar_ax_importance.axis('off')
 
         # 5. Metrics and Info
         ax5 = fig.add_subplot(gs[0, 8])
@@ -950,7 +974,7 @@ class Gear3Tester:
         return aggregated
 
 
-@hydra.main(version_base=None, config_path="configs/gear3", config_name="config")
+@hydra.main(version_base=None, config_path="configs/gear2", config_name="config")
 def main(config: DictConfig):
     """Main entry point"""
     import os
@@ -958,7 +982,7 @@ def main(config: DictConfig):
     # Override config for testing
     config.inference = True
 
-    tester = Gear3Tester(config)
+    tester = Gear2Tester(config)
     tester.test()
 
 

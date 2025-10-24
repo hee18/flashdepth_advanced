@@ -1,19 +1,23 @@
 """
-Gear3 Training Script: Feature-level Metric Depth Learning
+Gear2 Training Script: Ablation Study (No FG/BG Separation)
 
 Three-phase training:
     Phase 1: Train on 5 datasets (518×518)
     Phase 2: Train on mvs-synth, spring (2K resolution)
     Phase 3: Fine-tune on nuScenes (2K resolution)
 
-Key differences from baseline:
-    - No scale/shift operation on depth map
+Key differences from Gear3:
+    - No importance map computation
+    - No FG/BG separation
+    - Uses CLS token for global feature extraction
+    - Uniform modulation (same gamma/beta for all pixels)
     - Feature-level modulation using FiLM
     - Canonical space normalization (focal_length=1000)
     - Loss on inverse depth: loss(100/pred, 100/gt)
 """
 
 import os
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -26,7 +30,6 @@ import hydra
 from omegaconf import DictConfig, OmegaConf
 import wandb
 from tqdm import tqdm
-import numpy as np
 from pathlib import Path
 from einops import rearrange
 import math
@@ -34,8 +37,8 @@ import time
 from datetime import timedelta
 
 from flashdepth.model import FlashDepth
-from utils.gear3_visualization import Gear3Visualizer
-from flashdepth.gear3_modules import Gear3MetricHead
+from utils.gear2_visualization import Gear2Visualizer
+from flashdepth.gear2_modules import Gear2MetricHead
 from dataloaders.combined_dataset import CombinedDataset
 from utils.helpers import *
 from utils.metric_depth_metrics import MetricDepthMetrics
@@ -188,15 +191,228 @@ class LogL1Loss(nn.Module):
         return loss
 
 
-
-
-class Gear3Trainer:
+class DepthVariancePseudoLabelLoss(nn.Module):
     """
-    Trainer for Gear3 metric depth learning.
+    Depth Variance Pseudo-Label Loss for importance maps.
+
+    Uses local depth variance as pseudo-label (supervision) for importance map.
+
+    High variance regions (complex geometry) → High importance
+    Low variance regions (flat surfaces) → Low importance
+
+    This encourages importance map to have spatial diversity (high std).
+
+    **CRITICAL**: GT depth variance is computed with torch.no_grad() to prevent gradient flow.
+    """
+    def __init__(self, kernel_size=15, sigma=3.0):
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.sigma = sigma
+
+        # Create Gaussian kernel for weighted variance computation
+        self.register_buffer('gaussian_kernel', self._create_gaussian_kernel(kernel_size, sigma))
+
+    def _create_gaussian_kernel(self, kernel_size, sigma):
+        """Create 2D Gaussian kernel for weighted variance"""
+        # Create 1D Gaussian
+        ax = torch.arange(-kernel_size // 2 + 1., kernel_size // 2 + 1.)
+        xx, yy = torch.meshgrid(ax, ax, indexing='ij')
+        kernel = torch.exp(-(xx**2 + yy**2) / (2. * sigma**2))
+
+        # Normalize to sum to 1
+        kernel = kernel / kernel.sum()
+
+        # Reshape for conv2d: [1, 1, kernel_size, kernel_size]
+        return kernel.view(1, 1, kernel_size, kernel_size)
+
+    def compute_local_variance(self, depth_map):
+        """
+        Compute local variance using Gaussian-weighted window.
+
+        Variance = E[x²] - E[x]²
+
+        Args:
+            depth_map: [B, 1, H, W] depth values (inverse depth in 100/m scale)
+
+        Returns:
+            variance: [B, 1, H, W] local variance map
+        """
+        # Match dtype and device
+        kernel = self.gaussian_kernel.to(dtype=depth_map.dtype, device=depth_map.device)
+        padding = self.kernel_size // 2
+
+        # E[x] (local mean)
+        local_mean = F.conv2d(depth_map, kernel, padding=padding)
+
+        # E[x²] (local mean of squares)
+        local_mean_sq = F.conv2d(depth_map**2, kernel, padding=padding)
+
+        # Variance = E[x²] - E[x]²
+        variance = local_mean_sq - local_mean**2
+
+        # Clamp to avoid negative values due to numerical errors
+        return variance.clamp(min=0)
+
+    def forward(self, importance_map, depth_map, valid_mask=None):
+        """
+        Args:
+            importance_map: [B, 1, H, W] predicted importance in range [0, 1]
+            depth_map: [B, 1, H, W] GT depth (inverse depth in 100/m scale)
+            valid_mask: [B, 1, H, W] valid pixels (optional)
+
+        Returns:
+            loss: scalar L1 distance between importance and normalized variance
+        """
+        # CRITICAL: Compute variance WITHOUT gradient to GT depth
+        with torch.no_grad():
+            # Compute local variance from GT depth
+            variance = self.compute_local_variance(depth_map)  # [B, 1, H, W]
+
+            # Normalize to [0, 1] range (min-max normalization)
+            if valid_mask is not None:
+                # Only consider valid pixels for normalization
+                variance_valid = variance[valid_mask.bool()]
+                if len(variance_valid) > 0:
+                    var_min = variance_valid.min()
+                    var_max = variance_valid.max()
+                else:
+                    var_min = variance.min()
+                    var_max = variance.max()
+            else:
+                var_min = variance.min()
+                var_max = variance.max()
+
+            # Avoid division by zero
+            variance_range = var_max - var_min + 1e-8
+            variance_norm = (variance - var_min) / variance_range  # [0, 1]
+
+        # L1 loss: importance_map (trainable) vs variance_norm (pseudo-label)
+        if valid_mask is not None:
+            loss = F.l1_loss(
+                importance_map[valid_mask.bool()],
+                variance_norm[valid_mask.bool()]
+            )
+        else:
+            loss = F.l1_loss(importance_map, variance_norm)
+
+        return loss
+
+
+class EdgeAwareLoss(nn.Module):
+    """
+    Edge-aware loss for importance maps.
+
+    Aligns importance map edges with depth edges, ensuring that:
+    - FG/BG boundaries coincide with depth discontinuities
+    - Interior regions remain smooth
+    - Prevents noisy importance maps
+
+    Uses Sobel filter to compute gradients.
+
+    Reference: "Edge-Guided Depth Estimation" (CVPR 2024)
+    """
+    def __init__(self):
+        super().__init__()
+
+        # Sobel kernels for edge detection (fixed, non-trainable)
+        sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32)
+        sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32)
+
+        self.register_buffer('sobel_x', sobel_x.view(1, 1, 3, 3))
+        self.register_buffer('sobel_y', sobel_y.view(1, 1, 3, 3))
+
+    def compute_edges(self, tensor):
+        """
+        Compute edge magnitude using Sobel filter.
+
+        Args:
+            tensor: [B, 1, H, W]
+
+        Returns:
+            edges: [B, 1, H, W] edge magnitude
+        """
+        # Match dtype and device of input tensor (handles BFloat16)
+        sobel_x = self.sobel_x.to(dtype=tensor.dtype, device=tensor.device)
+        sobel_y = self.sobel_y.to(dtype=tensor.dtype, device=tensor.device)
+
+        grad_x = F.conv2d(tensor, sobel_x, padding=1)
+        grad_y = F.conv2d(tensor, sobel_y, padding=1)
+
+        # Edge magnitude
+        edges = torch.sqrt(grad_x ** 2 + grad_y ** 2 + 1e-8)
+        return edges
+
+    def forward(self, importance_map, depth_map):
+        """
+        Args:
+            importance_map: [B, 1, H, W] importance values in range [0, 1]
+            depth_map: [B, 1, H, W] depth values (inverse depth in 100/m scale)
+
+        Returns:
+            loss: scalar (L1 distance between edges)
+        """
+        # Compute edges
+        importance_edges = self.compute_edges(importance_map)
+        depth_edges = self.compute_edges(depth_map)
+
+        # Normalize edges to [0, 1] for fair comparison
+        importance_edges = importance_edges / (importance_edges.max() + 1e-8)
+        depth_edges = depth_edges / (depth_edges.max() + 1e-8)
+
+        # L1 loss between edge maps
+        return F.l1_loss(importance_edges, depth_edges)
+
+
+class ContrastiveFGBGLoss(nn.Module):
+    """
+    Contrastive loss for FG/BG features.
+
+    Encourages FG and BG features to be different in embedding space.
+    Based on InfoNCE loss: maximize distance between FG and BG features.
+
+    This ensures that modulation parameters (γ_fg, β_fg, γ_bg, β_bg) are distinct,
+    leading to effective spatial modulation.
+
+    Reference: "Foreground-Aware Feature Contrast (FAC++)" (CVPR 2024)
+    """
+    def __init__(self, temperature=0.07):
+        super().__init__()
+        self.temperature = temperature
+
+    def forward(self, fg_features, bg_features):
+        """
+        Args:
+            fg_features: [B, feature_dim] foreground features
+            bg_features: [B, feature_dim] background features
+
+        Returns:
+            loss: scalar (negative cosine similarity, to maximize distance)
+        """
+        B = fg_features.shape[0]
+
+        # Normalize features to unit sphere
+        fg_norm = F.normalize(fg_features, dim=1)  # [B, feature_dim]
+        bg_norm = F.normalize(bg_features, dim=1)  # [B, feature_dim]
+
+        # Compute cosine similarity for same batch indices
+        # We want FG[i] and BG[i] to be DIFFERENT (low similarity)
+        similarity = (fg_norm * bg_norm).sum(dim=1)  # [B]
+
+        # Average over batch
+        avg_similarity = similarity.mean()
+
+        # Maximize distance = minimize similarity
+        # Add temperature scaling for numerical stability
+        return avg_similarity / self.temperature
+
+
+class Gear2Trainer:
+    """
+    Trainer for Gear2 metric depth learning.
 
     Frozen: DINOv2, DPT
     Fine-tuned: Mamba (LR: 1e-5)
-    Trained: Gear3 modules (LR: 1e-4)
+    Trained: Gear2 modules (LR: 1e-4)
     """
     def __init__(self, config, rank, world_size, local_rank):
         self.config = config
@@ -214,7 +430,7 @@ class Gear3Trainer:
 
         # Setup results directory (only rank 0)
         phase_suffix = f"_phase{self.phase}"
-        self.results_dir = Path(config.get('results_dir', f'./train_results/gear3{phase_suffix}'))
+        self.results_dir = Path(config.get('results_dir', f'./train_results/gear2{phase_suffix}'))
         if rank == 0:
             self.results_dir.mkdir(parents=True, exist_ok=True)
 
@@ -274,19 +490,30 @@ class Gear3Trainer:
         self.scheduler = self._setup_scheduler()
         self.loss_fn = LogL1Loss()
 
-        # FPS measurement removed (only in test_gear3.py with batch=1 for fair comparison)
+        # Regularization losses - ALL DISABLED
+        # Importance map now uses raw attention directly (no trainable parameters)
+        # Therefore no regularization is needed
+        self.use_depth_variance_loss = False
+        self.use_edge_aware_loss = False
+        self.use_contrastive_fgbg_loss = False
+
+        if rank == 0:
+            self.logger.info("=== Regularization Losses ===")
+            self.logger.info("✗ ALL regularization losses disabled (importance map uses raw attention)")
+
+        # FPS measurement removed (only in test_gear2.py with batch=1 for fair comparison)
 
         # Setup wandb
         if config.training.get('wandb', False):
             wandb.init(
-                project="flashdepth-gear3",
-                name=f"gear3_phase{self.phase}_{config.training.get('wandb_name', 'experiment')}",
+                project="flashdepth-gear2",
+                name=f"gear2_phase{self.phase}_{config.training.get('wandb_name', 'experiment')}",
                 config=dict(config)
             )
 
         # Setup visualizer with separate folders
-        self.train_visualizer = Gear3Visualizer(save_dir=self.results_dir / "visualizations" / "train")
-        self.val_visualizer = Gear3Visualizer(save_dir=self.results_dir / "visualizations" / "valid")
+        self.train_visualizer = Gear2Visualizer(save_dir=self.results_dir / "visualizations" / "train")
+        self.val_visualizer = Gear2Visualizer(save_dir=self.results_dir / "visualizations" / "valid")
 
         self.global_step = 0
         self.best_val_loss = float('inf')
@@ -311,7 +538,7 @@ class Gear3Trainer:
             }
 
     def _setup_model(self):
-        """Initialize FlashDepth with Gear3 metric head"""
+        """Initialize FlashDepth with Gear2 metric head"""
         # Create base FlashDepth model
         model_config = dict(self.config.model)
         model_config['batch_size'] = self.config.training.batch_size
@@ -321,7 +548,7 @@ class Gear3Trainer:
 
         # Load pre-trained checkpoint
         # Phase 1: Load from config (DINOv2 + DPT only)
-        # Phase 2, 3: Load Phase 1 best model (all Gear3 modules included)
+        # Phase 2, 3: Load Phase 1 best model (all Gear2 modules included)
         if self.phase == 1:
             checkpoint_path = self.config.get('load')
         else:
@@ -348,13 +575,13 @@ class Gear3Trainer:
 
                 if self.phase == 1:
                     # Phase 1: Load only DINOv2 and DPT refinement layers
-                    # Exclude: Mamba (modulated input), output_conv1/2 (modulated features), gear3_head
+                    # Exclude: Mamba (modulated input), output_conv1/2 (modulated features), gear2_head
                     loaded_dict = {}
                     excluded_keys = []
                     for k, v in state_dict.items():
                         # Exclude modules that receive modulated features
                         if any(x in k for x in ['mamba', 'hybrid_fusion', 'teacher_model',
-                                                'output_conv1', 'output_conv2', 'gear3_head']):
+                                                'output_conv1', 'output_conv2', 'gear2_head']):
                             excluded_keys.append(k)
                         else:
                             loaded_dict[k] = v
@@ -365,26 +592,24 @@ class Gear3Trainer:
                     self.logger.info(f"  - DINOv2 encoder: ✓")
                     self.logger.info(f"  - DPT projects/resize/refinenet: ✓")
                     self.logger.info(f"Excluded {len(excluded_keys)} parameters (will train from scratch):")
-                    self.logger.info(f"  - Mamba, output_conv1/2, gear3_head")
+                    self.logger.info(f"  - Mamba, output_conv1/2, gear2_head")
                 else:
-                    # Phase 2, 3: Load ALL parameters including gear3_head
-                    # But need to add gear3_head first before loading
-                    pass  # Will load after gear3_head is created
+                    # Phase 2, 3: Load ALL parameters including gear2_head
+                    # But need to add gear2_head first before loading
+                    pass  # Will load after gear2_head is created
             else:
                 self.logger.warning(f"Checkpoint {checkpoint_path} not found")
 
-        # Add Gear3 metric head
+        # Add Gear2 metric head
         embed_dim = 1024 if model.encoder == 'vitl' else 384
         dpt_dim = 256 if model.encoder == 'vitl' else 64
-        num_heads = 16 if model.encoder == 'vitl' else 6
 
-        model.gear3_head = Gear3MetricHead(
+        model.gear2_head = Gear2MetricHead(
             embed_dim=embed_dim,
-            dpt_dim=dpt_dim,
-            num_heads=num_heads
+            dpt_dim=dpt_dim
         )
 
-        # Phase 2, 3: Load ALL parameters after gear3_head is created
+        # Phase 2, 3: Load ALL parameters after gear2_head is created
         if self.phase > 1 and checkpoint_path and checkpoint_path != 'true' and os.path.exists(checkpoint_path):
             checkpoint = torch.load(checkpoint_path, map_location='cpu')
             if isinstance(checkpoint, dict) and 'model' in checkpoint:
@@ -396,13 +621,13 @@ class Gear3Trainer:
 
             state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
 
-            # Load all parameters including gear3_head
+            # Load all parameters including gear2_head
             model.load_state_dict(state_dict, strict=False)
             self.logger.info(f"Phase {self.phase}: Loaded ALL parameters from Phase 1 checkpoint")
-            self.logger.info(f"  - DINOv2, DPT, Mamba, output_conv, Gear3: ✓")
+            self.logger.info(f"  - DINOv2, DPT, Mamba, output_conv, Gear2: ✓")
 
         # Enable attention weights storage ONLY for last block (saves ~11GB memory)
-        # Gear3 only uses last block's attention for importance prediction
+        # Gear2 only uses last block's attention for importance prediction
         for i, block in enumerate(model.pretrained.blocks):
             if i == len(model.pretrained.blocks) - 1:
                 block.attn.store_attn_weights = True
@@ -430,19 +655,19 @@ class Gear3Trainer:
     def _configure_parameters(self, model):
         """
         Freeze: DINOv2, DPT refinement layers
-        Train from scratch: Mamba, output_conv1/2, Gear3 modules
+        Train from scratch: Mamba, output_conv1/2, Gear2 modules
         """
         frozen_params = 0
         mamba_params = 0
         output_conv_params = 0
-        gear3_params = 0
+        gear2_params = 0
 
         for name, param in model.named_parameters():
-            if 'gear3_head' in name:
-                # Gear3 modules: trainable
+            if 'gear2_head' in name:
+                # Gear2 modules: trainable
                 param.requires_grad = True
-                gear3_params += param.numel()
-                self.logger.info(f"Trainable (Gear3): {name} - {param.shape}")
+                gear2_params += param.numel()
+                self.logger.info(f"Trainable (Gear2): {name} - {param.shape}")
 
             elif 'mamba' in name:
                 # Mamba: train from scratch (receives modulated input)
@@ -463,9 +688,9 @@ class Gear3Trainer:
         self.logger.info(f"Frozen (DINOv2 + DPT refinement): {frozen_params:,}")
         self.logger.info(f"Trainable (Mamba, from scratch): {mamba_params:,}")
         self.logger.info(f"Trainable (output_conv, from scratch): {output_conv_params:,}")
-        self.logger.info(f"Trainable (Gear3 modules): {gear3_params:,}")
+        self.logger.info(f"Trainable (Gear2 modules): {gear2_params:,}")
 
-        total_trainable = mamba_params + output_conv_params + gear3_params
+        total_trainable = mamba_params + output_conv_params + gear2_params
         self.logger.info(f"Total trainable: {total_trainable:,}")
 
     def _set_train_mode(self):
@@ -482,7 +707,7 @@ class Gear3Trainer:
                 continue
 
             # Keep trainable parts in train mode
-            if any(keyword in name for keyword in ['gear3_head', 'mamba', 'output_conv']):
+            if any(keyword in name for keyword in ['gear2_head', 'mamba', 'output_conv']):
                 continue
 
             # Set frozen parts to eval mode
@@ -595,17 +820,17 @@ class Gear3Trainer:
 
     def _setup_optimizer(self):
         """Setup optimizer - same LR for all trainable modules (all train from scratch)"""
-        base_lr = self.config.training.get('gear3_lr', 1e-4)  # Use same LR for all
+        base_lr = self.config.training.get('gear2_lr', 1e-4)  # Use same LR for all
 
         # Separate parameter groups (for monitoring and potential future tuning)
         mamba_params = []
-        gear3_params = []
+        gear2_params = []
         output_conv_params = []
 
         for name, param in self.model.named_parameters():
             if param.requires_grad:
-                if 'gear3_head' in name:
-                    gear3_params.append(param)
+                if 'gear2_head' in name:
+                    gear2_params.append(param)
                 elif 'mamba' in name:
                     mamba_params.append(param)
                 elif 'output_conv' in name:
@@ -615,7 +840,7 @@ class Gear3Trainer:
                     self.logger.warning(f"Trainable parameter not in any group: {name}")
 
         param_groups = [
-            {'params': gear3_params, 'lr': base_lr, 'name': 'gear3'},
+            {'params': gear2_params, 'lr': base_lr, 'name': 'gear2'},
             {'params': mamba_params, 'lr': base_lr, 'name': 'mamba'},
             {'params': output_conv_params, 'lr': base_lr, 'name': 'output_conv'}
         ]
@@ -627,7 +852,7 @@ class Gear3Trainer:
         )
 
         self.logger.info(f"Optimizer setup:")
-        self.logger.info(f"  Gear3: {len(gear3_params)} params, LR={base_lr}")
+        self.logger.info(f"  Gear2: {len(gear2_params)} params, LR={base_lr}")
         self.logger.info(f"  Mamba: {len(mamba_params)} params, LR={base_lr}")
         self.logger.info(f"  Output_conv: {len(output_conv_params)} params, LR={base_lr}")
 
@@ -687,20 +912,21 @@ class Gear3Trainer:
             loss_dict = self.train_step(batch)
             
             # Get learning rates
-            lr_gear3 = self.optimizer.param_groups[0]['lr']
+            lr_gear2 = self.optimizer.param_groups[0]['lr']
             lr_mamba = self.optimizer.param_groups[1]['lr']
 
             # Update progress bar (every step)
             postfix_dict = {
                 'loss': f'{loss_dict["loss"]:.4f}',
-                'lr_g3': f'{lr_gear3:.2e}',
+                'depth': f'{loss_dict["depth_loss"]:.4f}',
+                'lr_g3': f'{lr_gear2:.2e}',
                 'lr_mb': f'{lr_mamba:.2e}'
             }
 
             pbar.set_postfix(postfix_dict)
 
             # WandB logging (every step)
-            wandb_dict = {**loss_dict, 'lr_gear3': lr_gear3, 'lr_mamba': lr_mamba}
+            wandb_dict = {**loss_dict, 'lr_gear2': lr_gear2, 'lr_mamba': lr_mamba}
             if self.config.training.get('wandb', False):
                 wandb.log(wandb_dict, step=step)
 
@@ -743,7 +969,7 @@ class Gear3Trainer:
                         patch_h, patch_w = h // model.patch_size, w // model.patch_size
                         dpt_features = model.depth_head.get_forward_features(encoder_features, patch_h, patch_w)
 
-                        path_1_modulated, importance_map, fg_features, bg_features = model.gear3_head(
+                        path_1_modulated, importance_map, fg_features, bg_features = model.gear2_head(
                             patch_tokens, attention_weights, dpt_features, patch_h, patch_w
                         )
 
@@ -756,9 +982,14 @@ class Gear3Trainer:
                         pred_depth_metric = 100.0 / (out + 1e-8)
                         gt_depth_metric = 100.0 / (gt_t_inverse + 1e-8)
 
-                        importance_map_resized = F.interpolate(
-                            importance_map, size=(h, w), mode='bilinear', align_corners=True
-                        )
+                        # Handle importance_map (None for Gear2)
+                        if importance_map is not None:
+                            importance_map_resized = F.interpolate(
+                                importance_map, size=(h, w), mode='bilinear', align_corners=True
+                            )
+                            importance_map_cpu = importance_map_resized[:1].cpu()
+                        else:
+                            importance_map_cpu = None
 
                         # Move tensors to CPU for visualization (only first batch, first frame)
                         sample_batch = (
@@ -768,10 +999,10 @@ class Gear3Trainer:
                         )
                         model_outputs_cpu = {
                             'pred_depth': pred_depth_metric[:1].cpu(),  # [1, 1, H, W]
-                            'importance_map': importance_map_resized[:1].cpu()  # [1, 1, H, W]
+                            'importance_map': importance_map_cpu  # [1, 1, H, W] or None
                         }
 
-                        # FPS removed from training (only measured in test_gear3.py)
+                        # FPS removed from training (only measured in test_gear2.py)
                         current_fps = None
 
                         # Pass loss_dict for visualization
@@ -850,6 +1081,7 @@ class Gear3Trainer:
 
         # Forward pass with BFloat16 autocast (like original FlashDepth)
         total_loss = 0
+        total_depth_loss = 0
         valid_frames = 0
 
         for t in range(T):
@@ -863,11 +1095,11 @@ class Gear3Trainer:
                     encoder_features = model.pretrained.get_intermediate_layers(
                         img_t, model.intermediate_layer_idx[model.encoder]
                     )
-
+                    
                     # Get attention weights (already computed and stored)
                     last_block = model.pretrained.blocks[-1]
                     attention_weights = last_block.attn.attn_weights
-
+                    
                     # Get patch tokens from last encoder layer
                     patch_tokens = encoder_features[-1]
 
@@ -880,8 +1112,8 @@ class Gear3Trainer:
                         encoder_features, patch_h, patch_w
                     )
 
-                # Apply Gear3 modulation (trainable) - only path_1 is modulated
-                path_1_modulated, importance_map, fg_features, bg_features = model.gear3_head(
+                # Apply Gear2 modulation (trainable) - only path_1 is modulated
+                path_1_modulated, importance_map, fg_features, bg_features = model.gear2_head(
                     patch_tokens, attention_weights, dpt_features, patch_h, patch_w
                 )
 
@@ -915,7 +1147,10 @@ class Gear3Trainer:
                     continue
 
                 # Loss computation in BFloat16
-                loss_t = self.loss_fn(pred_depth_inverse, gt_t, valid_mask.float())
+                depth_loss_t = self.loss_fn(pred_depth_inverse, gt_t, valid_mask.float())
+
+                # No regularization losses - importance map uses raw attention
+                loss_t = depth_loss_t
 
             # Safety check: skip if loss is NaN or too large
             if torch.isnan(loss_t) or torch.isinf(loss_t):
@@ -927,14 +1162,16 @@ class Gear3Trainer:
                 continue
 
             total_loss += loss_t
+            total_depth_loss += depth_loss_t
             valid_frames += 1
 
         # Average loss over valid frames
         if valid_frames == 0:
             self.logger.error("No valid frames in batch!")
-            return {'loss': 0.0}
+            return {'loss': 0.0, 'depth_loss': 0.0}
 
         loss = total_loss / valid_frames
+        avg_depth_loss = total_depth_loss / valid_frames
 
         # Backward pass (outside autocast for numerical stability)
         self.optimizer.zero_grad()
@@ -944,7 +1181,8 @@ class Gear3Trainer:
         self.scheduler.step()
 
         return {
-            'loss': loss.item()
+            'loss': loss.item(),
+            'depth_loss': avg_depth_loss.item()
         }
 
     @torch.no_grad()
@@ -1029,7 +1267,7 @@ class Gear3Trainer:
                     dpt_features = model.depth_head.get_forward_features(encoder_features, patch_h, patch_w)
 
                     # Apply modulation and get importance map (only path_1 is modulated)
-                    path_1_modulated, importance_map, fg_features, bg_features = model.gear3_head(
+                    path_1_modulated, importance_map, fg_features, bg_features = model.gear2_head(
                         patch_tokens, attention_weights, dpt_features, patch_h, patch_w
                     )
 
@@ -1099,10 +1337,14 @@ class Gear3Trainer:
                                     # Get GT resolution for visualization
                                     gt_h, gt_w = gt_t_inverse.shape[-2:]
 
-                                    # Resize importance map to GT resolution
-                                    importance_map_resized = F.interpolate(
-                                        importance_map, size=(gt_h, gt_w), mode='bilinear', align_corners=True
-                                    )
+                                    # Resize importance map to GT resolution (None for Gear2)
+                                    if importance_map is not None:
+                                        importance_map_resized = F.interpolate(
+                                            importance_map, size=(gt_h, gt_w), mode='bilinear', align_corners=True
+                                        )
+                                        importance_map_cpu = importance_map_resized.float().cpu()
+                                    else:
+                                        importance_map_cpu = None
 
                                     # Resize images to GT resolution (for visualization consistency)
                                     img_t_resized = F.interpolate(
@@ -1111,7 +1353,7 @@ class Gear3Trainer:
 
                                     model_outputs = {
                                         'pred_depth': pred_depth_metric,  # [B, 1, gt_h, gt_w] at GT resolution
-                                        'importance_map': importance_map_resized.float().cpu()  # [B, 1, gt_h, gt_w]
+                                        'importance_map': importance_map_cpu  # [B, 1, gt_h, gt_w] or None
                                     }
 
                                     # For visualization, we need [B, T, ...] format like training
@@ -1122,7 +1364,7 @@ class Gear3Trainer:
                                         dataset_idx
                                     )
 
-                                    # FPS removed from training (only measured in test_gear3.py)
+                                    # FPS removed from training (only measured in test_gear2.py)
                                     current_fps = None
 
                                     # Create loss_dict with current frame loss (for visualization)
@@ -1238,14 +1480,14 @@ class Gear3Trainer:
         self.logger.info(f"Saved checkpoint: {checkpoint_path}")
 
 
-@hydra.main(version_base=None, config_path="configs/gear3", config_name="config")
+@hydra.main(version_base=None, config_path="configs/gear2", config_name="config")
 def main(config: DictConfig):
     """Main entry point"""
     # Initialize distributed training
     rank, world_size, local_rank = init_distributed()
 
     # Create trainer
-    trainer = Gear3Trainer(config, rank, world_size, local_rank)
+    trainer = Gear2Trainer(config, rank, world_size, local_rank)
     trainer.train()
 
     # Cleanup

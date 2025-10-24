@@ -51,3 +51,6 @@ flashdepth_claude/.triton_cache
 flashdepth_claude/train_results/
 flashdepth_claude/test_results/
 *.log
+flashdepth_claude/test_gear3/
+flashdepth_claude/ppt_data/
+*.mp4
