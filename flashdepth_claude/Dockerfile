@@ -31,7 +31,7 @@ RUN pip install xformers==0.0.27.post2+cu118 --index-url https://download.pytorc
 RUN pip install ipdb tqdm wandb
 RUN pip install matplotlib einops scipy h5py OpenEXR seaborn pandas
 RUN pip install hydra-core
-RUN pip install opencv-python pillow
+RUN pip install opencv-python pillow pyarrow
 RUN pip install packaging wheel
 
 # Install flash-attention

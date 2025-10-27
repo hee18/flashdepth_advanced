@@ -89,3 +89,8 @@ eval:
   save_depth_npy: false
   save_vis_map: false
   dummy_timing: false
+
+# Object-wise evaluation configuration
+object_wise:
+  enabled: false  # Enable object-wise evaluation (set via CLI: object_wise.enabled=true)
+  dataset: waymo  # Dataset type for object-wise eval: waymo, sintel

@@ -235,8 +235,8 @@ class MultiLayerAttentionFusion(nn.Module):
 
         # Process each layer's attention
         for attn in attention_weights_list:
-            importance = process_attention_to_importance(attn, patch_h, patch_w)
-            importance_maps.append(importance)
+            importance = process_attention_to_importance(attn, patch_h, patch_w)  # [B, 1, H, W]
+            importance_maps.append(importance.squeeze(1))  # Remove channel dim → [B, H, W]
 
         # Stack: [B, num_layers, patch_h, patch_w]
         importance_stack = torch.stack(importance_maps, dim=1)
@@ -244,8 +244,8 @@ class MultiLayerAttentionFusion(nn.Module):
         # Normalize fusion weights
         weights_norm = torch.softmax(self.fusion_weights, dim=0)
 
-        # Weighted fusion
-        importance_fused = (importance_stack * weights_norm.view(1, -1, 1, 1)).sum(dim=1)
+        # Weighted fusion: [B, num_layers, patch_h, patch_w] → [B, patch_h, patch_w] → [B, 1, patch_h, patch_w]
+        importance_fused = (importance_stack * weights_norm.view(1, -1, 1, 1)).sum(dim=1).unsqueeze(1)
 
         return importance_fused
 
@@ -314,13 +314,31 @@ class ForegroundBackgroundNetworks(nn.Module):
         """
         B, num_patches, embed_dim = patch_tokens.shape
 
-        # Flatten masks to match patch_tokens shape
-        fg_mask_flat = fg_mask.flatten(2).squeeze(1)  # [B, num_patches]
-        bg_mask_flat = bg_mask.flatten(2).squeeze(1)
+        # Flatten masks first
+        fg_mask_flat = fg_mask.flatten(2).squeeze(1)  # [B, mask_patches]
+        bg_mask_flat = bg_mask.flatten(2).squeeze(1)  # [B, mask_patches]
+
+        # Handle dimension mismatch using 1D interpolation (more robust than 2D)
+        mask_patches = fg_mask_flat.shape[1]
+        if mask_patches != num_patches:
+            # Use 1D interpolation to match exact patch count
+            fg_mask_flat = F.interpolate(
+                fg_mask_flat.unsqueeze(1), size=num_patches, mode='linear', align_corners=True
+            ).squeeze(1)  # [B, num_patches]
+            bg_mask_flat = F.interpolate(
+                bg_mask_flat.unsqueeze(1), size=num_patches, mode='linear', align_corners=True
+            ).squeeze(1)  # [B, num_patches]
 
         # If importance_map provided, use it for soft weighting (like Gear3)
         if importance_map is not None:
-            attn_scores = importance_map.flatten(2).squeeze(1)  # [B, num_patches]
+            # Flatten importance_map
+            attn_scores = importance_map.flatten(2).squeeze(1)  # [B, map_patches]
+
+            # Handle dimension mismatch using 1D interpolation
+            if attn_scores.shape[1] != num_patches:
+                attn_scores = F.interpolate(
+                    attn_scores.unsqueeze(1), size=num_patches, mode='linear', align_corners=True
+                ).squeeze(1)  # [B, num_patches]
 
             # Weighted pooling with attention scores (matches Gear3!)
             fg_weights = attn_scores * fg_mask_flat  # Soft weighting
@@ -494,7 +512,7 @@ class Gear3UpgradeMetricHead(nn.Module):
                 attention_weights_multi_layer=None, cls_token=None):
         """
         Args:
-            patch_tokens: [B, num_patches, embed_dim] from Layer 23
+            patch_tokens: [B, num_patches+1, embed_dim] from Layer 23 (includes CLS token at index 0)
             attention_weights: [B, num_heads, N+1, N+1] from Layer 23
             dpt_features: List of [B, dpt_dim, H, W] for 4 DPT layers
             patch_h, patch_w: Spatial dimensions
@@ -509,11 +527,14 @@ class Gear3UpgradeMetricHead(nn.Module):
             fg_mask: [B, 1, patch_h, patch_w] - for visualization
             bg_mask: [B, 1, patch_h, patch_w] - for visualization
         """
+        # Remove CLS token to get patch-only tokens
+        patch_tokens_only = patch_tokens[:, 1:, :]  # [B, num_patches, embed_dim]
+
         # Step 1: Generate importance map and FG/BG masks
         if self.separation_method == 'cls_seg':
             # CLS-based segmentation
             assert cls_token is not None, "cls_token required for cls_seg mode"
-            fg_mask, bg_mask = self.segmentation_head(cls_token, patch_tokens, patch_h, patch_w)
+            fg_mask, bg_mask = self.segmentation_head(cls_token, patch_tokens_only, patch_h, patch_w)
             importance_map = fg_mask  # Use FG probability as importance
             # cls_seg: masks are already soft (softmax output), no need for importance_map weighting
             use_importance_weighting = False
@@ -542,11 +563,11 @@ class Gear3UpgradeMetricHead(nn.Module):
         # Pass importance_map for multi_layer (binary masks need soft weighting like Gear3)
         if use_importance_weighting:
             fg_features, bg_features = self.fg_bg_networks(
-                patch_tokens, fg_mask, bg_mask, importance_map=importance_map
+                patch_tokens_only, fg_mask, bg_mask, importance_map=importance_map
             )
         else:
             fg_features, bg_features = self.fg_bg_networks(
-                patch_tokens, fg_mask, bg_mask, importance_map=None
+                patch_tokens_only, fg_mask, bg_mask, importance_map=None
             )
 
         # Step 3: Get modulation parameters

@@ -17,6 +17,9 @@ class Gear2Visualizer:
     Visualization utilities for Gear2 training (Ablation: No FG/BG separation)
     """
 
+    # Sparse depth datasets that need inpainting for visualization
+    SPARSE_DATASETS = ['waymo', 'nuscenes']
+
     def __init__(self, save_dir="./visualizations"):
         self.save_dir = Path(save_dir)
         self.save_dir.mkdir(exist_ok=True, parents=True)
@@ -26,7 +29,7 @@ class Gear2Visualizer:
         plt.style.use('default')
         sns.set_palette("husl")
 
-    def create_validation_summary(self, sample_batch, model_outputs, step, save_name=None, prefix="validation", fps=None, loss_dict=None):
+    def create_validation_summary(self, sample_batch, model_outputs, step, save_name=None, prefix="validation", fps=None, loss_dict=None, dataset_name=None):
         """
         Create a comprehensive validation summary for Gear2
 
@@ -39,6 +42,7 @@ class Gear2Visualizer:
             fps: Forward pass FPS (optional)
             loss_dict: Dictionary with loss values (optional)
                 - 'depth_loss': Depth loss value
+            dataset_name: Name of the dataset (for sparse depth detection)
 
         Returns:
             fig: Matplotlib figure object
@@ -111,8 +115,10 @@ class Gear2Visualizer:
             # 2. Ground Truth Depth (with sparse depth handling)
             ax2 = fig.add_subplot(gs[0, 1])
 
-            # Use enhanced sparse visualization if valid_ratio < 50% (e.g., Waymo LiDAR)
-            if valid_ratio < 0.5:
+            # Use inpainting ONLY for sparse datasets (waymo, nuscenes)
+            is_sparse_dataset = dataset_name in self.SPARSE_DATASETS if dataset_name else False
+
+            if is_sparse_dataset:
                 # Sparse depth: use dual visualization (inpainted)
                 _, gt_dense_vis, gt_info = create_dual_sparse_depth_vis(
                     gt_depth_frame, valid_mask, colormap='plasma', percentile_range=(2, 98)
@@ -134,7 +140,7 @@ class Gear2Visualizer:
             # 3. Predicted Metric Depth (with sparse depth handling)
             ax3 = fig.add_subplot(gs[0, 2])
 
-            if valid_ratio < 0.5:
+            if is_sparse_dataset:
                 # Sparse depth: use dual visualization (inpainted)
                 _, pred_dense_vis, pred_info = create_dual_sparse_depth_vis(
                     pred_depth_frame, valid_mask, colormap='plasma', percentile_range=(2, 98)

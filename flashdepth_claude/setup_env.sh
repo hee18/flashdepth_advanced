@@ -7,6 +7,7 @@ pip install ipdb tqdm wandb
 pip install matplotlib einops scipy h5py OpenEXR
 pip install hydra-core
 pip install opencv-python pillow
+pip install pyarrow  # Required for Waymo Parquet dataset loading
 
 pip install flash-attn --no-build-isolation
 

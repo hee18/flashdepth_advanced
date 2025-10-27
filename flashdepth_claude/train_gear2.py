@@ -1376,7 +1376,7 @@ class Gear2Trainer:
                                     save_name = f"validation_{current_dataset}_seq{seq_num:03d}_step_{self.global_step:06d}"
                                     self.val_visualizer.create_validation_summary(
                                         sample_batch, model_outputs, self.global_step,
-                                        save_name=save_name, fps=current_fps, loss_dict=val_loss_dict
+                                        save_name=save_name, fps=current_fps, loss_dict=val_loss_dict, dataset_name=current_dataset
                                     )
                                     config['saved'].append(seq_num)
                                     self.logger.info(f"Saved validation visualization: {current_dataset} sequence {seq_num} ({len(config['saved'])}/{len(config['sequences'])})")

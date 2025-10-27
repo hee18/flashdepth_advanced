@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Test script for Gear3: Feature-level Metric Depth Learning
+Test script for Gear3 Upgrade: Feature-level Metric Depth Learning with FG/BG Masks
 
-Key differences from baseline:
-    - No relative depth visualization (features are modulated)
-    - Test on inverse depth metrics
-    - De-canonicalize outputs for final evaluation
+Key differences from Gear3:
+    - Produces FG/BG masks in addition to importance map
+    - Visualizes FG/BG masks separately
+    - Uses Gear3UpgradeMetricHead for prediction
 """
 
 import os
@@ -32,7 +32,7 @@ project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
 
 from flashdepth.model import FlashDepth
-from flashdepth.gear3_modules import Gear3MetricHead
+from flashdepth.gear3_upgrade_modules import Gear3UpgradeMetricHead
 from dataloaders.combined_dataset import CombinedDataset
 from dataloaders.sintel_segmentation_dataset import SintelSegmentationDataset, collate_fn as sintel_collate_fn
 from dataloaders.waymo_segmentation_dataset import WaymoSegmentationDataset, collate_fn as waymo_collate_fn
@@ -49,14 +49,15 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-class Gear3Tester:
+class Gear3UpgradeTester:
     """
-    Test harness for Gear3 model.
+    Test harness for Gear3 Upgrade model.
 
     Evaluates on:
         - Inverse depth metrics (TAE, AbsRel, δ1/δ2/δ3)
         - Metric depth visualization (no relative depth)
         - Importance map visualization
+        - FG/BG mask visualization
     """
     def __init__(self, config):
         self.config = config
@@ -88,7 +89,7 @@ class Gear3Tester:
         self.metrics = MetricDepthMetrics()
 
     def _setup_model(self):
-        """Load trained Gear3 model"""
+        """Load trained Gear3 Upgrade model"""
         # Create base FlashDepth model
         model_config = dict(self.config.model)
         model_config['batch_size'] = 1
@@ -96,18 +97,20 @@ class Gear3Tester:
 
         model = FlashDepth(**model_config)
 
-        # Add Gear3 metric head
+        # Add Gear3 Upgrade metric head
         embed_dim = 1024 if model.encoder == 'vitl' else 384
         dpt_dim = 256 if model.encoder == 'vitl' else 64
         num_heads = 16 if model.encoder == 'vitl' else 6
+        separation_method = self.config.get('separation_method', 'cls_seg')
 
-        model.gear3_head = Gear3MetricHead(
+        model.gear3_upgrade_head = Gear3UpgradeMetricHead(
             embed_dim=embed_dim,
             dpt_dim=dpt_dim,
-            num_heads=num_heads
+            num_heads=num_heads,
+            separation_method=separation_method
         )
 
-        # Enable attention weights storage ONLY for last block (like train_gear3)
+        # Enable attention weights storage ONLY for last block (like train_gear3_upgrade)
         for i, block in enumerate(model.pretrained.blocks):
             if i == len(model.pretrained.blocks) - 1:
                 block.attn.store_attn_weights = True
@@ -130,8 +133,18 @@ class Gear3Tester:
                 else:
                     state_dict = checkpoint
 
+                # Convert gear3_head keys to gear3_upgrade_head for backward compatibility
+                converted_state_dict = {}
+                for key, value in state_dict.items():
+                    if key.startswith('gear3_head.'):
+                        new_key = key.replace('gear3_head.', 'gear3_upgrade_head.', 1)
+                        converted_state_dict[new_key] = value
+                        logger.debug(f"Converted key: {key} -> {new_key}")
+                    else:
+                        converted_state_dict[key] = value
+
                 # Load state dict
-                model.load_state_dict(state_dict, strict=True)
+                model.load_state_dict(converted_state_dict, strict=True)
                 logger.info(f"Loaded checkpoint successfully")
 
                 # Log training info if available
@@ -434,9 +447,8 @@ class Gear3Tester:
             logger.error(f"Batch is not a dict! Type: {type(batch)}, Content: {batch if not isinstance(batch, torch.Tensor) else 'Tensor'}")
             raise TypeError(f"Expected dict, got {type(batch)}")
 
-        # Preload all data to GPU memory (논문 방법: FPS 측정 시 데이터 전송 시간 제외)
-        images = batch['image'].to(self.device)  # [1, T, 3, H, W] - 전체 시퀀스를 GPU에 미리 로드
-        gt_depth = batch['depth'].to(self.device)  # [1, T, H, W]
+        images = batch['image'].to(self.device)  # [1, T, 3, H, W]
+        gt_depth = batch['depth'].to(self.device)  # [1, T, H, W] - val split has no channel dim
 
         # Add channel dimension if needed
         if gt_depth.ndim == 3:
@@ -454,8 +466,8 @@ class Gear3Tester:
         # Storage for predictions
         pred_depths = []
         importance_maps = []
-        fg_features_list = []
-        bg_features_list = []
+        fg_mask_list = []
+        bg_mask_list = []
 
         # Best frame tracking
         best_frame_idx = 0
@@ -470,13 +482,15 @@ class Gear3Tester:
             )
             last_block = self.model.pretrained.blocks[-1]
             attention_weights_warmup = last_block.attn.attn_weights
-            patch_tokens_warmup = encoder_features_warmup[-1]
+            patch_tokens_warmup = encoder_features_warmup[-1]  # [B, N+1, embed_dim] (includes CLS)
+            cls_token_warmup = patch_tokens_warmup[:, 0]  # [B, embed_dim]
             h_warmup, w_warmup = img_warmup.shape[2:]
             patch_h_warmup = h_warmup // self.model.patch_size
             patch_w_warmup = w_warmup // self.model.patch_size
             dpt_features_warmup = self.model.depth_head.get_forward_features(encoder_features_warmup, patch_h_warmup, patch_w_warmup)
-            path_1_warmup, _, _, _ = self.model.gear3_head(
-                patch_tokens_warmup, attention_weights_warmup, dpt_features_warmup, patch_h_warmup, patch_w_warmup
+            path_1_warmup, _, _, _, _, _ = self.model.gear3_upgrade_head(
+                patch_tokens_warmup, attention_weights_warmup, dpt_features_warmup, patch_h_warmup, patch_w_warmup,
+                cls_token=cls_token_warmup
             )
             out_warmup = self.model.depth_head.scratch.output_conv1(path_1_warmup)
             out_warmup = F.interpolate(out_warmup, (h_warmup, w_warmup), mode="bilinear", align_corners=True)
@@ -497,9 +511,8 @@ class Gear3Tester:
                 import time
                 start_time = time.time()
 
-            # GPU에서 인덱싱만 (전송 없음, 데이터는 이미 GPU에 로드됨)
-            img_t = images[0, t]  # [3, H, W] - GPU에서 인덱싱만
-            gt_t_inverse = gt_depth_inverse_100[0, t]  # [1, H, W] - GPU에서 인덱싱만
+            img_t = images[0, t]  # [3, H, W]
+            gt_t_inverse = gt_depth_inverse_100[0, t]  # [1, H, W] in 100/m
 
             # Use BFloat16 for forward pass (same as train_gear3.py)
             with torch.amp.autocast('cuda', dtype=torch.bfloat16):
@@ -512,17 +525,20 @@ class Gear3Tester:
                 last_block = self.model.pretrained.blocks[-1]
                 attention_weights = last_block.attn.attn_weights
 
-                # Get patch tokens from last encoder layer
-                patch_tokens = encoder_features[-1]
+                # Get patch tokens from last encoder layer (includes CLS token)
+                patch_tokens = encoder_features[-1]  # [B, N+1, embed_dim]
+                cls_token = patch_tokens[:, 0]  # [B, embed_dim]
 
                 # Get DPT features
                 h, w = img_t.shape[1:]
                 patch_h, patch_w = h // self.model.patch_size, w // self.model.patch_size
                 dpt_features = self.model.depth_head.get_forward_features(encoder_features, patch_h, patch_w)
 
-                # Apply Gear3 modulation
-                path_1_modulated, importance_map, fg_features, bg_features = self.model.gear3_head(
-                    patch_tokens, attention_weights, dpt_features, patch_h, patch_w
+                # Apply Gear3 Upgrade modulation (produces FG/BG masks)
+                # Pass cls_token for cls_seg mode support
+                path_1_modulated, importance_map, fg_features, bg_features, fg_mask, bg_mask = self.model.gear3_upgrade_head(
+                    patch_tokens, attention_weights, dpt_features, patch_h, patch_w,
+                    cls_token=cls_token
                 )
 
                 # Get depth prediction (output is inverse depth in 100/m scale)
@@ -545,7 +561,7 @@ class Gear3Tester:
                 pred_depth_metric = 100.0 / (pred_depth_inverse_100[0] + 1e-8)  # [1, H, W]
 
                 # Upsample importance_map to image resolution for smooth visualization
-                # (like train_gear3.py does before passing to visualizer)
+                # (like train_gear3_upgrade.py does before passing to visualizer)
                 h_full, w_full = img_t.shape[1:]  # Image resolution
                 importance_map_resized = F.interpolate(
                     importance_map, size=(h_full, w_full), mode='bilinear', align_corners=True
@@ -560,8 +576,8 @@ class Gear3Tester:
             pred_depths.append(pred_depth_metric)
             # Save upsampled importance_map (already smooth, no need to interpolate again in visualization)
             importance_maps.append(importance_map_resized[0])  # [1, H, W] at image resolution
-            fg_features_list.append(fg_features[0])
-            bg_features_list.append(bg_features[0])
+            fg_mask_list.append(fg_mask[0])
+            bg_mask_list.append(bg_mask[0])
 
         # Calculate FPS (like original FlashDepth: exclude warmup frames)
         if start_time is not None:
@@ -577,8 +593,8 @@ class Gear3Tester:
         # Stack predictions
         pred_depths = torch.stack(pred_depths, dim=0)  # [T, 1, H, W] in meters
         importance_maps = torch.stack(importance_maps, dim=0)  # [T, 1, patch_h, patch_w]
-        fg_features_all = torch.stack(fg_features_list, dim=0)  # [T, C, patch_h, patch_w]
-        bg_features_all = torch.stack(bg_features_list, dim=0)  # [T, C, patch_h, patch_w]
+        fg_mask_all = torch.stack(fg_mask_list, dim=0)  # [T, 1, patch_h, patch_w]
+        bg_mask_all = torch.stack(bg_mask_list, dim=0)  # [T, 1, patch_h, patch_w]
 
         # Convert GT to metric depth for evaluation: 100/m -> m
         gt_depth_metric = 100.0 / (gt_depth_inverse_100[0] + 1e-8)  # [T, 1, H, W] in meters
@@ -764,8 +780,8 @@ class Gear3Tester:
                 pred_depths[best_frame_idx, 0],  # [H, W]
                 gt_depth_metric[best_frame_idx, 0],  # [H, W]
                 importance_maps[best_frame_idx, 0],  # [patch_h, patch_w]
-                fg_features_all[best_frame_idx],  # [C, patch_h, patch_w]
-                bg_features_all[best_frame_idx],  # [C, patch_h, patch_w]
+                fg_mask_all[best_frame_idx],  # [1, patch_h, patch_w]
+                bg_mask_all[best_frame_idx],  # [1, patch_h, patch_w]
                 sequence_id,
                 best_frame_idx,
                 best_frame_abs_rel,
@@ -937,7 +953,7 @@ class Gear3Tester:
         return grid
 
     def _save_best_frame_visualizations(self, image, pred_depth, gt_depth, importance_map,
-                                        fg_features, bg_features, sequence_id, frame_idx, abs_rel, fps=None):
+                                        fg_mask, bg_mask, sequence_id, frame_idx, abs_rel, fps=None):
         """
         Save best frame visualization matching train_gear3_upgrade layout
 
@@ -955,8 +971,8 @@ class Gear3Tester:
             pred_depth: [H, W] - Predicted metric depth
             gt_depth: [H, W] - Ground truth metric depth
             importance_map: [patch_h, patch_w] - Importance map (0-1 normalized)
-            fg_features: [C, patch_h, patch_w] - Foreground features (used to extract FG mask)
-            bg_features: [C, patch_h, patch_w] - Background features (used to extract BG mask)
+            fg_mask: [1, patch_h, patch_w] - Foreground mask from Gear3 Upgrade head
+            bg_mask: [1, patch_h, patch_w] - Background mask from Gear3 Upgrade head
             sequence_id: int - Sequence index
             frame_idx: int - Frame index within sequence
             abs_rel: float - AbsRel metric for this frame
@@ -998,10 +1014,23 @@ class Gear3Tester:
         imp_mean = importance_map.mean()
         imp_std = importance_map.std()
 
-        # Extract FG/BG masks from importance map (binary thresholding)
-        # Use mean threshold to separate foreground from background
-        fg_mask = (importance_map >= imp_mean).astype(np.float32)
-        bg_mask = (importance_map < imp_mean).astype(np.float32)
+        # Convert FG/BG masks to numpy (already provided from model)
+        # fg_mask and bg_mask are [1, patch_h, patch_w] from model output
+        if isinstance(fg_mask, torch.Tensor):
+            fg_mask = fg_mask.float().cpu().numpy()
+        if isinstance(bg_mask, torch.Tensor):
+            bg_mask = bg_mask.float().cpu().numpy()
+
+        # Squeeze to [patch_h, patch_w] if needed
+        if fg_mask.ndim > 2:
+            fg_mask = fg_mask.squeeze()
+        if bg_mask.ndim > 2:
+            bg_mask = bg_mask.squeeze()
+
+        # IMPORTANT: Convert soft masks to binary (like train_gear3_upgrade.py)
+        # cls_seg and kmeans return soft probabilities, but we want binary visualization
+        fg_mask = (fg_mask > 0.5).astype(np.float32)
+        bg_mask = (bg_mask > 0.5).astype(np.float32)
 
         # Upsample FG/BG masks to match input image resolution (bilinear for smoother visualization)
         fg_mask_upsampled = F.interpolate(
@@ -1213,7 +1242,7 @@ class Gear3Tester:
         ax11.grid(True, alpha=0.3)
 
         # Overall title
-        plt.suptitle(f'Gear3: Sequence {sequence_id+1} Best Frame {frame_idx}',
+        plt.suptitle(f'Gear3 Upgrade: Sequence {sequence_id+1} Best Frame {frame_idx}',
                     fontsize=16, fontweight='bold')
 
         # Save with same naming convention
@@ -1221,7 +1250,7 @@ class Gear3Tester:
         plt.savefig(save_path, dpi=150, bbox_inches='tight', facecolor='white')
         plt.close(fig)
 
-        logger.info(f"Saved Gear3 best frame visualization: {save_path}")
+        logger.info(f"Saved Gear3 Upgrade best frame visualization: {save_path}")
 
     def _aggregate_metrics(self, all_metrics):
         """Aggregate metrics across sequences"""
@@ -1236,7 +1265,7 @@ class Gear3Tester:
         return aggregated
 
 
-@hydra.main(version_base=None, config_path="configs/gear3", config_name="config")
+@hydra.main(version_base=None, config_path="configs/gear3_upgrade", config_name="config")
 def main(config: DictConfig):
     """Main entry point"""
     import os
@@ -1244,7 +1273,7 @@ def main(config: DictConfig):
     # Override config for testing
     config.inference = True
 
-    tester = Gear3Tester(config)
+    tester = Gear3UpgradeTester(config)
     tester.test()
 
 

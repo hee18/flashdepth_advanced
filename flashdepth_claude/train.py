@@ -127,7 +127,8 @@ def inference(cfg, process_dict):
         'loss_type': cfg.training.loss_type,
         'use_all_frames': True,
         'use_metrics': False,
-        'dummy_timing': cfg.eval.dummy_timing
+        'dummy_timing': cfg.eval.dummy_timing,
+        'inverse': cfg.eval.get('inverse', False)
     }
 
     

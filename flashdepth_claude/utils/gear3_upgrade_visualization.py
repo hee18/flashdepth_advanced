@@ -28,6 +28,9 @@ class Gear3UpgradeVisualizer:
     FG/BG overlay matches visualize_attention_weights.py implementation.
     """
 
+    # Sparse depth datasets that need inpainting for visualization
+    SPARSE_DATASETS = ['waymo', 'nuscenes']
+
     def __init__(self, save_dir="./visualizations"):
         self.save_dir = Path(save_dir)
         self.save_dir.mkdir(exist_ok=True, parents=True)
@@ -37,7 +40,7 @@ class Gear3UpgradeVisualizer:
         plt.style.use('default')
         sns.set_palette("husl")
 
-    def create_validation_summary(self, sample_batch, model_outputs, step, save_name=None, prefix="validation", fps=None, loss_dict=None):
+    def create_validation_summary(self, sample_batch, model_outputs, step, save_name=None, prefix="validation", fps=None, loss_dict=None, dataset_name=None, layer_weights=None):
         """
         Create a comprehensive validation summary for Gear3 Upgrade
 
@@ -55,6 +58,7 @@ class Gear3UpgradeVisualizer:
             prefix: Prefix for the visualization
             fps: Forward pass FPS (optional)
             loss_dict: Dictionary with loss values (optional)
+            dataset_name: Name of the dataset (for sparse depth detection)
 
         Returns:
             fig: Matplotlib figure object
@@ -192,8 +196,10 @@ class Gear3UpgradeVisualizer:
             # 2. Ground Truth Depth (with sparse depth handling - IDENTICAL to Gear3)
             ax2 = fig.add_subplot(gs[0, 1])
 
-            # Use enhanced sparse visualization if valid_ratio < 50% (e.g., Waymo LiDAR)
-            if valid_ratio < 0.5:
+            # Use inpainting ONLY for sparse datasets (waymo, nuscenes)
+            is_sparse_dataset = dataset_name in self.SPARSE_DATASETS if dataset_name else False
+
+            if is_sparse_dataset:
                 # Sparse depth: use dual visualization (inpainted within valid row range only)
                 _, gt_dense_vis, gt_info = create_dual_sparse_depth_vis(
                     gt_depth_frame, valid_mask, colormap='plasma', percentile_range=(2, 98)
@@ -215,7 +221,7 @@ class Gear3UpgradeVisualizer:
             # 3. Predicted Metric Depth (with sparse depth handling - IDENTICAL to Gear3)
             ax3 = fig.add_subplot(gs[0, 2])
 
-            if valid_ratio < 0.5:
+            if is_sparse_dataset:
                 # Sparse depth: use dual visualization (inpainted within valid row range only)
                 _, pred_dense_vis, pred_info = create_dual_sparse_depth_vis(
                     pred_depth_frame, valid_mask, colormap='plasma', percentile_range=(2, 98)
@@ -234,9 +240,17 @@ class Gear3UpgradeVisualizer:
 
             # ==================== Row 2: Importance, FG, BG ====================
 
-            # 4. Importance Map (IDENTICAL to Gear3)
+            # 4. Importance Map (upsampled with bilinear for smooth visualization)
             ax4 = fig.add_subplot(gs[1, 0])
-            im4 = ax4.imshow(importance_frame, cmap='jet', vmin=0, vmax=1)
+            # Upsample importance map to image resolution
+            img_h, img_w = input_img.shape[:2]
+            importance_upsampled = F.interpolate(
+                torch.from_numpy(importance_frame).unsqueeze(0).unsqueeze(0),
+                size=(img_h, img_w),
+                mode='bilinear',
+                align_corners=True
+            ).squeeze().numpy()
+            im4 = ax4.imshow(importance_upsampled, cmap='jet', vmin=0, vmax=1)
             ax4.set_title(f'Importance Map\nmean={imp_mean:.3f}, std={imp_std:.3f}',
                          fontsize=14, fontweight='bold')
             ax4.axis('off')
@@ -253,18 +267,20 @@ class Gear3UpgradeVisualizer:
                 fg_mask_frame = (fg_mask_frame > 0.5).astype(np.float32)
                 bg_mask_frame = (bg_mask_frame > 0.5).astype(np.float32)
 
-            # Upsample FG/BG masks to match input image resolution (like visualize_attention_weights.py)
+            # Upsample FG/BG masks to match input image resolution (bilinear for smoother visualization)
             img_h, img_w = input_img.shape[:2]
             fg_mask_upsampled = F.interpolate(
                 torch.from_numpy(fg_mask_frame).unsqueeze(0).unsqueeze(0),
                 size=(img_h, img_w),
-                mode='nearest'
+                mode='bilinear',
+                align_corners=True
             ).squeeze().numpy()
 
             bg_mask_upsampled = F.interpolate(
                 torch.from_numpy(bg_mask_frame).unsqueeze(0).unsqueeze(0),
                 size=(img_h, img_w),
-                mode='nearest'
+                mode='bilinear',
+                align_corners=True
             ).squeeze().numpy()
 
             # 5. FG Mask (visualize_attention_weights.py style)
@@ -393,6 +409,14 @@ class Gear3UpgradeVisualizer:
                 if 'contrastive_fgbg_loss' in loss_dict and loss_dict['contrastive_fgbg_loss'] > 0:
                     ax9.text(0.05, y_pos, f'Contrast: {loss_dict["contrastive_fgbg_loss"]:.4f}', fontsize=9,
                             transform=ax9.transAxes, bbox=dict(boxstyle="round", facecolor='lightgreen'))
+                    y_pos -= 0.08
+
+            # Layer weights (only for multi_layer separation method)
+            if layer_weights is not None:
+                # Format: "0.12:0.18:0.30:0.40"
+                weights_str = ":".join([f"{w:.2f}" for w in layer_weights])
+                ax9.text(0.05, y_pos, f'Layer weights: {weights_str}', fontsize=9,
+                        transform=ax9.transAxes, bbox=dict(boxstyle="round", facecolor='lavender'))
 
             ax9.set_title('Depth Metrics & Training Info', fontsize=14, fontweight='bold')
             ax9.axis('off')

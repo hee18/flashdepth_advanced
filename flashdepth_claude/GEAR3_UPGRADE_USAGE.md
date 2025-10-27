@@ -1,7 +1,7 @@
 # FlashDepth Gear3 Upgrade: 고급 FG/BG 분리 전략
 
 **작성일**: 2025-10-23
-**최종 업데이트**: 2025-10-23
+**최종 업데이트**: 2025-10-25 (Loss 구조 및 FAQ 추가)
 **브랜치**: gear3
 **목적**: 다양한 FG/BG 분리 방법을 통한 Feature-level Metric Depth 성능 향상
 
@@ -104,6 +104,23 @@ bg_prob = probs[:, :, 1]  # [B, 1, patch_h, patch_w]
 - 메모리 제약이 있는 경우
 - Semantic 기반 분리가 필요한 경우
 
+**학습 방식 (중요!)**:
+- ❌ **별도의 segmentation loss 없음** (depth-variance loss, attention-consistency loss 등 사용 안 함)
+- ✅ **End-to-end 학습**: 오직 depth prediction loss (LogL1Loss)만 사용
+- ✅ **Self-supervised**: Depth를 잘 예측하도록 학습하면 FG/BG 분리도 자동으로 최적화됨
+- ✅ **Instance 구분 없음**: FG/BG 2개 클래스로만 분리 (instance segmentation이 아님)
+
+```python
+# train_step()에서
+loss = LogL1Loss(pred_inverse_depth, gt_inverse_depth, valid_mask)
+# 이 loss 하나로 전체 파이프라인 학습 (FG/BG queries 포함)
+```
+
+**왜 별도 loss가 필요없는가?**:
+- FG/BG 분리 → FG/BG features → Modulation → Depth prediction
+- Depth loss의 gradient가 역전파되면서 "depth를 잘 예측하는 FG/BG 분리"를 학습
+- CLS token의 FG/BG queries가 자동으로 의미있는 분리를 배움
+
 ---
 
 ### 2. Differentiable K-means (`kmeans`)
@@ -148,6 +165,29 @@ bg_prob = assignments[:, :, argmin(centroids)]
 - 복잡한 장면 (여러 객체, depth discontinuity)
 - Bimodal distribution이 명확한 경우
 - 정확도가 속도보다 중요한 경우
+
+**학습 방식 (중요!)**:
+- ❌ **별도의 clustering loss 없음**
+- ✅ **Learnable centroids**: init_centroids ([0.3, 0.7])가 학습 가능한 파라미터
+- ✅ **Differentiable EM**: Soft assignment가 미분 가능하므로 gradient가 centroids까지 전달
+- ✅ **End-to-end**: Depth prediction loss를 통해 "depth를 잘 예측하는 clustering"이 되도록 자동 최적화
+
+```python
+# Learnable centroids
+self.init_centroids = nn.Parameter(torch.tensor([0.3, 0.7]))  # 학습됨!
+
+# EM algorithm (all differentiable)
+for i in range(10):
+    distances = (x - centroids)**2
+    assignments = softmax(-distances / temp)  # Soft (미분 가능)
+    centroids = weighted_average(x, assignments)  # Gradient flows!
+
+# Depth loss → assignments → centroids 순으로 gradient 전달
+```
+
+**K-means vs 일반 threshold의 차이**:
+- **Mean threshold**: 항상 50:50 비율 (고정)
+- **K-means**: 데이터 기반 최적 비율 (예: 30:70도 가능, centroid 위치에 따라 결정)
 
 ---
 
@@ -201,6 +241,28 @@ bg_mask = (importance_fused <= threshold).float()
 - 다양한 scale의 객체가 섞인 장면
 - Robustness가 중요한 경우
 - 메모리 여유가 있는 경우
+
+**학습 방식 (중요!)**:
+- ❌ **별도의 fusion loss 없음**
+- ✅ **Learnable fusion weights**: [0.1, 0.2, 0.3, 0.4] (초기값)가 학습됨
+- ✅ **End-to-end**: Depth loss를 통해 "각 layer의 최적 기여도"를 자동 학습
+- ✅ **Binary masks**: Mean threshold 사용 (50:50 비율)
+
+```python
+# Learnable fusion weights
+self.fusion_weights = nn.Parameter(torch.tensor([0.1, 0.2, 0.3, 0.4]))
+
+# Forward: weighted fusion
+weights_norm = softmax(self.fusion_weights)  # 학습됨!
+importance_fused = (importance_stack * weights_norm).sum(dim=1)
+
+# Depth loss → importance_fused → fusion_weights 순으로 gradient 전달
+```
+
+**Multi-layer가 robust한 이유**:
+- 단일 layer는 특정 scale에 편향될 수 있음 (Layer 23은 abstract, Layer 4는 low-level)
+- 여러 layer를 조합하면 다양한 scale의 정보를 균형있게 활용
+- Fusion weights가 데이터셋/task에 맞게 자동 조정됨
 
 ---
 
@@ -395,6 +457,39 @@ MultiLayerAttentionFusion:
 ---
 
 ## 학습 전략
+
+### Loss 구조 (핵심!)
+
+**중요**: Gear3 Upgrade는 **단일 loss만 사용**합니다!
+
+```python
+# train_gear3_upgrade.py의 train_step()
+loss = LogL1Loss(pred_inverse_depth, gt_inverse_depth, valid_mask)
+# = L1(log(pred), log(gt))
+
+# 이 loss 하나로 전체 파이프라인이 end-to-end로 학습됨:
+# - CLS-based queries (cls_seg)
+# - K-means centroids (kmeans)
+# - Fusion weights (multi_layer)
+# - FG/BG Networks
+# - Modulation Networks
+# - Mamba
+# - output_conv
+```
+
+**별도 loss가 없는 이유**:
+1. **Depth prediction loss만으로 충분**: FG/BG 분리가 depth를 잘 예측하도록 자동 최적화됨
+2. **Self-supervised**: GT segmentation mask 필요 없음
+3. **End-to-end 최적화**: 모든 모듈이 함께 학습되어 전체 성능 향상
+
+**혹시 추가하고 싶은 loss가 있다면** (현재는 구현 안 됨):
+- ❌ **Depth-variance loss**: Instance별로 depth가 일정하도록 (하지만 instance mask 필요)
+- ❌ **Attention-consistency loss**: Multi-layer attention이 일관성 있도록
+- ❌ **Segmentation loss**: GT mask와 비교 (하지만 GT mask 없음)
+
+**현재 구현에서는 이런 loss들이 필요 없습니다** - Depth loss만으로 충분히 잘 작동합니다!
+
+---
 
 ### 파라미터 설정
 
@@ -675,6 +770,105 @@ separation_method=cls_seg  # Softmax → adaptive ratio
 
 ---
 
+## FAQ (자주 묻는 질문)
+
+### Q1. Depth-variance loss나 attention-consistency loss는 어디에 있나요?
+
+**A**: 현재 코드에는 구현되어 있지 않습니다!
+
+Gear3 Upgrade는 **오직 depth prediction loss (LogL1Loss)만 사용**합니다. 다른 auxiliary loss 없이 end-to-end로 학습됩니다.
+
+왜 추가 loss가 필요 없는가:
+- Depth를 잘 예측하려면 FG/BG 분리도 잘 되어야 함 → 자동으로 최적화됨
+- GT segmentation mask가 없어도 self-supervised로 학습 가능
+- 실험 결과 depth loss만으로 충분히 잘 작동함
+
+혹시 추가하고 싶다면:
+```python
+# train_step()에 추가 가능 (현재는 없음)
+depth_loss = LogL1Loss(pred, gt, mask)
+
+# Optional: Depth variance loss (instance별 depth 일정하게)
+# 하지만 instance mask가 필요함
+variance_loss = compute_depth_variance_per_instance(pred, instance_mask)
+
+# Optional: Attention consistency loss (multi-layer 간 일관성)
+consistency_loss = compute_attention_consistency(attn_weights_list)
+
+total_loss = depth_loss + 0.1 * variance_loss + 0.05 * consistency_loss
+```
+
+### Q2. Instance segmentation이 필요한가요? FG/BG로만 나누는 게 목적인가요?
+
+**A**: **FG/BG binary separation이 목적**입니다 (instance 구분 없음)
+
+현재 구현:
+- 3가지 방법 모두 **FG vs BG 2개 클래스**로만 분리
+- Instance별로 나누지 않음 (예: car1, car2, car3 구분 안 함)
+- 모든 "salient objects"를 FG로, "background context"를 BG로 통합
+
+만약 instance 구분이 필요하다면:
+- 외부 instance segmentation model 필요 (SAM, Mask R-CNN 등)
+- Depth-variance loss를 instance별로 적용 가능
+- 하지만 현재 depth estimation task에서는 불필요함
+
+### Q3. K-means의 centroid는 어떻게 학습되나요? Clustering loss가 있나요?
+
+**A**: **별도의 clustering loss 없이 depth loss만으로 학습**됩니다!
+
+작동 원리:
+1. `init_centroids` ([0.3, 0.7])가 **learnable parameter**
+2. EM algorithm이 **differentiable** (soft assignment)
+3. Depth loss의 gradient가 centroids까지 역전파됨
+4. "Depth를 잘 예측하는 clustering"이 되도록 자동 조정됨
+
+예시:
+```python
+# Forward
+centroids = [0.3, 0.7]  # 초기값 (학습 가능)
+for _ in range(10):
+    assignments = softmax(-distances / temp)  # Soft (미분 가능!)
+    centroids = weighted_avg(x, assignments)  # Update
+
+# Backward (depth loss에서)
+depth_loss.backward()
+# → grad flows: depth_loss → assignments → centroids
+# → centroids가 업데이트됨 (optimizer.step())
+```
+
+K-means vs Mean threshold:
+- **Mean threshold**: 항상 50:50 (고정)
+- **K-means**: 데이터 기반 최적 비율 (centroid 위치에 따라 30:70도 가능)
+
+### Q4. cls_seg는 self-supervised라고 하는데 어떻게 작동하나요?
+
+**A**: GT segmentation mask 없이 **depth loss만으로 학습**됩니다!
+
+Self-supervised 원리:
+1. CLS token → FG/BG queries 생성
+2. Patch tokens와 similarity 계산 → FG/BG masks
+3. Masks로 FG/BG features 추출 → Modulation
+4. Modulated features로 depth 예측
+5. **Depth loss만 계산** (mask loss 없음!)
+6. Gradient 역전파: depth → modulation → masks → queries
+7. "Depth를 잘 예측하는 FG/BG 분리"를 자동으로 학습
+
+즉, GT mask가 없어도 depth를 잘 맞추려면 의미있는 FG/BG 분리가 필요하므로, 네트워크가 자동으로 배웁니다.
+
+### Q5. 3가지 방법 중 어떤 것을 써야 하나요?
+
+**A**: **대부분의 경우 `cls_seg` 추천** (속도/메모리/성능 균형)
+
+| 상황 | 추천 Method | 이유 |
+|-----|-------------|------|
+| 일반적인 경우 | **cls_seg** ⭐ | 1-2ms 오버헤드, semantic 기반 |
+| 실시간 처리 | **cls_seg** | 가장 빠름 |
+| 복잡한 장면 | **kmeans** | 데이터 기반 최적 분리 |
+| Robustness 중시 | **multi_layer** | Multi-scale 정보 활용 |
+| 메모리 제약 | **cls_seg** 또는 **kmeans** | +0.5-1GB만 사용 |
+
+---
+
 ## 권장 사항
 
 ### 상황별 추천 방법
@@ -760,6 +954,26 @@ flashdepth_claude/
 
 ---
 
-**Last Update**: 2025-10-23
+## 핵심 요약 (TL;DR)
+
+**Loss 구조**:
+- ✅ **단일 loss**: LogL1Loss(pred_inverse_depth, gt_inverse_depth) only
+- ❌ **없음**: depth-variance loss, attention-consistency loss, segmentation loss
+- ✅ **End-to-end**: Depth loss만으로 FG/BG 분리, modulation, 모든 것이 자동 최적화
+
+**3가지 방법**:
+1. **cls_seg** (추천 ⭐): CLS token 기반 soft segmentation (1-2ms)
+2. **kmeans**: Differentiable K-means clustering (5-10ms, learnable centroids)
+3. **multi_layer**: Multi-layer attention fusion (3ms, learnable weights)
+
+**공통점**:
+- 모두 FG/BG binary separation (instance 구분 없음)
+- 모두 depth loss만 사용 (별도 loss 없음)
+- 모두 self-supervised (GT mask 불필요)
+- Common modules는 Gear3와 100% 동일
+
+---
+
+**Last Update**: 2025-10-25
 **Branch**: gear3
 **Developer**: hsy

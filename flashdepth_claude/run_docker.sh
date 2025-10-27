@@ -40,6 +40,11 @@ show_usage() {
     echo "  test_gear3  Start Gear3 testing with default settings"
     echo "  train_gear3_upgrade Start Gear3 Upgrade training (single GPU) - Enhanced FG/BG separation"
     echo "  train_gear3_upgrade_ddp Start Gear3 Upgrade training with 2 GPUs (GPU 0,1)"
+    echo "  test_gear3_upgrade  Start Gear3 Upgrade testing (supports --separation option)"
+    echo "  test_gear2_objwise  Start Gear2 object-wise evaluation (Waymo/Sintel segmentation)"
+    echo "  test_gear3_objwise  Start Gear3 object-wise evaluation (Waymo/Sintel segmentation)"
+    echo "  test_gear3_upgrade_objwise  Start Gear3 Upgrade object-wise evaluation"
+    echo "  test_original_flashdepth  Test original FlashDepth (without Gear modules) for comparison"
     echo "  shell       Start interactive shell in container"
     echo "  clean       Remove containers and images"
     echo "  logs        Show container logs"
@@ -58,6 +63,9 @@ show_usage() {
     echo "  --measure-fps BOOL    Enable/disable FPS measurement (default: true)"
     echo "  --phase NUM           Set training phase (1, 2, or 3, default: 1)"
     echo "  --separation METHOD  Set FG/BG separation method: cls_seg, kmeans, multi_layer (default: cls_seg)"
+    echo "  --dataset DATASET     Set object-wise evaluation dataset: waymo, sintel (default: waymo)"
+    echo "  --config VARIANT     Set FlashDepth config: flashdepth, flashdepth-l, flashdepth-s (default: flashdepth-l)"
+    echo "  --inverse BOOL       Inverse colormap for depth (original FlashDepth only, default: false)"
     echo ""
     echo "Note: Regularization losses are deprecated. Importance map now uses raw DINOv2 attention (frozen)."
     echo ""
@@ -79,6 +87,15 @@ show_usage() {
     echo "  $0 train_gear3_upgrade                # Start Gear3 Upgrade training (cls_seg method)"
     echo "  $0 train_gear3_upgrade --separation kmeans  # Train with K-means clustering"
     echo "  $0 train_gear3_upgrade_ddp --separation multi_layer  # DDP with multi-layer fusion"
+    echo "  $0 test_gear3_upgrade                 # Start Gear3 Upgrade testing with defaults (cls_seg)"
+    echo "  $0 test_gear3_upgrade --separation kmeans --gpu 1  # Test with K-means separation method"
+    echo "  $0 test_gear3_upgrade --vid-len 25 --frame-interval 5  # Custom video length and interval"
+    echo "  $0 test_gear2_objwise --dataset waymo --gpu 0  # Object-wise evaluation on Waymo"
+    echo "  $0 test_gear3_objwise --dataset sintel --gpu 1  # Object-wise evaluation on Sintel"
+    echo "  $0 test_original_flashdepth --gpu 0  # Test original FlashDepth on Sintel dataset (ViT-L)"
+    echo "  DATASET=waymo $0 test_original_flashdepth --gpu 1  # Test on Waymo dataset"
+    echo "  $0 test_original_flashdepth --config flashdepth-s --gpu 0  # Use ViT-S variant (smaller/faster)"
+    echo "  CHECKPOINT=/app/configs/flashdepth-s/iter_10001.pth $0 test_original_flashdepth --config flashdepth-s  # ViT-S with matching checkpoint"
     echo "  $0 train --results-dir train_results/results_2  # Custom results directory"
     echo "  $0 shell                              # Interactive development"
 }
@@ -87,23 +104,25 @@ show_usage() {
 COMMAND=""
 BATCH_SIZE=20  # Per GPU (effective 40 with 2 GPUs in DDP)
 WORKERS=8      # Optimized for 96 CPU cores, prevents I/O bottleneck
-TOTAL_ITERS=40001
+TOTAL_ITERS=30001
 GPU_ID=0
 RESULTS_DIR="train_results/results_1"
 FLASHDEPTH_CHECKPOINT="configs/flashdepth-l/iter_10001.pth"
-GSP_CHECKPOINT="train_results/results_5/best_metric_head_step_21000.pth"  # Only used for old test script
+# GSP_CHECKPOINT="train_results/results_5/best_metric_head_step_21000.pth"  # Only used for old test script
 FRAME_INTERVAL=1
 VID_LEN=50
 SINGLE_SEQUENCE=""  # Path to single sequence directory (optional)
 MEASURE_FPS="true"
 PHASE=1  # Training phase (1, 2, or 3)
 SEPARATION_METHOD="cls_seg"  # FG/BG separation method for Gear3 Upgrade (cls_seg, kmeans, multi_layer)
+CONFIG="flashdepth-l"  # FlashDepth config variant (flashdepth, flashdepth-l, flashdepth-s)
+INVERSE="false"  # Inverse colormap for depth visualization (original FlashDepth only)
 
 # Parse arguments
 USER_BATCH_SIZE=""  # Track if user explicitly set batch size
 while [[ $# -gt 0 ]]; do
     case $1 in
-        build|train|test|train_gear2|train_gear2_ddp|test_gear2|train_gear3|train_gear3_ddp|test_gear3|train_gear3_upgrade|train_gear3_upgrade_ddp|shell|clean|logs)
+        build|train|test|train_gear2|train_gear2_ddp|test_gear2|train_gear3|train_gear3_ddp|test_gear3|train_gear3_upgrade|train_gear3_upgrade_ddp|test_gear3_upgrade|test_gear2_objwise|test_gear3_objwise|test_gear3_upgrade_objwise|test_original_flashdepth|shell|clean|logs)
             COMMAND="$1"
             shift
             ;;
@@ -160,6 +179,18 @@ while [[ $# -gt 0 ]]; do
             SEPARATION_METHOD="$2"
             shift 2
             ;;
+        --dataset)
+            OBJWISE_DATASET="$2"
+            shift 2
+            ;;
+        --config)
+            CONFIG="$2"
+            shift 2
+            ;;
+        --inverse)
+            INVERSE="$2"
+            shift 2
+            ;;
         -h|--help)
             show_usage
             exit 0
@@ -171,6 +202,10 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# Normalize separation method (convert hyphens to underscores for Python compatibility)
+# User can use --separation multi-layer but Python expects multi_layer
+SEPARATION_METHOD="${SEPARATION_METHOD//-/_}"
 
 # Set CUDA_VISIBLE_DEVICES environment variable
 export CUDA_VISIBLE_DEVICES=$GPU_ID
@@ -461,6 +496,12 @@ case $COMMAND in
         else
             # Phase 1: 518x518 resolution - can use more workers and larger batch
             ACTUAL_WORKERS=$WORKERS
+
+            # Auto-adjust batch size for multi_layer separation method (requires more memory)
+            if [ "$SEPARATION_METHOD" = "multi_layer" ] && [ -z "$USER_BATCH_SIZE" ]; then
+                BATCH_SIZE=16
+                echo "  NOTE: Auto-adjusted batch size to $BATCH_SIZE for separation method 'multi_layer' (to avoid OOM)"
+            fi
         fi
 
         echo "Starting Gear3 Upgrade training (Multi-GPU: 0,1) - Enhanced FG/BG Separation..."
@@ -578,6 +619,45 @@ case $COMMAND in
         CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm flashdepth $TEST_CMD
         ;;
 
+    test_gear3_upgrade)
+        # Set default checkpoint for gear3_upgrade if not explicitly provided
+        if [ "$FLASHDEPTH_CHECKPOINT" == "configs/flashdepth-l/iter_10001.pth" ]; then
+            FLASHDEPTH_CHECKPOINT="train_results/results_14/gear_3_upgrade/phase_1/best.pth"
+        fi
+
+        echo "Starting Gear3 Upgrade testing - Enhanced FG/BG Separation..."
+        echo "Configuration:"
+        echo "  - Separation method: $SEPARATION_METHOD"
+        echo "  - GPU: $GPU_ID"
+        echo "  - Results directory: $RESULTS_DIR"
+        echo "  - Video length: $VID_LEN"
+        echo "  - Frame interval: $FRAME_INTERVAL"
+        echo "  - Checkpoint: $FLASHDEPTH_CHECKPOINT"
+        if [ -n "$SINGLE_SEQUENCE" ]; then
+            echo "  - Single sequence: $SINGLE_SEQUENCE"
+        fi
+        echo ""
+
+        # Build test_gear3_upgrade command (uses single checkpoint with all weights)
+        TEST_CMD="python test_gear3_upgrade.py --config-path configs/gear3_upgrade dataset.data_root=/data/datasets +results_dir=$RESULTS_DIR +gpu=$GPU_ID separation_method=$SEPARATION_METHOD"
+
+        # Use --checkpoint option for the unified checkpoint
+        if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
+            TEST_CMD="$TEST_CMD load=$FLASHDEPTH_CHECKPOINT"
+        fi
+
+        # Add frame interval and video length options
+        TEST_CMD="$TEST_CMD +frame_interval=$FRAME_INTERVAL +vid_len=$VID_LEN"
+
+        # Add single sequence path if specified
+        if [ -n "$SINGLE_SEQUENCE" ]; then
+            TEST_CMD="$TEST_CMD +single_sequence=$SINGLE_SEQUENCE"
+        fi
+
+        # Run test_gear3_upgrade.py with custom parameters (with GPU selection)
+        CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm flashdepth $TEST_CMD
+        ;;
+
     shell)
         echo "Starting interactive shell..."
         # Check if container is already running
@@ -589,6 +669,171 @@ case $COMMAND in
             echo "No running container found. Starting new container..."
             docker compose run --rm flashdepth /bin/bash
         fi
+        ;;
+
+    test_gear2_objwise)
+        # Object-wise evaluation for Gear2
+        OBJWISE_DATASET=${OBJWISE_DATASET:-waymo}  # Default to waymo
+
+        echo "Starting Gear2 Object-Wise Evaluation..."
+        echo "Configuration:"
+        echo "  - Dataset: $OBJWISE_DATASET"
+        echo "  - GPU: $GPU_ID"
+        echo "  - Results directory: $RESULTS_DIR"
+        echo "  - Video length: $VID_LEN"
+        echo "  - Checkpoint: $FLASHDEPTH_CHECKPOINT"
+        echo ""
+
+        # Build command with object-wise options
+        TEST_CMD="python test_gear2.py --config-path configs/gear2 dataset.data_root=/data/datasets/${OBJWISE_DATASET}_seg +results_dir=$RESULTS_DIR +gpu=$GPU_ID object_wise.enabled=true object_wise.dataset=$OBJWISE_DATASET +vid_len=$VID_LEN"
+
+        if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
+            TEST_CMD="$TEST_CMD load=$FLASHDEPTH_CHECKPOINT"
+        fi
+
+        CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm flashdepth $TEST_CMD
+        ;;
+
+    test_gear3_objwise)
+        # Object-wise evaluation for Gear3
+        OBJWISE_DATASET=${OBJWISE_DATASET:-waymo}  # Default to waymo
+
+        echo "Starting Gear3 Object-Wise Evaluation..."
+        echo "Configuration:"
+        echo "  - Dataset: $OBJWISE_DATASET"
+        echo "  - GPU: $GPU_ID"
+        echo "  - Results directory: $RESULTS_DIR"
+        echo "  - Video length: $VID_LEN"
+        echo "  - Checkpoint: $FLASHDEPTH_CHECKPOINT"
+        echo ""
+
+        # Build command with object-wise options
+        TEST_CMD="python test_gear3.py --config-path configs/gear3 dataset.data_root=/data/datasets/${OBJWISE_DATASET}_seg +results_dir=$RESULTS_DIR +gpu=$GPU_ID object_wise.enabled=true object_wise.dataset=$OBJWISE_DATASET +vid_len=$VID_LEN"
+
+        if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
+            TEST_CMD="$TEST_CMD load=$FLASHDEPTH_CHECKPOINT"
+        fi
+
+        CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm flashdepth $TEST_CMD
+        ;;
+
+    test_gear3_upgrade_objwise)
+        # Object-wise evaluation for Gear3 Upgrade
+        OBJWISE_DATASET=${OBJWISE_DATASET:-waymo}  # Default to waymo
+        SEPARATION_METHOD=${SEPARATION_METHOD:-kmeans}  # Default separation method
+
+        echo "Starting Gear3 Upgrade Object-Wise Evaluation..."
+        echo "Configuration:"
+        echo "  - Dataset: $OBJWISE_DATASET"
+        echo "  - Separation method: $SEPARATION_METHOD"
+        echo "  - GPU: $GPU_ID"
+        echo "  - Results directory: $RESULTS_DIR"
+        echo "  - Video length: $VID_LEN"
+        echo "  - Checkpoint: $FLASHDEPTH_CHECKPOINT"
+        echo ""
+
+        # Build command with object-wise options
+        TEST_CMD="python test_gear3_upgrade.py --config-path configs/gear3_upgrade dataset.data_root=/data/datasets/${OBJWISE_DATASET}_seg +results_dir=$RESULTS_DIR +gpu=$GPU_ID separation_method=$SEPARATION_METHOD object_wise.enabled=true object_wise.dataset=$OBJWISE_DATASET +vid_len=$VID_LEN"
+
+        if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
+            TEST_CMD="$TEST_CMD load=$FLASHDEPTH_CHECKPOINT"
+        fi
+
+        CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm flashdepth $TEST_CMD
+        ;;
+
+    test_original_flashdepth)
+        # Test original FlashDepth (without Gear modules)
+        DATASET=${DATASET:-sintel}
+
+        # Initialize CHECKPOINT from FLASHDEPTH_CHECKPOINT or environment variable
+        if [ -z "$CHECKPOINT" ]; then
+            CHECKPOINT="$FLASHDEPTH_CHECKPOINT"
+        fi
+
+        # Convert to absolute path if needed
+        if [[ "$CHECKPOINT" != /app/* ]] && [[ "$CHECKPOINT" != /* ]]; then
+            CHECKPOINT="/app/$CHECKPOINT"
+        fi
+
+        # Set default checkpoint based on config variant if using default
+        if [ "$CHECKPOINT" = "/app/configs/flashdepth-l/iter_10001.pth" ]; then
+            # User didn't specify checkpoint, use default for selected config
+            case "$CONFIG" in
+                flashdepth-l)
+                    CHECKPOINT="/app/configs/flashdepth-l/iter_10001.pth"
+                    ;;
+                flashdepth-s)
+                    CHECKPOINT="/app/configs/flashdepth-s/iter_10001.pth"
+                    ;;
+                flashdepth)
+                    CHECKPOINT="/app/configs/flashdepth/iter_10001.pth"
+                    ;;
+                *)
+                    echo "Unknown config variant: $CONFIG"
+                    echo "Valid options: flashdepth, flashdepth-l, flashdepth-s"
+                    exit 1
+                    ;;
+            esac
+        fi
+
+        # Use custom results dir if provided, otherwise default to test_results/${DATASET}_original_${CONFIG}
+        if [ "$RESULTS_DIR" = "train_results/results_1" ]; then
+            # Default value not changed by user, use dataset and config specific default
+            OUTFOLDER="/app/test_results/${DATASET}_original_${CONFIG}"
+        else
+            # User provided custom results dir
+            # If it's a relative path, prefix with /app/ to save to host
+            if [[ "$RESULTS_DIR" != /* ]]; then
+                OUTFOLDER="/app/$RESULTS_DIR"
+            else
+                OUTFOLDER="$RESULTS_DIR"
+            fi
+        fi
+
+        # Extract results directory path for host (remove /app prefix for local path)
+        LOCAL_OUTFOLDER="${OUTFOLDER#/app/}"
+
+        echo "Testing Original FlashDepth (inference mode)..."
+        echo "Configuration:"
+        echo "  - Config variant: $CONFIG"
+        echo "  - Dataset: $DATASET"
+        echo "  - GPU: $GPU_ID"
+        echo "  - Checkpoint: $CHECKPOINT"
+        echo "  - Results directory: $OUTFOLDER"
+        echo "  - Inverse colormap: $INVERSE"
+        echo "  - Log file: ${LOCAL_OUTFOLDER}/test.log"
+        echo ""
+
+        # Create output directory on host
+        mkdir -p "$LOCAL_OUTFOLDER"
+
+        TEST_CMD="cd /FlashDepth && torchrun --nproc_per_node=1 train.py \
+          --config-path configs/$CONFIG \
+          inference=true \
+          eval.test_datasets=[$DATASET] \
+          eval.metrics=true \
+          dataset.data_root=/data/datasets \
+          eval.outfolder=$OUTFOLDER \
+          load=$CHECKPOINT \
+          +eval.inverse=$INVERSE \
+          eval.compile=false"
+
+        # Run test and save log
+        echo "Running FlashDepth inference..."
+        CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm flashdepth bash -c "$TEST_CMD" 2>&1 | tee "${LOCAL_OUTFOLDER}/test.log"
+
+        # Parse log and save as JSON
+        echo ""
+        echo "Parsing results to JSON..."
+        python3 utils/parse_flashdepth_results.py "${LOCAL_OUTFOLDER}/test.log" "$LOCAL_OUTFOLDER"
+
+        echo ""
+        echo "✓ Test complete! Results saved to:"
+        echo "  - FPS Summary: ${LOCAL_OUTFOLDER}/fps_results.json"
+        echo "  - Per-sequence FPS: ${LOCAL_OUTFOLDER}/per_sequence_fps.json"
+        echo "  - Full log: ${LOCAL_OUTFOLDER}/test.log"
+        echo "  - Depth files: ${LOCAL_OUTFOLDER}/sintel/"
         ;;
 
     clean)

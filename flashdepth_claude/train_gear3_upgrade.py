@@ -812,9 +812,21 @@ class Gear3UpgradeTrainer:
                         # FPS removed from training (only measured in test_gear3.py)
                         current_fps = None
 
-                        # Pass loss_dict for visualization
+                        # Extract layer_weights for visualization (multi_layer separation only)
+                        layer_weights = None
+                        if self.separation_method == 'multi_layer':
+                            try:
+                                # Handle DDP wrapping
+                                model = self.model.module if hasattr(self.model, 'module') else self.model
+                                # Get softmax-normalized weights
+                                fusion_weights = model.gear3_head.multi_layer_fusion.fusion_weights
+                                layer_weights = torch.softmax(fusion_weights, dim=0).detach().cpu().numpy()
+                            except Exception as e:
+                                self.logger.warning(f"Failed to extract layer_weights: {e}")
+
+                        # Pass loss_dict and layer_weights for visualization
                         self.train_visualizer.create_validation_summary(
-                            sample_batch, model_outputs_cpu, step, prefix="training", fps=current_fps, loss_dict=loss_dict
+                            sample_batch, model_outputs_cpu, step, prefix="training", fps=current_fps, loss_dict=loss_dict, layer_weights=layer_weights
                         )
 
                     self._set_train_mode()
@@ -923,11 +935,11 @@ class Gear3UpgradeTrainer:
                 cls_token = None
 
                 if self.separation_method == 'multi_layer':
-                    with torch.no_grad():
-                        attention_weights_multi_layer = [
-                            model.pretrained.blocks[i].attn.attn_weights
-                            for i in [3, 10, 16, 22]
-                        ]
+                    # Attention weights are detached (frozen encoder), but fusion_weights needs gradient
+                    attention_weights_multi_layer = [
+                        model.pretrained.blocks[i].attn.attn_weights.detach()
+                        for i in [3, 10, 16, 22]
+                    ]
                 elif self.separation_method == 'cls_seg':
                     with torch.no_grad():
                         cls_token = patch_tokens[:, 0]  # [B, embed_dim]
@@ -1087,11 +1099,11 @@ class Gear3UpgradeTrainer:
                     cls_token = None
 
                     if self.separation_method == 'multi_layer':
-                        with torch.no_grad():
-                            attention_weights_multi_layer = [
-                                model.pretrained.blocks[i].attn.attn_weights
-                                for i in [3, 10, 16, 22]
-                            ]
+                        # Attention weights are detached (frozen encoder), but fusion_weights needs gradient
+                        attention_weights_multi_layer = [
+                            model.pretrained.blocks[i].attn.attn_weights.detach()
+                            for i in [3, 10, 16, 22]
+                        ]
                     elif self.separation_method == 'cls_seg':
                         with torch.no_grad():
                             cls_token = patch_tokens[:, 0]  # [B, embed_dim]
@@ -1210,11 +1222,23 @@ class Gear3UpgradeTrainer:
                                         'val_loss': loss_t.item() if len(frame_losses) > 0 else 0.0
                                     }
 
+                                    # Extract layer_weights for visualization (multi_layer separation only)
+                                    layer_weights = None
+                                    if self.separation_method == 'multi_layer':
+                                        try:
+                                            # Handle DDP wrapping
+                                            model = self.model.module if hasattr(self.model, 'module') else self.model
+                                            # Get softmax-normalized weights
+                                            fusion_weights = model.gear3_head.multi_layer_fusion.fusion_weights
+                                            layer_weights = torch.softmax(fusion_weights, dim=0).detach().cpu().numpy()
+                                        except Exception as e:
+                                            self.logger.warning(f"Failed to extract layer_weights: {e}")
+
                                     # Save with dataset and sequence-specific name
                                     save_name = f"validation_{current_dataset}_seq{seq_num:03d}_step_{self.global_step:06d}"
                                     self.val_visualizer.create_validation_summary(
                                         sample_batch, model_outputs, self.global_step,
-                                        save_name=save_name, fps=current_fps, loss_dict=val_loss_dict
+                                        save_name=save_name, fps=current_fps, loss_dict=val_loss_dict, dataset_name=current_dataset, layer_weights=layer_weights
                                     )
                                     config['saved'].append(seq_num)
                                     self.logger.info(f"Saved validation visualization: {current_dataset} sequence {seq_num} ({len(config['saved'])}/{len(config['sequences'])})")

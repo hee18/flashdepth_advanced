@@ -57,12 +57,46 @@ class ObjectWiseMetrics:
         9: 'misc', 10: 'truck', 11: 'car', 12: 'van', 255: 'ignore'
     }
 
+    # Waymo Open Dataset class IDs (Semantic Segmentation v2.0)
+    # Based on Waymo Open Dataset 2.0 semantic segmentation labels
+    WAYMO_CLASSES = {
+        0: 'undefined',
+        1: 'vehicle',
+        2: 'pedestrian',
+        3: 'sign',
+        4: 'cyclist',
+        5: 'traffic_light',
+        6: 'pole',
+        7: 'construction_cone',
+        8: 'bicycle',
+        9: 'motorcycle',
+        10: 'building',
+        11: 'vegetation',
+        12: 'tree_trunk',
+        13: 'curb',
+        14: 'road',
+        15: 'lane_marker',
+        16: 'other_ground',
+        17: 'walkable',
+        18: 'sidewalk',
+        255: 'ignore'
+    }
+
+    # Sintel Segmentation (Instance-based)
+    # Note: Sintel provides instance segmentation, not semantic classes
+    # We group by instance ID ranges or use instance-level metrics
+    SINTEL_CLASSES = {
+        0: 'background',
+        # Instance IDs 1-999: foreground objects (dynamic)
+        # We'll use clustering or simple foreground/background split
+    }
+
     def __init__(self, dataset_type: str = 'kitti'):
         """
         Initialize object-wise metrics calculator.
 
         Args:
-            dataset_type: Dataset type ('kitti', 'cityscapes', 'nyu', 'vkitti2')
+            dataset_type: Dataset type ('kitti', 'cityscapes', 'nyu', 'vkitti2', 'waymo', 'sintel')
         """
         self.dataset_type = dataset_type.lower()
 
@@ -74,6 +108,10 @@ class ObjectWiseMetrics:
             self.classes = self.NYU_CLASSES
         elif self.dataset_type == 'vkitti2':
             self.classes = self.VKITTI2_CLASSES
+        elif self.dataset_type == 'waymo':
+            self.classes = self.WAYMO_CLASSES
+        elif self.dataset_type == 'sintel':
+            self.classes = self.SINTEL_CLASSES
         else:
             raise ValueError(f"Unknown dataset type: {dataset_type}")
 

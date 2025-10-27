@@ -34,7 +34,11 @@ sys.path.insert(0, str(project_root))
 from flashdepth.model import FlashDepth
 from flashdepth.gear2_modules import Gear2MetricHead
 from dataloaders.combined_dataset import CombinedDataset
+from dataloaders.sintel_segmentation_dataset import SintelSegmentationDataset, collate_fn as sintel_collate_fn
+from dataloaders.waymo_segmentation_dataset import WaymoSegmentationDataset, collate_fn as waymo_collate_fn
 from utils.metric_depth_metrics import MetricDepthMetrics, format_metrics
+from utils.object_wise_evaluation import ObjectWiseMetrics
+from utils.object_wise_visualization import create_object_wise_grid
 from utils.helpers import save_gifs_as_grid, save_grid_to_mp4, depth_to_np_arr, torch_batch_to_np_arr
 
 # Setup logging
@@ -63,6 +67,16 @@ class Gear2Tester:
         self.save_dir = Path(save_dir_str)
         self.save_dir.mkdir(parents=True, exist_ok=True)
         logger.info(f"Save directory: {self.save_dir}")
+
+        # Object-wise evaluation configuration
+        self.object_wise_enabled = config.get('object_wise', {}).get('enabled', False)
+        self.object_wise_dataset = config.get('object_wise', {}).get('dataset', 'waymo')
+
+        if self.object_wise_enabled:
+            logger.info(f"Object-wise evaluation ENABLED for dataset: {self.object_wise_dataset}")
+            self.object_wise_metrics = ObjectWiseMetrics(dataset_type=self.object_wise_dataset)
+        else:
+            self.object_wise_metrics = None
 
         # Initialize model
         self.model = self._setup_model()
@@ -139,14 +153,44 @@ class Gear2Tester:
         # Check if single sequence mode
         single_seq_path = self.config.get('single_sequence', None)
 
-        if single_seq_path:
+        # Object-wise evaluation: use segmentation datasets
+        if self.object_wise_enabled:
+            video_length = int(self.config.get('vid_len', 50))  # Ensure integer (Hydra may pass string)
+            resolution = self.config.eval.test_dataset_resolution
+            data_root = self.config.dataset.data_root
+
+            if self.object_wise_dataset == 'sintel':
+                test_dataset = SintelSegmentationDataset(
+                    data_root=data_root,
+                    split='val',
+                    video_length=video_length,
+                    resolution=resolution
+                )
+                collate_fn = sintel_collate_fn
+            elif self.object_wise_dataset == 'waymo':
+                test_dataset = WaymoSegmentationDataset(
+                    data_root=data_root,
+                    split='val',
+                    video_length=video_length,
+                    resolution=resolution,
+                    camera_name=1,  # FRONT camera
+                    use_depth=False  # Use placeholder depth (complex to extract from LiDAR)
+                )
+                collate_fn = waymo_collate_fn
+            else:
+                raise ValueError(f"Unknown object-wise dataset: {self.object_wise_dataset}")
+
+            logger.info(f"Object-wise dataset: {self.object_wise_dataset} (size: {len(test_dataset)})")
+
+        elif single_seq_path:
             # Single sequence mode: create custom dataset
             logger.info(f"Single sequence mode: {single_seq_path}")
             test_dataset = self._create_single_sequence_dataset(single_seq_path)
+            collate_fn = self._collate_fn
         else:
             # Normal mode: use CombinedDataset
             test_datasets = self.config.eval.test_datasets
-            video_length = self.config.get('vid_len', 50)  # Get from config override
+            video_length = int(self.config.get('vid_len', 50))  # Ensure integer (Hydra may pass string)
 
             logger.info(f"Test datasets: {test_datasets}")
             logger.info(f"Video length: {video_length}")
@@ -158,6 +202,7 @@ class Gear2Tester:
                 split='val',  # Use 'val' split which returns dict format
                 video_length=video_length
             )
+            collate_fn = self._collate_fn
 
         test_loader = DataLoader(
             test_dataset,
@@ -165,7 +210,7 @@ class Gear2Tester:
             shuffle=False,
             num_workers=0,  # Single process for testing
             pin_memory=True,
-            collate_fn=self._collate_fn
+            collate_fn=collate_fn
         )
 
         logger.info(f"Test dataset size: {len(test_dataset)}")
@@ -286,6 +331,14 @@ class Gear2Tester:
                 'dataset_name': names
             }
 
+        # Segmentation datasets return dict with 'images' key, rename to 'image' for compatibility
+        if len(batch) > 0 and isinstance(batch[0], dict) and 'images' in batch[0]:
+            # Already batched by segmentation collate_fn
+            result = batch[0]  # Batch size is 1
+            if 'images' in result:
+                result['image'] = result.pop('images')  # Rename 'images' -> 'image'
+            return result
+
         # Use default collate for dict items (training split)
         return torch.utils.data.dataloader.default_collate(batch)
 
@@ -295,6 +348,7 @@ class Gear2Tester:
         logger.info("Starting testing...")
 
         all_metrics = []
+        all_object_wise_metrics = []  # Track object-wise metrics separately
         sequence_id = 0
 
         for batch_idx, batch in enumerate(tqdm(self.test_loader, desc="Testing")):
@@ -303,6 +357,11 @@ class Gear2Tester:
                 # Add sequence_id for tracking
                 metrics['sequence_id'] = sequence_id
                 all_metrics.append(metrics)
+
+                # Extract and store object-wise metrics
+                if self.object_wise_enabled and 'object_wise' in metrics:
+                    all_object_wise_metrics.append(metrics['object_wise'])
+
                 sequence_id += 1
 
             except Exception as e:
@@ -343,6 +402,25 @@ class Gear2Tester:
             logger.info(f"  δ1: {best_seq['a1']:.4f}")
             logger.info(f"Best sequence saved to {best_seq_path}")
 
+            # Aggregate and save object-wise metrics
+            if self.object_wise_enabled and all_object_wise_metrics:
+                logger.info("\n" + "="*80)
+                logger.info("OBJECT-WISE EVALUATION RESULTS")
+                logger.info("="*80)
+
+                # Aggregate metrics across all sequences
+                aggregated_class_metrics = self.object_wise_metrics.aggregate_metrics(all_object_wise_metrics)
+
+                # Print summary
+                self.object_wise_metrics.print_summary(aggregated_class_metrics)
+
+                # Save to JSON
+                object_wise_path = self.save_dir / "object_wise_results.json"
+                self.object_wise_metrics.save_results(
+                    aggregated_class_metrics,
+                    object_wise_path
+                )
+
         else:
             logger.warning("No metrics computed!")
 
@@ -354,8 +432,10 @@ class Gear2Tester:
             logger.error(f"Batch is not a dict! Type: {type(batch)}, Content: {batch if not isinstance(batch, torch.Tensor) else 'Tensor'}")
             raise TypeError(f"Expected dict, got {type(batch)}")
 
-        images = batch['image'].to(self.device)  # [1, T, 3, H, W]
-        gt_depth = batch['depth'].to(self.device)  # [1, T, H, W] - val split has no channel dim
+        # Preload all data to GPU memory (논문 방법: FPS 측정 시 데이터 전송 시간 제외)
+        # "We preprocess all images and load them onto GPU memory before starting inference"
+        images = batch['image'].to(self.device)  # [1, T, 3, H, W] - 전체 시퀀스를 GPU에 미리 로드
+        gt_depth = batch['depth'].to(self.device)  # [1, T, H, W]
 
         # Add channel dimension if needed
         if gt_depth.ndim == 3:
@@ -383,7 +463,7 @@ class Gear2Tester:
         # Warmup run for FPS measurement
         logger.info(f"Warmup run for FPS measurement...")
         with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-            img_warmup = images[0, 0].unsqueeze(0)
+            img_warmup = images[0, 0].unsqueeze(0)  # Already on GPU
             encoder_features_warmup = self.model.pretrained.get_intermediate_layers(
                 img_warmup, self.model.intermediate_layer_idx[self.model.encoder]
             )
@@ -404,20 +484,21 @@ class Gear2Tester:
         del path_1_warmup, out_warmup
         torch.cuda.empty_cache()
 
-        # FPS measurement (like original FlashDepth)
+        # FPS measurement (논문 방법: 데이터가 GPU에 미리 로드된 상태에서 순수 inference 시간만 측정)
         warmup_frames = min(5, T)  # Warmup frames to skip initial overhead
         start_time = None  # Will start timing after warmup
 
         # Process each frame
         for t in range(T):
-            # Start timing after warmup frames (like original FlashDepth)
+            # Start timing after warmup frames (논문: "start timer after a single warmup iteration")
             if t == warmup_frames:
                 torch.cuda.synchronize()
                 import time
                 start_time = time.time()
 
-            img_t = images[0, t]  # [3, H, W]
-            gt_t_inverse = gt_depth_inverse_100[0, t]  # [1, H, W] in 100/m
+            # GPU에서 인덱싱만 (전송 없음, 데이터는 이미 GPU에 로드됨)
+            img_t = images[0, t]  # [3, H, W] - GPU에서 인덱싱만
+            gt_t_inverse = gt_depth_inverse_100[0, t]  # [1, H, W] - GPU에서 인덱싱만
 
             # Use BFloat16 for forward pass (same as train_gear2.py)
             with torch.amp.autocast('cuda', dtype=torch.bfloat16):
@@ -582,6 +663,71 @@ class Gear2Tester:
 
         # Add FPS to metrics
         metrics['fps'] = fps
+
+        # Object-wise evaluation: compute per-class metrics
+        if self.object_wise_enabled and 'segmentation' in batch:
+            try:
+                # Get segmentation mask for last frame
+                seg_mask = batch['segmentation'][0]  # [H, W] - batch size is 1
+
+                # Get last frame predictions and GT
+                pred_last = pred_depths_cpu[-1, 0].numpy()  # [H, W] numpy array
+                gt_last = gt_depth_metric_cpu[-1, 0].numpy()  # [H, W] numpy array
+                seg_mask_np = seg_mask.cpu().numpy() if isinstance(seg_mask, torch.Tensor) else seg_mask
+
+                # Resize segmentation to match pred/GT resolution if needed
+                if seg_mask_np.shape != pred_last.shape:
+                    import cv2
+                    seg_mask_np = cv2.resize(
+                        seg_mask_np.astype(np.int32),
+                        (pred_last.shape[1], pred_last.shape[0]),
+                        interpolation=cv2.INTER_NEAREST
+                    )
+
+                # Compute per-class metrics
+                class_metrics = self.object_wise_metrics.compute_metrics_per_class(
+                    pred_depth=pred_last,
+                    gt_depth=gt_last,
+                    seg_mask=seg_mask_np,
+                    min_pixels=100
+                )
+
+                metrics['object_wise'] = class_metrics
+                logger.info(f"Computed object-wise metrics for {len(class_metrics)} classes")
+
+                # Create object-wise visualization
+                if class_metrics:
+                    try:
+                        # Get last frame image (convert to numpy HWC format)
+                        img_last = images[0, -1].cpu().numpy()  # [3, H, W]
+                        img_last = img_last.transpose(1, 2, 0)  # [H, W, 3]
+
+                        # Normalize to [0, 1] if needed
+                        if img_last.max() > 1.0:
+                            img_last = img_last / 255.0
+
+                        # Create visualization
+                        objwise_vis_path = self.save_dir / f"objwise_seq{sequence_id:04d}.png"
+                        create_object_wise_grid(
+                            input_image=img_last,
+                            gt_depth=gt_last,
+                            pred_depth=pred_last,
+                            seg_mask=seg_mask_np,
+                            class_metrics=class_metrics,
+                            class_names_dict=self.object_wise_metrics.classes,
+                            output_path=str(objwise_vis_path)
+                        )
+                        logger.info(f"Saved object-wise visualization to {objwise_vis_path}")
+                    except Exception as vis_e:
+                        logger.error(f"Error creating object-wise visualization: {vis_e}")
+                        import traceback
+                        traceback.print_exc()
+
+            except Exception as e:
+                logger.error(f"Error computing object-wise metrics: {e}")
+                import traceback
+                traceback.print_exc()
+                metrics['object_wise'] = {}
 
         # Recreate valid_mask on GPU for visualization
         valid_mask = (gt_depth_metric > 0)  # [T, 1, H, W] on GPU
@@ -802,21 +948,28 @@ class Gear2Tester:
     def _save_best_frame_visualizations(self, image, pred_depth, gt_depth, importance_map,
                                         fg_features, bg_features, sequence_id, frame_idx, abs_rel, fps=None):
         """
-        Save best frame visualization similar to test_metric_head.py
+        Save best frame visualization matching train_gear3_upgrade layout
 
-        Creates a single combined visualization PNG file with format:
+        Creates a comprehensive 4x3 grid visualization with format:
             best_frame_seq{N}_{frame_idx}_absrel_{abs_rel:.4f}.png
+
+        Layout:
+            Row 1: Input Image | GT Depth | Pred Depth
+            Row 2: Importance Map (N/A) | FG Mask (N/A) | BG Mask (N/A)
+            Row 3: Valid Mask | Error Map | Metrics
+            Row 4: Depth Distribution (2 cols) | Importance Distribution (N/A)
 
         Args:
             image: [3, H, W] - RGB image
             pred_depth: [H, W] - Predicted metric depth
             gt_depth: [H, W] - Ground truth metric depth
-            importance_map: [patch_h, patch_w] - Importance map (0-1 normalized)
-            fg_features: [C, patch_h, patch_w] - Foreground features (not used)
-            bg_features: [C, patch_h, patch_w] - Background features (not used)
+            importance_map: None for Gear2 (uniform modulation)
+            fg_features: Not used (Gear2 has no FG/BG separation)
+            bg_features: Not used (Gear2 has no FG/BG separation)
             sequence_id: int - Sequence index
             frame_idx: int - Frame index within sequence
             abs_rel: float - AbsRel metric for this frame
+            fps: float - Optional FPS measurement
         """
         # Convert tensors to numpy and move to CPU
         if isinstance(image, torch.Tensor):
@@ -828,8 +981,6 @@ class Gear2Tester:
             pred_depth = pred_depth.float().cpu().numpy()
         if isinstance(gt_depth, torch.Tensor):
             gt_depth = gt_depth.float().cpu().numpy()
-        if isinstance(importance_map, torch.Tensor):
-            importance_map = importance_map.float().cpu().numpy()
 
         # Denormalize ImageNet normalization for image
         mean = np.array([0.485, 0.456, 0.406])
@@ -840,81 +991,116 @@ class Gear2Tester:
         # Get image size
         img_h, img_w = image_np.shape[:2]
 
-        # Create figure with 5 subplots: Input, GT, Pred, Importance, Metrics
-        fig = plt.figure(figsize=(25, 5))
-        gs = gridspec.GridSpec(1, 10, hspace=0.2, wspace=0.1,
-                              width_ratios=[1, 1, 1, 0.05, 0.1, 1, 0.05, 0.15, 1.2, 0.1])
+        # Create valid mask
+        MAX_DEPTH = 200.0
+        gt_valid = (gt_depth > 0) & (gt_depth < MAX_DEPTH)
+        pred_valid = (pred_depth > 0) & (pred_depth < 1000)
+        valid_mask = gt_valid & pred_valid
+
+        # Calculate error
+        abs_error = np.abs(pred_depth - gt_depth)
+        abs_error_masked = np.where(valid_mask, abs_error, np.nan)
+
+        # Create figure with 4x3 grid layout matching train_gear3_upgrade
+        fig = plt.figure(figsize=(15, 16))
+        gs = gridspec.GridSpec(4, 3, figure=fig, hspace=0.3, wspace=0.3)
+
+        # ==================== Row 1: Input, GT, Pred ====================
 
         # 1. Input Image
         ax1 = fig.add_subplot(gs[0, 0])
-        ax1.imshow(image_np, aspect='equal')
-        ax1.set_title('Input Image', fontsize=12, fontweight='bold')
+        ax1.imshow(image_np)
+        ax1.set_title('Input Image', fontsize=14, fontweight='bold')
         ax1.axis('off')
 
         # 2. Ground Truth Depth
         ax2 = fig.add_subplot(gs[0, 1])
-        gt_valid = gt_depth > 0
-        gt_display = np.where(gt_valid, gt_depth, np.nan)
-        if gt_valid.sum() > 0:
-            gt_vmin, gt_vmax = np.nanpercentile(gt_display, [2, 98])
+        gt_display = np.where(valid_mask, gt_depth, np.nan)
+        if valid_mask.sum() > 0:
+            vmin, vmax = np.nanpercentile(gt_display, [2, 98])
         else:
-            gt_vmin, gt_vmax = 0, 1
-        im2 = ax2.imshow(gt_display, cmap='plasma', vmin=gt_vmin, vmax=gt_vmax, aspect='equal')
-        ax2.set_title('Ground Truth Depth', fontsize=12, fontweight='bold')
+            vmin, vmax = 0, 1
+        im2 = ax2.imshow(gt_display, cmap='plasma', vmin=vmin, vmax=vmax)
+        ax2.set_title('Ground Truth Depth (m)', fontsize=14, fontweight='bold')
         ax2.axis('off')
+        plt.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
 
         # 3. Predicted Metric Depth
         ax3 = fig.add_subplot(gs[0, 2])
-        pred_valid = (pred_depth > 0) & (pred_depth < 1000)
-        pred_display = np.where(pred_valid, pred_depth, np.nan)
-        if pred_valid.sum() > 0:
-            pred_vmin, pred_vmax = np.nanpercentile(pred_display, [2, 98])
-        else:
-            pred_vmin, pred_vmax = 0, 1
-        im3 = ax3.imshow(pred_display, cmap='plasma', vmin=pred_vmin, vmax=pred_vmax, aspect='equal')
-        ax3.set_title('Predicted Metric Depth', fontsize=12, fontweight='bold')
+        pred_display = np.where(valid_mask, pred_depth, np.nan)
+        im3 = ax3.imshow(pred_display, cmap='plasma', vmin=vmin, vmax=vmax)
+        ax3.set_title('Predicted Metric Depth (m)', fontsize=14, fontweight='bold')
         ax3.axis('off')
+        plt.colorbar(im3, ax=ax3, fraction=0.046, pad=0.04)
 
-        # Add depth colorbar
-        cbar_ax_depth = fig.add_subplot(gs[0, 3])
-        depth_vmin = min(gt_vmin, pred_vmin)
-        depth_vmax = max(gt_vmax, pred_vmax)
-        plt.colorbar(im2, cax=cbar_ax_depth, label='Depth (m)')
+        # ==================== Row 2: Importance, FG, BG (All N/A for Gear2) ====================
 
-        # 4. Importance Map (N/A for Gear2, which uses uniform modulation)
-        ax4 = fig.add_subplot(gs[0, 5])
-        if importance_map is not None:
-            importance_upsampled = F.interpolate(
-                torch.from_numpy(importance_map).unsqueeze(0).unsqueeze(0),
-                size=(img_h, img_w),
-                mode='bilinear',
-                align_corners=True
-            ).squeeze().numpy()
+        # 4. Importance Map → N/A for Gear2
+        ax4 = fig.add_subplot(gs[1, 0])
+        ax4.text(0.5, 0.5, 'No Importance Map\n\nUniform Modulation',
+                ha='center', va='center', transform=ax4.transAxes,
+                fontsize=16, fontweight='bold',
+                bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.8))
+        ax4.set_title('Importance Map (N/A)', fontsize=14, fontweight='bold')
+        ax4.axis('off')
 
-            im4 = ax4.imshow(importance_upsampled, cmap='jet', vmin=0, vmax=1, aspect='equal')
-            ax4.set_title('Importance Map', fontsize=12, fontweight='bold')
-            ax4.axis('off')
+        # 5. FG Mask → N/A for Gear2
+        ax5 = fig.add_subplot(gs[1, 1])
+        ax5.text(0.5, 0.5, 'No FG/BG Separation\n\nGear2 Ablation',
+                ha='center', va='center', transform=ax5.transAxes,
+                fontsize=16, fontweight='bold',
+                bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.8))
+        ax5.set_title('FG Mask (N/A)', fontsize=14, fontweight='bold')
+        ax5.axis('off')
 
-            # Importance map colorbar
-            cbar_ax_importance = fig.add_subplot(gs[0, 6])
-            plt.colorbar(im4, cax=cbar_ax_importance, label='Importance')
+        # 6. BG Mask → N/A for Gear2
+        ax6 = fig.add_subplot(gs[1, 2])
+        ax6.text(0.5, 0.5, 'No FG/BG Separation\n\nGear2 Ablation',
+                ha='center', va='center', transform=ax6.transAxes,
+                fontsize=16, fontweight='bold',
+                bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.8))
+        ax6.set_title('BG Mask (N/A)', fontsize=14, fontweight='bold')
+        ax6.axis('off')
+
+        # ==================== Row 3: Valid Mask, Error, Metrics ====================
+
+        # 7. Valid Mask
+        ax7 = fig.add_subplot(gs[2, 0])
+        ax7.imshow(valid_mask.astype(np.uint8), cmap='gray_r', vmin=0, vmax=1)
+        valid_ratio = valid_mask.sum() / valid_mask.size
+        ax7.set_title(f'Valid Mask\n{valid_ratio*100:.1f}% ({valid_mask.sum():,} pixels)',
+                     fontsize=14, fontweight='bold')
+        ax7.axis('off')
+
+        # 8. Absolute Error Map
+        ax8 = fig.add_subplot(gs[2, 1])
+        if valid_mask.sum() > 0:
+            error_vmax = np.nanpercentile(abs_error_masked, 95)
         else:
-            # Gear2 doesn't produce importance maps
-            ax4.text(0.5, 0.5, 'N/A\n(Uniform Modulation)',
-                    ha='center', va='center', fontsize=16, color='gray',
-                    transform=ax4.transAxes)
-            ax4.set_title('Importance Map', fontsize=12, fontweight='bold')
-            ax4.axis('off')
+            error_vmax = 1
+        im8 = ax8.imshow(abs_error_masked, cmap='hot', vmin=0, vmax=error_vmax)
+        ax8.set_title(f'Absolute Error (m)\nMean: {np.nanmean(abs_error_masked):.3f}',
+                     fontsize=14, fontweight='bold')
+        ax8.axis('off')
+        plt.colorbar(im8, ax=ax8, fraction=0.046, pad=0.04)
 
-            # Empty colorbar space for layout consistency
-            cbar_ax_importance = fig.add_subplot(gs[0, 6])
-            cbar_ax_importance.axis('off')
+        # 9. Depth Metrics
+        ax9 = fig.add_subplot(gs[2, 2])
+        y_pos = 0.95
 
-        # 5. Metrics and Info
-        ax5 = fig.add_subplot(gs[0, 8])
+        # Sequence info
+        ax9.text(0.05, y_pos, f'Seq {sequence_id+1} Frame {frame_idx}', fontsize=11,
+                transform=ax9.transAxes, bbox=dict(boxstyle="round", facecolor='wheat'),
+                fontweight='bold')
+        y_pos -= 0.12
 
-        # Compute additional metrics if possible
-        valid_mask = gt_valid & pred_valid
+        # FPS if available
+        if fps is not None:
+            ax9.text(0.05, y_pos, f'FPS: {fps:.1f}', fontsize=10,
+                    transform=ax9.transAxes, bbox=dict(boxstyle="round", facecolor='lightgreen'))
+            y_pos -= 0.10
+
+        # Depth metrics
         if valid_mask.sum() > 0:
             valid_gt = torch.from_numpy(gt_depth[valid_mask])
             valid_pred = torch.from_numpy(pred_depth[valid_mask])
@@ -922,44 +1108,73 @@ class Gear2Tester:
             rmse = torch.sqrt(torch.mean((valid_pred - valid_gt) ** 2))
             mae = torch.mean(torch.abs(valid_pred - valid_gt))
 
-            # Compute Delta metrics
             threshold = 1.25
             max_ratio = torch.max(valid_pred / valid_gt, valid_gt / valid_pred)
             delta_1 = (max_ratio < threshold).float().mean()
             delta_2 = (max_ratio < threshold ** 2).float().mean()
             delta_3 = (max_ratio < threshold ** 3).float().mean()
 
-            # Display metrics in organized layout
-            ax5.text(0.05, 0.85, f'AbsRel: {abs_rel:.4f}', fontsize=14,
-                    transform=ax5.transAxes, bbox=dict(boxstyle="round", facecolor='lightcoral'))
-            ax5.text(0.05, 0.70, f'δ₁: {delta_1:.3f}', fontsize=14,
-                    transform=ax5.transAxes, bbox=dict(boxstyle="round", facecolor='lightgreen'))
-            ax5.text(0.05, 0.55, f'δ₂: {delta_2:.3f}', fontsize=14,
-                    transform=ax5.transAxes, bbox=dict(boxstyle="round", facecolor='lightgreen'))
-            ax5.text(0.05, 0.40, f'δ₃: {delta_3:.3f}', fontsize=14,
-                    transform=ax5.transAxes, bbox=dict(boxstyle="round", facecolor='lightgreen'))
-            ax5.text(0.05, 0.25, f'RMSE: {rmse:.3f}m', fontsize=14,
-                    transform=ax5.transAxes, bbox=dict(boxstyle="round", facecolor='wheat'))
-            ax5.text(0.05, 0.10, f'MAE: {mae:.3f}m', fontsize=14,
-                    transform=ax5.transAxes, bbox=dict(boxstyle="round", facecolor='lightblue'))
+            ax9.text(0.05, y_pos, f'AbsRel: {abs_rel:.4f}', fontsize=10,
+                    transform=ax9.transAxes, bbox=dict(boxstyle="round", facecolor='lightcoral'))
+            y_pos -= 0.08
+            ax9.text(0.05, y_pos, f'Delta_1: {delta_1:.3f}', fontsize=10,
+                    transform=ax9.transAxes, bbox=dict(boxstyle="round", facecolor='lightgreen'))
+            y_pos -= 0.08
+            ax9.text(0.05, y_pos, f'Delta_2: {delta_2:.3f}', fontsize=10,
+                    transform=ax9.transAxes, bbox=dict(boxstyle="round", facecolor='lightgreen'))
+            y_pos -= 0.08
+            ax9.text(0.05, y_pos, f'Delta_3: {delta_3:.3f}', fontsize=10,
+                    transform=ax9.transAxes, bbox=dict(boxstyle="round", facecolor='lightgreen'))
+            y_pos -= 0.08
+            ax9.text(0.05, y_pos, f'RMSE: {rmse:.3f}m', fontsize=9,
+                    transform=ax9.transAxes, bbox=dict(boxstyle="round", facecolor='wheat'))
+            y_pos -= 0.08
+            ax9.text(0.05, y_pos, f'MAE: {mae:.3f}m', fontsize=9,
+                    transform=ax9.transAxes, bbox=dict(boxstyle="round", facecolor='lightblue'))
 
-            # Add FPS if available
-            if fps is not None:
-                ax5.text(0.05, -0.05, f'FPS: {fps:.1f}', fontsize=14,
-                        transform=ax5.transAxes, bbox=dict(boxstyle="round", facecolor='lightgreen'))
+        ax9.set_title('Depth Metrics', fontsize=14, fontweight='bold')
+        ax9.axis('off')
 
-        ax5.set_title('Depth Metrics', fontsize=12, fontweight='bold')
-        ax5.axis('off')
+        # ==================== Row 4: Depth Distribution, Importance Distribution ====================
+
+        # 10. Depth Distribution Histogram
+        ax10 = fig.add_subplot(gs[3, :2])
+        if valid_mask.sum() > 0:
+            gt_valid = gt_depth[valid_mask]
+            pred_valid = pred_depth[valid_mask]
+
+            bins = np.linspace(min(gt_valid.min(), pred_valid.min()),
+                              max(gt_valid.max(), pred_valid.max()), 50)
+
+            ax10.hist(gt_valid, bins=bins, alpha=0.6, label='Ground Truth',
+                    color='blue', density=True)
+            ax10.hist(pred_valid, bins=bins, alpha=0.6, label='Predicted',
+                    color='red', density=True)
+            ax10.set_xlabel('Depth (meters)', fontsize=12)
+            ax10.set_ylabel('Density', fontsize=12)
+            ax10.set_title('Depth Distribution', fontsize=14, fontweight='bold')
+            ax10.legend(fontsize=12)
+            ax10.grid(True, alpha=0.3)
+
+        # 11. Importance Distribution → N/A for Gear2
+        ax11 = fig.add_subplot(gs[3, 2])
+        ax11.text(0.5, 0.5, 'No Importance Map\n\nUniform Modulation\n(Same gamma/beta for all pixels)',
+                 ha='center', va='center', transform=ax11.transAxes,
+                 fontsize=14, fontweight='bold',
+                 bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.8))
+        ax11.set_title('Importance Distribution (N/A)', fontsize=14, fontweight='bold')
+        ax11.axis('off')
 
         # Overall title
-        plt.suptitle(f'Sequence {sequence_id+1} Best Frame {frame_idx}', fontsize=16, fontweight='bold')
+        plt.suptitle(f'Gear2 (Ablation): Sequence {sequence_id+1} Best Frame {frame_idx}',
+                    fontsize=16, fontweight='bold')
 
-        # Save with test_metric_head.py naming convention
+        # Save with same naming convention
         save_path = self.save_dir / f"best_frame_seq{sequence_id+1}_{frame_idx}_absrel_{abs_rel:.4f}.png"
         plt.savefig(save_path, dpi=150, bbox_inches='tight', facecolor='white')
         plt.close(fig)
 
-        logger.info(f"Saved best frame visualization: {save_path}")
+        logger.info(f"Saved Gear2 best frame visualization: {save_path}")
 
     def _aggregate_metrics(self, all_metrics):
         """Aggregate metrics across sequences"""

@@ -238,15 +238,18 @@ def torch_batch_to_np_arr(batch, assume_neg1_pos1=False):
 
     return np_imgs
 
-def depth_to_np_arr(depth):
+def depth_to_np_arr(depth, inverse=False):
     # torch batch of B,H,W
 
     if isinstance(depth, list):
         depth = torch.stack(depth)
     depth = depth.detach().cpu().float()
-    depth = (depth - depth.min()) / (depth.max() - depth.min()) 
+    depth = (depth - depth.min()) / (depth.max() - depth.min())
     depth = depth.numpy()
-    cmap = matplotlib.colormaps.get_cmap('inferno')
+
+    # inverse=True: use reversed colormap (inferno_r)
+    cmap_name = 'inferno_r' if inverse else 'inferno'
+    cmap = matplotlib.colormaps.get_cmap(cmap_name)
 
     np_depth = []
     for i in range(len(depth)):

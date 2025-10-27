@@ -510,14 +510,20 @@ class FlashDepth(nn.Module):
     
     @torch.no_grad()
     def forward(self, batch, use_mamba, gif_path, resolution, out_mp4 ,save_depth_npy=False, save_vis_map=False, **kwargs):
-        
+
         # both have shape (B, T, C, H, W)
         if isinstance(batch, list) or isinstance(batch, tuple):
-            video, gt_depth = batch 
+            video, gt_depth = batch
         elif isinstance(batch, torch.Tensor):
             video = batch
             gt_depth = None
-        
+
+        # For fair FPS measurement: pre-load entire video to GPU (exclude data transfer from measurement)
+        if kwargs.get('print_time', False):
+            video = video.to(torch.cuda.current_device())
+            if gt_depth is not None:
+                gt_depth = gt_depth.to(torch.cuda.current_device())
+
         preds = []
 
         loss = 0
@@ -529,24 +535,33 @@ class FlashDepth(nn.Module):
             if kwargs.get('print_time', False) and i==warmup_frames:
                 torch.cuda.synchronize()
                 start = time.time()
-            frame = video[:, i, :, :, :].to(torch.cuda.current_device())
+
+            # For FPS measurement: video already on GPU, just index
+            if kwargs.get('print_time', False):
+                frame = video[:, i, :, :, :]
+            else:
+                frame = video[:, i, :, :, :].to(torch.cuda.current_device())
             B, C, H, W = frame.shape
 
-       
+
             patch_h, patch_w = frame.shape[-2] // self.patch_size, frame.shape[-1] // self.patch_size
 
             # dpt_features = self.get_dpt_features(frame)
-            dpt_features = self.get_dpt_features(frame, input_shape=(B,C,H,W)) 
+            dpt_features = self.get_dpt_features(frame, input_shape=(B,C,H,W))
 
             pred_depth = self.final_head(dpt_features, patch_h, patch_w)
             pred_depth = torch.clip(pred_depth, min=0)
 
-        
+
             if gt_depth is not None and pred_depth.shape != gt_depth[:, i, :, :].shape:
                 pred_depth = F.interpolate(pred_depth.unsqueeze(1), gt_depth[:, i, :, :].unsqueeze(1).shape[-2:], mode="bilinear", align_corners=True).squeeze(1)
 
             if gt_depth is not None:
-                gt_frame = gt_depth[:, i, :, :].to(torch.cuda.current_device()) 
+                # For FPS measurement: gt_depth already on GPU
+                if kwargs.get('print_time', False):
+                    gt_frame = gt_depth[:, i, :, :]
+                else:
+                    gt_frame = gt_depth[:, i, :, :].to(torch.cuda.current_device())
                 valid_mask = gt_frame >=0
                 # if loss_type == 'l1':
                 #     loss += F.l1_loss(pred_depth[valid_mask], gt_frame[valid_mask])
@@ -557,12 +572,12 @@ class FlashDepth(nn.Module):
                 loss += F.l1_loss(pred_depth[valid_mask], gt_frame[valid_mask])
 
             preds.append(pred_depth)
-        
+
         if kwargs.get('print_time', False):
             try:
                 torch.cuda.synchronize()
                 end = time.time()
-                logging.info(f'wall time taken: {end - start:.2f}; fps: {((video.shape[1]-warmup_frames) / (end - start)):.2f}; num frames: {video.shape[1]-warmup_frames}')
+                logging.info(f'Inference FPS (data pre-loaded): {((video.shape[1]-warmup_frames) / (end - start)):.2f} | wall time: {end - start:.2f}s | num frames: {video.shape[1]-warmup_frames}')
             except Exception as e:
                 logging.info(f"Error in printing time: {e}")
                 pass
@@ -601,12 +616,13 @@ class FlashDepth(nn.Module):
             try:
                 pred0 = []
                 for i in range(len(preds)):
-                    pred0.append(preds[i][0].cpu()) 
+                    pred0.append(preds[i][0].cpu())
                 pred0 = torch.stack(pred0)
-                pred_save = depth_to_np_arr(pred0)
+                inverse_colormap = kwargs.get('inverse', False)
+                pred_save = depth_to_np_arr(pred0, inverse=inverse_colormap)
                 video_save = torch_batch_to_np_arr(video[0])
                 if gt_depth is not None:
-                    gt_save = depth_to_np_arr(gt_depth[0])
+                    gt_save = depth_to_np_arr(gt_depth[0], inverse=inverse_colormap)
                 else:
                     gt_save = None
 

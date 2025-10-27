@@ -95,3 +95,8 @@ eval:
   save_depth_npy: false  # Save raw depth as .npy files
   save_vis_map: false    # Save colorized depth as .png files
   dummy_timing: false
+
+# Object-wise evaluation configuration
+object_wise:
+  enabled: false  # Enable object-wise evaluation (set via CLI: object_wise.enabled=true)
+  dataset: waymo  # Dataset type for object-wise eval: waymo, sintel
