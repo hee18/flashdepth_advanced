@@ -121,50 +121,102 @@ class ObjectWiseEvaluator:
         images: torch.Tensor
     ) -> np.ndarray:
         """
-        Predict depth for a sequence of images.
+        Predict depth for a sequence of images using full sequence processing.
+        Supports both original FlashDepth and Gear models (Gear2/3/3 Upgrade).
 
         Args:
-            model: FlashDepth model
+            model: FlashDepth model (with or without Gear modules)
             images: Input images (B, T, C, H, W)
 
         Returns:
             Predicted depth map for last frame (H, W)
         """
-        B, T, C, H, W = images.shape
+        from einops import rearrange
+
+        B_orig, T_orig, C, H, W = images.shape
 
         with torch.no_grad():
             with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-                # Initialize hidden states
-                hidden_states = None
+                # Initialize Mamba sequence (critical for temporal processing!)
+                if hasattr(model, 'mamba'):
+                    model.mamba.start_new_sequence()
 
-                # Process sequence frame by frame
-                for t in range(T):
-                    frame = images[:, t]  # (B, C, H, W)
+                # Reshape video from (B, T, C, H, W) to (B*T, C, H, W) for encoder
+                images_flat = rearrange(images, 'b t c h w -> (b t) c h w')
+                patch_h, patch_w = H // model.patch_size, W // model.patch_size
 
-                    # Extract features from DINOv2
-                    encoder_features = model.pretrained.get_intermediate_layers(
-                        frame, n=model.intermediate_layers, return_class_token=True
-                    )
+                # Extract features from DINOv2 - all frames at once
+                encoder_features = model.pretrained.get_intermediate_layers(
+                    images_flat, model.intermediate_layer_idx[model.encoder]
+                )
 
-                    # Get patch features and CLS token
-                    patch_features = [feat[0] for feat in encoder_features]
-                    cls_tokens = [feat[1] for feat in encoder_features]
+                # Get DPT features with Mamba temporal processing
+                dpt_output = model.depth_head.forward_with_mamba(
+                    encoder_features, patch_h, patch_w,
+                    temporal_layer=model.mamba_in_dpt_layer,
+                    mamba_fn=model.dpt_features_to_mamba,
+                    shape_placeholder=(B_orig, T_orig, None, H, W)
+                )  # Returns path_1 with Mamba applied, shape: (B*T, dpt_dim, h, w)
 
-                    # Pass through DPT decoder with Mamba
-                    if hasattr(model, 'depth_head'):
-                        depth_pred, hidden_states = model.depth_head(
-                            patch_features,
-                            cls_tokens,
-                            hidden_states=hidden_states,
-                            patch_h=H // model.patch_size,
-                            patch_w=W // model.patch_size
+                # Check if this is a Gear model (has gear2_head, gear3_head, or gear3_upgrade_head)
+                if hasattr(model, 'gear2_head') or hasattr(model, 'gear3_head'):
+                    # Gear model: apply FG/BG modulation
+                    # Get attention weights and patch tokens for Gear head
+                    last_block = model.pretrained.blocks[-1]
+                    attention_weights = last_block.attn.attn_weights
+                    patch_tokens = encoder_features[-1]
+
+                    # Determine which Gear head to use
+                    if hasattr(model, 'gear3_head'):
+                        # Gear3 or Gear3 Upgrade
+                        # Prepare inputs based on separation_method (if available)
+                        attention_weights_multi_layer = None
+                        cls_token = None
+
+                        if hasattr(model.gear3_head, 'multi_layer_fusion'):
+                            # Multi-layer separation method
+                            attention_weights_multi_layer = [
+                                model.pretrained.blocks[i].attn.attn_weights
+                                for i in [3, 10, 16, 22]
+                            ]
+                        else:
+                            # CLS token separation method
+                            cls_token = patch_tokens[:, 0]  # (B*T, embed_dim)
+
+                        # Apply Gear3 modulation
+                        path_1_modulated, _, _, _, _, _ = model.gear3_head(
+                            patch_tokens, attention_weights, [dpt_output], patch_h, patch_w,
+                            attention_weights_multi_layer=attention_weights_multi_layer,
+                            cls_token=cls_token
                         )
                     else:
-                        depth_pred = model.forward_features(patch_features, cls_tokens)
+                        # Gear2
+                        path_1_modulated, _, _, _ = model.gear2_head(
+                            patch_tokens, attention_weights, [dpt_output], patch_h, patch_w
+                        )
 
-        # Return last frame prediction (convert to numpy)
-        depth_pred = depth_pred.float().cpu().numpy()[0, 0]  # (H, W)
-        return depth_pred
+                    # Use modulated features
+                    out = model.depth_head.scratch.output_conv1(path_1_modulated)
+                else:
+                    # Original FlashDepth: use DPT output directly
+                    out = model.depth_head.scratch.output_conv1(dpt_output)
+
+                # Final depth prediction
+                out = F.interpolate(out, (H, W), mode="bilinear", align_corners=True)
+                out = model.depth_head.scratch.output_conv2(out)
+
+                # Output is inverse depth (100/m) with Softplus activation
+                pred_depth_inverse = out  # Shape: (B*T, 1, H, W)
+
+        # Reshape to (B, T, 1, H, W) and get last frame
+        pred_depth_inverse_seq = rearrange(pred_depth_inverse, '(b t) 1 h w -> b t 1 h w', b=B_orig, t=T_orig)
+        pred_depth_inverse_last = pred_depth_inverse_seq[0, -1, 0]  # Last frame (H, W)
+
+        # Convert inverse depth to metric depth: 100/m -> m
+        pred_depth_metric = 100.0 / (pred_depth_inverse_last.float() + 1e-8)
+
+        # Return as numpy array
+        return pred_depth_metric.cpu().numpy()  # (H, W)
 
     def evaluate_sequence(
         self,
@@ -225,7 +277,12 @@ class ObjectWiseEvaluator:
         num_sequences = 0
 
         for batch in tqdm(dataloader, desc="Evaluating sequences"):
-            images = batch['images'].to(self.device)  # (B, T, C, H, W)
+            # Add batch dimension if not present (dataset returns (T, C, H, W))
+            images = batch['image']  # (T, C, H, W) or (B, T, C, H, W)
+            if images.ndim == 4:
+                images = images.unsqueeze(0)  # Add batch dim -> (1, T, C, H, W)
+            images = images.to(self.device)  # (B, T, C, H, W)
+
             gt_depth = batch['depth'].cpu().numpy()[0, -1]  # Last frame (H, W)
             seg_mask = batch['segmentation'].cpu().numpy()[0]  # (H, W)
 
@@ -308,6 +365,60 @@ def create_dataloader(
         logger.info(f"Created KITTI dataloader with {len(dataset)} sequences")
         return dataloader
 
+    elif dataset_type == 'sintel':
+        from dataloaders.sintel_segmentation_dataset import SintelSegmentationDataset, collate_fn
+
+        dataset = SintelSegmentationDataset(
+            data_root=str(data_root),
+            split='test',  # Sintel test split has segmentation annotations
+            video_length=video_length,
+            resolution=518
+        )
+
+        dataloader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=4,
+            collate_fn=collate_fn,
+            pin_memory=True
+        )
+
+        logger.info(f"Created Sintel dataloader with {len(dataset)} sequences")
+        return dataloader
+
+    elif dataset_type == 'waymo':
+        from dataloaders.waymo_segmentation_dataset import WaymoSegmentationDataset, collate_fn
+
+        # Use sparse depth from preprocessed waymo dataset
+        if 'waymo_seg' in str(data_root):
+            # Point to preprocessed depth: waymo_seg -> waymo/val
+            depth_root = str(data_root).replace('waymo_seg', 'waymo') + '/val'
+        else:
+            # Assume waymo_seg is at /home/cvlab/hsy/Datasets/waymo_seg
+            depth_root = '/home/cvlab/hsy/Datasets/waymo/val'
+
+        dataset = WaymoSegmentationDataset(
+            data_root=str(data_root),
+            split='val',  # Waymo uses 'val' not 'validation'
+            video_length=video_length,
+            resolution=518,
+            use_depth=True,  # Load sparse depth from preprocessed dataset
+            depth_root=depth_root
+        )
+
+        dataloader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=4,
+            collate_fn=collate_fn,
+            pin_memory=True
+        )
+
+        logger.info(f"Created Waymo dataloader with {len(dataset)} sequences")
+        return dataloader
+
     elif dataset_type in ['cityscapes', 'nyu', 'vkitti2']:
         # TODO: Implement other dataset loaders
         logger.warning(f"Dataset loader for {dataset_type} not yet implemented!")
@@ -332,7 +443,7 @@ def main():
 
     # Dataset arguments
     parser.add_argument('--dataset', type=str, required=True,
-                        choices=['kitti', 'cityscapes', 'nyu', 'vkitti2'],
+                        choices=['kitti', 'cityscapes', 'nyu', 'vkitti2', 'sintel', 'waymo'],
                         help='Dataset type')
     parser.add_argument('--data-root', type=Path, required=True,
                         help='Root directory of dataset')

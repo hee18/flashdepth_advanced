@@ -728,6 +728,13 @@ class Gear3Trainer:
                     gt_depth_inverse_canonical = self.canonical_normalizer.canonicalize_inverse(gt_depth, focal_length)
                     gt_depth_inverse = gt_depth_inverse_canonical * 100.0  # Training uses 100/m
 
+                    # Get batch size for Mamba initialization
+                    B, T = images.shape[:2]
+
+                    # Initialize Mamba sequence for temporal processing
+                    if hasattr(model, 'mamba'):
+                        model.mamba.start_new_sequence()
+
                     img_t = images[:, 0]
                     gt_t_inverse = gt_depth_inverse[:, 0]
 
@@ -741,10 +748,18 @@ class Gear3Trainer:
 
                         h, w = img_t.shape[2:]
                         patch_h, patch_w = h // model.patch_size, w // model.patch_size
-                        dpt_features = model.depth_head.get_forward_features(encoder_features, patch_h, patch_w)
 
+                        # Use forward_with_mamba for temporal processing
+                        dpt_output = model.depth_head.forward_with_mamba(
+                            encoder_features, patch_h, patch_w,
+                            temporal_layer=model.mamba_in_dpt_layer,
+                            mamba_fn=model.dpt_features_to_mamba,
+                            shape_placeholder=(B, T, None, h, w)
+                        )
+
+                        # Wrap dpt_output in list for compatibility with Gear3 head
                         path_1_modulated, importance_map, fg_features, bg_features = model.gear3_head(
-                            patch_tokens, attention_weights, dpt_features, patch_h, patch_w
+                            patch_tokens, attention_weights, [dpt_output], patch_h, patch_w
                         )
 
                         out = model.depth_head.scratch.output_conv1(path_1_modulated)
@@ -848,93 +863,85 @@ class Gear3Trainer:
             self.logger.info(f"DEBUG - After canonicalization & scaling: min={gt_depth_inverse.min():.4f}, max={gt_depth_inverse.max():.4f}")
             self.logger.info(f"DEBUG - Has {(gt_depth_inverse > 0).sum()} valid pixels")
 
-        # Forward pass with BFloat16 autocast (like original FlashDepth)
-        total_loss = 0
-        valid_frames = 0
+        # Forward pass following original FlashDepth pattern (whole sequence at once)
+        # Initialize Mamba sequence (critical for temporal processing!)
+        if hasattr(model, 'mamba'):
+            model.mamba.start_new_sequence()
 
-        for t in range(T):
-            img_t = images[:, t]
-            gt_t = gt_depth_inverse[:, t]
+        # Reshape video from (B, T, C, H, W) to (B*T, C, H, W) for encoder
+        B_orig, T_orig, C, H, W = images.shape
+        images_flat = rearrange(images, 'b t c h w -> (b t) c h w')
 
-            # Use BFloat16 for forward pass
-            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-                # Extract features from DINOv2 (frozen, no grad)
-                with torch.no_grad():
-                    encoder_features = model.pretrained.get_intermediate_layers(
-                        img_t, model.intermediate_layer_idx[model.encoder]
-                    )
+        patch_h, patch_w = H // model.patch_size, W // model.patch_size
 
-                    # Get attention weights (already computed and stored)
-                    last_block = model.pretrained.blocks[-1]
-                    attention_weights = last_block.attn.attn_weights
-
-                    # Get patch tokens from last encoder layer
-                    patch_tokens = encoder_features[-1]
-
-                # Get DPT features (frozen, no grad)
-                h, w = img_t.shape[2:]
-                patch_h, patch_w = h // model.patch_size, w // model.patch_size
-
-                with torch.no_grad():
-                    dpt_features = model.depth_head.get_forward_features(
-                        encoder_features, patch_h, patch_w
-                    )
-
-                # Apply Gear3 modulation (trainable) - only path_1 is modulated
-                path_1_modulated, importance_map, fg_features, bg_features = model.gear3_head(
-                    patch_tokens, attention_weights, dpt_features, patch_h, patch_w
+        # Use BFloat16 for forward pass
+        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+            # Extract features from DINOv2 (frozen, no grad) - all frames at once
+            with torch.no_grad():
+                encoder_features = model.pretrained.get_intermediate_layers(
+                    images_flat, model.intermediate_layer_idx[model.encoder]
                 )
 
-                # Pass through DPT output head (trainable)
-                out = model.depth_head.scratch.output_conv1(path_1_modulated)
-                out = F.interpolate(out, (h, w), mode="bilinear", align_corners=True)
-                out = model.depth_head.scratch.output_conv2(out)
+                # Get attention weights from last block (B*T, num_heads, N, N)
+                last_block = model.pretrained.blocks[-1]
+                attention_weights = last_block.attn.attn_weights
 
-                # Prediction is already positive (Softplus activation in output_conv2)
-                pred_depth_inverse = out
+                # Get patch tokens from last encoder layer (B*T, N, C)
+                patch_tokens = encoder_features[-1]
 
-            # Continue with loss computation (outside autocast for stability)
-            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-                # DEBUG: Check prediction values in first few steps
-                if self.global_step < 5:
-                    self.logger.info(f"DEBUG - Pred inverse depth: min={pred_depth_inverse.min():.4f}, max={pred_depth_inverse.max():.4f}, mean={pred_depth_inverse.mean():.4f}")
+            # Get DPT features with Mamba temporal processing (frozen, no grad)
+            with torch.no_grad():
+                dpt_output = model.depth_head.forward_with_mamba(
+                    encoder_features, patch_h, patch_w,
+                    temporal_layer=model.mamba_in_dpt_layer,
+                    mamba_fn=model.dpt_features_to_mamba,
+                    shape_placeholder=(B_orig, T_orig, None, H, W)
+                )  # Returns path_1 with Mamba applied, shape: (B*T, dpt_dim, h, w)
 
-                # Clamp prediction to reasonable range to prevent NaN
-                pred_depth_inverse = torch.clamp(pred_depth_inverse, min=1e-3, max=1e4)
+            # Apply Gear3 modulation (trainable) - only path_1 is modulated
+            # Inputs: (B*T, ...), Output: (B*T, ...)
+            path_1_modulated, importance_map, fg_features, bg_features = model.gear3_head(
+                patch_tokens, attention_weights, [dpt_output], patch_h, patch_w
+            )
 
-                # Compute loss with valid mask (GT only, like original FlashDepth)
-                # Filter out invalid inverse depths: should be in reasonable range
-                # Max 70m depth = 100/70 = 1.43 in (100/m) inverse depth
-                # So inverse depth should be > 1.43 (i.e., depth < 70m)
-                MIN_INVERSE_DEPTH = 100.0 / 70.0  # 100/70m = 1.43 in 100/m scale (max 70m depth)
-                gt_valid_mask = (gt_t > MIN_INVERSE_DEPTH)  # Filter out >70m depths and invalid values
-                valid_mask = gt_valid_mask
+            # Pass through DPT output head (trainable)
+            out = model.depth_head.scratch.output_conv1(path_1_modulated)
+            out = F.interpolate(out, (H, W), mode="bilinear", align_corners=True)
+            out = model.depth_head.scratch.output_conv2(out)
 
-                if valid_mask.sum() == 0:
-                    self.logger.warning(f"Skipping frame {t} - no valid GT pixels")
-                    continue
+            # Prediction is already positive (Softplus activation in output_conv2)
+            # Shape: (B*T, 1, H, W)
+            pred_depth_inverse = out
 
-                # Loss computation in BFloat16
-                loss_t = self.loss_fn(pred_depth_inverse, gt_t, valid_mask.float())
+        # Compute loss (outside autocast for stability)
+        # Reshape GT from (B, T, 1, H, W) to (B*T, H, W)
+        gt_depth_inverse_flat = rearrange(gt_depth_inverse, 'b t 1 h w -> (b t) h w')
 
-            # Safety check: skip if loss is NaN or too large
-            if torch.isnan(loss_t) or torch.isinf(loss_t):
-                self.logger.warning(f"Skipping frame {t} due to NaN/Inf loss")
-                continue
+        # Remove channel dimension from prediction
+        pred_depth_inverse_flat = pred_depth_inverse.squeeze(1)  # (B*T, H, W)
 
-            if loss_t > 1e6:
-                self.logger.warning(f"Skipping frame {t} due to abnormal loss: {loss_t.item():.2f}")
-                continue
+        # DEBUG: Check values in first few steps
+        if self.global_step < 5:
+            self.logger.info(f"DEBUG - Pred inverse depth: min={pred_depth_inverse_flat.min():.4f}, max={pred_depth_inverse_flat.max():.4f}, mean={pred_depth_inverse_flat.mean():.4f}")
 
-            total_loss += loss_t
-            valid_frames += 1
+        # Clamp prediction to reasonable range to prevent NaN
+        pred_depth_inverse_flat = torch.clamp(pred_depth_inverse_flat, min=1e-3, max=1e4)
 
-        # Average loss over valid frames
-        if valid_frames == 0:
-            self.logger.error("No valid frames in batch!")
+        # Compute valid mask (GT only, like original FlashDepth)
+        MIN_INVERSE_DEPTH = 100.0 / 70.0  # Filter out >70m depths
+        valid_mask = (gt_depth_inverse_flat > MIN_INVERSE_DEPTH)
+
+        if valid_mask.sum() == 0:
+            self.logger.error("No valid GT pixels in batch!")
             return {'loss': 0.0}
 
-        loss = total_loss / valid_frames
+        # Compute loss (like original FlashDepth)
+        with torch.amp.autocast('cuda', enabled=False):
+            loss = self.loss_fn(
+                pred_depth_inverse_flat.float(),
+                gt_depth_inverse_flat.float(),
+                valid_mask.float()
+            )
 
         # Backward pass (outside autocast for numerical stability)
         self.optimizer.zero_grad()
@@ -1007,6 +1014,10 @@ class Gear3Trainer:
                 gt_depth_inverse_canonical = self.canonical_normalizer.canonicalize_inverse(gt_depth, focal_length)
                 gt_depth_inverse = gt_depth_inverse_canonical * 100.0  # Training uses 100/m
 
+                # Initialize Mamba sequence for temporal processing
+                if hasattr(model, 'mamba'):
+                    model.mamba.start_new_sequence()
+
                 # Process all frames in sequence (like original FlashDepth)
                 frame_losses = []
                 for t in range(T):
@@ -1023,14 +1034,20 @@ class Gear3Trainer:
                     attention_weights = last_block.attn.attn_weights
                     patch_tokens = encoder_features[-1]
 
-                    # Get DPT features
+                    # Get DPT features with Mamba temporal processing
                     h, w = img_t.shape[2:]
                     patch_h, patch_w = h // model.patch_size, w // model.patch_size
-                    dpt_features = model.depth_head.get_forward_features(encoder_features, patch_h, patch_w)
+                    dpt_output = model.depth_head.forward_with_mamba(
+                        encoder_features, patch_h, patch_w,
+                        temporal_layer=model.mamba_in_dpt_layer,
+                        mamba_fn=model.dpt_features_to_mamba,
+                        shape_placeholder=(B, T, None, h, w)
+                    )  # Returns path_1 with Mamba applied
 
                     # Apply modulation and get importance map (only path_1 is modulated)
+                    # Wrap dpt_output in list for compatibility with Gear3 head
                     path_1_modulated, importance_map, fg_features, bg_features = model.gear3_head(
-                        patch_tokens, attention_weights, dpt_features, patch_h, patch_w
+                        patch_tokens, attention_weights, [dpt_output], patch_h, patch_w
                     )
 
                     # Get depth (at model resolution)

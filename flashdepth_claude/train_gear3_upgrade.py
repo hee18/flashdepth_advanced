@@ -744,20 +744,33 @@ class Gear3UpgradeTrainer:
                     gt_depth_inverse_canonical = self.canonical_normalizer.canonicalize_inverse(gt_depth, focal_length)
                     gt_depth_inverse = gt_depth_inverse_canonical * 100.0  # Training uses 100/m
 
-                    img_t = images[:, 0]
-                    gt_t_inverse = gt_depth_inverse[:, 0]
+                    # Get batch size for Mamba initialization
+                    B_orig, T_orig, C, H, W = images.shape
+
+                    # Initialize Mamba sequence for temporal processing
+                    if hasattr(model, 'mamba'):
+                        model.mamba.start_new_sequence()
+
+                    # Process entire sequence at once (full sequence processing)
+                    images_flat = rearrange(images, 'b t c h w -> (b t) c h w')
+                    patch_h, patch_w = H // model.patch_size, W // model.patch_size
 
                     with torch.no_grad():
+                        # Extract features from all frames at once
                         encoder_features = model.pretrained.get_intermediate_layers(
-                            img_t, model.intermediate_layer_idx[model.encoder]
+                            images_flat, model.intermediate_layer_idx[model.encoder]
                         )
                         last_block = model.pretrained.blocks[-1]
                         attention_weights = last_block.attn.attn_weights
                         patch_tokens = encoder_features[-1]
 
-                        h, w = img_t.shape[2:]
-                        patch_h, patch_w = h // model.patch_size, w // model.patch_size
-                        dpt_features = model.depth_head.get_forward_features(encoder_features, patch_h, patch_w)
+                        # Use forward_with_mamba for temporal processing
+                        dpt_output = model.depth_head.forward_with_mamba(
+                            encoder_features, patch_h, patch_w,
+                            temporal_layer=model.mamba_in_dpt_layer,
+                            mamba_fn=model.dpt_features_to_mamba,
+                            shape_placeholder=(B_orig, T_orig, None, H, W)
+                        )
 
                         # Prepare inputs based on separation_method
                         attention_weights_multi_layer = None
@@ -769,41 +782,58 @@ class Gear3UpgradeTrainer:
                                 for i in [3, 10, 16, 22]
                             ]
                         elif self.separation_method == 'cls_seg':
-                            cls_token = encoder_features[-1][:, 0]  # [B, embed_dim]
+                            cls_token = encoder_features[-1][:, 0]  # [B*T, embed_dim]
 
+                        # Apply Gear3 Upgrade head
                         path_1_modulated, importance_map, fg_features, bg_features, fg_mask, bg_mask = model.gear3_head(
-                            patch_tokens, attention_weights, dpt_features, patch_h, patch_w,
+                            patch_tokens, attention_weights, [dpt_output], patch_h, patch_w,
                             attention_weights_multi_layer=attention_weights_multi_layer,
                             cls_token=cls_token
                         )
 
                         out = model.depth_head.scratch.output_conv1(path_1_modulated)
-                        out = F.interpolate(out, (h, w), mode="bilinear", align_corners=True)
+                        out = F.interpolate(out, (H, W), mode="bilinear", align_corners=True)
                         out = model.depth_head.scratch.output_conv2(out)
 
-                        # Convert prediction to metric depth for visualization: 100/m -> m
-                        # Already positive (Softplus activation in output_conv2)
+                        # Convert prediction to metric depth: 100/m -> m
+                        # Output shape: (B*T, 1, H, W)
                         pred_depth_metric = 100.0 / (out + 1e-8)
-                        gt_depth_metric = 100.0 / (gt_t_inverse + 1e-8)
 
+                        # Reshape outputs from (B*T, ...) to (B, T, ...)
+                        pred_depth_metric_seq = rearrange(pred_depth_metric, '(b t) 1 h w -> b t 1 h w', b=B_orig, t=T_orig)
+                        importance_map_seq = rearrange(importance_map, '(b t) c h w -> b t c h w', b=B_orig, t=T_orig)
+                        fg_mask_seq = rearrange(fg_mask, '(b t) c h w -> b t c h w', b=B_orig, t=T_orig)
+                        bg_mask_seq = rearrange(bg_mask, '(b t) c h w -> b t c h w', b=B_orig, t=T_orig)
+
+                        # Select first frame for visualization
+                        pred_depth_metric_vis = pred_depth_metric_seq[:, 0]  # [B, 1, H, W]
+                        importance_map_vis = importance_map_seq[:, 0]  # [B, C, H, W]
+                        fg_mask_vis = fg_mask_seq[:, 0]  # [B, 1, H, W]
+                        bg_mask_vis = bg_mask_seq[:, 0]  # [B, 1, H, W]
+
+                        # GT depth for first frame
+                        gt_depth_inverse_vis = gt_depth_inverse[:, 0]  # [B, 1, H, W]
+                        gt_depth_metric = 100.0 / (gt_depth_inverse_vis + 1e-8)
+
+                        # Resize masks to match image resolution (no need to resize pred_depth_metric_vis as it's already at H, W)
                         importance_map_resized = F.interpolate(
-                            importance_map, size=(h, w), mode='bilinear', align_corners=True
+                            importance_map_vis, size=(H, W), mode='bilinear', align_corners=True
                         )
                         fg_mask_resized = F.interpolate(
-                            fg_mask, size=(h, w), mode='bilinear', align_corners=True
+                            fg_mask_vis, size=(H, W), mode='bilinear', align_corners=True
                         )
                         bg_mask_resized = F.interpolate(
-                            bg_mask, size=(h, w), mode='bilinear', align_corners=True
+                            bg_mask_vis, size=(H, W), mode='bilinear', align_corners=True
                         )
 
                         # Move tensors to CPU for visualization (only first batch, first frame)
                         sample_batch = (
                             images[:1, :1].cpu(),  # [1, 1, 3, H, W]
-                            gt_depth_metric[:1].cpu(),  # [1, 1, H, W] (already has channel dim)
+                            gt_depth_metric[:1].cpu(),  # [1, 1, H, W]
                             dataset_idx
                         )
                         model_outputs_cpu = {
-                            'pred_depth': pred_depth_metric[:1].cpu(),  # [1, 1, H, W]
+                            'pred_depth': pred_depth_metric_vis[:1].cpu(),  # [1, 1, H, W]
                             'importance_map': importance_map_resized[:1].cpu(),  # [1, 1, H, W]
                             'fg_mask': fg_mask_resized[:1].cpu(),  # [1, 1, H, W]
                             'bg_mask': bg_mask_resized[:1].cpu()   # [1, 1, H, W]
@@ -898,109 +928,102 @@ class Gear3UpgradeTrainer:
             self.logger.info(f"DEBUG - After canonicalization & scaling: min={gt_depth_inverse.min():.4f}, max={gt_depth_inverse.max():.4f}")
             self.logger.info(f"DEBUG - Has {(gt_depth_inverse > 0).sum()} valid pixels")
 
-        # Forward pass with BFloat16 autocast (like original FlashDepth)
-        total_loss = 0
-        valid_frames = 0
+        # Forward pass following original FlashDepth pattern (whole sequence at once)
+        # Initialize Mamba sequence (critical for temporal processing!)
+        if hasattr(model, 'mamba'):
+            model.mamba.start_new_sequence()
 
-        for t in range(T):
-            img_t = images[:, t]
-            gt_t = gt_depth_inverse[:, t]
+        # Reshape video from (B, T, C, H, W) to (B*T, C, H, W) for encoder
+        B_orig, T_orig, C, H, W = images.shape
+        images_flat = rearrange(images, 'b t c h w -> (b t) c h w')
 
-            # Use BFloat16 for forward pass
-            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-                # Extract features from DINOv2 (frozen, no grad)
-                with torch.no_grad():
-                    encoder_features = model.pretrained.get_intermediate_layers(
-                        img_t, model.intermediate_layer_idx[model.encoder]
-                    )
+        patch_h, patch_w = H // model.patch_size, W // model.patch_size
 
-                    # Get attention weights (already computed and stored)
-                    last_block = model.pretrained.blocks[-1]
-                    attention_weights = last_block.attn.attn_weights
-
-                    # Get patch tokens from last encoder layer
-                    patch_tokens = encoder_features[-1]
-
-                # Get DPT features (frozen, no grad)
-                h, w = img_t.shape[2:]
-                patch_h, patch_w = h // model.patch_size, w // model.patch_size
-
-                with torch.no_grad():
-                    dpt_features = model.depth_head.get_forward_features(
-                        encoder_features, patch_h, patch_w
-                    )
-
-                # Prepare inputs based on separation_method
-                attention_weights_multi_layer = None
-                cls_token = None
-
-                if self.separation_method == 'multi_layer':
-                    # Attention weights are detached (frozen encoder), but fusion_weights needs gradient
-                    attention_weights_multi_layer = [
-                        model.pretrained.blocks[i].attn.attn_weights.detach()
-                        for i in [3, 10, 16, 22]
-                    ]
-                elif self.separation_method == 'cls_seg':
-                    with torch.no_grad():
-                        cls_token = patch_tokens[:, 0]  # [B, embed_dim]
-
-                # Apply Gear3 Upgrade modulation (trainable) - only path_1 is modulated
-                path_1_modulated, importance_map, fg_features, bg_features, fg_mask, bg_mask = model.gear3_head(
-                    patch_tokens, attention_weights, dpt_features, patch_h, patch_w,
-                    attention_weights_multi_layer=attention_weights_multi_layer,
-                    cls_token=cls_token
+        # Use BFloat16 for forward pass
+        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+            # Extract features from DINOv2 (frozen, no grad) - all frames at once
+            with torch.no_grad():
+                encoder_features = model.pretrained.get_intermediate_layers(
+                    images_flat, model.intermediate_layer_idx[model.encoder]
                 )
 
-                # Pass through DPT output head (trainable)
-                out = model.depth_head.scratch.output_conv1(path_1_modulated)
-                out = F.interpolate(out, (h, w), mode="bilinear", align_corners=True)
-                out = model.depth_head.scratch.output_conv2(out)
+                # Get attention weights from last block (B*T, num_heads, N, N)
+                last_block = model.pretrained.blocks[-1]
+                attention_weights = last_block.attn.attn_weights
 
-                # Prediction is already positive (Softplus activation in output_conv2)
-                pred_depth_inverse = out
+                # Get patch tokens from last encoder layer (B*T, N, C)
+                patch_tokens = encoder_features[-1]
 
-            # Continue with loss computation (outside autocast for stability)
-            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-                # DEBUG: Check prediction values in first few steps
-                if self.global_step < 5:
-                    self.logger.info(f"DEBUG - Pred inverse depth: min={pred_depth_inverse.min():.4f}, max={pred_depth_inverse.max():.4f}, mean={pred_depth_inverse.mean():.4f}")
+            # Get DPT features with Mamba temporal processing (frozen, no grad)
+            with torch.no_grad():
+                dpt_output = model.depth_head.forward_with_mamba(
+                    encoder_features, patch_h, patch_w,
+                    temporal_layer=model.mamba_in_dpt_layer,
+                    mamba_fn=model.dpt_features_to_mamba,
+                    shape_placeholder=(B_orig, T_orig, None, H, W)
+                )  # Returns path_1 with Mamba applied, shape: (B*T, dpt_dim, h, w)
 
-                # Clamp prediction to reasonable range to prevent NaN
-                pred_depth_inverse = torch.clamp(pred_depth_inverse, min=1e-3, max=1e4)
+            # Prepare inputs based on separation_method
+            attention_weights_multi_layer = None
+            cls_token = None
 
-                # Compute loss with valid mask (GT only, like original FlashDepth)
-                # Filter out invalid inverse depths: should be in reasonable range
-                # Max 70m depth = 100/70 = 1.43 in (100/m) inverse depth
-                # So inverse depth should be > 1.43 (i.e., depth < 70m)
-                MIN_INVERSE_DEPTH = 100.0 / 70.0  # 100/70m = 1.43 in 100/m scale (max 70m depth)
-                gt_valid_mask = (gt_t > MIN_INVERSE_DEPTH)  # Filter out >70m depths and invalid values
-                valid_mask = gt_valid_mask
+            if self.separation_method == 'multi_layer':
+                # Collect attention weights from multiple layers
+                # Each has shape (B*T, num_heads, N, N)
+                attention_weights_multi_layer = [
+                    model.pretrained.blocks[i].attn.attn_weights.detach()
+                    for i in [3, 10, 16, 22]
+                ]
+            elif self.separation_method == 'cls_seg':
+                with torch.no_grad():
+                    cls_token = patch_tokens[:, 0]  # (B*T, embed_dim)
 
-                if valid_mask.sum() == 0:
-                    self.logger.warning(f"Skipping frame {t} - no valid GT pixels")
-                    continue
+            # Apply Gear3 Upgrade modulation
+            # Inputs: (B*T, ...), Output: (B*T, ...)
+            path_1_modulated, importance_map, fg_features, bg_features, fg_mask, bg_mask = model.gear3_head(
+                patch_tokens, attention_weights, [dpt_output], patch_h, patch_w,
+                attention_weights_multi_layer=attention_weights_multi_layer,
+                cls_token=cls_token
+            )
 
-                # Loss computation in BFloat16
-                loss_t = self.loss_fn(pred_depth_inverse, gt_t, valid_mask.float())
+            # Pass through DPT output head (trainable)
+            out = model.depth_head.scratch.output_conv1(path_1_modulated)
+            out = F.interpolate(out, (H, W), mode="bilinear", align_corners=True)
+            out = model.depth_head.scratch.output_conv2(out)
 
-            # Safety check: skip if loss is NaN or too large
-            if torch.isnan(loss_t) or torch.isinf(loss_t):
-                self.logger.warning(f"Skipping frame {t} due to NaN/Inf loss")
-                continue
+            # Prediction is already positive (Softplus activation in output_conv2)
+            # Shape: (B*T, 1, H, W)
+            pred_depth_inverse = out
 
-            if loss_t > 1e6:
-                self.logger.warning(f"Skipping frame {t} due to abnormal loss: {loss_t.item():.2f}")
-                continue
+        # Compute loss (outside autocast for stability)
+        # Reshape GT from (B, T, 1, H, W) to (B*T, H, W)
+        gt_depth_inverse_flat = rearrange(gt_depth_inverse, 'b t 1 h w -> (b t) h w')
 
-            total_loss += loss_t
-            valid_frames += 1
+        # Remove channel dimension from prediction
+        pred_depth_inverse_flat = pred_depth_inverse.squeeze(1)  # (B*T, H, W)
 
-        # Average loss over valid frames
-        if valid_frames == 0:
-            self.logger.error("No valid frames in batch!")
+        # DEBUG: Check values in first few steps
+        if self.global_step < 5:
+            self.logger.info(f"DEBUG - Pred inverse depth: min={pred_depth_inverse_flat.min():.4f}, max={pred_depth_inverse_flat.max():.4f}, mean={pred_depth_inverse_flat.mean():.4f}")
+
+        # Clamp prediction to reasonable range to prevent NaN
+        pred_depth_inverse_flat = torch.clamp(pred_depth_inverse_flat, min=1e-3, max=1e4)
+
+        # Compute valid mask (GT only, like original FlashDepth)
+        MIN_INVERSE_DEPTH = 100.0 / 70.0  # Filter out >70m depths
+        valid_mask = (gt_depth_inverse_flat > MIN_INVERSE_DEPTH)
+
+        if valid_mask.sum() == 0:
+            self.logger.error("No valid GT pixels in batch!")
             return {'loss': 0.0}
 
-        loss = total_loss / valid_frames
+        # Compute loss (like original FlashDepth)
+        with torch.amp.autocast('cuda', enabled=False):
+            loss = self.loss_fn(
+                pred_depth_inverse_flat.float(),
+                gt_depth_inverse_flat.float(),
+                valid_mask.float()
+            )
 
         # Backward pass (outside autocast for numerical stability)
         self.optimizer.zero_grad()
@@ -1073,183 +1096,199 @@ class Gear3UpgradeTrainer:
                 gt_depth_inverse_canonical = self.canonical_normalizer.canonicalize_inverse(gt_depth, focal_length)
                 gt_depth_inverse = gt_depth_inverse_canonical * 100.0  # Training uses 100/m
 
-                # Process all frames in sequence (like original FlashDepth)
-                frame_losses = []
-                for t in range(T):
-                    img_t = images[:, t]
-                    gt_t_inverse = gt_depth_inverse[:, t]
+                # Initialize Mamba sequence for temporal processing
+                if hasattr(model, 'mamba'):
+                    model.mamba.start_new_sequence()
 
-                    # Extract features from DINOv2
-                    encoder_features = model.pretrained.get_intermediate_layers(
-                        img_t, model.intermediate_layer_idx[model.encoder]
+                # Process entire sequence at once (like training)
+                B_orig, T_orig, C, H, W = images.shape
+                images_flat = rearrange(images, 'b t c h w -> (b t) c h w')
+                patch_h, patch_w = H // model.patch_size, W // model.patch_size
+
+                # Extract features from DINOv2 - all frames at once
+                encoder_features = model.pretrained.get_intermediate_layers(
+                    images_flat, model.intermediate_layer_idx[model.encoder]
+                )
+
+                # Get attention weights from last block (B*T, num_heads, N, N)
+                last_block = model.pretrained.blocks[-1]
+                attention_weights = last_block.attn.attn_weights
+                patch_tokens = encoder_features[-1]
+
+                # Get DPT features with Mamba temporal processing
+                dpt_output = model.depth_head.forward_with_mamba(
+                    encoder_features, patch_h, patch_w,
+                    temporal_layer=model.mamba_in_dpt_layer,
+                    mamba_fn=model.dpt_features_to_mamba,
+                    shape_placeholder=(B_orig, T_orig, None, H, W)
+                )  # Returns path_1 with Mamba applied, shape: (B*T, dpt_dim, h, w)
+
+                # Prepare inputs based on separation_method
+                attention_weights_multi_layer = None
+                cls_token = None
+
+                if self.separation_method == 'multi_layer':
+                    attention_weights_multi_layer = [
+                        model.pretrained.blocks[i].attn.attn_weights.detach()
+                        for i in [3, 10, 16, 22]
+                    ]
+                elif self.separation_method == 'cls_seg':
+                    cls_token = patch_tokens[:, 0]  # (B*T, embed_dim)
+
+                # Apply modulation - inputs/outputs: (B*T, ...)
+                path_1_modulated, importance_map, fg_features, bg_features, fg_mask, bg_mask = model.gear3_head(
+                    patch_tokens, attention_weights, [dpt_output], patch_h, patch_w,
+                    attention_weights_multi_layer=attention_weights_multi_layer,
+                    cls_token=cls_token
+                )
+
+                # Get depth (at model resolution)
+                out = model.depth_head.scratch.output_conv1(path_1_modulated)
+                out = F.interpolate(out, (H, W), mode="bilinear", align_corners=True)
+                out = model.depth_head.scratch.output_conv2(out)
+
+                pred_depth_inverse = out  # [B*T, 1, H, W] at model resolution
+
+                # Reshape GT from (B, T, 1, H, W) to (B*T, 1, H, W)
+                gt_depth_inverse_flat = rearrange(gt_depth_inverse, 'b t 1 h w -> (b t) 1 h w')
+
+                # Interpolate prediction to GT resolution (like original FlashDepth validation)
+                gt_shape = gt_depth_inverse_flat.shape[-2:]
+                if pred_depth_inverse.shape[-2:] != gt_shape:
+                    pred_depth_inverse = F.interpolate(
+                        pred_depth_inverse, size=gt_shape, mode="bilinear", align_corners=True
                     )
 
-                    # Get attention weights from last block
-                    last_block = model.pretrained.blocks[-1]
-                    attention_weights = last_block.attn.attn_weights
-                    patch_tokens = encoder_features[-1]
+                # Compute loss for entire sequence
+                gt_valid_mask = (gt_depth_inverse_flat >= 0)
+                valid_mask = gt_valid_mask.float()
 
-                    # Get DPT features
-                    h, w = img_t.shape[2:]
-                    patch_h, patch_w = h // model.patch_size, w // model.patch_size
-                    dpt_features = model.depth_head.get_forward_features(encoder_features, patch_h, patch_w)
+                if valid_mask.sum() > 0:
+                    loss_batch = self.loss_fn(pred_depth_inverse, gt_depth_inverse_flat, valid_mask)
+                    frame_losses = [loss_batch.float()]
+                else:
+                    frame_losses = []
 
-                    # Prepare inputs based on separation_method
-                    attention_weights_multi_layer = None
-                    cls_token = None
+                # Get dataset name for this batch
+                if isinstance(dataset_idx, str):
+                    current_dataset = dataset_idx
+                elif isinstance(dataset_idx, (list, tuple)):
+                    current_dataset = str(dataset_idx[0])
+                elif torch.is_tensor(dataset_idx):
+                    current_dataset = str(dataset_idx[0].item() if dataset_idx.dim() > 0 else dataset_idx.item())
+                else:
+                    current_dataset = str(dataset_idx)
 
-                    if self.separation_method == 'multi_layer':
-                        # Attention weights are detached (frozen encoder), but fusion_weights needs gradient
-                        attention_weights_multi_layer = [
-                            model.pretrained.blocks[i].attn.attn_weights.detach()
-                            for i in [3, 10, 16, 22]
-                        ]
-                    elif self.separation_method == 'cls_seg':
-                        with torch.no_grad():
-                            cls_token = patch_tokens[:, 0]  # [B, embed_dim]
+                # Validation visualization: save multiple sequences per dataset (rank 0 only)
+                # Reshape predictions back to (B, T, 1, H, W) for visualization
+                pred_depth_inverse_seq = rearrange(pred_depth_inverse, '(b t) 1 h w -> b t 1 h w', b=B_orig, t=T_orig)
 
-                    # Apply modulation and get importance map (only path_1 is modulated)
-                    path_1_modulated, importance_map, fg_features, bg_features, fg_mask, bg_mask = model.gear3_head(
-                        patch_tokens, attention_weights, dpt_features, patch_h, patch_w,
-                        attention_weights_multi_layer=attention_weights_multi_layer,
-                        cls_token=cls_token
-                    )
+                # Use first frame for visualization
+                if self.val_visualizer and self.rank == 0:
+                    # Check if this dataset is in our visualization config
+                    if current_dataset in self.val_vis_config:
+                        config = self.val_vis_config[current_dataset]
+                        seq_num = dataset_sequence_counters[current_dataset]
 
-                    # Get depth (at model resolution)
-                    out = model.depth_head.scratch.output_conv1(path_1_modulated)
-                    out = F.interpolate(out, (h, w), mode="bilinear", align_corners=True)
-                    out = model.depth_head.scratch.output_conv2(out)
-
-                    pred_depth_inverse = out  # [B, 1, h, w] at model resolution
-
-                    # Interpolate prediction to GT resolution (like original FlashDepth)
-                    gt_t_shape = gt_t_inverse.shape[-2:]  # GT original resolution
-                    if pred_depth_inverse.shape[-2:] != gt_t_shape:
-                        pred_depth_inverse = F.interpolate(
-                            pred_depth_inverse, size=gt_t_shape, mode="bilinear", align_corners=True
+                        # Check if we should save this sequence
+                        should_save = (
+                            seq_num in config['sequences'] and
+                            seq_num not in config['saved']
                         )
 
-                    # Compute loss in inverse depth space (100/m)
-                    # Filter out invalid inverse depths (valid_mask: >= 0 for original FlashDepth)
-                    gt_valid_mask = (gt_t_inverse >= 0)  # -1 means invalid
-                    valid_mask = gt_valid_mask.float()
+                        if should_save:
+                            try:
+                                # Use first frame (t=0) for visualization
+                                pred_depth_inverse_vis = pred_depth_inverse_seq[:, 0]  # [B, 1, H, W]
+                                gt_depth_inverse_vis = gt_depth_inverse[:, 0]  # [B, 1, H, W]
 
-                    # Ensure shapes match: pred [B, 1, H, W], gt [B, 1, H, W], mask [B, 1, H, W]
-                    if gt_t_inverse.dim() == 3:  # [B, H, W]
-                        gt_t_inverse = gt_t_inverse.unsqueeze(1)  # [B, 1, H, W]
-                    if valid_mask.dim() == 3:  # [B, H, W]
-                        valid_mask = valid_mask.unsqueeze(1)  # [B, 1, H, W]
+                                # Convert to metric depth for visualization: 100/m -> m
+                                # Convert to Float32 for CPU operations
+                                pred_depth_metric = (100.0 / (pred_depth_inverse_vis.float() + 1e-8)).cpu()
+                                gt_depth_metric = (100.0 / (gt_depth_inverse_vis.float() + 1e-8)).cpu()
 
-                    if valid_mask.sum() > 0:
-                        loss_t = self.loss_fn(pred_depth_inverse, gt_t_inverse, valid_mask)
-                        frame_losses.append(loss_t.float())  # Convert to Float32 for accumulation
+                                # Get GT resolution for visualization
+                                gt_h, gt_w = gt_depth_inverse_vis.shape[-2:]
 
-                    # Get dataset name for this batch
-                    if isinstance(dataset_idx, str):
-                        current_dataset = dataset_idx
-                    elif isinstance(dataset_idx, (list, tuple)):
-                        current_dataset = str(dataset_idx[0])
-                    elif torch.is_tensor(dataset_idx):
-                        current_dataset = str(dataset_idx[0].item() if dataset_idx.dim() > 0 else dataset_idx.item())
-                    else:
-                        current_dataset = str(dataset_idx)
+                                # Reshape importance/mask maps to (B, T, ...) and select first frame
+                                importance_map_seq = rearrange(importance_map, '(b t) c h w -> b t c h w', b=B_orig, t=T_orig)
+                                fg_mask_seq = rearrange(fg_mask, '(b t) c h w -> b t c h w', b=B_orig, t=T_orig)
+                                bg_mask_seq = rearrange(bg_mask, '(b t) c h w -> b t c h w', b=B_orig, t=T_orig)
 
-                    # Validation visualization: save multiple sequences per dataset (rank 0 only)
-                    # Sintel: 3 samples (sequence 0, 5, 10)
-                    # Waymo: 8 samples (sequence 0, 5, 10, 15, 20, 25, 30, 35)
-                    if t == 0 and self.val_visualizer and self.rank == 0:
-                        # Check if this dataset is in our visualization config
-                        if current_dataset in self.val_vis_config:
-                            config = self.val_vis_config[current_dataset]
-                            seq_num = dataset_sequence_counters[current_dataset]
+                                importance_map_vis = importance_map_seq[:, 0]  # [B, C, h, w]
+                                fg_mask_vis = fg_mask_seq[:, 0]
+                                bg_mask_vis = bg_mask_seq[:, 0]
 
-                            # Check if we should save this sequence
-                            # Save only specified sequences (e.g., [0, 4, 7] for sintel, [0,1,2,3,4,5,6,7] for waymo)
-                            # We only save if this seq_num hasn't been saved yet in THIS validation run
-                            should_save = (
-                                seq_num in config['sequences'] and
-                                seq_num not in config['saved']
-                            )
+                                # Resize importance map to GT resolution
+                                importance_map_resized = F.interpolate(
+                                    importance_map_vis, size=(gt_h, gt_w), mode='bilinear', align_corners=True
+                                )
 
-                            if should_save:
-                                try:
-                                    # Convert to metric depth for visualization: 100/m -> m
-                                    # Convert to Float32 for CPU operations
-                                    pred_depth_metric = (100.0 / (pred_depth_inverse.float() + 1e-8)).cpu()
-                                    gt_depth_metric = (100.0 / (gt_t_inverse.float() + 1e-8)).cpu()
+                                # Resize FG/BG masks to GT resolution
+                                fg_mask_resized = F.interpolate(
+                                    fg_mask_vis, size=(gt_h, gt_w), mode='bilinear', align_corners=True
+                                )
+                                bg_mask_resized = F.interpolate(
+                                    bg_mask_vis, size=(gt_h, gt_w), mode='bilinear', align_corners=True
+                                )
 
-                                    # Get GT resolution for visualization
-                                    gt_h, gt_w = gt_t_inverse.shape[-2:]
+                                # Resize images to GT resolution (for visualization consistency)
+                                img_vis = images[:, 0]  # [B, C, H, W] - first frame
+                                img_t_resized = F.interpolate(
+                                    img_vis, size=(gt_h, gt_w), mode='bilinear', align_corners=True
+                                )
 
-                                    # Resize importance map to GT resolution
-                                    importance_map_resized = F.interpolate(
-                                        importance_map, size=(gt_h, gt_w), mode='bilinear', align_corners=True
-                                    )
+                                model_outputs = {
+                                    'pred_depth': pred_depth_metric,  # [B, 1, gt_h, gt_w] at GT resolution
+                                    'importance_map': importance_map_resized.float().cpu(),  # [B, 1, gt_h, gt_w]
+                                    'fg_mask': fg_mask_resized.float().cpu(),  # [B, 1, gt_h, gt_w]
+                                    'bg_mask': bg_mask_resized.float().cpu()   # [B, 1, gt_h, gt_w]
+                                }
 
-                                    # Resize FG/BG masks to GT resolution
-                                    fg_mask_resized = F.interpolate(
-                                        fg_mask, size=(gt_h, gt_w), mode='bilinear', align_corners=True
-                                    )
-                                    bg_mask_resized = F.interpolate(
-                                        bg_mask, size=(gt_h, gt_w), mode='bilinear', align_corners=True
-                                    )
+                                # For visualization, we need [B, T, ...] format like training
+                                # But we only have one frame (t=0), so unsqueeze T dimension
+                                sample_batch = (
+                                    img_t_resized.unsqueeze(1).float().cpu(),  # [B, 1, C, gt_h, gt_w] at GT resolution
+                                    gt_depth_metric.unsqueeze(1),  # [B, 1, gt_h, gt_w]
+                                    dataset_idx
+                                )
 
-                                    # Resize images to GT resolution (for visualization consistency)
-                                    img_t_resized = F.interpolate(
-                                        img_t, size=(gt_h, gt_w), mode='bilinear', align_corners=True
-                                    )
+                                # FPS removed from training (only measured in test_gear3.py)
+                                current_fps = None
 
-                                    model_outputs = {
-                                        'pred_depth': pred_depth_metric,  # [B, 1, gt_h, gt_w] at GT resolution
-                                        'importance_map': importance_map_resized.float().cpu(),  # [B, 1, gt_h, gt_w]
-                                        'fg_mask': fg_mask_resized.float().cpu(),  # [B, 1, gt_h, gt_w]
-                                        'bg_mask': bg_mask_resized.float().cpu()   # [B, 1, gt_h, gt_w]
-                                    }
+                                # Create loss_dict with current frame loss (for visualization)
+                                val_loss_dict = {
+                                    'val_loss': loss_batch.item() if len(frame_losses) > 0 else 0.0
+                                }
 
-                                    # For visualization, we need [B, T, ...] format like training
-                                    # But we only have one frame (t=0), so unsqueeze T dimension
-                                    sample_batch = (
-                                        img_t_resized.unsqueeze(1).float().cpu(),  # [B, 1, C, gt_h, gt_w] at GT resolution
-                                        gt_depth_metric.unsqueeze(1),  # [B, 1, gt_h, gt_w]
-                                        dataset_idx
-                                    )
+                                # Extract layer_weights for visualization (multi_layer separation only)
+                                layer_weights = None
+                                if self.separation_method == 'multi_layer':
+                                    try:
+                                        # Handle DDP wrapping
+                                        model = self.model.module if hasattr(self.model, 'module') else self.model
+                                        # Get softmax-normalized weights
+                                        fusion_weights = model.gear3_head.multi_layer_fusion.fusion_weights
+                                        layer_weights = torch.softmax(fusion_weights, dim=0).detach().cpu().numpy()
+                                    except Exception as e:
+                                        self.logger.warning(f"Failed to extract layer_weights: {e}")
 
-                                    # FPS removed from training (only measured in test_gear3.py)
-                                    current_fps = None
+                                # Save with dataset and sequence-specific name
+                                save_name = f"validation_{current_dataset}_seq{seq_num:03d}_step_{self.global_step:06d}"
+                                self.val_visualizer.create_validation_summary(
+                                    sample_batch, model_outputs, self.global_step,
+                                    save_name=save_name, fps=current_fps, loss_dict=val_loss_dict, dataset_name=current_dataset, layer_weights=layer_weights
+                                )
+                                config['saved'].append(seq_num)
+                                self.logger.info(f"Saved validation visualization: {current_dataset} sequence {seq_num} ({len(config['saved'])}/{len(config['sequences'])})")
+                            except Exception as e:
+                                if self.rank == 0:
+                                    self.logger.warning(f"Failed to save validation visualization for {current_dataset} seq {seq_num}: {e}")
 
-                                    # Create loss_dict with current frame loss (for visualization)
-                                    val_loss_dict = {
-                                        'val_loss': loss_t.item() if len(frame_losses) > 0 else 0.0
-                                    }
-
-                                    # Extract layer_weights for visualization (multi_layer separation only)
-                                    layer_weights = None
-                                    if self.separation_method == 'multi_layer':
-                                        try:
-                                            # Handle DDP wrapping
-                                            model = self.model.module if hasattr(self.model, 'module') else self.model
-                                            # Get softmax-normalized weights
-                                            fusion_weights = model.gear3_head.multi_layer_fusion.fusion_weights
-                                            layer_weights = torch.softmax(fusion_weights, dim=0).detach().cpu().numpy()
-                                        except Exception as e:
-                                            self.logger.warning(f"Failed to extract layer_weights: {e}")
-
-                                    # Save with dataset and sequence-specific name
-                                    save_name = f"validation_{current_dataset}_seq{seq_num:03d}_step_{self.global_step:06d}"
-                                    self.val_visualizer.create_validation_summary(
-                                        sample_batch, model_outputs, self.global_step,
-                                        save_name=save_name, fps=current_fps, loss_dict=val_loss_dict, dataset_name=current_dataset, layer_weights=layer_weights
-                                    )
-                                    config['saved'].append(seq_num)
-                                    self.logger.info(f"Saved validation visualization: {current_dataset} sequence {seq_num} ({len(config['saved'])}/{len(config['sequences'])})")
-                                except Exception as e:
-                                    if self.rank == 0:
-                                        self.logger.warning(f"Failed to save validation visualization for {current_dataset} seq {seq_num}: {e}")
-
-                    # Clear intermediate tensors to free memory after each frame
-                    del encoder_features, attention_weights, patch_tokens, dpt_features
+                    # Clear intermediate tensors to free memory after each sequence
+                    del encoder_features, attention_weights, patch_tokens, dpt_output
                     del path_1_modulated, importance_map, fg_features, bg_features, fg_mask, bg_mask, pred_depth_inverse
-                    # Always clear cache after each frame to prevent OOM during validation
+                    # Always clear cache after each sequence to prevent OOM during validation
                     torch.cuda.empty_cache()
 
                 # Average loss over all frames in sequence

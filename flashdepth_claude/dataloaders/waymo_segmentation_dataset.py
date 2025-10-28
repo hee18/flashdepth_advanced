@@ -73,7 +73,8 @@ class WaymoSegmentationDataset(Dataset):
         resolution: int = 518,
         max_depth: float = 80.0,
         camera_name: int = 1,  # 1 = FRONT camera
-        use_depth: bool = False  # Depth extraction from LiDAR is complex
+        use_depth: bool = False,  # Set True to load preprocessed depth
+        depth_root: str = None  # Path to preprocessed depth (e.g., /path/to/waymo/val)
     ):
         """
         Initialize Waymo dataset.
@@ -85,7 +86,8 @@ class WaymoSegmentationDataset(Dataset):
             resolution: Target resolution (square)
             max_depth: Maximum depth value (meters)
             camera_name: Camera to use (1=FRONT, 2=FRONT_LEFT, etc.)
-            use_depth: Whether to load depth (complex, set False for seg-only)
+            use_depth: Whether to load depth (requires depth_root)
+            depth_root: Path to preprocessed depth directory (e.g., /path/to/waymo/val)
         """
         if not PYARROW_AVAILABLE:
             raise ImportError("PyArrow is required. Install with: pip install pyarrow")
@@ -102,11 +104,34 @@ class WaymoSegmentationDataset(Dataset):
         self.camera_name = camera_name
         self.use_depth = use_depth
 
-        # Paths
+        # Camera name mapping
+        self.camera_names = {
+            1: 'FRONT',
+            2: 'FRONT_LEFT',
+            3: 'FRONT_RIGHT',
+            4: 'SIDE_LEFT',
+            5: 'SIDE_RIGHT'
+        }
+        self.camera_str = self.camera_names.get(camera_name, 'FRONT')
+
+        # Paths for segmentation dataset
         self.waymo_root = self.data_root / 'waymo' / '2.0.1' / split
         self.image_dir = self.waymo_root / 'camera_image'
         self.seg_dir = self.waymo_root / 'camera_segmentation'
-        self.depth_dir = self.waymo_root / 'lidar_camera_projection'
+
+        # Depth path (preprocessed depth from waymo dataset)
+        if use_depth:
+            if depth_root is None:
+                # Default: assume preprocessed waymo dataset is at same level as waymo_seg
+                self.depth_root = self.data_root.parent / 'waymo' / split
+            else:
+                self.depth_root = Path(depth_root)
+            
+            if not self.depth_root.exists():
+                logger.warning(f"Depth root not found: {self.depth_root}. Depth will be zeros.")
+                self.use_depth = False
+        else:
+            self.depth_root = None
 
         # Validate paths
         if not self.waymo_root.exists():
@@ -185,7 +210,7 @@ class WaymoSegmentationDataset(Dataset):
         Returns:
             Dictionary with:
                 - images: (T, 3, H, W) tensor
-                - depth: (T, H, W) tensor (zeros if use_depth=False)
+                - depth: (T, H, W) tensor (sparse depth if use_depth=True, zeros otherwise)
                 - segmentation: (H, W) tensor (last frame only)
                 - valid_mask: (H, W) tensor
                 - sequence_name: str
@@ -202,6 +227,9 @@ class WaymoSegmentationDataset(Dataset):
             seg_df = seg_table.to_pandas()
             seg_camera_df = seg_df[seg_df['key.camera_name'] == self.camera_name].reset_index(drop=True)
 
+            # Extract sequence name from file
+            sequence_name = image_file.stem
+
             images = []
             depths = []
             seg_mask = None
@@ -216,10 +244,9 @@ class WaymoSegmentationDataset(Dataset):
                 image = torch.from_numpy(image).permute(2, 0, 1)  # (3, H, W)
                 images.append(image)
 
-                # Depth: placeholder (LiDAR projection is complex)
+                # Load sparse depth from preprocessed dataset
                 if self.use_depth:
-                    # TODO: Implement LiDAR range image to depth conversion
-                    depth = np.zeros((self.resolution, self.resolution), dtype=np.float32)
+                    depth = self._load_sparse_depth(sequence_name, frame_idx, (self.resolution, self.resolution))
                 else:
                     depth = np.zeros((self.resolution, self.resolution), dtype=np.float32)
 
@@ -261,12 +288,74 @@ class WaymoSegmentationDataset(Dataset):
                 'depth': depths,
                 'segmentation': seg_mask,
                 'valid_mask': valid_mask,
-                'sequence_name': image_file.stem
+                'sequence_name': sequence_name
             }
 
         except Exception as e:
             logger.error(f"Error loading sequence {idx}: {e}")
             return None
+
+    def _load_sparse_depth(self, sequence_name: str, frame_idx: int, target_size: tuple) -> np.ndarray:
+        """
+        Load sparse depth from preprocessed .npy file and convert to dense image.
+
+        Args:
+            sequence_name: Sequence name (e.g., '1024360143612057520_3580_000_3600_000')
+            frame_idx: Frame index
+            target_size: (H, W) target resolution
+
+        Returns:
+            Dense depth image (H, W) in meters
+        """
+        # Path: depth_root/segment-{sequence_name}/FRONT/depth/{frame:04d}.npy
+        depth_file = self.depth_root / f"segment-{sequence_name}" / self.camera_str / "depth" / f"{frame_idx:04d}.npy"
+
+        if not depth_file.exists():
+            logger.warning(f"Depth file not found: {depth_file}")
+            return np.zeros(target_size, dtype=np.float32)
+
+        try:
+            # Load sparse depth: (N, 3) format [x_pixel, y_pixel, depth_meters]
+            sparse_depth = np.load(depth_file)
+
+            if len(sparse_depth) == 0:
+                return np.zeros(target_size, dtype=np.float32)
+
+            # Get original image dimensions from sparse depth
+            original_h = int(sparse_depth[:, 1].max()) + 1
+            original_w = int(sparse_depth[:, 0].max()) + 1
+
+            # Create dense depth at original resolution
+            dense_depth = np.zeros((original_h, original_w), dtype=np.float32)
+
+            # Fill in sparse points
+            x_coords = sparse_depth[:, 0].astype(np.int32)
+            y_coords = sparse_depth[:, 1].astype(np.int32)
+            depth_values = sparse_depth[:, 2]
+
+            # Clip coordinates to be safe
+            x_coords = np.clip(x_coords, 0, original_w - 1)
+            y_coords = np.clip(y_coords, 0, original_h - 1)
+
+            # Assign depth values (if multiple points map to same pixel, take last one)
+            dense_depth[y_coords, x_coords] = depth_values
+
+            # Resize to target resolution
+            if (original_h, original_w) != target_size:
+                # Use PIL for resizing to maintain depth values
+                depth_img = Image.fromarray(dense_depth)
+                depth_img_resized = depth_img.resize((target_size[1], target_size[0]), Image.NEAREST)
+                dense_depth = np.array(depth_img_resized, dtype=np.float32)
+
+                # Scale depth values proportionally
+                scale_factor = target_size[1] / original_w
+                # Note: NEAREST interpolation doesn't need scaling, but bilinear would
+
+            return dense_depth
+
+        except Exception as e:
+            logger.error(f"Error loading sparse depth from {depth_file}: {e}")
+            return np.zeros(target_size, dtype=np.float32)
 
     def _resize_segmentation(self, seg: np.ndarray, target_size: tuple) -> np.ndarray:
         """Resize segmentation mask using nearest neighbor interpolation."""

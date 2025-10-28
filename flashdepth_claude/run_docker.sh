@@ -61,11 +61,14 @@ show_usage() {
     echo "  --vid-len NUM         Set video sequence length for testing (default: 50)"
     echo "  --single-sequence PATH Test on a single sequence directory (e.g., /path/to/dynamicreplica/seq)"
     echo "  --measure-fps BOOL    Enable/disable FPS measurement (default: true)"
-    echo "  --phase NUM           Set training phase (1, 2, or 3, default: 1)"
+    echo "  --config-variant VARIANT  Set Gear config variant: l, s, hybrid (default: l for Stage 1)"
+    echo "  --nuscenes            Enable nuScenes fine-tuning mode (Stage 3)"
     echo "  --separation METHOD  Set FG/BG separation method: cls_seg, kmeans, multi_layer (default: cls_seg)"
     echo "  --dataset DATASET     Set object-wise evaluation dataset: waymo, sintel (default: waymo)"
     echo "  --config VARIANT     Set FlashDepth config: flashdepth, flashdepth-l, flashdepth-s (default: flashdepth-l)"
     echo "  --inverse BOOL       Inverse colormap for depth (original FlashDepth only, default: false)"
+    echo ""
+    echo "Note: --phase option is DEPRECATED. Use --config-variant (l/s/hybrid) instead."
     echo ""
     echo "Note: Regularization losses are deprecated. Importance map now uses raw DINOv2 attention (frozen)."
     echo ""
@@ -102,7 +105,7 @@ show_usage() {
 
 # Parse command line arguments - optimized for RTX A6000 (2x 48GB)
 COMMAND=""
-BATCH_SIZE=20  # Per GPU (effective 40 with 2 GPUs in DDP)
+BATCH_SIZE=2  # Per GPU for full sequence processing (2*5=10 frames/GPU, effective 20 frames with DDP)
 WORKERS=8      # Optimized for 96 CPU cores, prevents I/O bottleneck
 TOTAL_ITERS=30001
 GPU_ID=0
@@ -113,7 +116,9 @@ FRAME_INTERVAL=1
 VID_LEN=50
 SINGLE_SEQUENCE=""  # Path to single sequence directory (optional)
 MEASURE_FPS="true"
-PHASE=1  # Training phase (1, 2, or 3)
+CONFIG_VARIANT="l"  # Gear config variant: l (Stage 1 ViT-L), s (Stage 1 ViT-S), hybrid (Stage 2)
+NUSCENES="false"  # nuScenes fine-tuning mode (Stage 3)
+PHASE=1  # DEPRECATED: Use --config-variant instead (kept for backwards compatibility)
 SEPARATION_METHOD="cls_seg"  # FG/BG separation method for Gear3 Upgrade (cls_seg, kmeans, multi_layer)
 CONFIG="flashdepth-l"  # FlashDepth config variant (flashdepth, flashdepth-l, flashdepth-s)
 INVERSE="false"  # Inverse colormap for depth visualization (original FlashDepth only)
@@ -171,7 +176,16 @@ while [[ $# -gt 0 ]]; do
             MEASURE_FPS="$2"
             shift 2
             ;;
+        --config-variant)
+            CONFIG_VARIANT="$2"
+            shift 2
+            ;;
+        --nuscenes)
+            NUSCENES="true"
+            shift
+            ;;
         --phase)
+            echo "WARNING: --phase is DEPRECATED. Use --config-variant instead."
             PHASE="$2"
             shift 2
             ;;
@@ -278,6 +292,8 @@ case $COMMAND in
     train_gear2)
         echo "Starting Gear2 training (Single GPU) - Ablation Study..."
         echo "Configuration:"
+        echo "  - Config variant: $CONFIG_VARIANT"
+        echo "  - nuScenes mode: $NUSCENES"
         echo "  - Batch size: $BATCH_SIZE"
         echo "  - Workers: $WORKERS"
         echo "  - Total iterations: $TOTAL_ITERS"
@@ -285,16 +301,22 @@ case $COMMAND in
         echo "  - Results directory: $RESULTS_DIR"
         echo ""
 
-        # Build train_gear2 command (uses all 5 datasets hardcoded in code)
+        # Build train_gear2 command with config variant
         DOCKER_CMD="CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm flashdepth python train_gear2.py \
             --config-path configs/gear2 \
+            --config-name config_$CONFIG_VARIANT \
             dataset.data_root=/data/datasets \
             training.batch_size=$BATCH_SIZE \
             training.workers=$WORKERS \
             training.iterations=$TOTAL_ITERS \
             +results_dir=$RESULTS_DIR"
 
-        # Add checkpoint loading - Gear2 requires FlashDepth-L pretrained weights
+        # Add nuScenes flag if enabled
+        if [ "$NUSCENES" = "true" ]; then
+            DOCKER_CMD="$DOCKER_CMD +nuscenes=true"
+        fi
+
+        # Add checkpoint loading - Gear2 requires FlashDepth or Gear2 pretrained weights
         if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
             DOCKER_CMD="$DOCKER_CMD load=$FLASHDEPTH_CHECKPOINT"
         fi
@@ -303,30 +325,31 @@ case $COMMAND in
         ;;
 
     train_gear2_ddp)
-        # Auto-adjust batch size, workers, and iterations for Phase 2/3 (2K resolution) if not explicitly set
-        if [ "$PHASE" -eq 2 ] || [ "$PHASE" -eq 3 ]; then
-            # Phase 2/3: 2K resolution - reduce both batch size and workers
+        # Auto-adjust batch size, workers, and iterations for Hybrid (2K resolution) if not explicitly set
+        if [ "$CONFIG_VARIANT" = "hybrid" ]; then
+            # Hybrid: 2K resolution - reduce both batch size and workers
             ACTUAL_WORKERS=2  # 2 workers per GPU (total 4 across 2 GPUs)
 
             # Auto-adjust batch size for 2K resolution if user didn't specify
             if [ -z "$USER_BATCH_SIZE" ]; then
                 BATCH_SIZE=1  # Minimal batch size for 2K resolution to avoid OOM
-                echo "  NOTE: Auto-adjusted batch size to $BATCH_SIZE for Phase $PHASE (2K resolution)"
+                echo "  NOTE: Auto-adjusted batch size to $BATCH_SIZE for Hybrid (2K resolution)"
             else
                 echo "  WARNING: Using user-specified batch size $BATCH_SIZE - may cause OOM on 2K resolution!"
             fi
 
-            # Reduce iterations for Phase 2/3 (half of Phase 1)
-            TOTAL_ITERS=30001
-            echo "  NOTE: Auto-adjusted iterations to $TOTAL_ITERS for Phase $PHASE (2K resolution)"
+            # Reduce iterations for Hybrid (same as Stage 1)
+            TOTAL_ITERS=40001
+            echo "  NOTE: Iterations set to $TOTAL_ITERS for Hybrid training"
         else
-            # Phase 1: 518x518 resolution - can use more workers and larger batch
+            # Stage 1 (L/S): 518x518 resolution - can use more workers and larger batch
             ACTUAL_WORKERS=$WORKERS
         fi
 
         echo "Starting Gear2 training (Multi-GPU: 0,1) - Ablation Study..."
         echo "Configuration:"
-        echo "  - Phase: $PHASE"
+        echo "  - Config variant: $CONFIG_VARIANT"
+        echo "  - nuScenes mode: $NUSCENES"
         echo "  - Batch size per GPU: $BATCH_SIZE"
         echo "  - Effective batch size: $((BATCH_SIZE * 2))"
         echo "  - Workers per GPU: $ACTUAL_WORKERS"
@@ -345,13 +368,18 @@ case $COMMAND in
             --nproc_per_node=2 \
             train_gear2.py \
             --config-path configs/gear2 \
+            --config-name config_$CONFIG_VARIANT \
             dataset.data_root=/data/datasets \
-            phase=$PHASE \
             training.batch_size=$BATCH_SIZE \
             training.workers=$ACTUAL_WORKERS \
             training.iterations=$TOTAL_ITERS \
             training.measure_fps=$MEASURE_FPS \
             +results_dir=$RESULTS_DIR"
+
+        # Add nuScenes flag if enabled
+        if [ "$NUSCENES" = "true" ]; then
+            DOCKER_CMD="$DOCKER_CMD +nuscenes=true"
+        fi
 
         # Add checkpoint loading
         if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
@@ -364,6 +392,8 @@ case $COMMAND in
     train_gear3)
         echo "Starting Gear3 training (Single GPU)..."
         echo "Configuration:"
+        echo "  - Config variant: $CONFIG_VARIANT"
+        echo "  - nuScenes mode: $NUSCENES"
         echo "  - Batch size: $BATCH_SIZE"
         echo "  - Workers: $WORKERS"
         echo "  - Total iterations: $TOTAL_ITERS"
@@ -371,16 +401,22 @@ case $COMMAND in
         echo "  - Results directory: $RESULTS_DIR"
         echo ""
 
-        # Build train_gear3 command (uses all 5 datasets hardcoded in code)
+        # Build train_gear3 command with config variant
         DOCKER_CMD="CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm flashdepth python train_gear3.py \
             --config-path configs/gear3 \
+            --config-name config_$CONFIG_VARIANT \
             dataset.data_root=/data/datasets \
             training.batch_size=$BATCH_SIZE \
             training.workers=$WORKERS \
             training.iterations=$TOTAL_ITERS \
             +results_dir=$RESULTS_DIR"
 
-        # Add checkpoint loading - Gear3 requires FlashDepth-L pretrained weights
+        # Add nuScenes flag if enabled
+        if [ "$NUSCENES" = "true" ]; then
+            DOCKER_CMD="$DOCKER_CMD +nuscenes=true"
+        fi
+
+        # Add checkpoint loading - Gear3 requires FlashDepth or Gear3 pretrained weights
         if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
             DOCKER_CMD="$DOCKER_CMD load=$FLASHDEPTH_CHECKPOINT"
         fi
@@ -389,30 +425,31 @@ case $COMMAND in
         ;;
 
     train_gear3_ddp)
-        # Auto-adjust batch size, workers, and iterations for Phase 2/3 (2K resolution) if not explicitly set
-        if [ "$PHASE" -eq 2 ] || [ "$PHASE" -eq 3 ]; then
-            # Phase 2/3: 2K resolution - reduce both batch size and workers
+        # Auto-adjust batch size, workers, and iterations for Hybrid (2K resolution) if not explicitly set
+        if [ "$CONFIG_VARIANT" = "hybrid" ]; then
+            # Hybrid: 2K resolution - reduce both batch size and workers
             ACTUAL_WORKERS=2  # 2 workers per GPU (total 4 across 2 GPUs)
 
             # Auto-adjust batch size for 2K resolution if user didn't specify
             if [ -z "$USER_BATCH_SIZE" ]; then
                 BATCH_SIZE=1  # Minimal batch size for 2K resolution to avoid OOM
-                echo "  NOTE: Auto-adjusted batch size to $BATCH_SIZE for Phase $PHASE (2K resolution)"
+                echo "  NOTE: Auto-adjusted batch size to $BATCH_SIZE for Hybrid (2K resolution)"
             else
                 echo "  WARNING: Using user-specified batch size $BATCH_SIZE - may cause OOM on 2K resolution!"
             fi
 
-            # Reduce iterations for Phase 2/3 (half of Phase 1)
-            TOTAL_ITERS=30001
-            echo "  NOTE: Auto-adjusted iterations to $TOTAL_ITERS for Phase $PHASE (2K resolution)"
+            # Iterations for Hybrid (same as Stage 1)
+            TOTAL_ITERS=40001
+            echo "  NOTE: Iterations set to $TOTAL_ITERS for Hybrid training"
         else
-            # Phase 1: 518x518 resolution - can use more workers and larger batch
+            # Stage 1 (L/S): 518x518 resolution - can use more workers and larger batch
             ACTUAL_WORKERS=$WORKERS
         fi
 
         echo "Starting Gear3 training (Multi-GPU: 0,1)..."
         echo "Configuration:"
-        echo "  - Phase: $PHASE"
+        echo "  - Config variant: $CONFIG_VARIANT"
+        echo "  - nuScenes mode: $NUSCENES"
         echo "  - Batch size per GPU: $BATCH_SIZE"
         echo "  - Effective batch size: $((BATCH_SIZE * 2))"
         echo "  - Workers per GPU: $ACTUAL_WORKERS"
@@ -431,13 +468,18 @@ case $COMMAND in
             --nproc_per_node=2 \
             train_gear3.py \
             --config-path configs/gear3 \
+            --config-name config_$CONFIG_VARIANT \
             dataset.data_root=/data/datasets \
-            phase=$PHASE \
             training.batch_size=$BATCH_SIZE \
             training.workers=$ACTUAL_WORKERS \
             training.iterations=$TOTAL_ITERS \
             training.measure_fps=$MEASURE_FPS \
             +results_dir=$RESULTS_DIR"
+
+        # Add nuScenes flag if enabled
+        if [ "$NUSCENES" = "true" ]; then
+            DOCKER_CMD="$DOCKER_CMD +nuscenes=true"
+        fi
 
         # Add checkpoint loading
         if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
@@ -450,6 +492,8 @@ case $COMMAND in
     train_gear3_upgrade)
         echo "Starting Gear3 Upgrade training (Single GPU) - Enhanced FG/BG Separation..."
         echo "Configuration:"
+        echo "  - Config variant: $CONFIG_VARIANT"
+        echo "  - nuScenes mode: $NUSCENES"
         echo "  - Separation method: $SEPARATION_METHOD"
         echo "  - Batch size: $BATCH_SIZE"
         echo "  - Workers: $WORKERS"
@@ -458,9 +502,10 @@ case $COMMAND in
         echo "  - Results directory: $RESULTS_DIR"
         echo ""
 
-        # Build train_gear3_upgrade command
+        # Build train_gear3_upgrade command with config variant
         DOCKER_CMD="CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm flashdepth python train_gear3_upgrade.py \
             --config-path configs/gear3_upgrade \
+            --config-name config_$CONFIG_VARIANT \
             dataset.data_root=/data/datasets \
             training.batch_size=$BATCH_SIZE \
             training.workers=$WORKERS \
@@ -468,7 +513,12 @@ case $COMMAND in
             separation_method=$SEPARATION_METHOD \
             +results_dir=$RESULTS_DIR"
 
-        # Add checkpoint loading - Gear3 Upgrade requires FlashDepth-L pretrained weights
+        # Add nuScenes flag if enabled
+        if [ "$NUSCENES" = "true" ]; then
+            DOCKER_CMD="$DOCKER_CMD +nuscenes=true"
+        fi
+
+        # Add checkpoint loading - Gear3 Upgrade requires FlashDepth or Gear3 Upgrade pretrained weights
         if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
             DOCKER_CMD="$DOCKER_CMD load=$FLASHDEPTH_CHECKPOINT"
         fi
@@ -477,37 +527,32 @@ case $COMMAND in
         ;;
 
     train_gear3_upgrade_ddp)
-        # Auto-adjust batch size, workers, and iterations for Phase 2/3 (2K resolution) if not explicitly set
-        if [ "$PHASE" -eq 2 ] || [ "$PHASE" -eq 3 ]; then
-            # Phase 2/3: 2K resolution - reduce both batch size and workers
+        # Auto-adjust batch size, workers, and iterations for Hybrid (2K resolution) if not explicitly set
+        if [ "$CONFIG_VARIANT" = "hybrid" ]; then
+            # Hybrid: 2K resolution - reduce both batch size and workers
             ACTUAL_WORKERS=2  # 2 workers per GPU (total 4 across 2 GPUs)
 
             # Auto-adjust batch size for 2K resolution if user didn't specify
             if [ -z "$USER_BATCH_SIZE" ]; then
                 BATCH_SIZE=1  # Minimal batch size for 2K resolution to avoid OOM
-                echo "  NOTE: Auto-adjusted batch size to $BATCH_SIZE for Phase $PHASE (2K resolution)"
+                echo "  NOTE: Auto-adjusted batch size to $BATCH_SIZE for Hybrid (2K resolution)"
             else
                 echo "  WARNING: Using user-specified batch size $BATCH_SIZE - may cause OOM on 2K resolution!"
             fi
 
-            # Reduce iterations for Phase 2/3 (half of Phase 1)
-            TOTAL_ITERS=30001
-            echo "  NOTE: Auto-adjusted iterations to $TOTAL_ITERS for Phase $PHASE (2K resolution)"
+            # Iterations for Hybrid (same as Stage 1)
+            TOTAL_ITERS=40001
+            echo "  NOTE: Iterations set to $TOTAL_ITERS for Hybrid training"
         else
-            # Phase 1: 518x518 resolution - can use more workers and larger batch
+            # Stage 1 (L/S): 518x518 resolution - can use more workers and larger batch
             ACTUAL_WORKERS=$WORKERS
-
-            # Auto-adjust batch size for multi_layer separation method (requires more memory)
-            if [ "$SEPARATION_METHOD" = "multi_layer" ] && [ -z "$USER_BATCH_SIZE" ]; then
-                BATCH_SIZE=16
-                echo "  NOTE: Auto-adjusted batch size to $BATCH_SIZE for separation method 'multi_layer' (to avoid OOM)"
-            fi
         fi
 
         echo "Starting Gear3 Upgrade training (Multi-GPU: 0,1) - Enhanced FG/BG Separation..."
         echo "Configuration:"
+        echo "  - Config variant: $CONFIG_VARIANT"
+        echo "  - nuScenes mode: $NUSCENES"
         echo "  - Separation method: $SEPARATION_METHOD"
-        echo "  - Phase: $PHASE"
         echo "  - Batch size per GPU: $BATCH_SIZE"
         echo "  - Effective batch size: $((BATCH_SIZE * 2))"
         echo "  - Workers per GPU: $ACTUAL_WORKERS"
@@ -526,14 +571,19 @@ case $COMMAND in
             --nproc_per_node=2 \
             train_gear3_upgrade.py \
             --config-path configs/gear3_upgrade \
+            --config-name config_$CONFIG_VARIANT \
             dataset.data_root=/data/datasets \
-            phase=$PHASE \
             training.batch_size=$BATCH_SIZE \
             training.workers=$ACTUAL_WORKERS \
             training.iterations=$TOTAL_ITERS \
             training.measure_fps=$MEASURE_FPS \
             separation_method=$SEPARATION_METHOD \
             +results_dir=$RESULTS_DIR"
+
+        # Add nuScenes flag if enabled
+        if [ "$NUSCENES" = "true" ]; then
+            DOCKER_CMD="$DOCKER_CMD +nuscenes=true"
+        fi
 
         # Add checkpoint loading
         if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
@@ -551,6 +601,7 @@ case $COMMAND in
 
         echo "Starting Gear2 testing - Ablation Study..."
         echo "Configuration:"
+        echo "  - Config variant: $CONFIG_VARIANT"
         echo "  - GPU: $GPU_ID"
         echo "  - Results directory: $RESULTS_DIR"
         echo "  - Video length: $VID_LEN"
@@ -561,8 +612,8 @@ case $COMMAND in
         fi
         echo ""
 
-        # Build test_gear2 command (uses single checkpoint with all weights)
-        TEST_CMD="python test_gear2.py --config-path configs/gear2 dataset.data_root=/data/datasets +results_dir=$RESULTS_DIR +gpu=$GPU_ID"
+        # Build test_gear2 command with config variant
+        TEST_CMD="python test_gear2.py --config-path configs/gear2 --config-name config_$CONFIG_VARIANT dataset.data_root=/data/datasets +results_dir=$RESULTS_DIR +gpu=$GPU_ID"
 
         # Use --checkpoint option for the unified checkpoint
         if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
@@ -589,6 +640,7 @@ case $COMMAND in
 
         echo "Starting Gear3 testing..."
         echo "Configuration:"
+        echo "  - Config variant: $CONFIG_VARIANT"
         echo "  - GPU: $GPU_ID"
         echo "  - Results directory: $RESULTS_DIR"
         echo "  - Video length: $VID_LEN"
@@ -599,8 +651,8 @@ case $COMMAND in
         fi
         echo ""
 
-        # Build test_gear3 command (uses single checkpoint with all weights)
-        TEST_CMD="python test_gear3.py --config-path configs/gear3 dataset.data_root=/data/datasets +results_dir=$RESULTS_DIR +gpu=$GPU_ID"
+        # Build test_gear3 command with config variant
+        TEST_CMD="python test_gear3.py --config-path configs/gear3 --config-name config_$CONFIG_VARIANT dataset.data_root=/data/datasets +results_dir=$RESULTS_DIR +gpu=$GPU_ID"
 
         # Use --checkpoint option for the unified checkpoint
         if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
@@ -627,6 +679,7 @@ case $COMMAND in
 
         echo "Starting Gear3 Upgrade testing - Enhanced FG/BG Separation..."
         echo "Configuration:"
+        echo "  - Config variant: $CONFIG_VARIANT"
         echo "  - Separation method: $SEPARATION_METHOD"
         echo "  - GPU: $GPU_ID"
         echo "  - Results directory: $RESULTS_DIR"
@@ -638,8 +691,8 @@ case $COMMAND in
         fi
         echo ""
 
-        # Build test_gear3_upgrade command (uses single checkpoint with all weights)
-        TEST_CMD="python test_gear3_upgrade.py --config-path configs/gear3_upgrade dataset.data_root=/data/datasets +results_dir=$RESULTS_DIR +gpu=$GPU_ID separation_method=$SEPARATION_METHOD"
+        # Build test_gear3_upgrade command with config variant
+        TEST_CMD="python test_gear3_upgrade.py --config-path configs/gear3_upgrade --config-name config_$CONFIG_VARIANT dataset.data_root=/data/datasets +results_dir=$RESULTS_DIR +gpu=$GPU_ID separation_method=$SEPARATION_METHOD"
 
         # Use --checkpoint option for the unified checkpoint
         if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then

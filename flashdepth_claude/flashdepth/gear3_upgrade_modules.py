@@ -582,3 +582,129 @@ class Gear3UpgradeMetricHead(nn.Module):
         )
 
         return path_1_modulated, importance_map, fg_features, bg_features, fg_mask, bg_mask
+
+
+# ==================== Ablation Study: Multi-layer CLS without FG/BG Separation ====================
+
+class MultiLayerCLSNetwork(nn.Module):
+    """
+    Extract multi-layer CLS features and fuse them.
+    
+    This module extracts CLS tokens from multiple ViT layers (4, 11, 17, 23)
+    and fuses them into a single global feature.
+    
+    Unlike Gear2 which uses only Layer 23 CLS, this captures hierarchical semantics:
+    - Layer 4 (early): Low-level patterns
+    - Layer 11 (mid): Mid-level semantics
+    - Layer 17 (late): High-level semantics
+    - Layer 23 (last): Abstract semantics
+    """
+    def __init__(self, embed_dim=1024, feature_dim=256, num_layers=4):
+        super().__init__()
+        self.num_layers = num_layers
+        
+        # Learnable fusion weights (favor later layers initially)
+        init_weights = torch.tensor([0.1, 0.2, 0.3, 0.4])
+        self.fusion_weights = nn.Parameter(init_weights)
+        
+        # Project fused CLS to feature space
+        self.projection = nn.Sequential(
+            nn.Linear(embed_dim, feature_dim * 2),
+            nn.ReLU(inplace=True),
+            nn.Linear(feature_dim * 2, feature_dim),
+            nn.ReLU(inplace=True)
+        )
+        
+        logging.info(f"Multi-layer CLS Network: {num_layers} layers -> {feature_dim} features")
+    
+    def forward(self, cls_tokens_list):
+        """
+        Args:
+            cls_tokens_list: List of [B, embed_dim] CLS tokens from different layers
+                            [Layer 4, Layer 11, Layer 17, Layer 23]
+        
+        Returns:
+            global_feature: [B, feature_dim] - fused multi-layer feature
+        """
+        # Stack CLS tokens: [B, num_layers, embed_dim]
+        cls_stack = torch.stack(cls_tokens_list, dim=1)
+        
+        # Normalize fusion weights
+        weights_norm = torch.softmax(self.fusion_weights, dim=0)
+        
+        # Weighted fusion: [B, num_layers, embed_dim] -> [B, embed_dim]
+        cls_fused = (cls_stack * weights_norm.view(1, -1, 1)).sum(dim=1)
+        
+        # Project to feature space
+        global_feature = self.projection(cls_fused)
+        
+        return global_feature
+
+
+class Gear3UpgradeAblationHead(nn.Module):
+    """
+    Ablation Study: Multi-layer CLS features WITHOUT FG/BG separation.
+    
+    This is a hybrid of Gear2 and Gear3 Upgrade:
+    - Uses multi-layer CLS tokens (like Gear3 Upgrade's multi-layer approach)
+    - No FG/BG separation (like Gear2's uniform modulation)
+    
+    Purpose: Evaluate whether the gain from multi-layer comes from:
+        (a) Better global features (multi-layer CLS)
+        (b) Better spatial reasoning (FG/BG separation)
+    
+    Expected result: If this performs better than Gear2 but worse than Gear3 Upgrade multi_layer,
+    it confirms that BOTH multi-layer features AND FG/BG separation contribute to performance.
+    """
+    def __init__(self, embed_dim=1024, dpt_dim=256):
+        super().__init__()
+        
+        self.embed_dim = embed_dim
+        
+        # Multi-layer CLS feature extraction
+        self.multi_layer_cls = MultiLayerCLSNetwork(
+            embed_dim=embed_dim,
+            feature_dim=256,
+            num_layers=4
+        )
+        
+        # Modulation network (uniform, like Gear2)
+        from flashdepth.gear2_modules import ModulationNetwork, SimpleFeatureModulator
+        self.modulation_network = ModulationNetwork(
+            feature_dim=256,
+            dpt_dim=dpt_dim
+        )
+        self.feature_modulator = SimpleFeatureModulator()
+        
+        # Count parameters
+        total_params = sum(p.numel() for p in self.parameters())
+        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        logging.info(f"Gear3 Upgrade Ablation Head (multi-layer CLS, no separation): {trainable_params:,} / {total_params:,} trainable parameters")
+    
+    def forward(self, cls_tokens_multi_layer, dpt_features):
+        """
+        Args:
+            cls_tokens_multi_layer: List of [B, embed_dim] CLS tokens from [Layer 4, 11, 17, 23]
+            dpt_features: List of [B, dpt_dim, H, W] for 4 DPT layers
+        
+        Returns:
+            path_1_modulated: [B, dpt_dim, H, W]
+            (dummy values for compatibility with Gear3 Upgrade interface)
+        """
+        # Step 1: Extract multi-layer global feature
+        global_feature = self.multi_layer_cls(cls_tokens_multi_layer)  # [B, 256]
+        
+        # Step 2: Get uniform modulation parameters
+        gamma, beta = self.modulation_network(global_feature)
+        
+        # Step 3: Modulate path_1 (last DPT layer)
+        path_1 = dpt_features[-1]
+        path_1_modulated = self.feature_modulator(path_1, gamma, beta)
+        
+        # Return dummy values for unused outputs (for compatibility)
+        B = path_1.shape[0]
+        dummy_importance = torch.zeros(B, 1, 1, 1, device=path_1.device)
+        dummy_features = torch.zeros(B, 256, device=path_1.device)
+        dummy_mask = torch.zeros(B, 1, 1, 1, device=path_1.device)
+        
+        return path_1_modulated, dummy_importance, dummy_features, dummy_features, dummy_mask, dummy_mask

@@ -462,6 +462,11 @@ class Gear2Tester:
 
         # Warmup run for FPS measurement
         logger.info(f"Warmup run for FPS measurement...")
+
+        # Initialize Mamba sequence for warmup
+        if hasattr(self.model, 'mamba'):
+            self.model.mamba.start_new_sequence()
+
         with torch.amp.autocast('cuda', dtype=torch.bfloat16):
             img_warmup = images[0, 0].unsqueeze(0)  # Already on GPU
             encoder_features_warmup = self.model.pretrained.get_intermediate_layers(
@@ -473,20 +478,34 @@ class Gear2Tester:
             h_warmup, w_warmup = img_warmup.shape[2:]
             patch_h_warmup = h_warmup // self.model.patch_size
             patch_w_warmup = w_warmup // self.model.patch_size
-            dpt_features_warmup = self.model.depth_head.get_forward_features(encoder_features_warmup, patch_h_warmup, patch_w_warmup)
+
+            # Use forward_with_mamba for temporal processing
+            B_warmup, T_warmup = 1, T  # Batch size 1 for warmup
+            dpt_output_warmup = self.model.depth_head.forward_with_mamba(
+                encoder_features_warmup, patch_h_warmup, patch_w_warmup,
+                temporal_layer=self.model.mamba_in_dpt_layer,
+                mamba_fn=self.model.dpt_features_to_mamba,
+                shape_placeholder=(B_warmup, T_warmup, None, h_warmup, w_warmup)
+            )
+
+            # Wrap in list for Gear2 head compatibility
             path_1_warmup, _, _, _ = self.model.gear2_head(
-                patch_tokens_warmup, attention_weights_warmup, dpt_features_warmup, patch_h_warmup, patch_w_warmup
+                patch_tokens_warmup, attention_weights_warmup, [dpt_output_warmup], patch_h_warmup, patch_w_warmup
             )
             out_warmup = self.model.depth_head.scratch.output_conv1(path_1_warmup)
             out_warmup = F.interpolate(out_warmup, (h_warmup, w_warmup), mode="bilinear", align_corners=True)
             _ = self.model.depth_head.scratch.output_conv2(out_warmup)
-        del encoder_features_warmup, attention_weights_warmup, patch_tokens_warmup, dpt_features_warmup
+        del encoder_features_warmup, attention_weights_warmup, patch_tokens_warmup, dpt_output_warmup
         del path_1_warmup, out_warmup
         torch.cuda.empty_cache()
 
         # FPS measurement (논문 방법: 데이터가 GPU에 미리 로드된 상태에서 순수 inference 시간만 측정)
         warmup_frames = min(5, T)  # Warmup frames to skip initial overhead
         start_time = None  # Will start timing after warmup
+
+        # Initialize Mamba sequence for actual test (critical for temporal processing!)
+        if hasattr(self.model, 'mamba'):
+            self.model.mamba.start_new_sequence()
 
         # Process each frame
         for t in range(T):
@@ -514,14 +533,21 @@ class Gear2Tester:
                 # Get patch tokens from last encoder layer
                 patch_tokens = encoder_features[-1]
 
-                # Get DPT features
+                # Get DPT features with Mamba temporal processing
                 h, w = img_t.shape[1:]
                 patch_h, patch_w = h // self.model.patch_size, w // self.model.patch_size
-                dpt_features = self.model.depth_head.get_forward_features(encoder_features, patch_h, patch_w)
+                B_test, T_test = 1, T  # Batch size 1 for test
+                dpt_output = self.model.depth_head.forward_with_mamba(
+                    encoder_features, patch_h, patch_w,
+                    temporal_layer=self.model.mamba_in_dpt_layer,
+                    mamba_fn=self.model.dpt_features_to_mamba,
+                    shape_placeholder=(B_test, T_test, None, h, w)
+                )  # Returns path_1 with Mamba applied
 
                 # Apply Gear2 modulation (returns None for importance_map, fg_features, bg_features)
+                # Wrap dpt_output in list for compatibility
                 path_1_modulated, importance_map, fg_features, bg_features = self.model.gear2_head(
-                    patch_tokens, attention_weights, dpt_features, patch_h, patch_w
+                    patch_tokens, attention_weights, [dpt_output], patch_h, patch_w
                 )
 
                 # Get depth prediction (output is inverse depth in 100/m scale)

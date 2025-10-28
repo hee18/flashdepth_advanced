@@ -39,6 +39,7 @@ from datetime import timedelta
 from flashdepth.model import FlashDepth
 from utils.gear2_visualization import Gear2Visualizer
 from flashdepth.gear2_modules import Gear2MetricHead
+from flashdepth.gear3_upgrade_modules import Gear3UpgradeAblationHead
 from dataloaders.combined_dataset import CombinedDataset
 from utils.helpers import *
 from utils.metric_depth_metrics import MetricDepthMetrics
@@ -600,14 +601,16 @@ class Gear2Trainer:
             else:
                 self.logger.warning(f"Checkpoint {checkpoint_path} not found")
 
-        # Add Gear2 metric head
+        # Add Gear2 metric head (using multi-layer CLS ablation)
         embed_dim = 1024 if model.encoder == 'vitl' else 384
         dpt_dim = 256 if model.encoder == 'vitl' else 64
 
-        model.gear2_head = Gear2MetricHead(
+        # Use Gear3 Upgrade Ablation Head (multi-layer CLS, no FG/BG separation)
+        model.gear2_head = Gear3UpgradeAblationHead(
             embed_dim=embed_dim,
             dpt_dim=dpt_dim
         )
+        self.logger.info("Using Gear3 Upgrade Ablation Head for multi-layer CLS ablation study")
 
         # Phase 2, 3: Load ALL parameters after gear2_head is created
         if self.phase > 1 and checkpoint_path and checkpoint_path != 'true' and os.path.exists(checkpoint_path):
@@ -626,12 +629,13 @@ class Gear2Trainer:
             self.logger.info(f"Phase {self.phase}: Loaded ALL parameters from Phase 1 checkpoint")
             self.logger.info(f"  - DINOv2, DPT, Mamba, output_conv, Gear2: ✓")
 
-        # Enable attention weights storage ONLY for last block (saves ~11GB memory)
-        # Gear2 only uses last block's attention for importance prediction
+        # Enable attention weights storage for multi-layer extraction (blocks 3, 10, 16, 22)
+        # Need to store attention from layers 4, 11, 17, 23 for multi-layer CLS extraction
+        target_blocks = [3, 10, 16, 22]  # Blocks 3, 10, 16, 22 (layers 4, 11, 17, 23)
         for i, block in enumerate(model.pretrained.blocks):
-            if i == len(model.pretrained.blocks) - 1:
+            if i in target_blocks:
                 block.attn.store_attn_weights = True
-                self.logger.info(f"Enabled attention weights storage for block {i} (last block)")
+                self.logger.info(f"Enabled attention weights storage for block {i}")
             else:
                 block.attn.store_attn_weights = False
 
@@ -961,16 +965,19 @@ class Gear2Trainer:
                         encoder_features = model.pretrained.get_intermediate_layers(
                             img_t, model.intermediate_layer_idx[model.encoder]
                         )
-                        last_block = model.pretrained.blocks[-1]
-                        attention_weights = last_block.attn.attn_weights
-                        patch_tokens = encoder_features[-1]
+
+                        # Extract multi-layer CLS tokens
+                        cls_tokens_multi_layer = [
+                            encoder_features[i][:, 0] for i in range(len(encoder_features))
+                        ]
 
                         h, w = img_t.shape[2:]
                         patch_h, patch_w = h // model.patch_size, w // model.patch_size
                         dpt_features = model.depth_head.get_forward_features(encoder_features, patch_h, patch_w)
 
-                        path_1_modulated, importance_map, fg_features, bg_features = model.gear2_head(
-                            patch_tokens, attention_weights, dpt_features, patch_h, patch_w
+                        # Multi-layer CLS ablation head
+                        path_1_modulated, importance_map, fg_features, bg_features, fg_mask, bg_mask = model.gear2_head(
+                            cls_tokens_multi_layer, dpt_features
                         )
 
                         out = model.depth_head.scratch.output_conv1(path_1_modulated)
@@ -1079,99 +1086,90 @@ class Gear2Trainer:
             self.logger.info(f"DEBUG - After canonicalization & scaling: min={gt_depth_inverse.min():.4f}, max={gt_depth_inverse.max():.4f}")
             self.logger.info(f"DEBUG - Has {(gt_depth_inverse > 0).sum()} valid pixels")
 
-        # Forward pass with BFloat16 autocast (like original FlashDepth)
-        total_loss = 0
-        total_depth_loss = 0
-        valid_frames = 0
+        # Forward pass following original FlashDepth pattern (whole sequence at once)
+        # Initialize Mamba sequence (critical for temporal processing!)
+        if hasattr(model, 'mamba'):
+            model.mamba.start_new_sequence()
 
-        for t in range(T):
-            img_t = images[:, t]
-            gt_t = gt_depth_inverse[:, t]
+        # Reshape video from (B, T, C, H, W) to (B*T, C, H, W) for encoder
+        B_orig, T_orig, C, H, W = images.shape
+        images_flat = rearrange(images, 'b t c h w -> (b t) c h w')
 
-            # Use BFloat16 for forward pass
-            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-                # Extract features from DINOv2 (frozen, no grad)
-                with torch.no_grad():
-                    encoder_features = model.pretrained.get_intermediate_layers(
-                        img_t, model.intermediate_layer_idx[model.encoder]
-                    )
-                    
-                    # Get attention weights (already computed and stored)
-                    last_block = model.pretrained.blocks[-1]
-                    attention_weights = last_block.attn.attn_weights
-                    
-                    # Get patch tokens from last encoder layer
-                    patch_tokens = encoder_features[-1]
+        patch_h, patch_w = H // model.patch_size, W // model.patch_size
 
-                # Get DPT features (frozen, no grad)
-                h, w = img_t.shape[2:]
-                patch_h, patch_w = h // model.patch_size, w // model.patch_size
-
-                with torch.no_grad():
-                    dpt_features = model.depth_head.get_forward_features(
-                        encoder_features, patch_h, patch_w
-                    )
-
-                # Apply Gear2 modulation (trainable) - only path_1 is modulated
-                path_1_modulated, importance_map, fg_features, bg_features = model.gear2_head(
-                    patch_tokens, attention_weights, dpt_features, patch_h, patch_w
+        # Use BFloat16 for forward pass
+        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+            # Extract features from DINOv2 (frozen, no grad) - all frames at once
+            with torch.no_grad():
+                encoder_features = model.pretrained.get_intermediate_layers(
+                    images_flat, model.intermediate_layer_idx[model.encoder]
                 )
 
-                # Pass through DPT output head (trainable)
-                out = model.depth_head.scratch.output_conv1(path_1_modulated)
-                out = F.interpolate(out, (h, w), mode="bilinear", align_corners=True)
-                out = model.depth_head.scratch.output_conv2(out)
+                # Get attention weights from last block (B*T, num_heads, N, N)
+                last_block = model.pretrained.blocks[-1]
+                attention_weights = last_block.attn.attn_weights
 
-                # Prediction is already positive (Softplus activation in output_conv2)
-                pred_depth_inverse = out
+                # Get patch tokens from last encoder layer (B*T, N, C)
+                patch_tokens = encoder_features[-1]
 
-            # Continue with loss computation (outside autocast for stability)
-            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-                # DEBUG: Check prediction values in first few steps
-                if self.global_step < 5:
-                    self.logger.info(f"DEBUG - Pred inverse depth: min={pred_depth_inverse.min():.4f}, max={pred_depth_inverse.max():.4f}, mean={pred_depth_inverse.mean():.4f}")
+            # Get DPT features with Mamba temporal processing
+            dpt_output = model.depth_head.forward_with_mamba(
+                encoder_features, patch_h, patch_w,
+                temporal_layer=model.mamba_in_dpt_layer,
+                mamba_fn=model.dpt_features_to_mamba,
+                shape_placeholder=(B_orig, T_orig, None, H, W)
+            )  # Returns path_1 with Mamba applied, shape: (B*T, dpt_dim, h, w)
 
-                # Clamp prediction to reasonable range to prevent NaN
-                pred_depth_inverse = torch.clamp(pred_depth_inverse, min=1e-3, max=1e4)
+            # Extract multi-layer CLS tokens for ablation study
+            # Get CLS tokens from layers 4, 11, 17, 23 (all encoder features)
+            cls_tokens_multi_layer = [
+                encoder_features[i][:, 0] for i in range(len(encoder_features))
+            ]
 
-                # Compute loss with valid mask (GT only, like original FlashDepth)
-                # Filter out invalid inverse depths: should be in reasonable range
-                # Max 70m depth = 100/70 = 1.43 in (100/m) inverse depth
-                # So inverse depth should be > 1.43 (i.e., depth < 70m)
-                MIN_INVERSE_DEPTH = 100.0 / 70.0  # 100/70m = 1.43 in 100/m scale (max 70m depth)
-                gt_valid_mask = (gt_t > MIN_INVERSE_DEPTH)  # Filter out >70m depths and invalid values
-                valid_mask = gt_valid_mask
+            # Apply Gear2 modulation (multi-layer CLS, no FG/BG separation)
+            # Inputs: (B*T, ...), Output: (B*T, ...)
+            path_1_modulated, importance_map, fg_features, bg_features, fg_mask, bg_mask = model.gear2_head(
+                cls_tokens_multi_layer, [dpt_output]
+            )
 
-                if valid_mask.sum() == 0:
-                    self.logger.warning(f"Skipping frame {t} - no valid GT pixels")
-                    continue
+            # Pass through DPT output head (trainable)
+            out = model.depth_head.scratch.output_conv1(path_1_modulated)
+            out = F.interpolate(out, (H, W), mode="bilinear", align_corners=True)
+            out = model.depth_head.scratch.output_conv2(out)
 
-                # Loss computation in BFloat16
-                depth_loss_t = self.loss_fn(pred_depth_inverse, gt_t, valid_mask.float())
+            # Prediction is already positive (Softplus activation in output_conv2)
+            # Shape: (B*T, 1, H, W)
+            pred_depth_inverse = out
 
-                # No regularization losses - importance map uses raw attention
-                loss_t = depth_loss_t
+        # Compute loss (outside autocast for stability)
+        # Reshape GT from (B, T, 1, H, W) to (B*T, H, W)
+        gt_depth_inverse_flat = rearrange(gt_depth_inverse, 'b t 1 h w -> (b t) h w')
 
-            # Safety check: skip if loss is NaN or too large
-            if torch.isnan(loss_t) or torch.isinf(loss_t):
-                self.logger.warning(f"Skipping frame {t} due to NaN/Inf loss")
-                continue
+        # Remove channel dimension from prediction
+        pred_depth_inverse_flat = pred_depth_inverse.squeeze(1)  # (B*T, H, W)
 
-            if loss_t > 1e6:
-                self.logger.warning(f"Skipping frame {t} due to abnormal loss: {loss_t.item():.2f}")
-                continue
+        # DEBUG: Check values in first few steps
+        if self.global_step < 5:
+            self.logger.info(f"DEBUG - Pred inverse depth: min={pred_depth_inverse_flat.min():.4f}, max={pred_depth_inverse_flat.max():.4f}, mean={pred_depth_inverse_flat.mean():.4f}")
 
-            total_loss += loss_t
-            total_depth_loss += depth_loss_t
-            valid_frames += 1
+        # Clamp prediction to reasonable range to prevent NaN
+        pred_depth_inverse_flat = torch.clamp(pred_depth_inverse_flat, min=1e-3, max=1e4)
 
-        # Average loss over valid frames
-        if valid_frames == 0:
-            self.logger.error("No valid frames in batch!")
+        # Compute valid mask (GT only, like original FlashDepth)
+        MIN_INVERSE_DEPTH = 100.0 / 70.0  # Filter out >70m depths
+        valid_mask = (gt_depth_inverse_flat > MIN_INVERSE_DEPTH)
+
+        if valid_mask.sum() == 0:
+            self.logger.error("No valid GT pixels in batch!")
             return {'loss': 0.0, 'depth_loss': 0.0}
 
-        loss = total_loss / valid_frames
-        avg_depth_loss = total_depth_loss / valid_frames
+        # Compute loss (like original FlashDepth)
+        with torch.amp.autocast('cuda', enabled=False):
+            loss = self.loss_fn(
+                pred_depth_inverse_flat.float(),
+                gt_depth_inverse_flat.float(),
+                valid_mask.float()
+            )
 
         # Backward pass (outside autocast for numerical stability)
         self.optimizer.zero_grad()
@@ -1182,7 +1180,7 @@ class Gear2Trainer:
 
         return {
             'loss': loss.item(),
-            'depth_loss': avg_depth_loss.item()
+            'depth_loss': loss.item()
         }
 
     @torch.no_grad()
@@ -1247,6 +1245,11 @@ class Gear2Trainer:
 
                 # Process all frames in sequence (like original FlashDepth)
                 frame_losses = []
+
+                # Initialize Mamba sequence for validation
+                if hasattr(model, 'mamba'):
+                    model.mamba.start_new_sequence()
+
                 for t in range(T):
                     img_t = images[:, t]
                     gt_t_inverse = gt_depth_inverse[:, t]
@@ -1256,19 +1259,27 @@ class Gear2Trainer:
                         img_t, model.intermediate_layer_idx[model.encoder]
                     )
 
-                    # Get attention weights from last block
-                    last_block = model.pretrained.blocks[-1]
-                    attention_weights = last_block.attn.attn_weights
-                    patch_tokens = encoder_features[-1]
+                    # Extract multi-layer CLS tokens
+                    cls_tokens_multi_layer = [
+                        encoder_features[i][:, 0] for i in range(len(encoder_features))
+                    ]
 
-                    # Get DPT features
+                    # Get DPT features WITH Mamba
                     h, w = img_t.shape[2:]
                     patch_h, patch_w = h // model.patch_size, w // model.patch_size
-                    dpt_features = model.depth_head.get_forward_features(encoder_features, patch_h, patch_w)
 
-                    # Apply modulation and get importance map (only path_1 is modulated)
-                    path_1_modulated, importance_map, fg_features, bg_features = model.gear2_head(
-                        patch_tokens, attention_weights, dpt_features, patch_h, patch_w
+                    # Get image shape for Mamba (processing one frame at a time)
+                    C = img_t.shape[1]
+                    dpt_output = model.depth_head.forward_with_mamba(
+                        encoder_features, patch_h, patch_w,
+                        temporal_layer=model.mamba_in_dpt_layer,
+                        mamba_fn=model.dpt_features_to_mamba,
+                        shape_placeholder=(B, 1, C, h, w)  # Single frame
+                    )
+
+                    # Apply multi-layer CLS ablation head
+                    path_1_modulated, importance_map, fg_features, bg_features, fg_mask, bg_mask = model.gear2_head(
+                        cls_tokens_multi_layer, [dpt_output]
                     )
 
                     # Get depth (at model resolution)

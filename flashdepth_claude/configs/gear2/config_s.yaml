@@ -1,0 +1,88 @@
+# Gear2 Configuration - ViT-S variant
+# Stage 1: Train on 5 datasets (518×518)
+# Use for: Initial training with ViT-S backbone
+
+# General settings
+config_dir: null # overwrite by --config-path
+inference: false
+load: configs/flashdepth-s/iter_10001.pth  # FlashDepth-S pretrained weights
+
+# Canonical space settings
+canonical_focal_length: 1000.0
+use_canonical_space: false  # DISABLED - using raw inverse depth without canonicalization
+
+# Dataset configuration
+dataset:
+  data_root: null # change data path
+  resolution: 'base'  # 518x518
+  video_length: 5
+  train_datasets: [mvs-synth, dynamicreplica, tartanair, pointodyssey, spring]
+  val_datasets: [sintel, waymo]
+
+# Training configuration
+training:
+  batch_size: 20  # Per GPU (effective 40 with 2 GPUs in DDP) - optimized based on GPU memory
+  workers: 8      # Optimized for 96 CPU cores
+  iterations: 40001  # Reduced from 60001 (best model at step 2k, overfitting after)
+  save_freq: 5000
+  val_freq: 1000  # Validation every 1k steps
+  log_freq: 100
+  wandb: false
+  wandb_name: "gear2_s_stage1"
+
+  # Learning rates (Gear2 specific)
+  gear2_lr: 1.0e-4  # For new Gear2 modules
+  mamba_lr: 1.0e-4  # For Mamba (train from scratch)
+  final_head_lr: 5.0e-5  # For output_conv1/2
+  weight_decay: 1.0e-6
+
+  # FPS measurement
+  measure_fps: true  # Measure forward pass FPS (inference speed)
+  fps_log_freq: 100  # Log FPS every N steps
+
+# Model configuration (ViT-S)
+model:
+  # ViT configuration
+  vit_size: "vits"
+  patch_size: 14
+  attn_class: "MemEffAttention"
+
+  # Mamba configuration
+  use_mamba: true
+  mamba_type: "add"
+  num_mamba_layers: 4
+  downsample_mamba: [0.1]
+  mamba_pos_embed: null
+  mamba_in_dpt_layer: [1]  # ViT-S uses layer 1 (path_3) for Mamba
+  mamba_d_conv: 4
+  mamba_d_state: 256
+  use_hydra: false
+  use_transformer_rnn: false
+  use_xlstm: false
+
+# Hybrid model (not used in Stage 1)
+hybrid_configs:
+  use_hybrid: false
+
+# Evaluation configuration
+eval:
+  compile: false
+  metrics: true
+  save_grid: true
+  outfolder: "test_gear2_s"
+  test_datasets: [sintel]
+  test_dataset_resolution: 'base'
+  random_input: null
+  out_video: true  # Enable video/GIF saving
+  out_mp4: false   # false=GIF, true=MP4
+  save_res: 518    # Video height (original resolution, matches test resolution)
+  video_fps: 24    # Frames per second for MP4 (FlashDepth default)
+  gif_duration: 110  # Duration per frame in milliseconds for GIF
+  save_depth_npy: false  # Save raw depth as .npy files
+  save_vis_map: false    # Save colorized depth as .png files
+  dummy_timing: false
+
+# Object-wise evaluation configuration
+object_wise:
+  enabled: false  # Enable object-wise evaluation (set via CLI: object_wise.enabled=true)
+  dataset: waymo  # Dataset type for object-wise eval: waymo, sintel
