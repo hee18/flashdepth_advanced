@@ -302,7 +302,7 @@ class Gear3UpgradeTrainer:
         # Validation visualization config: track which sequences to visualize
         # Phase 2/3: Save 1 sample per dataset at every validation step (for step-by-step comparison)
         # Sintel is smaller (1022×434), Waymo is 2K (1918×1274)
-        if self.phase in [2, 3]:
+        if self.phase >= 2:
             self.val_vis_config = {
                 'sintel': {'sequences': [0], 'saved': []},  # seq 0 only
                 'waymo': {'sequences': [0], 'saved': []}    # seq 0 only
@@ -329,8 +329,11 @@ class Gear3UpgradeTrainer:
         if self.phase == 1:
             checkpoint_path = self.config.get('load')
         else:
-            # Phase 2, 3: Load Phase 1 best model
-            checkpoint_path = 'train_results/results_14/best.pth'
+            # Phase 2, 3: Load Phase 1 best model (match model size)
+            if model.encoder == 'vitl':
+                checkpoint_path = self.config.get('phase1_l_checkpoint', 'train_results/gear3_upgrade_phase1_l/best.pth')
+            else:
+                checkpoint_path = self.config.get('phase1_s_checkpoint', 'train_results/gear3_upgrade_phase1_s/best.pth')
             if self.rank == 0:
                 self.logger.info(f"Phase {self.phase}: Loading Phase 1 best model from {checkpoint_path}")
 
@@ -358,7 +361,7 @@ class Gear3UpgradeTrainer:
                     for k, v in state_dict.items():
                         # Exclude modules that receive modulated features
                         if any(x in k for x in ['mamba', 'hybrid_fusion', 'teacher_model',
-                                                'output_conv1', 'output_conv2', 'gear3_head']):
+                                                'output_conv1', 'output_conv2', 'gear3_upgrade_head']):
                             excluded_keys.append(k)
                         else:
                             loaded_dict[k] = v
@@ -387,7 +390,7 @@ class Gear3UpgradeTrainer:
         self.separation_method = separation_method
         self.logger.info(f"Using FG/BG separation method: {separation_method}")
 
-        model.gear3_head = Gear3UpgradeMetricHead(
+        model.gear3_upgrade_head = Gear3UpgradeMetricHead(
             embed_dim=embed_dim,
             dpt_dim=dpt_dim,
             separation_method=separation_method,
@@ -411,10 +414,53 @@ class Gear3UpgradeTrainer:
             self.logger.info(f"Phase {self.phase}: Loaded ALL parameters from Phase 1 checkpoint")
             self.logger.info(f"  - DINOv2, DPT, Mamba, output_conv, Gear3: ✓")
 
+            # Phase 2 ONLY: Overwrite ViT-DPT with FlashDepth-hybrid weights
+            if self.phase == 2:
+                hybrid_path = self.config.get('flashdepth_hybrid', 'configs/flashdepth/iter_43002.pth')
+                if os.path.exists(hybrid_path):
+                    self.logger.info(f"Phase 2: Overwriting ViT-DPT with Hybrid weights from {hybrid_path}")
+                    hybrid_checkpoint = torch.load(hybrid_path, map_location='cpu')
+
+                    # Extract state dict
+                    if isinstance(hybrid_checkpoint, dict) and 'model' in hybrid_checkpoint:
+                        hybrid_state_dict = hybrid_checkpoint['model']
+                    elif isinstance(hybrid_checkpoint, dict) and 'state_dict' in hybrid_checkpoint:
+                        hybrid_state_dict = hybrid_checkpoint['state_dict']
+                    else:
+                        hybrid_state_dict = hybrid_checkpoint
+
+                    # Remove module. prefix if present
+                    hybrid_state_dict = {k.replace('module.', ''): v for k, v in hybrid_state_dict.items()}
+
+                    # Load ONLY DINOv2 and DPT parameters (overwrite Phase 1 weights)
+                    loaded_hybrid = {}
+                    for k, v in hybrid_state_dict.items():
+                        # Include only encoder and DPT refinement (same as Phase 1 loading)
+                        if not any(x in k for x in ['mamba', 'hybrid_fusion', 'teacher_model',
+                                                     'output_conv1', 'output_conv2', 'gear3_upgrade_head']):
+                            loaded_hybrid[k] = v
+
+                    # Overwrite ViT-DPT parameters
+                    model.load_state_dict(loaded_hybrid, strict=False)
+                    self.logger.info(f"Phase 2: Overwritten {len(loaded_hybrid)} ViT-DPT parameters with Hybrid weights")
+                    self.logger.info(f"  - Kept from Phase 1: Gear3, Mamba, output_conv (continue training)")
+                else:
+                    self.logger.warning(f"Hybrid checkpoint {hybrid_path} not found! Using Phase 1 ViT-DPT weights.")
+
         # Enable attention weights storage
-        # - 'multi_layer': Enable for blocks 3, 10, 16, 22 (layers 4, 11, 17, 23)
+        # - 'multi_layer': Enable for multiple blocks (encoder-specific)
+        #   - ViT-L (24 blocks): [3, 10, 16, 22]
+        #   - ViT-S (12 blocks): [2, 5, 8, 11]
         # - Others: Enable ONLY for last block (saves memory)
-        target_blocks = [3, 10, 16, 22] if separation_method == 'multi_layer' else [len(model.pretrained.blocks) - 1]
+        if separation_method == 'multi_layer':
+            # Use encoder-specific block indices for proportional coverage
+            multi_layer_blocks = {
+                'vitl': [3, 10, 16, 22],
+                'vits': [2, 5, 8, 11]
+            }
+            target_blocks = multi_layer_blocks[model.encoder]
+        else:
+            target_blocks = [len(model.pretrained.blocks) - 1]
 
         for i, block in enumerate(model.pretrained.blocks):
             if i in target_blocks:
@@ -425,6 +471,9 @@ class Gear3UpgradeTrainer:
 
         if separation_method == 'multi_layer':
             self.logger.info(f"Multi-layer attention fusion: storing attention from blocks {target_blocks}")
+
+        # Store target blocks for use in training/validation steps
+        self.target_blocks = target_blocks
 
         model = model.to(self.device)
 
@@ -454,7 +503,7 @@ class Gear3UpgradeTrainer:
         gear3_params = 0
 
         for name, param in model.named_parameters():
-            if 'gear3_head' in name:
+            if 'gear3_upgrade_head' in name:
                 # Gear3 modules: trainable
                 param.requires_grad = True
                 gear3_params += param.numel()
@@ -498,7 +547,7 @@ class Gear3UpgradeTrainer:
                 continue
 
             # Keep trainable parts in train mode
-            if any(keyword in name for keyword in ['gear3_head', 'mamba', 'output_conv']):
+            if any(keyword in name for keyword in ['gear3_upgrade_head', 'mamba', 'output_conv']):
                 continue
 
             # Set frozen parts to eval mode
@@ -512,16 +561,18 @@ class Gear3UpgradeTrainer:
                 ['mvs-synth', 'dynamicreplica', 'tartanair', 'pointodyssey', 'spring'])
             val_datasets = self.config.dataset.get('val_datasets', ['sintel', 'waymo'])
             resolution = 'base'  # 518×518
+        elif self.phase == 1.5:
+            # Phase 1.5: nuScenes fine-tuning, 518×518 (optional)
+            train_datasets = ['nuscenes']
+            val_datasets = ['nuscenes']
+            resolution = 'base'  # 518×518 (same as Phase 1)
         elif self.phase == 2:
-            # Phase 2: mvs-synth, spring only, 2K resolution
+            # Phase 2: mvs-synth, spring only, 2K resolution (Hybrid)
             train_datasets = ['mvs-synth', 'spring']
             val_datasets = ['sintel', 'waymo']
             resolution = '2k'
-        else:  # Phase 3
-            # Phase 3: nuScenes only, 2K resolution
-            train_datasets = ['nuscenes']
-            val_datasets = ['nuscenes']
-            resolution = '2k'
+        else:
+            raise ValueError(f"Invalid phase: {self.phase}. Must be 1, 1.5, or 2.")
 
         if self.rank == 0:
             self.logger.info(f"Phase {self.phase} - Train datasets: {train_datasets}")
@@ -540,7 +591,7 @@ class Gear3UpgradeTrainer:
 
         # Validation dataset: use shorter sequence for Phase 2/3 to save memory
         # Phase 2/3 use 2K resolution which requires much more memory
-        val_video_length = 1 if self.phase in [2, 3] else self.config.dataset.video_length
+        val_video_length = 1 if self.phase >= 2 else self.config.dataset.video_length
         val_dataset = CombinedDataset(
             root_dir=self.config.dataset.data_root,
             enable_dataset_flags=val_datasets,
@@ -593,7 +644,7 @@ class Gear3UpgradeTrainer:
             self.logger.info(f"Train dataset size: {len(train_dataset)}")
             self.logger.info(f"Val dataset size: {len(val_dataset)}")
             self.logger.info(f"Train batch size: {self.config.training.batch_size}, video_length: {self.config.dataset.video_length}")
-            self.logger.info(f"Val batch size: 1, video_length: {val_video_length} {'(reduced for 2K)' if self.phase in [2, 3] else '(like original FlashDepth)'}")
+            self.logger.info(f"Val batch size: 1, video_length: {val_video_length} {'(reduced for 2K)' if self.phase >= 2 else '(like original FlashDepth)'}")
 
         return train_loader, val_loader
 
@@ -620,7 +671,7 @@ class Gear3UpgradeTrainer:
 
         for name, param in self.model.named_parameters():
             if param.requires_grad:
-                if 'gear3_head' in name:
+                if 'gear3_upgrade_head' in name:
                     gear3_params.append(param)
                 elif 'mamba' in name:
                     mamba_params.append(param)
@@ -764,34 +815,40 @@ class Gear3UpgradeTrainer:
                         attention_weights = last_block.attn.attn_weights
                         patch_tokens = encoder_features[-1]
 
-                        # Use forward_with_mamba for temporal processing
-                        dpt_output = model.depth_head.forward_with_mamba(
-                            encoder_features, patch_h, patch_w,
-                            temporal_layer=model.mamba_in_dpt_layer,
-                            mamba_fn=model.dpt_features_to_mamba,
-                            shape_placeholder=(B_orig, T_orig, None, H, W)
+                        # Get DPT features WITHOUT Mamba
+                        dpt_features = model.depth_head.get_forward_features(
+                            encoder_features, patch_h, patch_w
                         )
+                        path_1 = dpt_features[-1]  # Extract path_1
 
                         # Prepare inputs based on separation_method
                         attention_weights_multi_layer = None
                         cls_token = None
 
                         if self.separation_method == 'multi_layer':
+                            # Collect attention weights from multiple layers (encoder-specific)
                             attention_weights_multi_layer = [
                                 model.pretrained.blocks[i].attn.attn_weights
-                                for i in [3, 10, 16, 22]
+                                for i in self.target_blocks
                             ]
                         elif self.separation_method == 'cls_seg':
                             cls_token = encoder_features[-1][:, 0]  # [B*T, embed_dim]
 
-                        # Apply Gear3 Upgrade head
-                        path_1_modulated, importance_map, fg_features, bg_features, fg_mask, bg_mask = model.gear3_head(
-                            patch_tokens, attention_weights, [dpt_output], patch_h, patch_w,
+                        # Apply Gear modulation BEFORE Mamba
+                        path_1_modulated, importance_map, fg_features, bg_features, fg_mask, bg_mask = model.gear3_upgrade_head(
+                            patch_tokens, attention_weights, [path_1], patch_h, patch_w,
                             attention_weights_multi_layer=attention_weights_multi_layer,
                             cls_token=cls_token
                         )
 
-                        out = model.depth_head.scratch.output_conv1(path_1_modulated)
+                        # Apply Mamba temporal modeling to modulated feature
+                        path_1_temporal = model.dpt_features_to_mamba(
+                            input_shape=(B_orig, T_orig, None, H, W),
+                            dpt_features=path_1_modulated,
+                            in_dpt_layer=0
+                        )
+
+                        out = model.depth_head.scratch.output_conv1(path_1_temporal)
                         out = F.interpolate(out, (H, W), mode="bilinear", align_corners=True)
                         out = model.depth_head.scratch.output_conv2(out)
 
@@ -849,7 +906,7 @@ class Gear3UpgradeTrainer:
                                 # Handle DDP wrapping
                                 model = self.model.module if hasattr(self.model, 'module') else self.model
                                 # Get softmax-normalized weights
-                                fusion_weights = model.gear3_head.multi_layer_fusion.fusion_weights
+                                fusion_weights = model.gear3_upgrade_head.multi_layer_fusion.fusion_weights
                                 layer_weights = torch.softmax(fusion_weights, dim=0).detach().cpu().numpy()
                             except Exception as e:
                                 self.logger.warning(f"Failed to extract layer_weights: {e}")
@@ -954,40 +1011,47 @@ class Gear3UpgradeTrainer:
                 # Get patch tokens from last encoder layer (B*T, N, C)
                 patch_tokens = encoder_features[-1]
 
-            # Get DPT features with Mamba temporal processing (frozen, no grad)
+            # Get DPT features WITHOUT Mamba (DPT frozen, no grad)
             with torch.no_grad():
-                dpt_output = model.depth_head.forward_with_mamba(
-                    encoder_features, patch_h, patch_w,
-                    temporal_layer=model.mamba_in_dpt_layer,
-                    mamba_fn=model.dpt_features_to_mamba,
-                    shape_placeholder=(B_orig, T_orig, None, H, W)
-                )  # Returns path_1 with Mamba applied, shape: (B*T, dpt_dim, h, w)
+                dpt_features = model.depth_head.get_forward_features(
+                    encoder_features, patch_h, patch_w
+                )  # Returns [path_4, path_3, path_2, path_1], each (B*T, dpt_dim, h, w)
+                path_1 = dpt_features[-1]  # Extract path_1: (B*T, dpt_dim, h, w)
 
             # Prepare inputs based on separation_method
             attention_weights_multi_layer = None
             cls_token = None
 
             if self.separation_method == 'multi_layer':
-                # Collect attention weights from multiple layers
+                # Collect attention weights from multiple layers (encoder-specific)
                 # Each has shape (B*T, num_heads, N, N)
                 attention_weights_multi_layer = [
                     model.pretrained.blocks[i].attn.attn_weights.detach()
-                    for i in [3, 10, 16, 22]
+                    for i in self.target_blocks
                 ]
             elif self.separation_method == 'cls_seg':
                 with torch.no_grad():
                     cls_token = patch_tokens[:, 0]  # (B*T, embed_dim)
 
-            # Apply Gear3 Upgrade modulation
+            # Apply Gear3 Upgrade modulation to path_1 (BEFORE Mamba)
+            # This makes the feature metric-aware before temporal modeling
             # Inputs: (B*T, ...), Output: (B*T, ...)
-            path_1_modulated, importance_map, fg_features, bg_features, fg_mask, bg_mask = model.gear3_head(
-                patch_tokens, attention_weights, [dpt_output], patch_h, patch_w,
+            path_1_modulated, importance_map, fg_features, bg_features, fg_mask, bg_mask = model.gear3_upgrade_head(
+                patch_tokens, attention_weights, [path_1], patch_h, patch_w,
                 attention_weights_multi_layer=attention_weights_multi_layer,
                 cls_token=cls_token
             )
 
+            # Apply Mamba temporal modeling to modulated (metric-aware) feature
+            # Mamba is trainable in Phase 1+, so gradients flow through it
+            path_1_temporal = model.dpt_features_to_mamba(
+                input_shape=(B_orig, T_orig, None, H, W),
+                dpt_features=path_1_modulated,
+                in_dpt_layer=0  # Single layer index
+            )  # Returns (B*T, dpt_dim, h, w) with temporal consistency
+
             # Pass through DPT output head (trainable)
-            out = model.depth_head.scratch.output_conv1(path_1_modulated)
+            out = model.depth_head.scratch.output_conv1(path_1_temporal)
             out = F.interpolate(out, (H, W), mode="bilinear", align_corners=True)
             out = model.depth_head.scratch.output_conv2(out)
 
@@ -1064,7 +1128,7 @@ class Gear3UpgradeTrainer:
 
         # Phase 2/3: Limit validation batches to save memory (2K resolution)
         # 8 batches to ensure both sintel and waymo are included (DDP splits across ranks)
-        max_val_batches = 8 if self.phase in [2, 3] else None
+        max_val_batches = 8 if self.phase >= 2 else None
 
         for batch_idx, batch in enumerate(tqdm(self.val_loader, desc="Validation", disable=(self.rank != 0))):
             # Limit validation batches for Phase 2/3 to prevent OOM
@@ -1115,35 +1179,42 @@ class Gear3UpgradeTrainer:
                 attention_weights = last_block.attn.attn_weights
                 patch_tokens = encoder_features[-1]
 
-                # Get DPT features with Mamba temporal processing
-                dpt_output = model.depth_head.forward_with_mamba(
-                    encoder_features, patch_h, patch_w,
-                    temporal_layer=model.mamba_in_dpt_layer,
-                    mamba_fn=model.dpt_features_to_mamba,
-                    shape_placeholder=(B_orig, T_orig, None, H, W)
-                )  # Returns path_1 with Mamba applied, shape: (B*T, dpt_dim, h, w)
+                # Get DPT features WITHOUT Mamba
+                dpt_features = model.depth_head.get_forward_features(
+                    encoder_features, patch_h, patch_w
+                )  # Returns [path_4, path_3, path_2, path_1]
+                path_1 = dpt_features[-1]  # Extract path_1: (B*T, dpt_dim, h, w)
 
                 # Prepare inputs based on separation_method
                 attention_weights_multi_layer = None
                 cls_token = None
 
                 if self.separation_method == 'multi_layer':
+                    # Collect attention weights from multiple layers (encoder-specific)
                     attention_weights_multi_layer = [
                         model.pretrained.blocks[i].attn.attn_weights.detach()
-                        for i in [3, 10, 16, 22]
+                        for i in self.target_blocks
                     ]
                 elif self.separation_method == 'cls_seg':
                     cls_token = patch_tokens[:, 0]  # (B*T, embed_dim)
 
-                # Apply modulation - inputs/outputs: (B*T, ...)
-                path_1_modulated, importance_map, fg_features, bg_features, fg_mask, bg_mask = model.gear3_head(
-                    patch_tokens, attention_weights, [dpt_output], patch_h, patch_w,
+                # Apply Gear modulation BEFORE Mamba (metric-aware feature)
+                # Inputs/outputs: (B*T, ...)
+                path_1_modulated, importance_map, fg_features, bg_features, fg_mask, bg_mask = model.gear3_upgrade_head(
+                    patch_tokens, attention_weights, [path_1], patch_h, patch_w,
                     attention_weights_multi_layer=attention_weights_multi_layer,
                     cls_token=cls_token
                 )
 
+                # Apply Mamba temporal modeling to modulated feature
+                path_1_temporal = model.dpt_features_to_mamba(
+                    input_shape=(B_orig, T_orig, None, H, W),
+                    dpt_features=path_1_modulated,
+                    in_dpt_layer=0
+                )  # Returns (B*T, dpt_dim, h, w) with temporal consistency
+
                 # Get depth (at model resolution)
-                out = model.depth_head.scratch.output_conv1(path_1_modulated)
+                out = model.depth_head.scratch.output_conv1(path_1_temporal)
                 out = F.interpolate(out, (H, W), mode="bilinear", align_corners=True)
                 out = model.depth_head.scratch.output_conv2(out)
 
@@ -1268,7 +1339,7 @@ class Gear3UpgradeTrainer:
                                         # Handle DDP wrapping
                                         model = self.model.module if hasattr(self.model, 'module') else self.model
                                         # Get softmax-normalized weights
-                                        fusion_weights = model.gear3_head.multi_layer_fusion.fusion_weights
+                                        fusion_weights = model.gear3_upgrade_head.multi_layer_fusion.fusion_weights
                                         layer_weights = torch.softmax(fusion_weights, dim=0).detach().cpu().numpy()
                                     except Exception as e:
                                         self.logger.warning(f"Failed to extract layer_weights: {e}")
@@ -1286,7 +1357,7 @@ class Gear3UpgradeTrainer:
                                     self.logger.warning(f"Failed to save validation visualization for {current_dataset} seq {seq_num}: {e}")
 
                     # Clear intermediate tensors to free memory after each sequence
-                    del encoder_features, attention_weights, patch_tokens, dpt_output
+                    del encoder_features, attention_weights, patch_tokens, dpt_features, path_1, path_1_temporal
                     del path_1_modulated, importance_map, fg_features, bg_features, fg_mask, bg_mask, pred_depth_inverse
                     # Always clear cache after each sequence to prevent OOM during validation
                     torch.cuda.empty_cache()
@@ -1333,7 +1404,7 @@ class Gear3UpgradeTrainer:
             self.logger.info(f"Overall Average Loss: {avg_loss:.4f}")
 
             # WARNING: Check if validation set is too small (Phase 2/3)
-            if self.phase in [2, 3] and num_batches < 20:
+            if self.phase >= 2 and num_batches < 20:
                 self.logger.warning(
                     f"⚠️  SMALL VALIDATION SET: Only {num_batches} batches evaluated! "
                     f"Consider increasing max_val_batches for more reliable validation."

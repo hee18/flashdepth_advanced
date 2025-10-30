@@ -480,24 +480,29 @@ class Gear3Tester:
             patch_h_warmup = h_warmup // self.model.patch_size
             patch_w_warmup = w_warmup // self.model.patch_size
 
-            # Use forward_with_mamba for temporal processing
-            B_warmup, T_warmup = 1, T
-            dpt_output_warmup = self.model.depth_head.forward_with_mamba(
-                encoder_features_warmup, patch_h_warmup, patch_w_warmup,
-                temporal_layer=self.model.mamba_in_dpt_layer,
-                mamba_fn=self.model.dpt_features_to_mamba,
-                shape_placeholder=(B_warmup, T_warmup, None, h_warmup, w_warmup)
+            # Get DPT features first (without Mamba)
+            dpt_features_warmup = self.model.depth_head.get_forward_features(
+                encoder_features_warmup, patch_h_warmup, patch_w_warmup
+            )
+            path_1_warmup = dpt_features_warmup[-1]
+
+            # Apply Gear3 modulation
+            path_1_modulated_warmup, _, _, _ = self.model.gear3_head(
+                patch_tokens_warmup, attention_weights_warmup, [path_1_warmup], patch_h_warmup, patch_w_warmup
             )
 
-            # Wrap in list for Gear3 head compatibility
-            path_1_warmup, _, _, _ = self.model.gear3_head(
-                patch_tokens_warmup, attention_weights_warmup, [dpt_output_warmup], patch_h_warmup, patch_w_warmup
+            # Apply Mamba temporal processing
+            path_1_temporal_warmup = self.model.dpt_features_to_mamba(
+                input_shape=(1, 3, h_warmup, w_warmup),
+                dpt_features=path_1_modulated_warmup,
+                in_dpt_layer=0
             )
-            out_warmup = self.model.depth_head.scratch.output_conv1(path_1_warmup)
+
+            out_warmup = self.model.depth_head.scratch.output_conv1(path_1_temporal_warmup)
             out_warmup = F.interpolate(out_warmup, (h_warmup, w_warmup), mode="bilinear", align_corners=True)
             _ = self.model.depth_head.scratch.output_conv2(out_warmup)
-        del encoder_features_warmup, attention_weights_warmup, patch_tokens_warmup, dpt_output_warmup
-        del path_1_warmup, out_warmup
+        del encoder_features_warmup, attention_weights_warmup, patch_tokens_warmup, dpt_features_warmup
+        del path_1_warmup, path_1_modulated_warmup, path_1_temporal_warmup, out_warmup
         torch.cuda.empty_cache()
 
         # FPS measurement (like original FlashDepth)
@@ -534,25 +539,28 @@ class Gear3Tester:
                 # Get patch tokens from last encoder layer
                 patch_tokens = encoder_features[-1]
 
-                # Get DPT features with Mamba temporal processing
+                # Get DPT features first (without Mamba)
                 h, w = img_t.shape[1:]
                 patch_h, patch_w = h // self.model.patch_size, w // self.model.patch_size
-                B_test, T_test = 1, T
-                dpt_output = self.model.depth_head.forward_with_mamba(
-                    encoder_features, patch_h, patch_w,
-                    temporal_layer=self.model.mamba_in_dpt_layer,
-                    mamba_fn=self.model.dpt_features_to_mamba,
-                    shape_placeholder=(B_test, T_test, None, h, w)
-                )  # Returns path_1 with Mamba applied
+                dpt_features = self.model.depth_head.get_forward_features(
+                    encoder_features, patch_h, patch_w
+                )
+                path_1 = dpt_features[-1]
 
-                # Apply Gear3 modulation - wrap dpt_output in list for compatibility
+                # Apply Gear3 modulation
                 path_1_modulated, importance_map, fg_features, bg_features = self.model.gear3_head(
-                    patch_tokens, attention_weights, [dpt_output], patch_h, patch_w
+                    patch_tokens, attention_weights, [path_1], patch_h, patch_w
+                )
+
+                # Apply Mamba temporal processing
+                path_1_temporal = self.model.dpt_features_to_mamba(
+                    input_shape=(1, 3, h, w),
+                    dpt_features=path_1_modulated,
+                    in_dpt_layer=0
                 )
 
                 # Get depth prediction (output is inverse depth in 100/m scale)
-                # path_1_modulated is already the modulated feature, no need to index
-                out = self.model.depth_head.scratch.output_conv1(path_1_modulated)
+                out = self.model.depth_head.scratch.output_conv1(path_1_temporal)
                 out = F.interpolate(out, (h, w), mode="bilinear", align_corners=True)
                 out = self.model.depth_head.scratch.output_conv2(out)  # [1, 1, H, W]
 
@@ -772,13 +780,10 @@ class Gear3Tester:
 
         # Save video (GIF or MP4)
         if self.config.eval.get('out_video', True):
-            # Resize images to match GT resolution for video creation
-            gt_h, gt_w = gt_depth_metric.shape[-2:]
-            images_resized = F.interpolate(
-                images[0], size=(gt_h, gt_w), mode='bilinear', align_corners=True
-            )
+            # Use original model resolution for images (following FlashDepth approach)
+            # save_gifs_as_grid/save_grid_to_mp4 will handle downsampling to save_res
             self._save_video(
-                images_resized, pred_depths, gt_depth_metric, valid_mask, sequence_id
+                images[0], pred_depths, gt_depth_metric, valid_mask, sequence_id
             )
 
         # Save best frame visualizations
@@ -1010,7 +1015,7 @@ class Gear3Tester:
         img_h, img_w = image_np.shape[:2]
 
         # Create valid mask
-        MAX_DEPTH = 200.0
+        MAX_DEPTH = 70.0  # Same as training (100/70 = 1.43 inverse depth threshold)
         gt_valid = (gt_depth > 0) & (gt_depth < MAX_DEPTH)
         pred_valid = (pred_depth > 0) & (pred_depth < 1000)
         valid_mask = gt_valid & pred_valid

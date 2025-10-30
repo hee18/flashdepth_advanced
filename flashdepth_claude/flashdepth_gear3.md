@@ -409,8 +409,8 @@ Decay (30-100%):   1e-4 → 1e-6
 # Training loop (NO canonicalization!)
 gt_depth_inverse = gt_depth * 100.0  # Dataloader gives 1/m, scale to 100/m
 
-# Valid mask: 0.5 < inverse_depth (i.e., depth < 200m)
-MIN_INVERSE_DEPTH = 0.5  # 100/200m = 0.5
+# Valid mask: 1.43 < inverse_depth (i.e., depth < 70m)
+MIN_INVERSE_DEPTH = 100.0 / 70.0  # ≈ 1.43 (same as original FlashDepth)
 valid_mask = (gt_inverse > MIN_INVERSE_DEPTH)
 
 depth_loss = LogL1Loss(pred_inverse, gt_inverse, valid_mask)
@@ -439,16 +439,17 @@ total_loss = depth_loss  # Log L1 loss on inverse depth
 # Regularization losses 모두 제거됨
 ```
 
-### Valid Depth Range: **200m 이하**
+### Valid Depth Range: **70m 이하** (원본 FlashDepth와 동일)
 
 **배경**:
 - 원본 FlashDepth: 70m (KITTI/NYUv2 기준)
-- Gear: **200m** (TartanAir, Spring 고려)
+- Gear: **70m** (원본과 일관성 유지)
 
 **적용**:
-1. **Training loss**: `gt_inverse > 0.5` (depth < 200m)
-2. **Validation loss**: 동일
-3. **Visualization**: `0 < depth < 200` 필터링
+1. **Training loss**: `gt_inverse > 100/70 ≈ 1.43` (depth < 70m)
+2. **Validation loss**: 동일 (70m threshold)
+3. **Test metrics**: `0 < depth < 70m` 필터링 (지표 계산용)
+4. **Visualization**: 제한 없음 (모든 depth 범위 표시, 단 지표는 70m 이하만)
 
 ---
 

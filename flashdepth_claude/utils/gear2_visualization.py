@@ -86,25 +86,40 @@ class Gear2Visualizer:
             while pred_depth_frame.ndim > 2:
                 pred_depth_frame = pred_depth_frame[0]
 
-            # Create valid mask
-            # Filter out invalid depths: GT and pred must be in [0, 200m] range
-            MAX_DEPTH = 200.0  # Maximum valid depth in meters
-            gt_valid_mask = (gt_depth_frame > 0) & (gt_depth_frame < MAX_DEPTH)
-            pred_valid_mask = (pred_depth_frame > 0) & (pred_depth_frame < MAX_DEPTH)
-            valid_mask = gt_valid_mask & pred_valid_mask
+            # Create two separate masks:
+            # 1. Metrics mask: 70m threshold (same as training loss)
+            # 2. Visualization mask: No upper limit (show all depths)
+            MAX_DEPTH_METRICS = 70.0  # For metrics calculation (100/70 = 1.43 inverse depth threshold)
 
-            if valid_mask.sum() > 0:
-                gt_valid = gt_depth_frame[valid_mask]
-                pred_valid = pred_depth_frame[valid_mask]
+            # Metrics mask: 70m threshold for fair comparison with training
+            gt_valid_metrics = (gt_depth_frame > 0) & (gt_depth_frame < MAX_DEPTH_METRICS)
+            pred_valid_metrics = (pred_depth_frame > 0) & (pred_depth_frame < MAX_DEPTH_METRICS)
+            valid_mask_metrics = gt_valid_metrics & pred_valid_metrics
+
+            # Visualization mask: Filter out invalid values (<=0) and extreme outliers (>1000m)
+            MAX_DEPTH_VIS = 1000.0  # Same as TartanAir's maximum valid depth
+            gt_valid_vis = (gt_depth_frame > 0) & (gt_depth_frame < MAX_DEPTH_VIS)
+            pred_valid_vis = (pred_depth_frame > 0) & (pred_depth_frame < MAX_DEPTH_VIS)
+            valid_mask_vis = gt_valid_vis & pred_valid_vis
+
+            if valid_mask_metrics.sum() > 0:
+                gt_valid = gt_depth_frame[valid_mask_metrics]
+                pred_valid = pred_depth_frame[valid_mask_metrics]
 
             # Create figure with subplots
             fig = plt.figure(figsize=(20, 12))
             gs = GridSpec(3, 4, figure=fig, hspace=0.3, wspace=0.3)
 
             # Calculate valid ratio and error BEFORE visualization
-            valid_ratio = valid_mask.sum() / valid_mask.size
+            # Use metrics mask for statistics (70m threshold)
+            num_valid_metrics = valid_mask_metrics.sum()
+            valid_ratio_metrics = num_valid_metrics / valid_mask_metrics.size
+            valid_ratio_vis = valid_mask_vis.sum() / valid_mask_vis.size
             abs_error = np.abs(pred_depth_frame - gt_depth_frame)
-            abs_error_masked = np.where(valid_mask, abs_error, np.nan)
+            abs_error_masked = np.where(valid_mask_metrics, abs_error, np.nan)  # Metrics use 70m threshold
+
+            # Check if we have valid pixels for metrics calculation
+            has_valid_pixels = num_valid_metrics > 0
 
             # 1. Input Image
             ax1 = fig.add_subplot(gs[0, 0])
@@ -120,19 +135,21 @@ class Gear2Visualizer:
 
             if is_sparse_dataset:
                 # Sparse depth: use dual visualization (inpainted)
+                # Use vis mask (no 70m limit) for visualization
                 _, gt_dense_vis, gt_info = create_dual_sparse_depth_vis(
-                    gt_depth_frame, valid_mask, colormap='plasma', percentile_range=(2, 98)
+                    gt_depth_frame, valid_mask_vis, colormap='plasma', percentile_range=(2, 98)
                 )
                 im2 = ax2.imshow(gt_dense_vis)
-                ax2.set_title(f'GT Depth (Inpainted)\n{valid_ratio*100:.1f}% valid',
-                             fontsize=14, fontweight='bold')
+                ax2.set_title(f'GT Depth (Inpainted)\n{valid_ratio_vis*100:.1f}% valid\n(Metrics: {valid_ratio_metrics*100:.1f}%)',
+                             fontsize=12, fontweight='bold')
                 vmin, vmax = gt_info['vmin'], gt_info['vmax']
             else:
-                # Dense depth: use standard visualization
-                gt_display = np.where(valid_mask, gt_depth_frame, np.nan)
+                # Dense depth: use standard visualization (no 70m limit)
+                gt_display = np.where(valid_mask_vis, gt_depth_frame, np.nan)
                 vmin, vmax = np.nanpercentile(gt_display, [2, 98])
                 im2 = ax2.imshow(gt_display, cmap='plasma', vmin=vmin, vmax=vmax)
-                ax2.set_title('Ground Truth Depth (m)', fontsize=14, fontweight='bold')
+                ax2.set_title(f'Ground Truth Depth (m)\n(Metrics: {valid_ratio_metrics*100:.1f}%)',
+                             fontsize=12, fontweight='bold')
 
             ax2.axis('off')
             plt.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
@@ -142,17 +159,21 @@ class Gear2Visualizer:
 
             if is_sparse_dataset:
                 # Sparse depth: use dual visualization (inpainted)
+                # Use vis mask (no 70m limit) for visualization
                 _, pred_dense_vis, pred_info = create_dual_sparse_depth_vis(
-                    pred_depth_frame, valid_mask, colormap='plasma', percentile_range=(2, 98)
+                    pred_depth_frame, valid_mask_vis, colormap='plasma', percentile_range=(2, 98)
                 )
                 im3 = ax3.imshow(pred_dense_vis)
-                ax3.set_title(f'Pred Depth (Inpainted)\nMAE: {np.nanmean(abs_error_masked):.2f}m',
-                             fontsize=14, fontweight='bold')
+                mae_str = f'{np.nanmean(abs_error_masked):.2f}m' if has_valid_pixels else 'N/A'
+                ax3.set_title(f'Pred Depth (Inpainted)\nMAE: {mae_str}',
+                             fontsize=12, fontweight='bold')
             else:
-                # Dense depth: use standard visualization
-                pred_display = np.where(valid_mask, pred_depth_frame, np.nan)
+                # Dense depth: use standard visualization (no 70m limit)
+                pred_display = np.where(valid_mask_vis, pred_depth_frame, np.nan)
                 im3 = ax3.imshow(pred_display, cmap='plasma', vmin=vmin, vmax=vmax)
-                ax3.set_title('Predicted Metric Depth (m)', fontsize=14, fontweight='bold')
+                mae_str = f'{np.nanmean(abs_error_masked):.2f}m' if has_valid_pixels else 'N/A'
+                ax3.set_title(f'Predicted Metric Depth (m)\nMAE: {mae_str}',
+                             fontsize=12, fontweight='bold')
 
             ax3.axis('off')
             plt.colorbar(im3, ax=ax3, fraction=0.046, pad=0.04)
@@ -166,28 +187,35 @@ class Gear2Visualizer:
             ax4.set_title('Importance Map (N/A)', fontsize=14, fontweight='bold')
             ax4.axis('off')
 
-            # 5. Valid Mask
+            # 5. Valid Mask (for metrics calculation, 70m threshold)
             ax5 = fig.add_subplot(gs[1, 0])
-            ax5.imshow(valid_mask.astype(np.uint8), cmap='gray_r', vmin=0, vmax=1)
-            ax5.set_title(f'Valid Mask\n({valid_mask.sum():,} pixels)', fontsize=14, fontweight='bold')
+            ax5.imshow(valid_mask_metrics.astype(np.uint8), cmap='gray_r', vmin=0, vmax=1)
+            ax5.set_title(f'Valid Mask\n({valid_mask_metrics.sum():,} pixels)',
+                         fontsize=12, fontweight='bold')
             ax5.axis('off')
 
             # 6. Absolute Error Map
             ax6 = fig.add_subplot(gs[1, 1])
-            # abs_error and abs_error_masked already computed above
-            error_vmax = np.nanpercentile(abs_error_masked, 95)
-            im6 = ax6.imshow(abs_error_masked, cmap='hot', vmin=0, vmax=error_vmax)
-            ax6.set_title(f'Absolute Error (m)\nMean: {np.nanmean(abs_error_masked):.3f}',
-                         fontsize=14, fontweight='bold')
+            if has_valid_pixels:
+                error_vmax = np.nanpercentile(abs_error_masked, 95)
+                im6 = ax6.imshow(abs_error_masked, cmap='hot', vmin=0, vmax=error_vmax)
+                ax6.set_title(f'Absolute Error (m)\nMean: {np.nanmean(abs_error_masked):.3f}',
+                             fontsize=14, fontweight='bold')
+                plt.colorbar(im6, ax=ax6, fraction=0.046, pad=0.04)
+            else:
+                # No valid pixels - show placeholder
+                ax6.text(0.5, 0.5, 'No Valid Pixels\n(All depths > 70m or invalid)',
+                        ha='center', va='center', transform=ax6.transAxes,
+                        fontsize=12, color='red', fontweight='bold')
+                ax6.set_title('Absolute Error (m)\nN/A', fontsize=14, fontweight='bold')
             ax6.axis('off')
-            plt.colorbar(im6, ax=ax6, fraction=0.046, pad=0.04)
 
-            # 7. Metric Evaluation
+            # 7. Metric Evaluation (using 70m threshold)
             ax7 = fig.add_subplot(gs[1, 2])
-            if valid_mask.sum() > 0:
+            if valid_mask_metrics.sum() > 0:
                 pred_tensor = torch.from_numpy(pred_depth_frame).float()
                 gt_tensor = torch.from_numpy(gt_depth_frame).float()
-                valid_tensor = torch.from_numpy(valid_mask).bool()
+                valid_tensor = torch.from_numpy(valid_mask_metrics).bool()
 
                 metrics = MetricDepthMetrics.compute_metric_depth_metrics(
                     pred_tensor, gt_tensor, valid_tensor
@@ -257,11 +285,11 @@ class Gear2Visualizer:
             ax8.set_title('Training Info', fontsize=14, fontweight='bold')
             ax8.axis('off')
 
-            # 9. Depth Distribution Histogram
+            # 9. Depth Distribution Histogram (70m threshold for metrics)
             ax9 = fig.add_subplot(gs[2, :2])
-            if valid_mask.sum() > 0:
-                gt_valid = gt_depth_frame[valid_mask]
-                pred_valid = pred_depth_frame[valid_mask]
+            if valid_mask_metrics.sum() > 0:
+                gt_valid = gt_depth_frame[valid_mask_metrics]
+                pred_valid = pred_depth_frame[valid_mask_metrics]
 
                 bins = np.linspace(min(gt_valid.min(), pred_valid.min()),
                                   max(gt_valid.max(), pred_valid.max()), 50)
