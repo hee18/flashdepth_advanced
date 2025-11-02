@@ -68,6 +68,7 @@ show_usage() {
     echo "  --resolution MODE    Set resolution mode for testing: base (518x518), 2k (1918x1078) (default: base)"
     echo "  --config VARIANT     Set FlashDepth config: flashdepth, flashdepth-l, flashdepth-s (default: flashdepth-l)"
     echo "  --inverse BOOL       Inverse colormap for depth (original FlashDepth only, default: false)"
+    echo "  --no-video           Skip video (GIF/MP4) generation for faster testing"
     echo ""
     echo "Note: --phase option is DEPRECATED. Use --config-variant (l/s/hybrid) instead."
     echo ""
@@ -95,6 +96,7 @@ show_usage() {
     echo "  $0 test_gear3_upgrade --separation kmeans --gpu 1  # Test with K-means separation method"
     echo "  $0 test_gear3_upgrade --vid-len 25 --frame-interval 5  # Custom video length and interval"
     echo "  $0 test_gear3_upgrade --dataset waymo --gpu 2  # Test on Waymo dataset"
+    echo "  $0 test_gear3_upgrade --vid-len 200 --no-video --gpu 2  # Fast testing without video generation"
     echo "  $0 test_gear2_objwise --dataset waymo_seg --config-variant l --gpu 0  # Object-wise evaluation on Waymo"
     echo "  $0 test_gear3_objwise --dataset waymo_seg --config-variant l --gpu 1  # Object-wise evaluation on Waymo"
     echo "  $0 test_gear3_upgrade_objwise --dataset waymo_seg --config-variant l --separation kmeans --gpu 2  # Gear3 Upgrade object-wise"
@@ -127,6 +129,7 @@ CONFIG="flashdepth-l"  # FlashDepth config variant (flashdepth, flashdepth-l, fl
 INVERSE="false"  # Inverse colormap for depth visualization (original FlashDepth only)
 OBJWISE_DATASET=""  # Dataset for evaluation (waymo) - empty means use config default
 RESOLUTION="base"  # Resolution mode for testing (base, 2k) - default to base (518x518)
+NO_VIDEO="false"  # Skip video (GIF/MP4) generation for faster testing
 
 # Parse arguments
 USER_BATCH_SIZE=""  # Track if user explicitly set batch size
@@ -213,6 +216,10 @@ while [[ $# -gt 0 ]]; do
         --inverse)
             INVERSE="$2"
             shift 2
+            ;;
+        --no-video)
+            NO_VIDEO="true"
+            shift
             ;;
         -h|--help)
             show_usage
@@ -787,6 +794,11 @@ case $COMMAND in
 
         # Add frame interval and video length options
         TEST_CMD="$TEST_CMD +frame_interval=$FRAME_INTERVAL +vid_len=$VID_LEN"
+
+        # Add video generation control
+        if [ "$NO_VIDEO" == "true" ]; then
+            TEST_CMD="$TEST_CMD eval.out_video=false"
+        fi
 
         # Add single sequence path if specified
         if [ -n "$SINGLE_SEQUENCE" ]; then
