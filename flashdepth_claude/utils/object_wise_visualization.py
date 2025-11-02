@@ -130,10 +130,10 @@ def create_object_wise_grid(
 def create_class_overlay(input_image, gt_depth, pred_depth, class_mask, depth_min, depth_max, cmap='turbo'):
     """
     Create 2x2 overlay for a single class:
-    - Top-left: Input image with segmentation highlight
-    - Top-right: GT depth (class region only)
-    - Bottom-left: Predicted depth (class region only)
-    - Bottom-right: Error map (class region only)
+    - Top-left: Input image (clean, no overlay)
+    - Top-right: Object mask (white=object, black=background)
+    - Bottom-left: GT depth (class region only)
+    - Bottom-right: Predicted depth (class region only)
 
     Args:
         input_image: RGB image (H, W, 3) in [0, 1]
@@ -152,14 +152,15 @@ def create_class_overlay(input_image, gt_depth, pred_depth, class_mask, depth_mi
     # Get colormap
     cmap_func = plt.get_cmap(cmap)
 
-    # 1. Input with segmentation highlight (top-left)
-    input_overlay = input_image.copy()
-    # Highlight class region with semi-transparent green overlay
-    highlight = np.zeros_like(input_overlay)
-    highlight[class_mask] = [0, 1, 0]  # Green
-    input_overlay = input_overlay * 0.7 + highlight * 0.3
+    # 1. Input image (top-left) - clean, no overlay
+    input_clean = input_image.copy()
 
-    # 2. GT depth (top-right)
+    # 2. Object mask (top-right) - white for object, black for background
+    mask_vis = np.zeros((h, w, 3), dtype=np.float32)
+    mask_vis[class_mask] = [1.0, 1.0, 1.0]  # White for class region
+    mask_vis[~class_mask] = [0.0, 0.0, 0.0]  # Black for background
+
+    # 3. GT depth (bottom-left)
     gt_vis = np.zeros((h, w, 3))
     if class_mask.sum() > 0:
         gt_normalized = np.clip((gt_depth - depth_min) / (depth_max - depth_min + 1e-8), 0, 1)
@@ -167,7 +168,7 @@ def create_class_overlay(input_image, gt_depth, pred_depth, class_mask, depth_mi
         # Only show class region
         gt_vis[class_mask] = gt_colored[class_mask]
 
-    # 3. Predicted depth (bottom-left)
+    # 4. Predicted depth (bottom-right)
     pred_vis = np.zeros((h, w, 3))
     if class_mask.sum() > 0:
         pred_normalized = np.clip((pred_depth - depth_min) / (depth_max - depth_min + 1e-8), 0, 1)
@@ -175,21 +176,9 @@ def create_class_overlay(input_image, gt_depth, pred_depth, class_mask, depth_mi
         # Only show class region
         pred_vis[class_mask] = pred_colored[class_mask]
 
-    # 4. Error map (bottom-right)
-    error_vis = np.zeros((h, w, 3))
-    if class_mask.sum() > 0:
-        error = np.abs(pred_depth - gt_depth)
-        # Normalize error (0 = blue, high error = red)
-        error_max = np.percentile(error[class_mask], 95)  # Robust max
-        error_normalized = np.clip(error / (error_max + 1e-8), 0, 1)
-        error_cmap = plt.get_cmap('RdYlBu_r')  # Red for high error, blue for low error
-        error_colored = error_cmap(error_normalized)[:, :, :3]
-        # Only show class region
-        error_vis[class_mask] = error_colored[class_mask]
-
     # Combine into 2x2 grid
-    top_row = np.concatenate([input_overlay, gt_vis], axis=1)
-    bottom_row = np.concatenate([pred_vis, error_vis], axis=1)
+    top_row = np.concatenate([input_clean, mask_vis], axis=1)
+    bottom_row = np.concatenate([gt_vis, pred_vis], axis=1)
     combined = np.concatenate([top_row, bottom_row], axis=0)
 
     return combined

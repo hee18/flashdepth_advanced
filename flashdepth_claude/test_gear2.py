@@ -34,7 +34,6 @@ sys.path.insert(0, str(project_root))
 from flashdepth.model import FlashDepth
 from flashdepth.gear2_modules import Gear2MetricHead
 from dataloaders.combined_dataset import CombinedDataset
-from dataloaders.sintel_segmentation_dataset import SintelSegmentationDataset, collate_fn as sintel_collate_fn
 from dataloaders.waymo_segmentation_dataset import WaymoSegmentationDataset, collate_fn as waymo_collate_fn
 from utils.metric_depth_metrics import MetricDepthMetrics, format_metrics
 from utils.object_wise_evaluation import ObjectWiseMetrics
@@ -156,18 +155,10 @@ class Gear2Tester:
         # Object-wise evaluation: use segmentation datasets
         if self.object_wise_enabled:
             video_length = int(self.config.get('vid_len', 50))  # Ensure integer (Hydra may pass string)
-            resolution = self.config.eval.test_dataset_resolution
+            resolution = self.config.get('resolution', self.config.eval.test_dataset_resolution)  # Allow resolution override
             data_root = self.config.dataset.data_root
 
-            if self.object_wise_dataset == 'sintel':
-                test_dataset = SintelSegmentationDataset(
-                    data_root=data_root,
-                    split='val',
-                    video_length=video_length,
-                    resolution=resolution
-                )
-                collate_fn = sintel_collate_fn
-            elif self.object_wise_dataset == 'waymo':
+            if self.object_wise_dataset == 'waymo':
                 test_dataset = WaymoSegmentationDataset(
                     data_root=data_root,
                     split='val',
@@ -191,14 +182,16 @@ class Gear2Tester:
             # Normal mode: use CombinedDataset
             test_datasets = self.config.eval.test_datasets
             video_length = int(self.config.get('vid_len', 50))  # Ensure integer (Hydra may pass string)
+            resolution = self.config.get('resolution', self.config.eval.test_dataset_resolution)  # Allow resolution override
 
             logger.info(f"Test datasets: {test_datasets}")
             logger.info(f"Video length: {video_length}")
+            logger.info(f"Resolution: {resolution}")
 
             test_dataset = CombinedDataset(
                 root_dir=self.config.dataset.data_root,
                 enable_dataset_flags=test_datasets,
-                resolution=self.config.eval.test_dataset_resolution,
+                resolution=resolution,
                 split='val',  # Use 'val' split which returns dict format
                 video_length=video_length
             )
@@ -728,33 +721,7 @@ class Gear2Tester:
                 metrics['object_wise'] = class_metrics
                 logger.info(f"Computed object-wise metrics for {len(class_metrics)} classes")
 
-                # Create object-wise visualization
-                if class_metrics:
-                    try:
-                        # Get last frame image (convert to numpy HWC format)
-                        img_last = images[0, -1].cpu().numpy()  # [3, H, W]
-                        img_last = img_last.transpose(1, 2, 0)  # [H, W, 3]
-
-                        # Normalize to [0, 1] if needed
-                        if img_last.max() > 1.0:
-                            img_last = img_last / 255.0
-
-                        # Create visualization
-                        objwise_vis_path = self.save_dir / f"objwise_seq{sequence_id:04d}.png"
-                        create_object_wise_grid(
-                            input_image=img_last,
-                            gt_depth=gt_last,
-                            pred_depth=pred_last,
-                            seg_mask=seg_mask_np,
-                            class_metrics=class_metrics,
-                            class_names_dict=self.object_wise_metrics.classes,
-                            output_path=str(objwise_vis_path)
-                        )
-                        logger.info(f"Saved object-wise visualization to {objwise_vis_path}")
-                    except Exception as vis_e:
-                        logger.error(f"Error creating object-wise visualization: {vis_e}")
-                        import traceback
-                        traceback.print_exc()
+                # Note: objwise_seq visualization disabled - using best_frame with object mask instead
 
             except Exception as e:
                 logger.error(f"Error computing object-wise metrics: {e}")
@@ -788,6 +755,10 @@ class Gear2Tester:
             fg_features_frame = fg_features_all[best_frame_idx] if fg_features_all is not None else None
             bg_features_frame = bg_features_all[best_frame_idx] if bg_features_all is not None else None
 
+            # Pass object-wise data if available
+            seg_mask_for_viz = seg_mask_np if self.config.object_wise.get('enabled', False) and 'seg_mask_np' in locals() else None
+            class_metrics_for_viz = class_metrics if self.config.object_wise.get('enabled', False) and 'class_metrics' in locals() else None
+
             self._save_best_frame_visualizations(
                 images[0, best_frame_idx],  # [3, H, W]
                 pred_depths[best_frame_idx, 0],  # [H, W]
@@ -798,7 +769,9 @@ class Gear2Tester:
                 sequence_id,
                 best_frame_idx,
                 best_frame_abs_rel,
-                fps  # Add FPS
+                fps,  # Add FPS
+                seg_mask_for_viz,  # Add segmentation mask
+                class_metrics_for_viz  # Add class metrics
             )
 
         return metrics
@@ -976,7 +949,8 @@ class Gear2Tester:
         return grid
 
     def _save_best_frame_visualizations(self, image, pred_depth, gt_depth, importance_map,
-                                        fg_features, bg_features, sequence_id, frame_idx, abs_rel, fps=None):
+                                        fg_features, bg_features, sequence_id, frame_idx, abs_rel, fps=None,
+                                        seg_mask=None, class_metrics=None):
         """
         Save best frame visualization matching train_gear3_upgrade layout
 
@@ -1092,15 +1066,25 @@ class Gear2Tester:
         ax6.set_title('BG Mask (N/A)', fontsize=14, fontweight='bold')
         ax6.axis('off')
 
-        # ==================== Row 3: Valid Mask, Error, Metrics ====================
+        # ==================== Row 3: Valid/Object Mask, Error, Metrics ====================
 
-        # 7. Valid Mask
+        # 7. Valid Mask or Object Mask (depending on object_wise mode)
         ax7 = fig.add_subplot(gs[2, 0])
-        ax7.imshow(valid_mask.astype(np.uint8), cmap='gray_r', vmin=0, vmax=1)
-        valid_ratio = valid_mask.sum() / valid_mask.size
-        ax7.set_title(f'Valid Mask\n{valid_ratio*100:.1f}% ({valid_mask.sum():,} pixels)',
-                     fontsize=14, fontweight='bold')
-        ax7.axis('off')
+        if seg_mask is None:
+            # Non-object-wise mode: show Valid Mask (like train visualizer)
+            ax7.imshow(valid_mask.astype(np.uint8), cmap='gray_r', vmin=0, vmax=1)
+            ax7.set_title(f'Valid Mask\n({valid_mask.sum():,} pixels)',
+                         fontsize=12, fontweight='bold')
+            ax7.axis('off')
+        else:
+            # Object-wise mode: show Object Mask
+            object_mask = (seg_mask > 0).astype(np.uint8)
+            ax7.imshow(object_mask, cmap='gray', vmin=0, vmax=1)
+            object_ratio = object_mask.sum() / object_mask.size
+            num_classes = len(np.unique(seg_mask[seg_mask > 0])) if (seg_mask > 0).any() else 0
+            ax7.set_title(f'Object Mask\n{object_ratio*100:.1f}% ({object_mask.sum():,} pixels)\n{num_classes} classes',
+                         fontsize=14, fontweight='bold')
+            ax7.axis('off')
 
         # 8. Absolute Error Map
         ax8 = fig.add_subplot(gs[2, 1])
@@ -1161,6 +1145,39 @@ class Gear2Tester:
             y_pos -= 0.08
             ax9.text(0.05, y_pos, f'MAE: {mae:.3f}m', fontsize=9,
                     transform=ax9.transAxes, bbox=dict(boxstyle="round", facecolor='lightblue'))
+            y_pos -= 0.08
+
+        # Per-class pixel counts (if available)
+        if class_metrics is not None and len(class_metrics) > 0:
+            # Add separator
+            y_pos -= 0.02
+            ax9.text(0.05, y_pos, '─' * 30, fontsize=8, transform=ax9.transAxes)
+            y_pos -= 0.06
+
+            # Add header
+            ax9.text(0.05, y_pos, 'Top 5 Classes (Pixels):', fontsize=9,
+                    transform=ax9.transAxes, fontweight='bold',
+                    bbox=dict(boxstyle="round", facecolor='lightyellow'))
+            y_pos -= 0.08
+
+            # Sort by pixel count and show top 5
+            sorted_classes = sorted(
+                class_metrics.items(),
+                key=lambda x: x[1].get('num_pixels', 0),
+                reverse=True
+            )[:5]
+
+            total_pixels = seg_mask.size if seg_mask is not None else 1
+
+            for class_name, metrics_dict in sorted_classes:
+                num_pixels = metrics_dict.get('num_pixels', 0)
+                percent = 100.0 * num_pixels / total_pixels
+                # Shorten class name if too long
+                display_name = class_name[:12] + '...' if len(class_name) > 15 else class_name
+                ax9.text(0.05, y_pos, f'{display_name}: {percent:.1f}%',
+                        fontsize=8, transform=ax9.transAxes,
+                        bbox=dict(boxstyle="round", facecolor='lavender', alpha=0.7))
+                y_pos -= 0.06
 
         ax9.set_title('Depth Metrics', fontsize=14, fontweight='bold')
         ax9.axis('off')
@@ -1196,11 +1213,11 @@ class Gear2Tester:
         ax11.axis('off')
 
         # Overall title
-        plt.suptitle(f'Gear2 (Ablation): Sequence {sequence_id+1} Best Frame {frame_idx}',
+        plt.suptitle(f'Gear2 (Ablation): Sequence {sequence_id} Best Frame {frame_idx}',
                     fontsize=16, fontweight='bold')
 
         # Save with same naming convention
-        save_path = self.save_dir / f"best_frame_seq{sequence_id+1}_{frame_idx}_absrel_{abs_rel:.4f}.png"
+        save_path = self.save_dir / f"best_frame_seq{sequence_id}_{frame_idx}_absrel_{abs_rel:.4f}.png"
         plt.savefig(save_path, dpi=150, bbox_inches='tight', facecolor='white')
         plt.close(fig)
 
@@ -1212,6 +1229,10 @@ class Gear2Tester:
         aggregated = {}
 
         for key in metric_keys:
+            # Skip nested dictionaries (like object_wise metrics)
+            if key == 'object_wise':
+                continue
+
             values = [m[key] for m in all_metrics if key in m]
             if values:
                 aggregated[key] = np.mean(values)

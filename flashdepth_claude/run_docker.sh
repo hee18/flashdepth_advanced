@@ -41,8 +41,8 @@ show_usage() {
     echo "  train_gear3_upgrade Start Gear3 Upgrade training (single GPU) - Enhanced FG/BG separation"
     echo "  train_gear3_upgrade_ddp Start Gear3 Upgrade training with 2 GPUs (GPU 0,1)"
     echo "  test_gear3_upgrade  Start Gear3 Upgrade testing (supports --separation option)"
-    echo "  test_gear2_objwise  Start Gear2 object-wise evaluation (Waymo/Sintel segmentation)"
-    echo "  test_gear3_objwise  Start Gear3 object-wise evaluation (Waymo/Sintel segmentation)"
+    echo "  test_gear2_objwise  Start Gear2 object-wise evaluation (Waymo segmentation)"
+    echo "  test_gear3_objwise  Start Gear3 object-wise evaluation (Waymo segmentation)"
     echo "  test_gear3_upgrade_objwise  Start Gear3 Upgrade object-wise evaluation"
     echo "  test_original_flashdepth  Test original FlashDepth (without Gear modules) for comparison"
     echo "  shell       Start interactive shell in container"
@@ -64,7 +64,8 @@ show_usage() {
     echo "  --config-variant VARIANT  Set Gear config variant: l, s, hybrid (default: l for Stage 1)"
     echo "  --nuscenes            Enable nuScenes fine-tuning mode (Stage 3)"
     echo "  --separation METHOD  Set FG/BG separation method: cls_seg, kmeans, multi_layer (default: cls_seg)"
-    echo "  --dataset DATASET     Set object-wise evaluation dataset: waymo, sintel (default: waymo)"
+    echo "  --dataset DATASET     Set object-wise evaluation dataset: waymo (default: waymo)"
+    echo "  --resolution MODE    Set resolution mode for testing: base (518x518), 2k (1918x1078) (default: base)"
     echo "  --config VARIANT     Set FlashDepth config: flashdepth, flashdepth-l, flashdepth-s (default: flashdepth-l)"
     echo "  --inverse BOOL       Inverse colormap for depth (original FlashDepth only, default: false)"
     echo ""
@@ -94,9 +95,10 @@ show_usage() {
     echo "  $0 test_gear3_upgrade --separation kmeans --gpu 1  # Test with K-means separation method"
     echo "  $0 test_gear3_upgrade --vid-len 25 --frame-interval 5  # Custom video length and interval"
     echo "  $0 test_gear3_upgrade --dataset waymo --gpu 2  # Test on Waymo dataset"
-    echo "  $0 test_gear2_objwise --dataset waymo --gpu 0  # Object-wise evaluation on Waymo"
-    echo "  $0 test_gear3_objwise --dataset sintel --gpu 1  # Object-wise evaluation on Sintel"
-    echo "  $0 test_original_flashdepth --gpu 0  # Test original FlashDepth on Sintel dataset (ViT-L)"
+    echo "  $0 test_gear2_objwise --dataset waymo_seg --config-variant l --gpu 0  # Object-wise evaluation on Waymo"
+    echo "  $0 test_gear3_objwise --dataset waymo_seg --config-variant l --gpu 1  # Object-wise evaluation on Waymo"
+    echo "  $0 test_gear3_upgrade_objwise --dataset waymo_seg --config-variant l --separation kmeans --gpu 2  # Gear3 Upgrade object-wise"
+    echo "  $0 test_original_flashdepth --gpu 0  # Test original FlashDepth (ViT-L)"
     echo "  DATASET=waymo $0 test_original_flashdepth --gpu 1  # Test on Waymo dataset"
     echo "  $0 test_original_flashdepth --config flashdepth-s --gpu 0  # Use ViT-S variant (smaller/faster)"
     echo "  CHECKPOINT=/app/configs/flashdepth-s/iter_10001.pth $0 test_original_flashdepth --config flashdepth-s  # ViT-S with matching checkpoint"
@@ -123,7 +125,8 @@ PHASE=1  # DEPRECATED: Use --config-variant instead (kept for backwards compatib
 SEPARATION_METHOD="cls_seg"  # FG/BG separation method for Gear3 Upgrade (cls_seg, kmeans, multi_layer)
 CONFIG="flashdepth-l"  # FlashDepth config variant (flashdepth, flashdepth-l, flashdepth-s)
 INVERSE="false"  # Inverse colormap for depth visualization (original FlashDepth only)
-OBJWISE_DATASET=""  # Dataset for evaluation (waymo, sintel, etc.) - empty means use config default
+OBJWISE_DATASET=""  # Dataset for evaluation (waymo) - empty means use config default
+RESOLUTION="base"  # Resolution mode for testing (base, 2k) - default to base (518x518)
 
 # Parse arguments
 USER_BATCH_SIZE=""  # Track if user explicitly set batch size
@@ -197,6 +200,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --dataset)
             OBJWISE_DATASET="$2"
+            shift 2
+            ;;
+        --resolution)
+            RESOLUTION="$2"
             shift 2
             ;;
         --config)
@@ -653,6 +660,9 @@ case $COMMAND in
         echo "  - Video length: $VID_LEN"
         echo "  - Frame interval: $FRAME_INTERVAL"
         echo "  - Checkpoint: $FLASHDEPTH_CHECKPOINT"
+        if [ -n "$OBJWISE_DATASET" ]; then
+            echo "  - Dataset: $OBJWISE_DATASET"
+        fi
         if [ -n "$SINGLE_SEQUENCE" ]; then
             echo "  - Single sequence: $SINGLE_SEQUENCE"
         fi
@@ -660,6 +670,14 @@ case $COMMAND in
 
         # Build test_gear2 command with config variant
         TEST_CMD="python test_gear2.py --config-path configs/gear2 --config-name config_$CONFIG_VARIANT dataset.data_root=/data/datasets +results_dir=$RESULTS_DIR +gpu=$GPU_ID"
+
+        # Override dataset if specified
+        if [ -n "$OBJWISE_DATASET" ]; then
+            TEST_CMD="$TEST_CMD eval.test_datasets=[$OBJWISE_DATASET]"
+        fi
+
+        # Add resolution override
+        TEST_CMD="$TEST_CMD +resolution=$RESOLUTION"
 
         # Use --checkpoint option for the unified checkpoint
         if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
@@ -692,6 +710,9 @@ case $COMMAND in
         echo "  - Video length: $VID_LEN"
         echo "  - Frame interval: $FRAME_INTERVAL"
         echo "  - Checkpoint: $FLASHDEPTH_CHECKPOINT"
+        if [ -n "$OBJWISE_DATASET" ]; then
+            echo "  - Dataset: $OBJWISE_DATASET"
+        fi
         if [ -n "$SINGLE_SEQUENCE" ]; then
             echo "  - Single sequence: $SINGLE_SEQUENCE"
         fi
@@ -699,6 +720,14 @@ case $COMMAND in
 
         # Build test_gear3 command with config variant
         TEST_CMD="python test_gear3.py --config-path configs/gear3 --config-name config_$CONFIG_VARIANT dataset.data_root=/data/datasets +results_dir=$RESULTS_DIR +gpu=$GPU_ID"
+
+        # Override dataset if specified
+        if [ -n "$OBJWISE_DATASET" ]; then
+            TEST_CMD="$TEST_CMD eval.test_datasets=[$OBJWISE_DATASET]"
+        fi
+
+        # Add resolution override
+        TEST_CMD="$TEST_CMD +resolution=$RESOLUTION"
 
         # Use --checkpoint option for the unified checkpoint
         if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
@@ -748,6 +777,9 @@ case $COMMAND in
             TEST_CMD="$TEST_CMD eval.test_datasets=[$OBJWISE_DATASET]"
         fi
 
+        # Add resolution override
+        TEST_CMD="$TEST_CMD +resolution=$RESOLUTION"
+
         # Use --checkpoint option for the unified checkpoint
         if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
             TEST_CMD="$TEST_CMD load=$FLASHDEPTH_CHECKPOINT"
@@ -780,10 +812,11 @@ case $COMMAND in
 
     test_gear2_objwise)
         # Object-wise evaluation for Gear2
-        OBJWISE_DATASET=${OBJWISE_DATASET:-waymo}  # Default to waymo
+        OBJWISE_DATASET=${OBJWISE_DATASET:-waymo_seg}  # Default to waymo_seg
 
         echo "Starting Gear2 Object-Wise Evaluation..."
         echo "Configuration:"
+        echo "  - Config variant: $CONFIG_VARIANT"
         echo "  - Dataset: $OBJWISE_DATASET"
         echo "  - GPU: $GPU_ID"
         echo "  - Results directory: $RESULTS_DIR"
@@ -792,7 +825,7 @@ case $COMMAND in
         echo ""
 
         # Build command with object-wise options
-        TEST_CMD="python test_gear2.py --config-path configs/gear2 dataset.data_root=/data/datasets/${OBJWISE_DATASET}_seg +results_dir=$RESULTS_DIR +gpu=$GPU_ID object_wise.enabled=true object_wise.dataset=$OBJWISE_DATASET +vid_len=$VID_LEN"
+        TEST_CMD="python test_gear2.py --config-path configs/gear2 --config-name config_$CONFIG_VARIANT dataset.data_root=/data/datasets eval.test_datasets=[$OBJWISE_DATASET] +results_dir=$RESULTS_DIR +gpu=$GPU_ID object_wise.enabled=true object_wise.dataset=${OBJWISE_DATASET/_seg/} +vid_len=$VID_LEN"
 
         if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
             TEST_CMD="$TEST_CMD load=$FLASHDEPTH_CHECKPOINT"
@@ -803,10 +836,11 @@ case $COMMAND in
 
     test_gear3_objwise)
         # Object-wise evaluation for Gear3
-        OBJWISE_DATASET=${OBJWISE_DATASET:-waymo}  # Default to waymo
+        OBJWISE_DATASET=${OBJWISE_DATASET:-waymo_seg}  # Default to waymo_seg
 
         echo "Starting Gear3 Object-Wise Evaluation..."
         echo "Configuration:"
+        echo "  - Config variant: $CONFIG_VARIANT"
         echo "  - Dataset: $OBJWISE_DATASET"
         echo "  - GPU: $GPU_ID"
         echo "  - Results directory: $RESULTS_DIR"
@@ -815,7 +849,7 @@ case $COMMAND in
         echo ""
 
         # Build command with object-wise options
-        TEST_CMD="python test_gear3.py --config-path configs/gear3 dataset.data_root=/data/datasets/${OBJWISE_DATASET}_seg +results_dir=$RESULTS_DIR +gpu=$GPU_ID object_wise.enabled=true object_wise.dataset=$OBJWISE_DATASET +vid_len=$VID_LEN"
+        TEST_CMD="python test_gear3.py --config-path configs/gear3 --config-name config_$CONFIG_VARIANT dataset.data_root=/data/datasets eval.test_datasets=[$OBJWISE_DATASET] +results_dir=$RESULTS_DIR +gpu=$GPU_ID object_wise.enabled=true object_wise.dataset=${OBJWISE_DATASET/_seg/} +vid_len=$VID_LEN"
 
         if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
             TEST_CMD="$TEST_CMD load=$FLASHDEPTH_CHECKPOINT"
@@ -826,11 +860,12 @@ case $COMMAND in
 
     test_gear3_upgrade_objwise)
         # Object-wise evaluation for Gear3 Upgrade
-        OBJWISE_DATASET=${OBJWISE_DATASET:-waymo}  # Default to waymo
+        OBJWISE_DATASET=${OBJWISE_DATASET:-waymo_seg}  # Default to waymo_seg
         SEPARATION_METHOD=${SEPARATION_METHOD:-kmeans}  # Default separation method
 
         echo "Starting Gear3 Upgrade Object-Wise Evaluation..."
         echo "Configuration:"
+        echo "  - Config variant: $CONFIG_VARIANT"
         echo "  - Dataset: $OBJWISE_DATASET"
         echo "  - Separation method: $SEPARATION_METHOD"
         echo "  - GPU: $GPU_ID"
@@ -840,7 +875,7 @@ case $COMMAND in
         echo ""
 
         # Build command with object-wise options
-        TEST_CMD="python test_gear3_upgrade.py --config-path configs/gear3_upgrade dataset.data_root=/data/datasets/${OBJWISE_DATASET}_seg +results_dir=$RESULTS_DIR +gpu=$GPU_ID separation_method=$SEPARATION_METHOD object_wise.enabled=true object_wise.dataset=$OBJWISE_DATASET +vid_len=$VID_LEN"
+        TEST_CMD="python test_gear3_upgrade.py --config-path configs/gear3_upgrade --config-name config_$CONFIG_VARIANT dataset.data_root=/data/datasets eval.test_datasets=[$OBJWISE_DATASET] +results_dir=$RESULTS_DIR +gpu=$GPU_ID separation_method=$SEPARATION_METHOD object_wise.enabled=true object_wise.dataset=${OBJWISE_DATASET/_seg/} +vid_len=$VID_LEN"
 
         if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
             TEST_CMD="$TEST_CMD load=$FLASHDEPTH_CHECKPOINT"
@@ -851,7 +886,7 @@ case $COMMAND in
 
     test_original_flashdepth)
         # Test original FlashDepth (without Gear modules)
-        DATASET=${DATASET:-sintel}
+        DATASET=${DATASET:-waymo}
 
         # Initialize CHECKPOINT from FLASHDEPTH_CHECKPOINT or environment variable
         if [ -z "$CHECKPOINT" ]; then
@@ -940,7 +975,7 @@ case $COMMAND in
         echo "  - FPS Summary: ${LOCAL_OUTFOLDER}/fps_results.json"
         echo "  - Per-sequence FPS: ${LOCAL_OUTFOLDER}/per_sequence_fps.json"
         echo "  - Full log: ${LOCAL_OUTFOLDER}/test.log"
-        echo "  - Depth files: ${LOCAL_OUTFOLDER}/sintel/"
+        echo "  - Depth files: ${LOCAL_OUTFOLDER}/"
         ;;
 
     clean)

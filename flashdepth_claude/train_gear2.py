@@ -529,13 +529,13 @@ class Gear2Trainer:
         if self.phase in [2, 3]:
             self.val_vis_config = {
                 'sintel': {'sequences': [0], 'saved': []},  # seq 0 only
-                'waymo': {'sequences': [0], 'saved': []}    # seq 0 only
+                'waymo_seg': {'sequences': [0], 'saved': []}    # seq 0 only
             }
         else:
             # Phase 1: Can afford more samples (518x518, no batch limit)
             self.val_vis_config = {
                 'sintel': {'sequences': [0, 4, 7], 'saved': []},  # seq 0, 4, 7 (3 samples)
-                'waymo': {'sequences': [0, 1, 2, 3, 4, 5, 6, 7], 'saved': []}  # all 8 sequences
+                'waymo_seg': {'sequences': [0, 1, 2, 3, 4, 5, 6, 7], 'saved': []}  # all 8 sequences
             }
 
     def _setup_model(self):
@@ -1218,12 +1218,19 @@ class Gear2Trainer:
         # Clamp prediction to reasonable range to prevent NaN
         pred_depth_inverse_flat = torch.clamp(pred_depth_inverse_flat, min=1e-3, max=1e4)
 
-        # Compute valid mask (GT only, like original FlashDepth)
-        MIN_INVERSE_DEPTH = 100.0 / 70.0  # Filter out >70m depths
-        valid_mask = (gt_depth_inverse_flat > MIN_INVERSE_DEPTH)
+        # Compute valid mask: GT and Pred must both be valid
+        # Warmup threshold for initial steps (prevent empty batches during initialization)
+        if self.global_step < 100:
+            MIN_INVERSE_DEPTH = 100.0 / 200.0  # Relaxed: 200m threshold for first 100 steps
+        else:
+            MIN_INVERSE_DEPTH = 100.0 / 70.0   # Normal: 70m threshold after warmup
+
+        gt_valid_mask = (gt_depth_inverse_flat > MIN_INVERSE_DEPTH)
+        pred_valid_mask = (pred_depth_inverse_flat > MIN_INVERSE_DEPTH)
+        valid_mask = gt_valid_mask & pred_valid_mask
 
         if valid_mask.sum() == 0:
-            self.logger.error("No valid GT pixels in batch!")
+            self.logger.error("No valid GT & Pred pixels in batch!")
             return {'loss': 0.0, 'depth_loss': 0.0}
 
         # Compute loss (like original FlashDepth)
@@ -1270,10 +1277,10 @@ class Gear2Trainer:
             self.val_vis_config[dataset_name]['saved'] = []
 
         # Track dataset-specific sequence counters for visualization
-        dataset_sequence_counters = {'sintel': 0, 'waymo': 0}
+        dataset_sequence_counters = {'sintel': 0, 'waymo_seg': 0}
 
         # Phase 2: Limit validation batches to save memory (2K resolution)
-        # 8 batches to ensure both sintel and waymo are included (DDP splits across ranks)
+        # 8 batches to ensure both sintel and waymo_seg are included (DDP splits across ranks)
         max_val_batches = 8 if self.phase >= 2 else None
 
         for batch_idx, batch in enumerate(tqdm(self.val_loader, desc="Validation", disable=(self.rank != 0))):
@@ -1288,6 +1295,16 @@ class Gear2Trainer:
             # Unpack batch
             images, gt_depth, dataset_idx = batch
             
+            # Get dataset name for this batch (before frame loop)
+            if isinstance(dataset_idx, str):
+                current_dataset = dataset_idx
+            elif isinstance(dataset_idx, (list, tuple)):
+                current_dataset = str(dataset_idx[0])
+            elif torch.is_tensor(dataset_idx):
+                current_dataset = str(dataset_idx[0].item() if dataset_idx.dim() > 0 else dataset_idx.item())
+            else:
+                current_dataset = str(dataset_idx)
+
             # Use BFloat16 autocast like original FlashDepth
             with torch.amp.autocast('cuda', dtype=torch.bfloat16):
                 images = images.to(self.device)
@@ -1364,9 +1381,13 @@ class Gear2Trainer:
                         )
 
                     # Compute loss in inverse depth space (100/m)
-                    # Filter out invalid inverse depths (valid_mask: >= 0 for original FlashDepth)
-                    gt_valid_mask = (gt_t_inverse >= 0)  # -1 means invalid
-                    valid_mask = gt_valid_mask.float()
+                    # Apply same 70m threshold as training for consistency
+                    MIN_INVERSE_DEPTH = 100.0 / 70.0  # Filter out >70m depths (same as training)
+
+                    # GT and Pred must both be valid (same as metrics calculation)
+                    gt_valid_mask = (gt_t_inverse >= MIN_INVERSE_DEPTH)  # GT within 70m and valid
+                    pred_valid_mask = (pred_depth_inverse >= MIN_INVERSE_DEPTH)  # Pred within reasonable range
+                    valid_mask = (gt_valid_mask & pred_valid_mask).float()
 
                     # Ensure shapes match: pred [B, 1, H, W], gt [B, 1, H, W], mask [B, 1, H, W]
                     if gt_t_inverse.dim() == 3:  # [B, H, W]
@@ -1377,16 +1398,6 @@ class Gear2Trainer:
                     if valid_mask.sum() > 0:
                         loss_t = self.loss_fn(pred_depth_inverse, gt_t_inverse, valid_mask)
                         frame_losses.append(loss_t.float())  # Convert to Float32 for accumulation
-
-                    # Get dataset name for this batch
-                    if isinstance(dataset_idx, str):
-                        current_dataset = dataset_idx
-                    elif isinstance(dataset_idx, (list, tuple)):
-                        current_dataset = str(dataset_idx[0])
-                    elif torch.is_tensor(dataset_idx):
-                        current_dataset = str(dataset_idx[0].item() if dataset_idx.dim() > 0 else dataset_idx.item())
-                    else:
-                        current_dataset = str(dataset_idx)
 
                     # Validation visualization: save multiple sequences per dataset (rank 0 only)
                     # Sintel: 3 samples (sequence 0, 5, 10)
@@ -1466,9 +1477,12 @@ class Gear2Trainer:
                     del encoder_features, cls_tokens_multi_layer, dpt_features, path_1
                     del path_1_modulated, importance_map, fg_features, bg_features, fg_mask, bg_mask, pred_depth_inverse
                     # Always clear cache after each frame to prevent OOM during validation
-                    torch.cuda.empty_cache()
+                    torch.cuda.empty_cache()                # Track sequence count (regardless of valid pixels)
+                if current_dataset not in dataset_sequence_counts:
+                    dataset_sequence_counts[current_dataset] = 0
+                dataset_sequence_counts[current_dataset] += 1
 
-                # Average loss over all frames in sequence
+                # Track loss only if valid pixels exist
                 if len(frame_losses) > 0:
                     avg_loss = sum(frame_losses) / len(frame_losses)
                     total_loss += avg_loss.item()
@@ -1477,9 +1491,7 @@ class Gear2Trainer:
                     # Track per-dataset loss
                     if current_dataset not in dataset_losses:
                         dataset_losses[current_dataset] = []
-                        dataset_sequence_counts[current_dataset] = 0
                     dataset_losses[current_dataset].append(avg_loss.item())
-                    dataset_sequence_counts[current_dataset] += 1
 
             # Increment sequence counter for this dataset
             if current_dataset in dataset_sequence_counters:
@@ -1496,18 +1508,27 @@ class Gear2Trainer:
             self.logger.info("=" * 80)
             self.logger.info(f"VALIDATION SUMMARY (Step {self.global_step})")
             self.logger.info("=" * 80)
-            self.logger.info(f"Total batches evaluated: {num_batches}")
+            self.logger.info(f"Total batches with valid pixels: {num_batches}")
 
-            for dataset_name, losses in dataset_losses.items():
-                dataset_avg = np.mean(losses)
-                dataset_std = np.std(losses)
-                num_seqs = dataset_sequence_counts[dataset_name]
-                self.logger.info(
-                    f"  [{dataset_name}] {num_seqs} sequences | "
-                    f"Loss: {dataset_avg:.4f} ± {dataset_std:.4f}"
-                )
+            # Show all datasets (including those with no valid pixels)
+            for dataset_name in dataset_sequence_counts.keys():
+                total_seqs = dataset_sequence_counts[dataset_name]
+                if dataset_name in dataset_losses:
+                    losses = dataset_losses[dataset_name]
+                    dataset_avg = np.mean(losses)
+                    dataset_std = np.std(losses)
+                    valid_seqs = len(losses)
+                    self.logger.info(
+                        f"  [{dataset_name}] {valid_seqs}/{total_seqs} sequences with valid pixels | "
+                        f"Loss: {dataset_avg:.4f} ± {dataset_std:.4f}"
+                    )
+                else:
+                    self.logger.info(
+                        f"  [{dataset_name}] 0/{total_seqs} sequences with valid pixels | "
+                        f"Loss: N/A (no valid pixels)"
+                    )
 
-            self.logger.info(f"Overall Average Loss: {avg_loss:.4f}")
+            self.logger.info(f"Overall Average Loss: {avg_loss:.4f} (from {num_batches} sequences)")
 
             # WARNING: Check if validation set is too small (Phase 2)
             if self.phase >= 2 and num_batches < 20:

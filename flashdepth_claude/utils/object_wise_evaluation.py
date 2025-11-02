@@ -82,40 +82,63 @@ class ObjectWiseMetrics:
         255: 'ignore'
     }
 
-    # Sintel Segmentation (Instance-based)
-    # Note: Sintel provides instance segmentation, not semantic classes
-    # We group by instance ID ranges or use instance-level metrics
-    SINTEL_CLASSES = {
-        0: 'background',
-        # Instance IDs 1-999: foreground objects (dynamic)
-        # We'll use clustering or simple foreground/background split
+
+    # Object class names (dynamic, movable objects) for visualization
+    # These classes will be visualized in test_object_wise
+
+    KITTI_OBJECT_CLASSES = {
+        'pedestrian', 'car', 'cyclist'
     }
+
+    CITYSCAPES_OBJECT_CLASSES = {
+        'person', 'rider', 'car', 'truck', 'bus', 'train',
+        'motorcycle', 'bicycle'
+    }
+
+    NYU_OBJECT_CLASSES = {
+        'chair', 'sofa', 'bed', 'table', 'tv', 'book'
+    }
+
+    VKITTI2_OBJECT_CLASSES = {
+        'truck', 'car', 'van'
+    }
+
+    WAYMO_OBJECT_CLASSES = {
+        'vehicle', 'pedestrian', 'cyclist', 'bicycle', 'motorcycle'
+    }
+
 
     def __init__(self, dataset_type: str = 'kitti'):
         """
         Initialize object-wise metrics calculator.
 
         Args:
-            dataset_type: Dataset type ('kitti', 'cityscapes', 'nyu', 'vkitti2', 'waymo', 'sintel')
+            dataset_type: Dataset type ('kitti', 'cityscapes', 'nyu', 'vkitti2', 'waymo')
+                         Also accepts '_seg' variants (e.g., 'waymo_seg')
         """
-        self.dataset_type = dataset_type.lower()
+        # Normalize dataset type: remove _seg suffix
+        self.dataset_type = dataset_type.lower().replace('_seg', '')
 
         if self.dataset_type == 'kitti':
             self.classes = self.KITTI_CLASSES
+            self.object_classes = self.KITTI_OBJECT_CLASSES
         elif self.dataset_type == 'cityscapes':
             self.classes = self.CITYSCAPES_CLASSES
+            self.object_classes = self.CITYSCAPES_OBJECT_CLASSES
         elif self.dataset_type == 'nyu':
             self.classes = self.NYU_CLASSES
+            self.object_classes = self.NYU_OBJECT_CLASSES
         elif self.dataset_type == 'vkitti2':
             self.classes = self.VKITTI2_CLASSES
+            self.object_classes = self.VKITTI2_OBJECT_CLASSES
         elif self.dataset_type == 'waymo':
             self.classes = self.WAYMO_CLASSES
-        elif self.dataset_type == 'sintel':
-            self.classes = self.SINTEL_CLASSES
+            self.object_classes = self.WAYMO_OBJECT_CLASSES
         else:
-            raise ValueError(f"Unknown dataset type: {dataset_type}")
+            raise ValueError(f"Unknown dataset type: {self.dataset_type} (original: {dataset_type})")
 
-        logger.info(f"Initialized object-wise metrics for {dataset_type} ({len(self.classes)} classes)")
+        logger.info(f"Initialized object-wise metrics for {self.dataset_type} ({len(self.classes)} classes)")
+        logger.info(f"Object classes for visualization: {len(self.object_classes)} classes")
 
     def compute_metrics_per_class(
         self,
@@ -138,6 +161,7 @@ class ObjectWiseMetrics:
         """
         results = {}
 
+        # Standard per-class processing
         # Get unique classes in this frame
         unique_classes = np.unique(seg_mask)
 
@@ -148,7 +172,7 @@ class ObjectWiseMetrics:
             class_name = self.classes[class_id]
 
             # Skip ignore classes
-            if class_name in ['ignore', 'unknown']:
+            if class_name in ['ignore', 'unknown', 'undefined']:
                 continue
 
             # Create mask for this class

@@ -8,9 +8,14 @@ from torchvision.transforms import Compose
 from PIL import Image
 import h5py
 import torch.distributed as dist
-import OpenEXR
 import pickle
-os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
+
+# OpenEXR is optional - only needed for certain datasets
+try:
+    import OpenEXR
+    os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
+except ImportError:
+    OpenEXR = None
 
 
 class BaseDatasetPairs(Dataset):
@@ -20,6 +25,10 @@ class BaseDatasetPairs(Dataset):
             from .spring_dataset import SpringDepth as DepthDataset
         elif dataset_name.lower() == 'waymo':
             from .waymo_dataset import WaymoDepth as DepthDataset
+            return DepthDataset(root_dir=root_dir, split=split, load_cache=load_cache, dataset_name='waymo')
+        elif dataset_name.lower() == 'waymo_seg':
+            from .waymo_dataset import WaymoDepth as DepthDataset
+            return DepthDataset(root_dir=root_dir, split=split, load_cache=load_cache, dataset_name='waymo_seg')
         elif dataset_name.lower() == 'dynamicreplica':
             from .dynamicreplica_dataset import DynamicReplicaDepth as DepthDataset
         elif dataset_name.lower() == 'pointodyssey':

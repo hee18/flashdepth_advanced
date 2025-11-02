@@ -14,12 +14,12 @@ class CombinedDataset(Dataset):
     def __init__(self, root_dir, enable_dataset_flags, resolution=None, split='train',
                  video_length=8, seed=42, tmp_res=None, color_aug=False):
         '''
-        enable_dataset_flags: list of datasets to use; e.g. ['spring', 'mvs-synth', 'urbansyn', 'eth3d', 'waymo']
+        enable_dataset_flags: list of datasets to use; e.g. ['spring', 'mvs-synth', 'urbansyn', 'eth3d', 'waymo', 'waymo_seg']
 
         # must have a couple of 2k, preferably dynamic datasets for testing
-        current options: eth3d, waymo, spring 
+        current options: eth3d, waymo, waymo_seg, spring
         eth resolution: 6048x4032 (ratio 1.5)
-        waymo: 1920x1280 (ratio 1.5)
+        waymo/waymo_seg: 1920x1280 (ratio 1.5)
         spring: 1920x1080 (ratio 1.77)
 
         # training datasets
@@ -86,7 +86,7 @@ class CombinedDataset(Dataset):
             else:
                 for dataset in self.reshape_list:
                     self.reshape_list[dataset]['crop_type'] = None
-                    if dataset in ['eth3d', 'waymo']:
+                    if dataset in ['eth3d', 'waymo', 'waymo_seg']:
                         self.reshape_list[dataset]['resolution'] = (784,518)
                     elif dataset in ['sintel']:
                         self.reshape_list[dataset]['resolution'] = (1022,434)
@@ -108,7 +108,7 @@ class CombinedDataset(Dataset):
             else:
                 for dataset in self.reshape_list:
                     self.reshape_list[dataset]['crop_type'] = None
-                    if dataset in ['eth3d', 'waymo']:
+                    if dataset in ['eth3d', 'waymo', 'waymo_seg']:
                         self.reshape_list[dataset]['resolution'] = (1918,1274) 
                     if dataset in ['sintel']:
                         self.reshape_list[dataset]['resolution'] = (1022,434)

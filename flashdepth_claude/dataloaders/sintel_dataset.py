@@ -15,7 +15,22 @@ import torch.distributed as dist
 from .base_dataset_pairs import BaseDatasetPairs
 
 class SintelDepth(BaseDatasetPairs):
-    def __init__(self, root_dir, split, load_cache=None):
+    def __init__(self, root_dir, split, load_cache=None, use_segmentation=False, return_dict=False, **kwargs):
+        """
+        Initialize Sintel dataset.
+
+        Args:
+            root_dir: Root directory
+            split: Dataset split ('train', 'val', 'test')
+            load_cache: Cache directory path
+            use_segmentation: Whether to load segmentation data (for sintel_seg) - currently ignored
+            return_dict: Whether to return dict (True) or tuple (False) - currently ignored
+            **kwargs: Additional arguments (ignored for now)
+
+        Note:
+            use_segmentation and return_dict are accepted for API compatibility but not used.
+            For object-wise evaluation with segmentation, use SintelSegmentationDataset directly.
+        """
         self.root_dir = os.path.join(root_dir, 'sintel/images/training/clean')
         super().__init__(dataset_name='sintel', root_dir=self.root_dir, split=split, load_cache=load_cache)
         # Set default parameters

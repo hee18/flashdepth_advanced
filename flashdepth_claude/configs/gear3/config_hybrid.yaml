@@ -17,7 +17,7 @@ dataset:
   resolution: '2k'  # 2K resolution for Stage 2
   video_length: 5
   train_datasets: [mvs-synth, spring]  # Only high-res datasets
-  val_datasets: [sintel, waymo]
+  val_datasets: [sintel, waymo_seg]
 
 # Training configuration
 training:
@@ -92,4 +92,4 @@ eval:
 # Object-wise evaluation configuration
 object_wise:
   enabled: false  # Enable object-wise evaluation (set via CLI: object_wise.enabled=true)
-  dataset: waymo  # Dataset type for object-wise eval: waymo, sintel
+  dataset: waymo_seg  # Dataset type for object-wise eval: waymo_seg, sintel

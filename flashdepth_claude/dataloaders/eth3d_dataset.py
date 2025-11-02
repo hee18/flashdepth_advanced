@@ -8,10 +8,10 @@ from torchvision.transforms import Compose
 from PIL import Image
 import h5py
 import torch.distributed as dist
-import OpenEXR
 import pickle
 from .base_dataset_pairs import BaseDatasetPairs
-os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
+
+# ETH3D doesn't use OpenEXR
 
 
 class Eth3dDepth(BaseDatasetPairs):
@@ -33,9 +33,15 @@ class Eth3dDepth(BaseDatasetPairs):
 
     def get_filter_scenes(self, split):
         all_scenes = self.get_all_scenes(self.get_scenes_path())
+        # filter_scenes = scenes to EXCLUDE
         if split == 'val':
-            return sorted(all_scenes)[8:]
-            # return ['relief_2', 'meadow', 'terrains']
+            # Exclude first 8 scenes (use last N scenes for validation)
+            # Also exclude multi_view_training_dslr_undistorted directory
+            exclude = sorted(all_scenes)[:8]
+            if 'multi_view_training_dslr_undistorted' not in exclude:
+                exclude.append('multi_view_training_dslr_undistorted')
+            return exclude
+        # For train: exclude nothing (use all)
         return []
 
     def get_rgb_depth_paths(self, scenes_path, scene_name):
@@ -51,11 +57,12 @@ class Eth3dDepth(BaseDatasetPairs):
         return img_name  # ETH3D uses same filename for depth and RGB
 
     def depth_read(self, path, return_torch=False, **kwargs):
-        imgpath = path.replace('ground_truth_depth', 'images')
-        h, w = cv2.imread(imgpath, cv2.IMREAD_ANYDEPTH).shape
+        # ETH3D depth is always stored at 6048x4032 resolution (original/native resolution)
+        # This is BEFORE any resizing in the dataloader preprocessing
+        w, h = 6048, 4032
 
         depth = np.fromfile(path, dtype=np.float32)
-        assert depth.size == h * w, "Mismatch between file size and expected depth dimensions"
+        assert depth.size == h * w, f"Mismatch between file size ({depth.size}) and expected depth dimensions ({h}x{w}={h*w})"
         depth = depth.reshape((h, w))
 
         invalid_mask = depth == np.inf

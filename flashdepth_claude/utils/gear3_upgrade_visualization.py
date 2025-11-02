@@ -17,7 +17,7 @@ import cv2
 from PIL import Image
 import logging
 from .metric_depth_metrics import MetricDepthMetrics
-from .sparse_depth_visualization import create_dual_sparse_depth_vis
+from .sparse_depth_visualization import create_sparse_depth_vis_no_inpaint
 
 
 class Gear3UpgradeVisualizer:
@@ -29,7 +29,7 @@ class Gear3UpgradeVisualizer:
     """
 
     # Sparse depth datasets that need inpainting for visualization
-    SPARSE_DATASETS = ['waymo', 'nuscenes']
+    SPARSE_DATASETS = ['waymo', 'waymo_seg', 'nuscenes']
 
     def __init__(self, save_dir="./visualizations"):
         self.save_dir = Path(save_dir)
@@ -126,13 +126,6 @@ class Gear3UpgradeVisualizer:
             # Normalize input image for display
             input_img = np.clip((input_img + 1) / 2, 0, 1)  # Assuming normalized input
 
-            # Debug: Check final shapes
-            print(f"DEBUG Visualization shapes:")
-            print(f"  input_img: {input_img.shape}")
-            print(f"  gt_depth_frame: {gt_depth_frame.shape}")
-            print(f"  pred_depth_frame: {pred_depth_frame.shape}")
-            print(f"  importance_frame: {importance_frame.shape}")
-
             # Ensure all frames are 2D
             while gt_depth_frame.ndim > 2:
                 gt_depth_frame = gt_depth_frame[0]
@@ -146,11 +139,6 @@ class Gear3UpgradeVisualizer:
             if bg_mask_frame is not None:
                 while bg_mask_frame.ndim > 2:
                     bg_mask_frame = bg_mask_frame[0]
-
-            print(f"DEBUG After squeeze:")
-            print(f"  gt_depth_frame: {gt_depth_frame.shape}")
-            print(f"  pred_depth_frame: {pred_depth_frame.shape}")
-            print(f"  importance_frame: {importance_frame.shape}")
 
             # Create two separate masks:
             # 1. Metrics mask: 70m threshold (same as training loss)
@@ -167,19 +155,6 @@ class Gear3UpgradeVisualizer:
             gt_valid_vis = (gt_depth_frame > 0) & (gt_depth_frame < MAX_DEPTH_VIS)
             pred_valid_vis = (pred_depth_frame > 0) & (pred_depth_frame < MAX_DEPTH_VIS)
             valid_mask_vis = gt_valid_vis & pred_valid_vis
-
-            # Debug: Print statistics
-            print(f"DEBUG Step {step}:")
-            print(f"  GT raw range: {gt_depth_frame.min():.3f} - {gt_depth_frame.max():.3f}")
-            print(f"  Pred raw range: {pred_depth_frame.min():.3f} - {pred_depth_frame.max():.3f}")
-            print(f"  Invalid GT pixels: {((gt_depth_frame <= 0) | (gt_depth_frame >= MAX_DEPTH_METRICS)).sum()}")
-
-            if valid_mask_metrics.sum() > 0:
-                gt_valid = gt_depth_frame[valid_mask_metrics]
-                pred_valid = pred_depth_frame[valid_mask_metrics]
-                print(f"  GT valid range: {gt_valid.min():.3f} - {gt_valid.max():.3f}")
-                print(f"  Pred valid range: {pred_valid.min():.3f} - {pred_valid.max():.3f}")
-                print(f"  Valid pixels: {valid_mask_metrics.sum()} / {gt_depth_frame.size}")
 
             # Create figure with subplots
             # NEW LAYOUT: 4 rows × 3 columns
@@ -215,12 +190,12 @@ class Gear3UpgradeVisualizer:
             is_sparse_dataset = dataset_name in self.SPARSE_DATASETS if dataset_name else False
 
             if is_sparse_dataset:
-                # Sparse depth: use dual visualization (inpainted within valid row range only)
-                _, gt_dense_vis, gt_info = create_dual_sparse_depth_vis(
+                # Sparse depth: show valid pixels only (no inpainting)
+                _, gt_dense_vis, gt_info = create_sparse_depth_vis_no_inpaint(
                     gt_depth_frame, valid_mask_vis, colormap='plasma', percentile_range=(2, 98)
                 )
                 im2 = ax2.imshow(gt_dense_vis)
-                ax2.set_title(f'GT Depth (Inpainted)\n{valid_ratio_vis*100:.1f}% valid',
+                ax2.set_title(f'GT Depth (Sparse)\n{valid_ratio_vis*100:.1f}% valid',
                              fontsize=14, fontweight='bold')
                 vmin, vmax = gt_info['vmin'], gt_info['vmax']
             else:
@@ -237,13 +212,10 @@ class Gear3UpgradeVisualizer:
             ax3 = fig.add_subplot(gs[0, 2])
 
             if is_sparse_dataset:
-                # Sparse depth: use dual visualization (inpainted within valid row range only)
-                _, pred_dense_vis, pred_info = create_dual_sparse_depth_vis(
-                    pred_depth_frame, valid_mask_vis, colormap='plasma', percentile_range=(2, 98)
-                )
-                im3 = ax3.imshow(pred_dense_vis)
-                mae_str = f'{np.nanmean(abs_error_masked):.2f}m' if has_valid_pixels else 'N/A'
-                ax3.set_title(f'Pred Depth (Inpainted)\nMAE: {mae_str}',
+                # Pred depth is already dense (model predicts all pixels), just visualize directly
+                im3 = ax3.imshow(pred_depth_frame, cmap='plasma', vmin=vmin, vmax=vmax)
+                mae_str = f'{np.nanmean(abs_error_masked):.3f}m' if has_valid_pixels else 'N/A'
+                ax3.set_title(f'Pred Depth\nMAE: {mae_str}',
                              fontsize=14, fontweight='bold')
             else:
                 # Dense depth: use standard visualization
@@ -436,8 +408,8 @@ class Gear3UpgradeVisualizer:
 
             # Layer weights (only for multi_layer separation method)
             if layer_weights is not None:
-                # Format: "0.12:0.18:0.30:0.40"
-                weights_str = ":".join([f"{w:.2f}" for w in layer_weights])
+                # Format: "0.123:0.234:0.345:0.456"
+                weights_str = ":".join([f"{w:.3f}" for w in layer_weights])
                 ax9.text(0.05, y_pos, f'Layer weights: {weights_str}', fontsize=9,
                         transform=ax9.transAxes, bbox=dict(boxstyle="round", facecolor='lavender'))
 

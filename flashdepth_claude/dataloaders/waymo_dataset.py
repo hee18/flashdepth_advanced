@@ -9,9 +9,30 @@ testing_scenes = ['segment-12831741023324393102_2673_230_2693_230', 'segment-108
 
 
 class WaymoDepth(BaseDatasetPairs):
-    def __init__(self, root_dir, split, load_cache=None):
-        self.root_dir = os.path.join(root_dir, 'waymo/val')  
-        super().__init__(dataset_name='waymo', root_dir=self.root_dir, split=split, load_cache=load_cache)
+    def __init__(self, root_dir, split, load_cache=None, use_segmentation=False, return_dict=False, dataset_name='waymo', **kwargs):
+        """
+        Initialize Waymo dataset.
+
+        Args:
+            root_dir: Root directory
+            split: Dataset split ('train', 'val', 'test')
+            load_cache: Cache directory path
+            use_segmentation: Whether to load segmentation data (for waymo_seg) - currently ignored
+            return_dict: Whether to return dict (True) or tuple (False) - currently ignored
+            dataset_name: Dataset name ('waymo' or 'waymo_seg') to determine directory path
+            **kwargs: Additional arguments (ignored for now)
+
+        Note:
+            use_segmentation and return_dict are accepted for API compatibility but not used.
+            For object-wise evaluation with segmentation, use WaymoSegmentationDataset directly.
+        """
+        # Set root directory based on dataset name
+        if dataset_name == 'waymo_seg':
+            self.root_dir = os.path.join(root_dir, 'waymo_seg/val')
+        else:
+            self.root_dir = os.path.join(root_dir, 'waymo/val')
+
+        super().__init__(dataset_name=dataset_name, root_dir=self.root_dir, split=split, load_cache=load_cache)
         # 1920x1280
         self.reshape_list['resolution'] = (1920, 1280)
 
@@ -44,7 +65,9 @@ class WaymoDepth(BaseDatasetPairs):
         return inverse_depth
 
     def get_cache_path(self, cache_dir):
-        return os.path.join(cache_dir, 'waymo_pairs.pkl')
+        # Use different cache files for waymo and waymo_seg
+        cache_filename = f'{self.dataset_name}_pairs.pkl'
+        return os.path.join(cache_dir, cache_filename)
 
     def get_filter_scenes(self, split):
         all_scenes = self.get_all_scenes(self.get_scenes_path())
