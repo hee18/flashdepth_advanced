@@ -6,6 +6,7 @@
 config_dir: null # overwrite by --config-path
 inference: false
 load: configs/flashdepth-l/iter_10001.pth  # FlashDepth-L pretrained weights
+phase: 1  # Stage 1: Base training (518×518)
 
 # Canonical space settings
 canonical_focal_length: 1000.0

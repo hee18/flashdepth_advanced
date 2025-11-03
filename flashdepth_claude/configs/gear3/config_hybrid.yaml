@@ -5,7 +5,9 @@
 # General settings
 config_dir: null # overwrite by --config-path
 inference: false
-load: train_results/results_XX/gear3_s/best.pth  # Gear2-S Stage 1 checkpoint
+load: configs/flashdepth/iter_43002.pth  # FlashDepth-hybrid checkpoint (for ViT-DPT overwrite)
+gear_checkpoint: train_results/results_XX/gear3_s/best.pth  # Gear3-S Stage 1 checkpoint (for Gear modules)
+phase: 2  # Stage 2: Hybrid training (2K resolution)
 
 # Canonical space settings
 canonical_focal_length: 1000.0

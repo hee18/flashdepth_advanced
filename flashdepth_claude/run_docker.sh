@@ -56,7 +56,7 @@ show_usage() {
     echo "  --gpu ID              Set GPU ID (default: 0)"
     echo "  --results-dir PATH    Set results directory (default: train_results/results_1)"
     echo "  --flashdepth-checkpoint PATH  Set FlashDepth pretrained weights path"
-    echo "  --gsp-checkpoint PATH Set GSP module weights path"
+    echo "  --gear-checkpoint PATH  Set Gear-S Phase 1 checkpoint path (required for --config-variant hybrid)"
     echo "  --frame-interval NUM  Set frame interval for sequence visualization (default: 1)"
     echo "  --vid-len NUM         Set video sequence length for testing (default: 50)"
     echo "  --single-sequence PATH Test on a single sequence directory (e.g., /path/to/dynamicreplica/seq)"
@@ -69,8 +69,7 @@ show_usage() {
     echo "  --config VARIANT     Set FlashDepth config: flashdepth, flashdepth-l, flashdepth-s (default: flashdepth-l)"
     echo "  --inverse BOOL       Inverse colormap for depth (original FlashDepth only, default: false)"
     echo "  --no-video           Skip video (GIF/MP4) generation for faster testing"
-    echo ""
-    echo "Note: --phase option is DEPRECATED. Use --config-variant (l/s/hybrid) instead."
+    echo "  --whole-test BOOL    Use all test datasets (true) or validation datasets only (false, default: false)"
     echo ""
     echo "Note: Regularization losses are deprecated. Importance map now uses raw DINOv2 attention (frozen)."
     echo ""
@@ -100,6 +99,7 @@ show_usage() {
     echo "  $0 test_gear2_objwise --dataset waymo_seg --config-variant l --gpu 0  # Object-wise evaluation on Waymo"
     echo "  $0 test_gear3_objwise --dataset waymo_seg --config-variant l --gpu 1  # Object-wise evaluation on Waymo"
     echo "  $0 test_gear3_upgrade_objwise --dataset waymo_seg --config-variant l --separation kmeans --gpu 2  # Gear3 Upgrade object-wise"
+    echo "  $0 train_gear2_ddp --config-variant hybrid --gear-checkpoint train_results/gear2_s/best.pth  # Hybrid training with Gear-S weights"
     echo "  $0 test_original_flashdepth --gpu 0  # Test original FlashDepth (ViT-L)"
     echo "  DATASET=waymo $0 test_original_flashdepth --gpu 1  # Test on Waymo dataset"
     echo "  $0 test_original_flashdepth --config flashdepth-s --gpu 0  # Use ViT-S variant (smaller/faster)"
@@ -116,20 +116,20 @@ TOTAL_ITERS=30001
 GPU_ID=0
 RESULTS_DIR="train_results/results_1"
 FLASHDEPTH_CHECKPOINT="configs/flashdepth-l/iter_10001.pth"
-# GSP_CHECKPOINT="train_results/results_5/best_metric_head_step_21000.pth"  # Only used for old test script
+GEAR_CHECKPOINT=""  # Gear-S Phase 1 checkpoint (required for hybrid only)
 FRAME_INTERVAL=1
 VID_LEN=50
 SINGLE_SEQUENCE=""  # Path to single sequence directory (optional)
 MEASURE_FPS="true"
 CONFIG_VARIANT="l"  # Gear config variant: l (Stage 1 ViT-L), s (Stage 1 ViT-S), hybrid (Stage 2)
 NUSCENES="false"  # nuScenes fine-tuning mode (Stage 3)
-PHASE=1  # DEPRECATED: Use --config-variant instead (kept for backwards compatibility)
 SEPARATION_METHOD="cls_seg"  # FG/BG separation method for Gear3 Upgrade (cls_seg, kmeans, multi_layer)
 CONFIG="flashdepth-l"  # FlashDepth config variant (flashdepth, flashdepth-l, flashdepth-s)
 INVERSE="false"  # Inverse colormap for depth visualization (original FlashDepth only)
 OBJWISE_DATASET=""  # Dataset for evaluation (waymo) - empty means use config default
 RESOLUTION="base"  # Resolution mode for testing (base, 2k) - default to base (518x518)
 NO_VIDEO="false"  # Skip video (GIF/MP4) generation for faster testing
+WHOLE_TEST="false"  # Use all test datasets (true) or validation datasets only (false, default)
 
 # Parse arguments
 USER_BATCH_SIZE=""  # Track if user explicitly set batch size
@@ -164,8 +164,8 @@ while [[ $# -gt 0 ]]; do
             FLASHDEPTH_CHECKPOINT="$2"
             shift 2
             ;;
-        --gsp-checkpoint)
-            GSP_CHECKPOINT="$2"
+        --gear-checkpoint)
+            GEAR_CHECKPOINT="$2"
             shift 2
             ;;
         --frame-interval)
@@ -192,11 +192,6 @@ while [[ $# -gt 0 ]]; do
             NUSCENES="true"
             shift
             ;;
-        --phase)
-            echo "WARNING: --phase is DEPRECATED. Use --config-variant instead."
-            PHASE="$2"
-            shift 2
-            ;;
         --separation)
             SEPARATION_METHOD="$2"
             shift 2
@@ -220,6 +215,10 @@ while [[ $# -gt 0 ]]; do
         --no-video)
             NO_VIDEO="true"
             shift
+            ;;
+        --whole-test)
+            WHOLE_TEST="$2"
+            shift 2
             ;;
         -h|--help)
             show_usage
@@ -292,10 +291,6 @@ case $COMMAND in
 
         if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
             TEST_CMD="$TEST_CMD +flashdepth_checkpoint=$FLASHDEPTH_CHECKPOINT"
-        fi
-
-        if [ -n "$GSP_CHECKPOINT" ]; then
-            TEST_CMD="$TEST_CMD +gsp_checkpoint=$GSP_CHECKPOINT"
         fi
 
         # Add frame interval and video length options
@@ -402,6 +397,11 @@ case $COMMAND in
             DOCKER_CMD="$DOCKER_CMD load=$FLASHDEPTH_CHECKPOINT"
         fi
 
+        # Add gear checkpoint for hybrid
+        if [ -n "$GEAR_CHECKPOINT" ]; then
+            DOCKER_CMD="$DOCKER_CMD gear_checkpoint=$GEAR_CHECKPOINT"
+        fi
+
         eval $DOCKER_CMD
         ;;
 
@@ -500,6 +500,11 @@ case $COMMAND in
         # Add checkpoint loading
         if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
             DOCKER_CMD="$DOCKER_CMD load=$FLASHDEPTH_CHECKPOINT"
+        fi
+
+        # Add gear checkpoint for hybrid
+        if [ -n "$GEAR_CHECKPOINT" ]; then
+            DOCKER_CMD="$DOCKER_CMD gear_checkpoint=$GEAR_CHECKPOINT"
         fi
 
         eval $DOCKER_CMD
@@ -650,6 +655,11 @@ case $COMMAND in
             DOCKER_CMD="$DOCKER_CMD load=$FLASHDEPTH_CHECKPOINT"
         fi
 
+        # Add gear checkpoint for hybrid
+        if [ -n "$GEAR_CHECKPOINT" ]; then
+            DOCKER_CMD="$DOCKER_CMD gear_checkpoint=$GEAR_CHECKPOINT"
+        fi
+
         eval $DOCKER_CMD
         ;;
 
@@ -692,7 +702,7 @@ case $COMMAND in
         fi
 
         # Add frame interval and video length options
-        TEST_CMD="$TEST_CMD +frame_interval=$FRAME_INTERVAL +vid_len=$VID_LEN"
+        TEST_CMD="$TEST_CMD +frame_interval=$FRAME_INTERVAL +vid_len=$VID_LEN +whole_test=$WHOLE_TEST"
 
         # Add single sequence path if specified
         if [ -n "$SINGLE_SEQUENCE" ]; then
@@ -742,7 +752,7 @@ case $COMMAND in
         fi
 
         # Add frame interval and video length options
-        TEST_CMD="$TEST_CMD +frame_interval=$FRAME_INTERVAL +vid_len=$VID_LEN"
+        TEST_CMD="$TEST_CMD +frame_interval=$FRAME_INTERVAL +vid_len=$VID_LEN +whole_test=$WHOLE_TEST"
 
         # Add single sequence path if specified
         if [ -n "$SINGLE_SEQUENCE" ]; then
@@ -793,7 +803,7 @@ case $COMMAND in
         fi
 
         # Add frame interval and video length options
-        TEST_CMD="$TEST_CMD +frame_interval=$FRAME_INTERVAL +vid_len=$VID_LEN"
+        TEST_CMD="$TEST_CMD +frame_interval=$FRAME_INTERVAL +vid_len=$VID_LEN +whole_test=$WHOLE_TEST"
 
         # Add video generation control
         if [ "$NO_VIDEO" == "true" ]; then
@@ -887,7 +897,7 @@ case $COMMAND in
         echo ""
 
         # Build command with object-wise options
-        TEST_CMD="python test_gear3_upgrade.py --config-path configs/gear3_upgrade --config-name config_$CONFIG_VARIANT dataset.data_root=/data/datasets eval.test_datasets=[$OBJWISE_DATASET] +results_dir=$RESULTS_DIR +gpu=$GPU_ID separation_method=$SEPARATION_METHOD object_wise.enabled=true object_wise.dataset=${OBJWISE_DATASET/_seg/} +vid_len=$VID_LEN"
+        TEST_CMD="python test_gear3_upgrade.py --config-path configs/gear3_upgrade --config-name config_$CONFIG_VARIANT dataset.data_root=/data/datasets eval.test_datasets=[$OBJWISE_DATASET] +results_dir=$RESULTS_DIR +gpu=$GPU_ID separation_method=$SEPARATION_METHOD object_wise.enabled=true object_wise.dataset=${OBJWISE_DATASET/_seg/} +vid_len=$VID_LEN +whole_test=$WHOLE_TEST"
 
         if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
             TEST_CMD="$TEST_CMD load=$FLASHDEPTH_CHECKPOINT"

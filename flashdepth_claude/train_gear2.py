@@ -12,7 +12,6 @@ Key differences from Gear3:
     - Uses CLS token for global feature extraction
     - Uniform modulation (same gamma/beta for all pixels)
     - Feature-level modulation using FiLM
-    - Canonical space normalization (focal_length=1000)
     - Loss on inverse depth: loss(100/pred, 100/gt)
 """
 
@@ -43,6 +42,7 @@ from flashdepth.gear3_upgrade_modules import Gear3UpgradeAblationHead
 from dataloaders.combined_dataset import CombinedDataset
 from utils.helpers import *
 from utils.metric_depth_metrics import MetricDepthMetrics
+from utils.gear_losses import LogL1Loss, DepthVariancePseudoLabelLoss, EdgeAwareLoss, ContrastiveFGBGLoss
 
 
 def init_distributed():
@@ -71,340 +71,6 @@ def init_distributed():
 
     return rank, world_size, local_rank
 
-
-class CanonicalSpaceNormalizer:
-    """
-    Canonical space normalization using fixed focal length.
-
-    Converts metric depth to canonical space:
-        depth_canonical = depth * (focal_canonical / focal_actual)
-
-    And de-canonicalizes predictions:
-        depth_actual = depth_canonical * (focal_actual / focal_canonical)
-    """
-    def __init__(self, focal_canonical=1000.0, enable=True):
-        self.focal_canonical = focal_canonical
-        self.enable = enable
-        logging.info(f"Canonical space normalization: {'enabled' if enable else 'disabled'} (f={focal_canonical})")
-
-    def canonicalize(self, depth, focal_length):
-        """Convert metric depth to canonical space"""
-        if not self.enable:
-            return depth
-
-        if isinstance(focal_length, (int, float)):
-            focal_length = torch.tensor(focal_length, device=depth.device, dtype=depth.dtype)
-
-        # depth_canonical = depth * (focal_canonical / focal_actual)
-        scale_factor = self.focal_canonical / focal_length
-        return depth * scale_factor.view(-1, 1, 1, 1)
-
-    def canonicalize_inverse(self, inverse_depth, focal_length):
-        """Convert inverse depth to canonical space
-
-        For inverse depth: inverse_canonical = inverse_depth / (focal_canonical / focal_actual)
-        Because: inverse = 1/depth, depth_canonical = depth * scale
-        Therefore: inverse_canonical = 1/depth_canonical = 1/(depth*scale) = inverse/scale
-        """
-        if not self.enable:
-            return inverse_depth
-
-        if isinstance(focal_length, (int, float)):
-            focal_length = torch.tensor(focal_length, device=inverse_depth.device, dtype=inverse_depth.dtype)
-
-        # inverse_canonical = inverse_depth / (focal_canonical / focal_actual)
-        scale_factor = self.focal_canonical / focal_length
-        return inverse_depth / scale_factor.view(-1, 1, 1, 1)
-
-    def decanonicalize(self, depth_canonical, focal_length):
-        """Convert canonical space depth back to metric depth"""
-        if not self.enable:
-            return depth_canonical
-
-        if isinstance(focal_length, (int, float)):
-            focal_length = torch.tensor(focal_length, device=depth_canonical.device, dtype=depth_canonical.dtype)
-
-        # depth_actual = depth_canonical * (focal_actual / focal_canonical)
-        scale_factor = focal_length / self.focal_canonical
-        return depth_canonical * scale_factor.view(-1, 1, 1, 1)
-
-    def decanonicalize_inverse(self, inverse_depth_canonical, focal_length):
-        """Convert canonical inverse depth back to actual inverse depth
-
-        For inverse depth: inverse_actual = inverse_canonical * (focal_canonical / focal_actual)
-        Because: inverse_canonical = inverse_actual / scale
-        Therefore: inverse_actual = inverse_canonical * scale
-        """
-        if not self.enable:
-            return inverse_depth_canonical
-
-        if isinstance(focal_length, (int, float)):
-            focal_length = torch.tensor(focal_length, device=inverse_depth_canonical.device, dtype=inverse_depth_canonical.dtype)
-
-        # inverse_actual = inverse_canonical * (focal_canonical / focal_actual)
-        scale_factor = self.focal_canonical / focal_length
-        return inverse_depth_canonical * scale_factor.view(-1, 1, 1, 1)
-
-
-class LogL1Loss(nn.Module):
-    """
-    Log L1 loss for inverse depth learning.
-
-    Loss = L1(log(pred_inverse), log(gt_inverse))
-    Works directly with inverse depth values (100/m)
-    """
-    def __init__(self):
-        super().__init__()
-
-    def forward(self, pred_inverse, gt_inverse, valid_mask=None):
-        """
-        Args:
-            pred_inverse: [B, 1, H, W] predicted inverse depth (100/m)
-            gt_inverse: [B, 1, H, W] ground truth inverse depth (100/m)
-            valid_mask: [B, 1, H, W] valid pixels (optional)
-
-        Returns:
-            loss: scalar
-        """
-        # Apply valid mask BEFORE log to avoid log(negative values)
-        if valid_mask is not None:
-            # Only compute loss on valid pixels
-            pred_valid = pred_inverse[valid_mask.bool()]
-            gt_valid = gt_inverse[valid_mask.bool()]
-
-            if len(pred_valid) == 0:
-                return torch.tensor(0.0, device=pred_inverse.device)
-
-            # Log L1 loss on valid pixels only
-            loss = F.l1_loss(
-                torch.log(pred_valid + 1e-8),
-                torch.log(gt_valid + 1e-8),
-                reduction='mean'
-            )
-        else:
-            # Fallback: compute on all pixels
-            loss = F.l1_loss(
-                torch.log(pred_inverse + 1e-8),
-                torch.log(gt_inverse + 1e-8),
-                reduction='mean'
-            )
-
-        return loss
-
-
-class DepthVariancePseudoLabelLoss(nn.Module):
-    """
-    Depth Variance Pseudo-Label Loss for importance maps.
-
-    Uses local depth variance as pseudo-label (supervision) for importance map.
-
-    High variance regions (complex geometry) → High importance
-    Low variance regions (flat surfaces) → Low importance
-
-    This encourages importance map to have spatial diversity (high std).
-
-    **CRITICAL**: GT depth variance is computed with torch.no_grad() to prevent gradient flow.
-    """
-    def __init__(self, kernel_size=15, sigma=3.0):
-        super().__init__()
-        self.kernel_size = kernel_size
-        self.sigma = sigma
-
-        # Create Gaussian kernel for weighted variance computation
-        self.register_buffer('gaussian_kernel', self._create_gaussian_kernel(kernel_size, sigma))
-
-    def _create_gaussian_kernel(self, kernel_size, sigma):
-        """Create 2D Gaussian kernel for weighted variance"""
-        # Create 1D Gaussian
-        ax = torch.arange(-kernel_size // 2 + 1., kernel_size // 2 + 1.)
-        xx, yy = torch.meshgrid(ax, ax, indexing='ij')
-        kernel = torch.exp(-(xx**2 + yy**2) / (2. * sigma**2))
-
-        # Normalize to sum to 1
-        kernel = kernel / kernel.sum()
-
-        # Reshape for conv2d: [1, 1, kernel_size, kernel_size]
-        return kernel.view(1, 1, kernel_size, kernel_size)
-
-    def compute_local_variance(self, depth_map):
-        """
-        Compute local variance using Gaussian-weighted window.
-
-        Variance = E[x²] - E[x]²
-
-        Args:
-            depth_map: [B, 1, H, W] depth values (inverse depth in 100/m scale)
-
-        Returns:
-            variance: [B, 1, H, W] local variance map
-        """
-        # Match dtype and device
-        kernel = self.gaussian_kernel.to(dtype=depth_map.dtype, device=depth_map.device)
-        padding = self.kernel_size // 2
-
-        # E[x] (local mean)
-        local_mean = F.conv2d(depth_map, kernel, padding=padding)
-
-        # E[x²] (local mean of squares)
-        local_mean_sq = F.conv2d(depth_map**2, kernel, padding=padding)
-
-        # Variance = E[x²] - E[x]²
-        variance = local_mean_sq - local_mean**2
-
-        # Clamp to avoid negative values due to numerical errors
-        return variance.clamp(min=0)
-
-    def forward(self, importance_map, depth_map, valid_mask=None):
-        """
-        Args:
-            importance_map: [B, 1, H, W] predicted importance in range [0, 1]
-            depth_map: [B, 1, H, W] GT depth (inverse depth in 100/m scale)
-            valid_mask: [B, 1, H, W] valid pixels (optional)
-
-        Returns:
-            loss: scalar L1 distance between importance and normalized variance
-        """
-        # CRITICAL: Compute variance WITHOUT gradient to GT depth
-        with torch.no_grad():
-            # Compute local variance from GT depth
-            variance = self.compute_local_variance(depth_map)  # [B, 1, H, W]
-
-            # Normalize to [0, 1] range (min-max normalization)
-            if valid_mask is not None:
-                # Only consider valid pixels for normalization
-                variance_valid = variance[valid_mask.bool()]
-                if len(variance_valid) > 0:
-                    var_min = variance_valid.min()
-                    var_max = variance_valid.max()
-                else:
-                    var_min = variance.min()
-                    var_max = variance.max()
-            else:
-                var_min = variance.min()
-                var_max = variance.max()
-
-            # Avoid division by zero
-            variance_range = var_max - var_min + 1e-8
-            variance_norm = (variance - var_min) / variance_range  # [0, 1]
-
-        # L1 loss: importance_map (trainable) vs variance_norm (pseudo-label)
-        if valid_mask is not None:
-            loss = F.l1_loss(
-                importance_map[valid_mask.bool()],
-                variance_norm[valid_mask.bool()]
-            )
-        else:
-            loss = F.l1_loss(importance_map, variance_norm)
-
-        return loss
-
-
-class EdgeAwareLoss(nn.Module):
-    """
-    Edge-aware loss for importance maps.
-
-    Aligns importance map edges with depth edges, ensuring that:
-    - FG/BG boundaries coincide with depth discontinuities
-    - Interior regions remain smooth
-    - Prevents noisy importance maps
-
-    Uses Sobel filter to compute gradients.
-
-    Reference: "Edge-Guided Depth Estimation" (CVPR 2024)
-    """
-    def __init__(self):
-        super().__init__()
-
-        # Sobel kernels for edge detection (fixed, non-trainable)
-        sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32)
-        sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32)
-
-        self.register_buffer('sobel_x', sobel_x.view(1, 1, 3, 3))
-        self.register_buffer('sobel_y', sobel_y.view(1, 1, 3, 3))
-
-    def compute_edges(self, tensor):
-        """
-        Compute edge magnitude using Sobel filter.
-
-        Args:
-            tensor: [B, 1, H, W]
-
-        Returns:
-            edges: [B, 1, H, W] edge magnitude
-        """
-        # Match dtype and device of input tensor (handles BFloat16)
-        sobel_x = self.sobel_x.to(dtype=tensor.dtype, device=tensor.device)
-        sobel_y = self.sobel_y.to(dtype=tensor.dtype, device=tensor.device)
-
-        grad_x = F.conv2d(tensor, sobel_x, padding=1)
-        grad_y = F.conv2d(tensor, sobel_y, padding=1)
-
-        # Edge magnitude
-        edges = torch.sqrt(grad_x ** 2 + grad_y ** 2 + 1e-8)
-        return edges
-
-    def forward(self, importance_map, depth_map):
-        """
-        Args:
-            importance_map: [B, 1, H, W] importance values in range [0, 1]
-            depth_map: [B, 1, H, W] depth values (inverse depth in 100/m scale)
-
-        Returns:
-            loss: scalar (L1 distance between edges)
-        """
-        # Compute edges
-        importance_edges = self.compute_edges(importance_map)
-        depth_edges = self.compute_edges(depth_map)
-
-        # Normalize edges to [0, 1] for fair comparison
-        importance_edges = importance_edges / (importance_edges.max() + 1e-8)
-        depth_edges = depth_edges / (depth_edges.max() + 1e-8)
-
-        # L1 loss between edge maps
-        return F.l1_loss(importance_edges, depth_edges)
-
-
-class ContrastiveFGBGLoss(nn.Module):
-    """
-    Contrastive loss for FG/BG features.
-
-    Encourages FG and BG features to be different in embedding space.
-    Based on InfoNCE loss: maximize distance between FG and BG features.
-
-    This ensures that modulation parameters (γ_fg, β_fg, γ_bg, β_bg) are distinct,
-    leading to effective spatial modulation.
-
-    Reference: "Foreground-Aware Feature Contrast (FAC++)" (CVPR 2024)
-    """
-    def __init__(self, temperature=0.07):
-        super().__init__()
-        self.temperature = temperature
-
-    def forward(self, fg_features, bg_features):
-        """
-        Args:
-            fg_features: [B, feature_dim] foreground features
-            bg_features: [B, feature_dim] background features
-
-        Returns:
-            loss: scalar (negative cosine similarity, to maximize distance)
-        """
-        B = fg_features.shape[0]
-
-        # Normalize features to unit sphere
-        fg_norm = F.normalize(fg_features, dim=1)  # [B, feature_dim]
-        bg_norm = F.normalize(bg_features, dim=1)  # [B, feature_dim]
-
-        # Compute cosine similarity for same batch indices
-        # We want FG[i] and BG[i] to be DIFFERENT (low similarity)
-        similarity = (fg_norm * bg_norm).sum(dim=1)  # [B]
-
-        # Average over batch
-        avg_similarity = similarity.mean()
-
-        # Maximize distance = minimize similarity
-        # Add temperature scaling for numerical stability
-        return avg_similarity / self.temperature
 
 
 class Gear2Trainer:
@@ -470,12 +136,6 @@ class Gear2Trainer:
         if rank == 0:
             self.logger.info(f"Results directory: {self.results_dir}")
             self.logger.info(f"Training phase: {self.phase}")
-
-        # Setup canonical space normalizer
-        self.canonical_normalizer = CanonicalSpaceNormalizer(
-            focal_canonical=config.get('canonical_focal_length', 1000.0),
-            enable=config.get('use_canonical_space', True)
-        )
 
         # Initialize model
         self.model = self._setup_model()
@@ -549,17 +209,19 @@ class Gear2Trainer:
 
         # Load pre-trained checkpoint
         # Phase 1: Load from config (DINOv2 + DPT only)
-        # Phase 2, 3: Load Phase 1 best model (all Gear2 modules included)
+        # Phase 2: Load Gear-S checkpoint (for Gear modules) + Hybrid weights (for ViT-DPT)
         if self.phase == 1:
             checkpoint_path = self.config.get('load')
         else:
-            # Phase 2, 3: Load Phase 1 best model (match model size)
-            if model.encoder == 'vitl':
-                checkpoint_path = self.config.get('phase1_l_checkpoint', 'train_results/gear2_phase1_l/best.pth')
-            else:
-                checkpoint_path = self.config.get('phase1_s_checkpoint', 'train_results/gear2_phase1_s/best.pth')
+            # Phase 2: Load Gear-S Phase 1 checkpoint (always S for hybrid)
+            checkpoint_path = self.config.get('gear_checkpoint')
+            if not checkpoint_path:
+                raise ValueError(
+                    "Phase 2 (hybrid) requires 'gear_checkpoint' in config! "
+                    "Set gear_checkpoint to your Gear-S Phase 1 checkpoint path."
+                )
             if self.rank == 0:
-                self.logger.info(f"Phase {self.phase}: Loading Phase 1 best model from {checkpoint_path}")
+                self.logger.info(f"Phase {self.phase}: Loading Gear-S checkpoint for Gear modules from {checkpoint_path}")
 
         if checkpoint_path and checkpoint_path != 'true':
             if os.path.exists(checkpoint_path):
@@ -634,7 +296,8 @@ class Gear2Trainer:
 
             # Phase 2 ONLY: Overwrite ViT-DPT with FlashDepth-hybrid weights
             if self.phase == 2:
-                hybrid_path = self.config.get('flashdepth_hybrid', 'configs/flashdepth/iter_43002.pth')
+                # Use 'load' config for hybrid weights (ViT-DPT overwrite)
+                hybrid_path = self.config.get('load', 'configs/flashdepth/iter_43002.pth')
                 if os.path.exists(hybrid_path):
                     self.logger.info(f"Phase 2: Overwriting ViT-DPT with Hybrid weights from {hybrid_path}")
                     hybrid_checkpoint = torch.load(hybrid_path, map_location='cpu')
@@ -992,9 +655,8 @@ class Gear2Trainer:
                     elif gt_depth.ndim == 4 and gt_depth.shape[1] != 1:
                         gt_depth = gt_depth.unsqueeze(2)
 
-                    focal_length = 1000.0
-                    gt_depth_inverse_canonical = self.canonical_normalizer.canonicalize_inverse(gt_depth, focal_length)
-                    gt_depth_inverse = gt_depth_inverse_canonical * 100.0  # Training uses 100/m
+                    # GT depth from dataloader is inverse depth (1/m), scale to 100/m
+                    gt_depth_inverse_100 = gt_depth * 100.0  # (1/m) * 100 = 100/m
 
                     # Get batch size for Mamba initialization
                     B, T = images.shape[:2]
@@ -1004,7 +666,7 @@ class Gear2Trainer:
                         model.mamba.start_new_sequence()
 
                     img_t = images[:, 0]
-                    gt_t_inverse = gt_depth_inverse[:, 0]
+                    gt_t_inverse_100 = gt_depth_inverse_100[:, 0]
 
                     with torch.no_grad():
                         encoder_features = model.pretrained.get_intermediate_layers(
@@ -1042,10 +704,10 @@ class Gear2Trainer:
                         out = F.interpolate(out, (h, w), mode="bilinear", align_corners=True)
                         out = model.depth_head.scratch.output_conv2(out)
 
-                        # Convert prediction to metric depth for visualization: 100/m -> m
+                        # Convert to metric depth for visualization: 100/m -> m
                         # Already positive (Softplus activation in output_conv2)
-                        pred_depth_metric = 100.0 / (out + 1e-8)
-                        gt_depth_metric = 100.0 / (gt_t_inverse + 1e-8)
+                        pred_depth_metric = 100.0 / (out + 1e-8)  # 100 / (100/m) = m
+                        gt_depth_metric = 100.0 / (gt_t_inverse_100 + 1e-8)  # 100 / (100/m) = m
 
                         # Handle importance_map (None for Gear2)
                         if importance_map is not None:
@@ -1132,17 +794,17 @@ class Gear2Trainer:
 
         # DEBUG: Check raw GT depth values
         if self.global_step < 5:  # Only log first few steps
-            self.logger.info(f"DEBUG - Raw GT depth from dataloader: min={gt_depth.min():.4f}, max={gt_depth.max():.4f}, shape={gt_depth.shape}")
-            self.logger.info(f"DEBUG - GT depth has {(gt_depth > 0).sum()} valid pixels out of {gt_depth.numel()} total")
+            self.logger.info(f"DEBUG - Raw GT from dataloader (inverse depth 1/m): min={gt_depth.min():.4f}, max={gt_depth.max():.4f}, shape={gt_depth.shape}")
+            self.logger.info(f"DEBUG - GT has {(gt_depth > 0).sum()} valid pixels out of {gt_depth.numel()} total")
 
-        # Convert GT to canonical inverse depth and scale by 100
-        gt_depth_inverse_canonical = self.canonical_normalizer.canonicalize_inverse(gt_depth, focal_length)
-        gt_depth_inverse = gt_depth_inverse_canonical * 100.0  # 100/meters for training
+        # GT depth from dataloader is inverse depth (1/m), scale to 100/m for training
+        # This matches FlashDepth's relative depth scale (≈ 100/metric_depth)
+        gt_depth_inverse_100 = gt_depth * 100.0  # (1/m) * 100 = 100/m
 
-        # DEBUG: Check after canonicalization
+        # DEBUG: Check after scaling
         if self.global_step < 5:
-            self.logger.info(f"DEBUG - After canonicalization & scaling: min={gt_depth_inverse.min():.4f}, max={gt_depth_inverse.max():.4f}")
-            self.logger.info(f"DEBUG - Has {(gt_depth_inverse > 0).sum()} valid pixels")
+            self.logger.info(f"DEBUG - After scaling to 100/m: min={gt_depth_inverse_100.min():.4f}, max={gt_depth_inverse_100.max():.4f}")
+            self.logger.info(f"DEBUG - Valid pixels: {(gt_depth_inverse_100 > 0).sum()}")
 
         # Forward pass following original FlashDepth pattern (whole sequence at once)
         # Initialize Mamba sequence (critical for temporal processing!)
@@ -1206,7 +868,7 @@ class Gear2Trainer:
 
         # Compute loss (outside autocast for stability)
         # Reshape GT from (B, T, 1, H, W) to (B*T, H, W)
-        gt_depth_inverse_flat = rearrange(gt_depth_inverse, 'b t 1 h w -> (b t) h w')
+        gt_depth_inverse_flat = rearrange(gt_depth_inverse_100, 'b t 1 h w -> (b t) h w')
 
         # Remove channel dimension from prediction
         pred_depth_inverse_flat = pred_depth_inverse.squeeze(1)  # (B*T, H, W)
@@ -1316,12 +978,10 @@ class Gear2Trainer:
                 elif gt_depth.ndim == 4 and gt_depth.shape[1] != 1:
                     gt_depth = gt_depth.unsqueeze(2)
 
-                focal_length = 1000.0
                 B, T = images.shape[:2]
 
-                # Canonicalize GT inverse depth and scale to 100/m
-                gt_depth_inverse_canonical = self.canonical_normalizer.canonicalize_inverse(gt_depth, focal_length)
-                gt_depth_inverse = gt_depth_inverse_canonical * 100.0  # Training uses 100/m
+                # GT depth from dataloader is inverse depth (1/m), scale to 100/m
+                gt_depth_inverse_100 = gt_depth * 100.0  # (1/m) * 100 = 100/m
 
                 # Process all frames in sequence (like original FlashDepth)
                 frame_losses = []
@@ -1332,7 +992,7 @@ class Gear2Trainer:
 
                 for t in range(T):
                     img_t = images[:, t]
-                    gt_t_inverse = gt_depth_inverse[:, t]
+                    gt_t_inverse_100 = gt_depth_inverse_100[:, t]
 
                     # Extract features from DINOv2
                     encoder_features = model.pretrained.get_intermediate_layers(
@@ -1385,18 +1045,18 @@ class Gear2Trainer:
                     MIN_INVERSE_DEPTH = 100.0 / 70.0  # Filter out >70m depths (same as training)
 
                     # GT and Pred must both be valid (same as metrics calculation)
-                    gt_valid_mask = (gt_t_inverse >= MIN_INVERSE_DEPTH)  # GT within 70m and valid
+                    gt_valid_mask = (gt_t_inverse_100 >= MIN_INVERSE_DEPTH)  # GT within 70m and valid
                     pred_valid_mask = (pred_depth_inverse >= MIN_INVERSE_DEPTH)  # Pred within reasonable range
                     valid_mask = (gt_valid_mask & pred_valid_mask).float()
 
                     # Ensure shapes match: pred [B, 1, H, W], gt [B, 1, H, W], mask [B, 1, H, W]
-                    if gt_t_inverse.dim() == 3:  # [B, H, W]
-                        gt_t_inverse = gt_t_inverse.unsqueeze(1)  # [B, 1, H, W]
+                    if gt_t_inverse_100.dim() == 3:  # [B, H, W]
+                        gt_t_inverse_100 = gt_t_inverse_100.unsqueeze(1)  # [B, 1, H, W]
                     if valid_mask.dim() == 3:  # [B, H, W]
                         valid_mask = valid_mask.unsqueeze(1)  # [B, 1, H, W]
 
                     if valid_mask.sum() > 0:
-                        loss_t = self.loss_fn(pred_depth_inverse, gt_t_inverse, valid_mask)
+                        loss_t = self.loss_fn(pred_depth_inverse, gt_t_inverse_100, valid_mask)
                         frame_losses.append(loss_t.float())  # Convert to Float32 for accumulation
 
                     # Validation visualization: save multiple sequences per dataset (rank 0 only)
@@ -1421,10 +1081,10 @@ class Gear2Trainer:
                                     # Convert to metric depth for visualization: 100/m -> m
                                     # Convert to Float32 for CPU operations
                                     pred_depth_metric = (100.0 / (pred_depth_inverse.float() + 1e-8)).cpu()
-                                    gt_depth_metric = (100.0 / (gt_t_inverse.float() + 1e-8)).cpu()
+                                    gt_depth_metric = (100.0 / (gt_t_inverse_100.float() + 1e-8)).cpu()
 
                                     # Get GT resolution for visualization
-                                    gt_h, gt_w = gt_t_inverse.shape[-2:]
+                                    gt_h, gt_w = gt_t_inverse_100.shape[-2:]
 
                                     # Resize importance map to GT resolution (None for Gear2)
                                     if importance_map is not None:
@@ -1498,10 +1158,10 @@ class Gear2Trainer:
                 dataset_sequence_counters[current_dataset] += 1
 
             # Clear batch memory and GPU cache to prevent OOM
-            del images, gt_depth, gt_depth_inverse
+            del images, gt_depth, gt_depth_inverse_100
             torch.cuda.empty_cache()
 
-        avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
+        avg_loss = total_loss / num_batches if num_batches > 0 else float('inf')
 
         # Log detailed per-dataset statistics (rank 0 only)
         if self.rank == 0:

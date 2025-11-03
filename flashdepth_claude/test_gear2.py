@@ -33,12 +33,15 @@ sys.path.insert(0, str(project_root))
 
 from flashdepth.model import FlashDepth
 from flashdepth.gear2_modules import Gear2MetricHead
+from flashdepth.gear3_upgrade_modules import Gear3UpgradeAblationHead
 from dataloaders.combined_dataset import CombinedDataset
 from dataloaders.waymo_segmentation_dataset import WaymoSegmentationDataset, collate_fn as waymo_collate_fn
 from utils.metric_depth_metrics import MetricDepthMetrics, format_metrics
 from utils.object_wise_evaluation import ObjectWiseMetrics
 from utils.object_wise_visualization import create_object_wise_grid
 from utils.helpers import save_gifs_as_grid, save_grid_to_mp4, depth_to_np_arr, torch_batch_to_np_arr
+from utils.gear_common_helpers import depth_to_colored_frame
+from utils.gear_video_utils import save_video as save_video_util
 
 # Setup logging
 logging.basicConfig(
@@ -95,20 +98,23 @@ class Gear2Tester:
 
         model = FlashDepth(**model_config)
 
-        # Add Gear2 metric head
+        # Add Gear2 metric head (using Gear3 Upgrade Ablation Head for multi-layer CLS)
         embed_dim = 1024 if model.encoder == 'vitl' else 384
         dpt_dim = 256 if model.encoder == 'vitl' else 64
 
-        model.gear2_head = Gear2MetricHead(
+        model.gear2_head = Gear3UpgradeAblationHead(
             embed_dim=embed_dim,
             dpt_dim=dpt_dim
         )
+        logger.info("Using Gear3 Upgrade Ablation Head for multi-layer CLS ablation study")
 
-        # Enable attention weights storage ONLY for last block (like train_gear2)
+        # Enable attention weights storage for multi-layer extraction (blocks 3, 10, 16, 22)
+        # Need to store attention from layers 4, 11, 17, 23 for multi-layer CLS extraction
+        target_blocks = [3, 10, 16, 22]  # Blocks 3, 10, 16, 22 (layers 4, 11, 17, 23)
         for i, block in enumerate(model.pretrained.blocks):
-            if i == len(model.pretrained.blocks) - 1:
+            if i in target_blocks:
                 block.attn.store_attn_weights = True
-                logger.info(f"Enabled attention weights storage for block {i} (last block)")
+                logger.info(f"Enabled attention weights storage for block {i}")
             else:
                 block.attn.store_attn_weights = False
 
@@ -219,14 +225,62 @@ class Gear2Tester:
         class SingleSequenceDataset(Dataset):
             def __init__(self, seq_path, resolution=518):
                 self.seq_path = Path(seq_path)
-                # Ensure resolution is an integer (config may pass 'base' string)
+                
+                # Infer dataset name from path for resolution mapping
+                seq_path_str = str(seq_path).lower()
+                dataset_name = None
+                for ds in ['waymo_seg', 'waymo', 'eth3d', 'sintel', 'urbansyn', 'unreal4k', 'tartanair', 
+                          'pointodyssey', 'dynamicreplica', 'spring', 'mvs-synth']:
+                    if ds in seq_path_str:
+                        dataset_name = ds
+                        break
+                
+                # Resolution mapping based on combined_dataset.py logic
+                # Test split uses non-square resolutions for different datasets
                 if isinstance(resolution, str):
                     if resolution == 'base':
-                        self.resolution = 518
+                        # Base resolution for test/val split (combined_dataset.py lines 86-99)
+                        if dataset_name in ['eth3d', 'waymo', 'waymo_seg']:
+                            self.resolution = (784, 518)  # (width, height)
+                        elif dataset_name in ['sintel']:
+                            self.resolution = (1022, 434)
+                        elif dataset_name in ['urbansyn']:
+                            self.resolution = (1036, 518)
+                        elif dataset_name in ['unreal4k']:
+                            self.resolution = (924, 518)
+                        elif dataset_name in ['tartanair']:
+                            self.resolution = (518, 518)
+                        else:
+                            # Default fallback for unknown datasets
+                            logger.warning(f"Unknown dataset '{dataset_name}' in path, using default 518x518")
+                            self.resolution = (518, 518)
+                    
+                    elif resolution == '2k':
+                        # 2K resolution for test/val split (combined_dataset.py lines 108-118)
+                        if dataset_name in ['eth3d', 'waymo', 'waymo_seg']:
+                            self.resolution = (1918, 1274)  # (width, height)
+                        elif dataset_name in ['sintel']:
+                            self.resolution = (1022, 434)
+                        elif dataset_name in ['urbansyn']:
+                            self.resolution = (2044, 1022)
+                        elif dataset_name in ['unreal4k']:
+                            self.resolution = (2044, 1148)
+                        else:
+                            # Default fallback for unknown datasets
+                            logger.warning(f"Unknown dataset '{dataset_name}' in path, using default 1918x1078")
+                            self.resolution = (1918, 1078)
+                    
                     else:
-                        self.resolution = int(resolution)
+                        # Custom resolution string, try to parse as integer
+                        try:
+                            res_int = int(resolution)
+                            self.resolution = (res_int, res_int)
+                        except ValueError:
+                            logger.error(f"Invalid resolution string: {resolution}, using 518x518")
+                            self.resolution = (518, 518)
                 else:
-                    self.resolution = int(resolution)
+                    # Integer resolution, assume square
+                    self.resolution = (int(resolution), int(resolution))
 
                 # Find images and depths
                 images_dir = self.seq_path / "images"
@@ -261,6 +315,7 @@ class Gear2Tester:
                     f"Mismatch: {len(self.image_files)} images vs {len(self.depth_files)} depths"
 
                 logger.info(f"Loaded single sequence: {len(self.image_files)} frames")
+                logger.info(f"Dataset: {dataset_name}, Resolution: {self.resolution[0]}x{self.resolution[1]}")
 
             def __len__(self):
                 return 1  # Single sequence
@@ -273,8 +328,9 @@ class Gear2Tester:
                 for img_path, depth_path in zip(self.image_files, self.depth_files):
                     # Load image
                     img = Image.open(img_path).convert('RGB')
+                    # self.resolution is now (width, height) tuple from combined_dataset.py logic
                     # Use integer constants for PIL compatibility (2=BILINEAR, 0=NEAREST)
-                    img = img.resize((self.resolution, self.resolution), 2)  # 2 = BILINEAR (positional arg)
+                    img = img.resize(self.resolution, 2)  # 2 = BILINEAR (positional arg)
                     img_array = np.array(img).astype(np.float32) / 255.0
                     # Normalize (ImageNet stats)
                     mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
@@ -286,9 +342,9 @@ class Gear2Tester:
                     # Load depth (.geometric.png for dynamicreplica)
                     depth_img = Image.open(depth_path)
                     depth_array = np.array(depth_img).astype(np.float32) / 1000.0  # mm to m
-                    # Resize depth
+                    # Resize depth using same resolution as image
                     depth_pil = Image.fromarray(depth_array)
-                    depth_resized = depth_pil.resize((self.resolution, self.resolution), 0)  # 0 = NEAREST (positional arg)
+                    depth_resized = depth_pil.resize(self.resolution, 0)  # 0 = NEAREST (positional arg)
                     depth_array = np.array(depth_resized)
                     # Convert to inverse depth (1/m) like CombinedDataset
                     inverse_depth = np.zeros_like(depth_array)
@@ -465,9 +521,12 @@ class Gear2Tester:
             encoder_features_warmup = self.model.pretrained.get_intermediate_layers(
                 img_warmup, self.model.intermediate_layer_idx[self.model.encoder]
             )
-            last_block = self.model.pretrained.blocks[-1]
-            attention_weights_warmup = last_block.attn.attn_weights
-            patch_tokens_warmup = encoder_features_warmup[-1]
+
+            # Extract multi-layer CLS tokens for Gear3 Upgrade Ablation Head
+            cls_tokens_multi_layer_warmup = [
+                encoder_features_warmup[i][:, 0] for i in range(len(encoder_features_warmup))
+            ]
+
             h_warmup, w_warmup = img_warmup.shape[2:]
             patch_h_warmup = h_warmup // self.model.patch_size
             patch_w_warmup = w_warmup // self.model.patch_size
@@ -478,9 +537,9 @@ class Gear2Tester:
             )
             path_1_warmup = dpt_features_warmup[-1]
 
-            # Apply Gear2 modulation
-            path_1_modulated_warmup, _, _, _ = self.model.gear2_head(
-                patch_tokens_warmup, attention_weights_warmup, [path_1_warmup], patch_h_warmup, patch_w_warmup
+            # Apply Gear2 modulation (Gear3 Upgrade Ablation Head interface)
+            path_1_modulated_warmup, importance_map_warmup, fg_features_warmup, bg_features_warmup, fg_mask_warmup, bg_mask_warmup = self.model.gear2_head(
+                cls_tokens_multi_layer_warmup, [path_1_warmup]
             )
 
             # Apply Mamba temporal processing
@@ -493,8 +552,9 @@ class Gear2Tester:
             out_warmup = self.model.depth_head.scratch.output_conv1(path_1_temporal_warmup)
             out_warmup = F.interpolate(out_warmup, (h_warmup, w_warmup), mode="bilinear", align_corners=True)
             _ = self.model.depth_head.scratch.output_conv2(out_warmup)
-        del encoder_features_warmup, attention_weights_warmup, patch_tokens_warmup, dpt_features_warmup
+        del encoder_features_warmup, cls_tokens_multi_layer_warmup, dpt_features_warmup
         del path_1_warmup, path_1_modulated_warmup, path_1_temporal_warmup, out_warmup
+        del importance_map_warmup, fg_features_warmup, bg_features_warmup, fg_mask_warmup, bg_mask_warmup
         torch.cuda.empty_cache()
 
         # FPS measurement (논문 방법: 데이터가 GPU에 미리 로드된 상태에서 순수 inference 시간만 측정)
@@ -524,12 +584,10 @@ class Gear2Tester:
                     img_t.unsqueeze(0), self.model.intermediate_layer_idx[self.model.encoder]
                 )
 
-                # Get attention weights from last block
-                last_block = self.model.pretrained.blocks[-1]
-                attention_weights = last_block.attn.attn_weights
-
-                # Get patch tokens from last encoder layer
-                patch_tokens = encoder_features[-1]
+                # Extract multi-layer CLS tokens for Gear3 Upgrade Ablation Head
+                cls_tokens_multi_layer = [
+                    encoder_features[i][:, 0] for i in range(len(encoder_features))
+                ]
 
                 # Get DPT features first (without Mamba)
                 h, w = img_t.shape[1:]
@@ -539,9 +597,9 @@ class Gear2Tester:
                 )
                 path_1 = dpt_features[-1]
 
-                # Apply Gear2 modulation (returns None for importance_map, fg_features, bg_features)
-                path_1_modulated, importance_map, fg_features, bg_features = self.model.gear2_head(
-                    patch_tokens, attention_weights, [path_1], patch_h, patch_w
+                # Apply Gear2 modulation (Gear3 Upgrade Ablation Head interface)
+                path_1_modulated, importance_map, fg_features, bg_features, fg_mask, bg_mask = self.model.gear2_head(
+                    cls_tokens_multi_layer, [path_1]
                 )
 
                 # Apply Mamba temporal processing
@@ -743,8 +801,10 @@ class Gear2Tester:
         if self.config.eval.get('out_video', True):
             # Use original model resolution for images (following FlashDepth approach)
             # save_gifs_as_grid/save_grid_to_mp4 will handle downsampling to save_res
-            self._save_video(
-                images[0], pred_depths, gt_depth_metric, valid_mask, sequence_id
+            save_video_util(
+                images[0], pred_depths, gt_depth_metric, valid_mask, sequence_id,
+                save_dir=self.save_dir,
+                config=self.config
             )
 
         # Save best frame visualizations
@@ -806,29 +866,36 @@ class Gear2Tester:
             axes[0, col].set_title(f'Frame {t}')
             axes[0, col].axis('off')
 
-            # Row 1: Predicted metric depth
+            # Row 1: Predicted metric depth (invalid pixels = black)
+            MAX_DEPTH = 70.0
             pred = pred_depths[t, 0].cpu().numpy()
-            pred_valid = (pred > 0) & (pred < 1000)
-            pred_display = np.full_like(pred, np.nan)
+            pred_valid = (pred > 0) & (pred < MAX_DEPTH)  # Only <70m
+            pred_display = np.where(pred_valid, pred, np.nan)  # Invalid = NaN (will be black)
             if pred_valid.sum() > 0:
-                pred_vmin, pred_vmax = np.nanpercentile(pred[pred_valid], [2, 98])
-                pred_display[pred_valid] = pred[pred_valid]
+                pred_vmin = np.nanpercentile(pred_display, 2)
+                pred_vmax = np.nanpercentile(pred_display, 98)
             else:
                 pred_vmin, pred_vmax = 0, 1
-            axes[1, col].imshow(pred_display, cmap='plasma', vmin=pred_vmin, vmax=pred_vmax)
+            cmap_pred = plt.cm.plasma_r.copy()
+            cmap_pred.set_bad(color='black')
+            axes[1, col].imshow(pred_display, cmap=cmap_pred, vmin=pred_vmin, vmax=pred_vmax)  # plasma_r: near=bright, far=dark
             axes[1, col].set_title(f'Pred (m)')
             axes[1, col].axis('off')
 
-            # Row 2: GT metric depth
+            # Row 2: GT metric depth (invalid pixels = black)
             gt = gt_depths[t, 0].cpu().numpy()
             gt_valid = valid_mask[t, 0].cpu().numpy().astype(bool)
-            gt_display = np.full_like(gt, np.nan)
+            # Also filter by MAX_DEPTH
+            gt_valid = gt_valid & (gt > 0) & (gt < MAX_DEPTH)
+            gt_display = np.where(gt_valid, gt, np.nan)  # Invalid = NaN (will be black)
             if gt_valid.sum() > 0:
-                gt_vmin, gt_vmax = np.nanpercentile(gt[gt_valid], [2, 98])
-                gt_display[gt_valid] = gt[gt_valid]
+                gt_vmin = np.nanpercentile(gt_display, 2)
+                gt_vmax = np.nanpercentile(gt_display, 98)
             else:
                 gt_vmin, gt_vmax = 0, 1
-            axes[2, col].imshow(gt_display, cmap='plasma', vmin=gt_vmin, vmax=gt_vmax)
+            cmap_gt = plt.cm.plasma_r.copy()
+            cmap_gt.set_bad(color='black')
+            axes[2, col].imshow(gt_display, cmap=cmap_gt, vmin=gt_vmin, vmax=gt_vmax)  # plasma_r: near=bright, far=dark
             axes[2, col].set_title(f'GT (m)')
             axes[2, col].axis('off')
 
@@ -867,86 +934,6 @@ class Gear2Tester:
         plt.close(fig)
 
         logger.info(f"Saved visualization: {save_path}")
-
-    def _save_video(self, images, pred_depths, gt_depths, valid_mask, sequence_id):
-        """
-        Create video files (GIF/MP4) similar to FlashDepth validation.
-
-        Args:
-            images: [T, 3, H, W] - RGB images
-            pred_depths: [T, 1, H, W] - Predicted metric depth
-            gt_depths: [T, 1, H, W] - GT metric depth
-            valid_mask: [T, 1, H, W] - Valid mask
-            sequence_id: int - Sequence index
-        """
-        T = images.shape[0]
-
-        # Convert to numpy arrays for video creation
-        video_frames = torch_batch_to_np_arr(images)  # [T, H, W, 3]
-
-        # Convert depth to colorized numpy arrays (per-frame normalization like sequence.png)
-        # Use same normalization as _visualize_sequence for consistency
-        pred_frames = []
-        gt_frames = []
-
-        for t in range(T):
-            # Process pred depth
-            pred = pred_depths[t, 0].cpu().numpy()
-            pred_valid = (pred > 0) & (pred < 1000)
-            if pred_valid.sum() > 0:
-                pred_vmin, pred_vmax = np.percentile(pred[pred_valid], [2, 98])
-                pred_display = np.clip((pred - pred_vmin) / (pred_vmax - pred_vmin + 1e-8), 0, 1)
-                pred_display[~pred_valid] = 0
-            else:
-                pred_display = np.zeros_like(pred)
-            pred_colored = (plt.cm.plasma(pred_display)[:, :, :3] * 255).astype(np.uint8)
-            pred_frames.append(pred_colored)
-
-            # Process GT depth
-            gt = gt_depths[t, 0].cpu().numpy()
-            gt_valid = valid_mask[t, 0].cpu().numpy().astype(bool)
-            if gt_valid.sum() > 0:
-                gt_vmin, gt_vmax = np.percentile(gt[gt_valid], [2, 98])
-                gt_display = np.clip((gt - gt_vmin) / (gt_vmax - gt_vmin + 1e-8), 0, 1)
-                gt_display[~gt_valid] = 0
-            else:
-                gt_display = np.zeros_like(gt)
-            gt_colored = (plt.cm.plasma(gt_display)[:, :, :3] * 255).astype(np.uint8)
-            gt_frames.append(gt_colored)
-
-        # Generate video paths
-        base_name = f"sequence_{sequence_id:04d}"
-        gif_path = self.save_dir / f"{base_name}.gif"
-        mp4_path = self.save_dir / f"{base_name}.mp4"
-
-        # Save based on config
-        if self.config.eval.get('out_mp4', False):
-            # Save as MP4 (with separate pred-only video)
-            logger.info(f"Saving MP4 videos for sequence {sequence_id}...")
-            grid = save_grid_to_mp4(
-                video_frames,
-                gt_frames,
-                pred_frames,
-                output_path=str(mp4_path),
-                fixed_height=self.config.eval.get('save_res', 256),
-                fps=self.config.eval.get('video_fps', 10)
-            )
-            logger.info(f"Saved: {mp4_path}")
-            logger.info(f"Saved: {grid['pred_video_path']}")
-        else:
-            # Save as GIF (default)
-            logger.info(f"Saving GIF for sequence {sequence_id}...")
-            grid = save_gifs_as_grid(
-                video_frames,
-                gt_frames,
-                pred_frames,
-                output_path=str(gif_path),
-                fixed_height=self.config.eval.get('save_res', 256),
-                duration=self.config.eval.get('gif_duration', 110)
-            )
-            logger.info(f"Saved: {gif_path}")
-
-        return grid
 
     def _save_best_frame_visualizations(self, image, pred_depth, gt_depth, importance_map,
                                         fg_features, bg_features, sequence_id, frame_idx, abs_rel, fps=None,
@@ -995,15 +982,15 @@ class Gear2Tester:
         # Get image size
         img_h, img_w = image_np.shape[:2]
 
-        # Create valid mask
+        # Create separate valid masks for GT and Pred
         MAX_DEPTH = 70.0  # Same as training (100/70 = 1.43 inverse depth threshold)
-        gt_valid = (gt_depth > 0) & (gt_depth < MAX_DEPTH)
-        pred_valid = (pred_depth > 0) & (pred_depth < 1000)
-        valid_mask = gt_valid & pred_valid
+        gt_valid_mask = (gt_depth > 0) & (gt_depth < MAX_DEPTH)  # GT valid pixels
+        pred_valid_mask = (pred_depth > 0) & (pred_depth < MAX_DEPTH)  # Pred valid pixels (<70m for visualization)
+        error_valid_mask = gt_valid_mask & pred_valid_mask  # Both valid for error computation
 
-        # Calculate error
+        # Calculate error (only where both GT and Pred are valid)
         abs_error = np.abs(pred_depth - gt_depth)
-        abs_error_masked = np.where(valid_mask, abs_error, np.nan)
+        abs_error_masked = np.where(error_valid_mask, abs_error, np.nan)
 
         # Create figure with 4x3 grid layout matching train_gear3_upgrade
         fig = plt.figure(figsize=(15, 16))
@@ -1017,22 +1004,27 @@ class Gear2Tester:
         ax1.set_title('Input Image', fontsize=14, fontweight='bold')
         ax1.axis('off')
 
-        # 2. Ground Truth Depth
+        # 2. Ground Truth Depth (invalid pixels = black)
         ax2 = fig.add_subplot(gs[0, 1])
-        gt_display = np.where(valid_mask, gt_depth, np.nan)
-        if valid_mask.sum() > 0:
-            vmin, vmax = np.nanpercentile(gt_display, [2, 98])
+        gt_display = np.where(gt_valid_mask, gt_depth, np.nan)  # Invalid = NaN (will be black)
+        if gt_valid_mask.sum() > 0:
+            vmin = np.nanpercentile(gt_display, 2)
+            vmax = np.nanpercentile(gt_display, 98)
         else:
             vmin, vmax = 0, 1
-        im2 = ax2.imshow(gt_display, cmap='plasma', vmin=vmin, vmax=vmax)
+        cmap_gt = plt.cm.plasma_r.copy()
+        cmap_gt.set_bad(color='black')  # NaN pixels = black
+        im2 = ax2.imshow(gt_display, cmap=cmap_gt, vmin=vmin, vmax=vmax)  # plasma_r: near=bright, far=dark
         ax2.set_title('Ground Truth Depth (m)', fontsize=14, fontweight='bold')
         ax2.axis('off')
         plt.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
 
-        # 3. Predicted Metric Depth
+        # 3. Predicted Metric Depth (invalid pixels = black)
         ax3 = fig.add_subplot(gs[0, 2])
-        pred_display = np.where(valid_mask, pred_depth, np.nan)
-        im3 = ax3.imshow(pred_display, cmap='plasma', vmin=vmin, vmax=vmax)
+        pred_display = np.where(pred_valid_mask, pred_depth, np.nan)  # Invalid = NaN (will be black)
+        cmap_pred = plt.cm.plasma_r.copy()
+        cmap_pred.set_bad(color='black')  # NaN pixels = black
+        im3 = ax3.imshow(pred_display, cmap=cmap_pred, vmin=vmin, vmax=vmax)  # plasma_r: near=bright, far=dark
         ax3.set_title('Predicted Metric Depth (m)', fontsize=14, fontweight='bold')
         ax3.axis('off')
         plt.colorbar(im3, ax=ax3, fraction=0.046, pad=0.04)
@@ -1071,15 +1063,16 @@ class Gear2Tester:
         # 7. Valid Mask or Object Mask (depending on object_wise mode)
         ax7 = fig.add_subplot(gs[2, 0])
         if seg_mask is None:
-            # Non-object-wise mode: show Valid Mask (like train visualizer)
-            ax7.imshow(valid_mask.astype(np.uint8), cmap='gray_r', vmin=0, vmax=1)
-            ax7.set_title(f'Valid Mask\n({valid_mask.sum():,} pixels)',
+            # Non-object-wise mode: show GT Valid Mask (valid=white, invalid=black)
+            gt_valid_ratio = gt_valid_mask.sum() / gt_valid_mask.size
+            ax7.imshow(gt_valid_mask.astype(np.uint8), cmap='gray', vmin=0, vmax=1, interpolation='nearest')
+            ax7.set_title(f'GT Valid Mask ({gt_valid_ratio*100:.1f}%)\ninvalid: black',
                          fontsize=12, fontweight='bold')
             ax7.axis('off')
         else:
             # Object-wise mode: show Object Mask
             object_mask = (seg_mask > 0).astype(np.uint8)
-            ax7.imshow(object_mask, cmap='gray', vmin=0, vmax=1)
+            ax7.imshow(object_mask, cmap='gray', vmin=0, vmax=1, interpolation='nearest')
             object_ratio = object_mask.sum() / object_mask.size
             num_classes = len(np.unique(seg_mask[seg_mask > 0])) if (seg_mask > 0).any() else 0
             ax7.set_title(f'Object Mask\n{object_ratio*100:.1f}% ({object_mask.sum():,} pixels)\n{num_classes} classes',
@@ -1088,7 +1081,7 @@ class Gear2Tester:
 
         # 8. Absolute Error Map
         ax8 = fig.add_subplot(gs[2, 1])
-        if valid_mask.sum() > 0:
+        if error_valid_mask.sum() > 0:
             error_vmax = np.nanpercentile(abs_error_masked, 95)
         else:
             error_vmax = 1
@@ -1114,10 +1107,10 @@ class Gear2Tester:
                     transform=ax9.transAxes, bbox=dict(boxstyle="round", facecolor='lightgreen'))
             y_pos -= 0.10
 
-        # Depth metrics
-        if valid_mask.sum() > 0:
-            valid_gt = torch.from_numpy(gt_depth[valid_mask])
-            valid_pred = torch.from_numpy(pred_depth[valid_mask])
+        # Depth metrics (computed on pixels where both GT and Pred are valid)
+        if error_valid_mask.sum() > 0:
+            valid_gt = torch.from_numpy(gt_depth[error_valid_mask])
+            valid_pred = torch.from_numpy(pred_depth[error_valid_mask])
 
             rmse = torch.sqrt(torch.mean((valid_pred - valid_gt) ** 2))
             mae = torch.mean(torch.abs(valid_pred - valid_gt))

@@ -395,7 +395,7 @@ def create_sparse_depth_vis_no_inpaint(
 ) -> Tuple[np.ndarray, np.ndarray, dict]:
     """
     Sparse depth visualization WITHOUT inpainting (just show valid pixels).
-    Valid row range 밖은 흰색, 안쪽은 valid 픽셀만 표시 (invalid는 회색).
+    Invalid pixels shown as black (0, 0, 0) instead of white.
 
     Args:
         depth: [H, W] depth array (sparse)
@@ -405,7 +405,7 @@ def create_sparse_depth_vis_no_inpaint(
 
     Returns:
         sparse_vis: [H, W, 3] sparse visualization (valid pixels only)
-        dense_vis: [H, W, 3] same as sparse_vis but white bg outside valid range
+        dense_vis: [H, W, 3] same as sparse_vis but black bg outside valid range
         info: statistics dict
     """
     import matplotlib.cm as cm
@@ -418,28 +418,24 @@ def create_sparse_depth_vis_no_inpaint(
         return empty, empty, {'valid_ratio': 0.0}
 
     # Get normalization range from valid depths
-    vmin, vmax = np.nanpercentile(valid_depth, percentile_range)
+    vmin = np.nanpercentile(valid_depth, percentile_range[0])
+    vmax = np.nanpercentile(valid_depth, percentile_range[1])
 
-    # Sparse visualization (show only valid pixels, rest is gray)
-    sparse_depth_vis = np.full((h, w), np.nan)
-    sparse_depth_vis[valid_mask] = depth[valid_mask]
+    # Sparse visualization (show only valid pixels, rest is black)
+    # Use NaN for invalid pixels
+    sparse_depth_vis = np.where(valid_mask, depth, np.nan)  # Invalid = NaN
     sparse_normalized = np.clip(
         (sparse_depth_vis - vmin) / (vmax - vmin + 1e-8), 0, 1
     )
 
-    cmap = cm.get_cmap(colormap)
-    sparse_vis = np.ones((h, w, 3)) * 0.3  # Gray background
-    valid_colored = cmap(sparse_normalized[valid_mask])[:, :3]
-    sparse_vis[valid_mask, :] = valid_colored
-    sparse_vis = (sparse_vis * 255).astype(np.uint8)
+    # Apply colormap with set_bad for NaN pixels
+    cmap = cm.get_cmap(colormap).copy()
+    cmap.set_bad(color='black')  # NaN pixels = black
+    sparse_vis_rgba = cmap(sparse_normalized)
+    sparse_vis = (sparse_vis_rgba[:, :, :3] * 255).astype(np.uint8)
 
-    # Dense visualization: white background with only valid pixels colored
-    dense_vis = np.ones((h, w, 3), dtype=np.float32)  # White background
-
-    # Color valid pixels only
-    dense_vis[valid_mask, :] = valid_colored
-
-    dense_vis = (dense_vis * 255).astype(np.uint8)
+    # Dense visualization: same as sparse for this helper
+    dense_vis = sparse_vis.copy()
 
     # For info, calculate valid row range
     valid_rows = np.any(valid_mask, axis=1)

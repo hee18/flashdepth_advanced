@@ -146,17 +146,23 @@ class Gear2Visualizer:
                 # Sparse depth: show valid pixels only (no inpainting)
                 # Use vis mask (no 70m limit) for visualization
                 _, gt_dense_vis, gt_info = create_sparse_depth_vis_no_inpaint(
-                    gt_depth_frame, valid_mask_vis, colormap='plasma', percentile_range=(2, 98)
+                    gt_depth_frame, valid_mask_vis, colormap='plasma_r', percentile_range=(2, 98)
                 )
                 im2 = ax2.imshow(gt_dense_vis)
                 ax2.set_title(f'GT Depth (Sparse)\n{valid_ratio_vis*100:.1f}% valid\n(Metrics: {valid_ratio_metrics*100:.1f}%)',
                              fontsize=12, fontweight='bold')
                 vmin, vmax = gt_info['vmin'], gt_info['vmax']
             else:
-                # Dense depth: use standard visualization (no 70m limit)
-                gt_display = np.where(valid_mask_vis, gt_depth_frame, np.nan)
-                vmin, vmax = np.nanpercentile(gt_display, [2, 98])
-                im2 = ax2.imshow(gt_display, cmap='plasma', vmin=vmin, vmax=vmax)
+                # Dense depth: use standard visualization (invalid pixels = black)
+                gt_display = np.where(valid_mask_vis, gt_depth_frame, np.nan)  # Invalid = NaN (will be black)
+                if valid_mask_vis.sum() > 0:
+                    vmin = np.nanpercentile(gt_display, 2)
+                    vmax = np.nanpercentile(gt_display, 98)
+                else:
+                    vmin, vmax = 0, 1
+                cmap = plt.cm.plasma_r.copy()
+                cmap.set_bad(color='black')  # NaN pixels = black
+                im2 = ax2.imshow(gt_display, cmap=cmap, vmin=vmin, vmax=vmax)  # plasma_r: near=bright, far=dark
                 ax2.set_title(f'Ground Truth Depth (m)\n(Metrics: {valid_ratio_metrics*100:.1f}%)',
                              fontsize=12, fontweight='bold')
 
@@ -168,14 +174,18 @@ class Gear2Visualizer:
 
             if is_sparse_dataset:
                 # Pred depth is already dense (model predicts all pixels), just visualize directly
-                im3 = ax3.imshow(pred_depth_frame, cmap='plasma', vmin=vmin, vmax=vmax)
+                cmap_pred = plt.cm.plasma_r.copy()
+                cmap_pred.set_bad(color='black')
+                im3 = ax3.imshow(pred_depth_frame, cmap=cmap_pred, vmin=vmin, vmax=vmax)  # plasma_r: near=bright, far=dark
                 mae_str = f'{np.nanmean(abs_error_masked):.3f}m' if has_valid_pixels else 'N/A'
                 ax3.set_title(f'Pred Depth\nMAE: {mae_str}',
                              fontsize=12, fontweight='bold')
             else:
-                # Dense depth: use standard visualization (no 70m limit)
-                pred_display = np.where(valid_mask_vis, pred_depth_frame, np.nan)
-                im3 = ax3.imshow(pred_display, cmap='plasma', vmin=vmin, vmax=vmax)
+                # Dense depth: use standard visualization (invalid pixels = black)
+                pred_display = np.where(valid_mask_vis, pred_depth_frame, np.nan)  # Invalid = NaN (will be black)
+                cmap_pred = plt.cm.plasma_r.copy()
+                cmap_pred.set_bad(color='black')  # NaN pixels = black
+                im3 = ax3.imshow(pred_display, cmap=cmap_pred, vmin=vmin, vmax=vmax)  # plasma_r: near=bright, far=dark
                 mae_str = f'{np.nanmean(abs_error_masked):.3f}m' if has_valid_pixels else 'N/A'
                 ax3.set_title(f'Predicted Metric Depth (m)\nMAE: {mae_str}',
                              fontsize=12, fontweight='bold')
@@ -215,9 +225,11 @@ class Gear2Visualizer:
             # ==================== Row 3: Valid Mask, Error, Metrics & Training Info ====================
 
             # 7. Valid Mask (for metrics calculation, 70m threshold)
+            # valid=white, invalid=black
             ax7 = fig.add_subplot(gs[2, 0])
-            ax7.imshow(valid_mask_metrics.astype(np.uint8), cmap='gray_r', vmin=0, vmax=1)
-            ax7.set_title(f'Valid Mask\n({valid_mask_metrics.sum():,} pixels)',
+            ax7.imshow(valid_mask_metrics.astype(np.uint8), cmap='gray', vmin=0, vmax=1)
+            valid_ratio_pct = (valid_mask_metrics.sum() / valid_mask_metrics.size) * 100
+            ax7.set_title(f'Valid Mask ({valid_ratio_pct:.1f}%)\ninvalid: black',
                          fontsize=12, fontweight='bold')
             ax7.axis('off')
 

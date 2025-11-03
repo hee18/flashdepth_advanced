@@ -80,6 +80,9 @@ class WaymoSegmentationDataset(Dataset):
         self.split = split
         self.video_length = video_length
 
+        # DEBUG: Log video_length
+        logger.info(f"WaymoSegmentationDataset initialized with video_length={video_length}")
+
         # Handle resolution: convert 'base' to 518, or ensure int
         if isinstance(resolution, str):
             self.resolution = 518 if resolution == 'base' else int(resolution)
@@ -137,20 +140,30 @@ class WaymoSegmentationDataset(Dataset):
 
             num_frames = len(rgb_files)
 
-            if num_frames < self.video_length:
-                logger.warning(f"Sequence {seq_dir.name} has only {num_frames} frames, skipping")
-                continue
-
             # Verify all have same number of files
             if len(seg_files) != num_frames or len(depth_files) != num_frames:
                 logger.warning(f"Mismatch in file counts for {seq_dir.name}: "
                              f"RGB={num_frames}, Seg={len(seg_files)}, Depth={len(depth_files)}, skipping")
                 continue
 
+            # Use available frames (min of num_frames and video_length)
+            # This allows testing on sequences with fewer frames than requested
+            actual_video_length = min(num_frames, self.video_length)
+
+            if actual_video_length < 5:
+                logger.warning(f"Sequence {seq_dir.name} has only {num_frames} frames (< 5), skipping")
+                continue
+
             # Create sliding window sequences
-            for start_idx in range(0, num_frames - self.video_length + 1, self.video_length // 2):
-                frame_indices = list(range(start_idx, start_idx + self.video_length))
+            # If num_frames < video_length, create a single sequence with all available frames
+            if num_frames <= self.video_length:
+                frame_indices = list(range(0, num_frames))
                 sequences.append((seq_dir, num_frames, frame_indices))
+            else:
+                # Normal case: create sliding windows
+                for start_idx in range(0, num_frames - self.video_length + 1, self.video_length // 2):
+                    frame_indices = list(range(start_idx, start_idx + self.video_length))
+                    sequences.append((seq_dir, num_frames, frame_indices))
 
         return sequences
 

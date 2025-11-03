@@ -43,6 +43,7 @@ from flashdepth.gear3_upgrade_modules import Gear3UpgradeMetricHead
 from dataloaders.combined_dataset import CombinedDataset
 from utils.helpers import *
 from utils.metric_depth_metrics import MetricDepthMetrics
+from utils.gear_losses import LogL1Loss
 
 
 def init_distributed():
@@ -71,125 +72,6 @@ def init_distributed():
 
     return rank, world_size, local_rank
 
-
-class CanonicalSpaceNormalizer:
-    """
-    Canonical space normalization using fixed focal length.
-
-    Converts metric depth to canonical space:
-        depth_canonical = depth * (focal_canonical / focal_actual)
-
-    And de-canonicalizes predictions:
-        depth_actual = depth_canonical * (focal_actual / focal_canonical)
-    """
-    def __init__(self, focal_canonical=1000.0, enable=True):
-        self.focal_canonical = focal_canonical
-        self.enable = enable
-        logging.info(f"Canonical space normalization: {'enabled' if enable else 'disabled'} (f={focal_canonical})")
-
-    def canonicalize(self, depth, focal_length):
-        """Convert metric depth to canonical space"""
-        if not self.enable:
-            return depth
-
-        if isinstance(focal_length, (int, float)):
-            focal_length = torch.tensor(focal_length, device=depth.device, dtype=depth.dtype)
-
-        # depth_canonical = depth * (focal_canonical / focal_actual)
-        scale_factor = self.focal_canonical / focal_length
-        return depth * scale_factor.view(-1, 1, 1, 1)
-
-    def canonicalize_inverse(self, inverse_depth, focal_length):
-        """Convert inverse depth to canonical space
-
-        For inverse depth: inverse_canonical = inverse_depth / (focal_canonical / focal_actual)
-        Because: inverse = 1/depth, depth_canonical = depth * scale
-        Therefore: inverse_canonical = 1/depth_canonical = 1/(depth*scale) = inverse/scale
-        """
-        if not self.enable:
-            return inverse_depth
-
-        if isinstance(focal_length, (int, float)):
-            focal_length = torch.tensor(focal_length, device=inverse_depth.device, dtype=inverse_depth.dtype)
-
-        # inverse_canonical = inverse_depth / (focal_canonical / focal_actual)
-        scale_factor = self.focal_canonical / focal_length
-        return inverse_depth / scale_factor.view(-1, 1, 1, 1)
-
-    def decanonicalize(self, depth_canonical, focal_length):
-        """Convert canonical space depth back to metric depth"""
-        if not self.enable:
-            return depth_canonical
-
-        if isinstance(focal_length, (int, float)):
-            focal_length = torch.tensor(focal_length, device=depth_canonical.device, dtype=depth_canonical.dtype)
-
-        # depth_actual = depth_canonical * (focal_actual / focal_canonical)
-        scale_factor = focal_length / self.focal_canonical
-        return depth_canonical * scale_factor.view(-1, 1, 1, 1)
-
-    def decanonicalize_inverse(self, inverse_depth_canonical, focal_length):
-        """Convert canonical inverse depth back to actual inverse depth
-
-        For inverse depth: inverse_actual = inverse_canonical * (focal_canonical / focal_actual)
-        Because: inverse_canonical = inverse_actual / scale
-        Therefore: inverse_actual = inverse_canonical * scale
-        """
-        if not self.enable:
-            return inverse_depth_canonical
-
-        if isinstance(focal_length, (int, float)):
-            focal_length = torch.tensor(focal_length, device=inverse_depth_canonical.device, dtype=inverse_depth_canonical.dtype)
-
-        # inverse_actual = inverse_canonical * (focal_canonical / focal_actual)
-        scale_factor = self.focal_canonical / focal_length
-        return inverse_depth_canonical * scale_factor.view(-1, 1, 1, 1)
-
-
-class LogL1Loss(nn.Module):
-    """
-    Log L1 loss for inverse depth learning.
-
-    Loss = L1(log(pred_inverse), log(gt_inverse))
-    Works directly with inverse depth values (100/m)
-    """
-    def __init__(self):
-        super().__init__()
-
-    def forward(self, pred_inverse, gt_inverse, valid_mask=None):
-        """
-        Args:
-            pred_inverse: [B, 1, H, W] predicted inverse depth (100/m)
-            gt_inverse: [B, 1, H, W] ground truth inverse depth (100/m)
-            valid_mask: [B, 1, H, W] valid pixels (optional)
-
-        Returns:
-            loss: scalar
-        """
-        # Apply valid mask BEFORE log to avoid log(negative values)
-        if valid_mask is not None:
-            # Only compute loss on valid pixels
-            pred_valid = pred_inverse[valid_mask.bool()]
-            gt_valid = gt_inverse[valid_mask.bool()]
-
-            if len(pred_valid) == 0:
-                return torch.tensor(0.0, device=pred_inverse.device)
-
-            # Log L1 loss on valid pixels only
-            loss = F.l1_loss(
-                torch.log(pred_valid + 1e-8),
-                torch.log(gt_valid + 1e-8),
-                reduction='mean'
-            )
-        else:
-            # Fallback: compute on all pixels
-            loss = F.l1_loss(
-                torch.log(pred_inverse + 1e-8),
-                torch.log(gt_inverse + 1e-8),
-                reduction='mean'
-            )
-
-        return loss
 
 
 
@@ -258,12 +140,6 @@ class Gear3UpgradeTrainer:
             self.logger.info(f"Results directory: {self.results_dir}")
             self.logger.info(f"Training phase: {self.phase}")
 
-        # Setup canonical space normalizer
-        self.canonical_normalizer = CanonicalSpaceNormalizer(
-            focal_canonical=config.get('canonical_focal_length', 1000.0),
-            enable=config.get('use_canonical_space', True)
-        )
-
         # Initialize model
         self.model = self._setup_model()
 
@@ -325,17 +201,19 @@ class Gear3UpgradeTrainer:
 
         # Load pre-trained checkpoint
         # Phase 1: Load from config (DINOv2 + DPT only)
-        # Phase 2, 3: Load Phase 1 best model (all Gear3 modules included)
+        # Phase 2: Load Gear-S checkpoint (for Gear modules) + Hybrid weights (for ViT-DPT)
         if self.phase == 1:
             checkpoint_path = self.config.get('load')
         else:
-            # Phase 2, 3: Load Phase 1 best model (match model size)
-            if model.encoder == 'vitl':
-                checkpoint_path = self.config.get('phase1_l_checkpoint', 'train_results/gear3_upgrade_phase1_l/best.pth')
-            else:
-                checkpoint_path = self.config.get('phase1_s_checkpoint', 'train_results/gear3_upgrade_phase1_s/best.pth')
+            # Phase 2: Load Gear-S Phase 1 checkpoint (always S for hybrid)
+            checkpoint_path = self.config.get('gear_checkpoint')
+            if not checkpoint_path:
+                raise ValueError(
+                    "Phase 2 (hybrid) requires 'gear_checkpoint' in config! "
+                    "Set gear_checkpoint to your Gear-S Phase 1 checkpoint path."
+                )
             if self.rank == 0:
-                self.logger.info(f"Phase {self.phase}: Loading Phase 1 best model from {checkpoint_path}")
+                self.logger.info(f"Phase {self.phase}: Loading Gear-S checkpoint for Gear modules from {checkpoint_path}")
 
         if checkpoint_path and checkpoint_path != 'true':
             if os.path.exists(checkpoint_path):
@@ -416,7 +294,8 @@ class Gear3UpgradeTrainer:
 
             # Phase 2 ONLY: Overwrite ViT-DPT with FlashDepth-hybrid weights
             if self.phase == 2:
-                hybrid_path = self.config.get('flashdepth_hybrid', 'configs/flashdepth/iter_43002.pth')
+                # Use 'load' config for hybrid weights (ViT-DPT overwrite)
+                hybrid_path = self.config.get('load', 'configs/flashdepth/iter_43002.pth')
                 if os.path.exists(hybrid_path):
                     self.logger.info(f"Phase 2: Overwriting ViT-DPT with Hybrid weights from {hybrid_path}")
                     hybrid_checkpoint = torch.load(hybrid_path, map_location='cpu')
@@ -791,9 +670,8 @@ class Gear3UpgradeTrainer:
                     elif gt_depth.ndim == 4 and gt_depth.shape[1] != 1:
                         gt_depth = gt_depth.unsqueeze(2)
 
-                    focal_length = 1000.0
-                    gt_depth_inverse_canonical = self.canonical_normalizer.canonicalize_inverse(gt_depth, focal_length)
-                    gt_depth_inverse = gt_depth_inverse_canonical * 100.0  # Training uses 100/m
+                    # GT depth from dataloader is inverse depth (1/m), scale to 100/m for training
+                    gt_depth_inverse_100 = gt_depth * 100.0  # (1/m) * 100 = 100/m
 
                     # Get batch size for Mamba initialization
                     B_orig, T_orig, C, H, W = images.shape
@@ -869,7 +747,7 @@ class Gear3UpgradeTrainer:
                         bg_mask_vis = bg_mask_seq[:, 0]  # [B, 1, H, W]
 
                         # GT depth for first frame
-                        gt_depth_inverse_vis = gt_depth_inverse[:, 0]  # [B, 1, H, W]
+                        gt_depth_inverse_vis = gt_depth_inverse_100[:, 0]  # [B, 1, H, W]
                         gt_depth_metric = 100.0 / (gt_depth_inverse_vis + 1e-8)
 
                         # Resize masks to match image resolution (no need to resize pred_depth_metric_vis as it's already at H, W)
@@ -976,14 +854,14 @@ class Gear3UpgradeTrainer:
             self.logger.info(f"DEBUG - Raw GT depth from dataloader: min={gt_depth.min():.4f}, max={gt_depth.max():.4f}, shape={gt_depth.shape}")
             self.logger.info(f"DEBUG - GT depth has {(gt_depth > 0).sum()} valid pixels out of {gt_depth.numel()} total")
 
-        # Convert GT to canonical inverse depth and scale by 100
-        gt_depth_inverse_canonical = self.canonical_normalizer.canonicalize_inverse(gt_depth, focal_length)
-        gt_depth_inverse = gt_depth_inverse_canonical * 100.0  # 100/meters for training
+        # GT depth from dataloader is inverse depth (1/m), scale to 100/m for training
+        # This matches FlashDepth's relative depth scale (≈ 100/metric_depth)
+        gt_depth_inverse_100 = gt_depth * 100.0  # (1/m) * 100 = 100/m
 
-        # DEBUG: Check after canonicalization
+        # DEBUG: Check after scaling to 100/m
         if self.global_step < 5:
-            self.logger.info(f"DEBUG - After canonicalization & scaling: min={gt_depth_inverse.min():.4f}, max={gt_depth_inverse.max():.4f}")
-            self.logger.info(f"DEBUG - Has {(gt_depth_inverse > 0).sum()} valid pixels")
+            self.logger.info(f"DEBUG - After scaling to 100/m: min={gt_depth_inverse_100.min():.4f}, max={gt_depth_inverse_100.max():.4f}")
+            self.logger.info(f"DEBUG - Has {(gt_depth_inverse_100 > 0).sum()} valid pixels")
 
         # Forward pass following original FlashDepth pattern (whole sequence at once)
         # Initialize Mamba sequence (critical for temporal processing!)
@@ -1061,7 +939,7 @@ class Gear3UpgradeTrainer:
 
         # Compute loss (outside autocast for stability)
         # Reshape GT from (B, T, 1, H, W) to (B*T, H, W)
-        gt_depth_inverse_flat = rearrange(gt_depth_inverse, 'b t 1 h w -> (b t) h w')
+        gt_depth_inverse_flat = rearrange(gt_depth_inverse_100, 'b t 1 h w -> (b t) h w')
 
         # Remove channel dimension from prediction
         pred_depth_inverse_flat = pred_depth_inverse.squeeze(1)  # (B*T, H, W)
@@ -1170,12 +1048,10 @@ class Gear3UpgradeTrainer:
                 elif gt_depth.ndim == 4 and gt_depth.shape[1] != 1:
                     gt_depth = gt_depth.unsqueeze(2)
 
-                focal_length = 1000.0
                 B, T = images.shape[:2]
 
-                # Canonicalize GT inverse depth and scale to 100/m
-                gt_depth_inverse_canonical = self.canonical_normalizer.canonicalize_inverse(gt_depth, focal_length)
-                gt_depth_inverse = gt_depth_inverse_canonical * 100.0  # Training uses 100/m
+                # GT depth from dataloader is inverse depth (1/m), scale to 100/m for training
+                gt_depth_inverse_100 = gt_depth * 100.0  # (1/m) * 100 = 100/m
 
                 # Initialize Mamba sequence for temporal processing
                 if hasattr(model, 'mamba'):
@@ -1238,7 +1114,7 @@ class Gear3UpgradeTrainer:
                 pred_depth_inverse = out  # [B*T, 1, H, W] at model resolution
 
                 # Reshape GT from (B, T, 1, H, W) to (B*T, 1, H, W)
-                gt_depth_inverse_flat = rearrange(gt_depth_inverse, 'b t 1 h w -> (b t) 1 h w')
+                gt_depth_inverse_flat = rearrange(gt_depth_inverse_100, 'b t 1 h w -> (b t) 1 h w')
 
                 # Interpolate prediction to GT resolution (like original FlashDepth validation)
                 gt_shape = gt_depth_inverse_flat.shape[-2:]
@@ -1283,7 +1159,7 @@ class Gear3UpgradeTrainer:
                             try:
                                 # Use first frame (t=0) for visualization
                                 pred_depth_inverse_vis = pred_depth_inverse_seq[:, 0]  # [B, 1, H, W]
-                                gt_depth_inverse_vis = gt_depth_inverse[:, 0]  # [B, 1, H, W]
+                                gt_depth_inverse_vis = gt_depth_inverse_100[:, 0]  # [B, 1, H, W]
 
                                 # Convert to metric depth for visualization: 100/m -> m
                                 # Convert to Float32 for CPU operations
@@ -1393,10 +1269,10 @@ class Gear3UpgradeTrainer:
                 dataset_sequence_counters[current_dataset] += 1
 
             # Clear batch memory and GPU cache to prevent OOM
-            del images, gt_depth, gt_depth_inverse
+            del images, gt_depth, gt_depth_inverse_100
             torch.cuda.empty_cache()
 
-        avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
+        avg_loss = total_loss / num_batches if num_batches > 0 else float('inf')
 
         # Log detailed per-dataset statistics (rank 0 only)
         if self.rank == 0:
