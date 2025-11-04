@@ -394,7 +394,7 @@ class ObjectWiseMetrics:
             logger.info(f"  MAE: {metrics['mae']:.4f}m")
             logger.info(f"  RMSE: {metrics['rmse']:.4f}m")
             logger.info(f"  AbsRel: {metrics['abs_rel']:.4f}")
-            logger.info(f"  δ1: {metrics['a1']:.4f}")
+            logger.info(f"  delta1: {metrics['a1']:.4f}")
 
         if comparison is not None:
             logger.info(f"\n{'='*80}")
@@ -406,7 +406,7 @@ class ObjectWiseMetrics:
                 logger.info(f"  MAE: {comp_metrics['mae_improvement']:+.2f}%")
                 logger.info(f"  RMSE: {comp_metrics['rmse_improvement']:+.2f}%")
                 logger.info(f"  AbsRel: {comp_metrics['abs_rel_improvement']:+.2f}%")
-                logger.info(f"  δ1: {comp_metrics['a1_improvement']:+.2f}%")
+                logger.info(f"  delta1: {comp_metrics['a1_improvement']:+.2f}%")
 
 
 def load_segmentation_mask(seg_path: Path, dataset_type: str) -> np.ndarray:

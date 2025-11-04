@@ -720,8 +720,8 @@ class Gear2Trainer:
 
                         # Move tensors to CPU for visualization (only first batch, first frame)
                         sample_batch = (
-                            images[:1, :1].cpu(),  # [1, 1, 3, H, W]
-                            gt_depth_metric[:1].cpu(),  # [1, 1, H, W] (already has channel dim)
+                            images[:1, :1].float().cpu(),  # [1, 1, 3, H, W] - convert BFloat16 to Float32 first
+                            gt_depth_metric[:1].float().cpu(),  # [1, 1, H, W] (already has channel dim)
                             dataset_idx
                         )
                         model_outputs_cpu = {
@@ -1109,7 +1109,7 @@ class Gear2Trainer:
                                     # But we only have one frame (t=0), so unsqueeze T dimension
                                     sample_batch = (
                                         img_t_resized.unsqueeze(1).float().cpu(),  # [B, 1, C, gt_h, gt_w] at GT resolution
-                                        gt_depth_metric.unsqueeze(1),  # [B, 1, gt_h, gt_w]
+                                        gt_depth_metric.unsqueeze(1).float().cpu(),  # [B, 1, gt_h, gt_w]
                                         dataset_idx
                                     )
 

@@ -71,11 +71,11 @@ class WaymoDepth(BaseDatasetPairs):
 
     def get_filter_scenes(self, split):
         all_scenes = self.get_all_scenes(self.get_scenes_path())
-        
+
         if split == 'val':
-            return sorted(all_scenes)[8:] # only use first 8 scenes
+            return sorted(all_scenes)[:8]  # only use first 8 scenes
         elif split == 'test':
-            return [s for s in all_scenes if s not in testing_scenes] # only use the 30 testing scenes
+            return [s for s in all_scenes if s not in testing_scenes]  # only use the 30 testing scenes
         return []  
 
     def get_rgb_depth_paths(self, scenes_path, scene_name):

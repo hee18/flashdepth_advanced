@@ -168,8 +168,8 @@ class Gear3Tester:
                     split='val',
                     video_length=video_length,
                     resolution=resolution,
-                    camera_name=1,  # FRONT camera
-                    use_depth=False  # Use placeholder depth (complex to extract from LiDAR)
+                    camera_name='FRONT',  # FRONT camera
+                    objwise_mode=True  # Only use frames 0-19 with segmentation annotation
                 )
                 collate_fn = waymo_collate_fn
             else:
@@ -184,7 +184,19 @@ class Gear3Tester:
             collate_fn = self._collate_fn
         else:
             # Normal mode: use CombinedDataset
-            test_datasets = self.config.eval.test_datasets
+            # Check if whole-test mode (default: False)
+            whole_test = self.config.get('whole_test', False)
+
+            if whole_test:
+                test_datasets = self.config.eval.test_datasets
+                logger.info("Using ALL test datasets (whole_test=True)")
+            else:
+                # Use validation datasets with waymo_seg (first 8 sequences)
+                test_datasets = self.config.dataset.get('val_datasets', ['sintel', 'waymo_seg'])
+                # Replace 'waymo' with 'waymo_seg' if present
+                test_datasets = ['waymo_seg' if d == 'waymo' else d for d in test_datasets]
+                logger.info(f"Using VALIDATION datasets only (whole_test=False): {test_datasets}")
+
             video_length = int(self.config.get('vid_len', 50))  # Ensure integer (Hydra may pass string)  # Get from config override
             resolution = self.config.get('resolution', self.config.eval.test_dataset_resolution)  # Allow resolution override
 
@@ -330,10 +342,10 @@ class Gear3Tester:
                     # Use integer constants for PIL compatibility (2=BILINEAR, 0=NEAREST)
                     img = img.resize(self.resolution, 2)  # 2 = BILINEAR (positional arg)
                     img_array = np.array(img).astype(np.float32) / 255.0
-                    # Normalize (ImageNet stats)
+                    # Normalize (ImageNet stats) - for model input only
                     mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
                     std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-                    img_normalized = (img_array - mean) / std
+                    img_normalized = (img_array - mean) / std  # This is for model input, not visualization
                     img_tensor = torch.from_numpy(img_normalized).permute(2, 0, 1).float()  # [3, H, W], ensure float32
                     images.append(img_tensor)
 
@@ -749,42 +761,52 @@ class Gear3Tester:
         metrics['fps'] = fps
 
         # Object-wise evaluation: compute per-class metrics
-        if self.object_wise_enabled and 'segmentation' in batch:
+        # Object-wise evaluation: compute per-class metrics for all frames
+        # Initialize variables
+        seg_masks_np = None  # Will store per-frame segmentations
+        per_frame_class_metrics = []  # Per-frame metrics
+
+        if self.object_wise_enabled and 'segmentations' in batch:
             try:
-                # Get segmentation mask for last frame
-                seg_mask = batch['segmentation'][0]  # [H, W] - batch size is 1
+                # Get per-frame segmentations
+                seg_masks = batch['segmentations'][0]  # [T, H, W] - batch size is 1
+                T_seg = seg_masks.shape[0]
 
-                # Get last frame predictions and GT
-                pred_last = pred_depths_cpu[-1, 0].numpy()  # [H, W] numpy array
-                gt_last = gt_depth_metric_cpu[-1, 0].numpy()  # [H, W] numpy array
-                seg_mask_np = seg_mask.cpu().numpy() if isinstance(seg_mask, torch.Tensor) else seg_mask
+                logger.info(f"Processing {T_seg} frames with segmentation")
 
-                # Debug: Check segmentation mask
-                unique_ids = np.unique(seg_mask_np)
-                logger.info(f"Segmentation mask - shape: {seg_mask_np.shape}, "
-                           f"unique_ids: {len(unique_ids)}, "
-                           f"non_zero: {(seg_mask_np > 0).sum()}/{seg_mask_np.size} "
-                           f"({100.0 * (seg_mask_np > 0).sum() / seg_mask_np.size:.2f}%)")
+                # Convert to numpy
+                seg_masks_np = seg_masks.cpu().numpy() if isinstance(seg_masks, torch.Tensor) else seg_masks
 
-                # Resize segmentation to match pred/GT resolution if needed
-                if seg_mask_np.shape != pred_last.shape:
-                    import cv2
-                    seg_mask_np = cv2.resize(
-                        seg_mask_np.astype(np.int32),
-                        (pred_last.shape[1], pred_last.shape[0]),
-                        interpolation=cv2.INTER_NEAREST
+                # Compute metrics for each frame
+                for t in range(T_seg):
+                    pred_frame = pred_depths_cpu[t, 0].numpy()  # [H, W]
+                    gt_frame = gt_depth_metric_cpu[t, 0].numpy()  # [H, W]
+                    seg_mask_frame = seg_masks_np[t]  # [H, W]
+
+                    # Resize segmentation to match pred/GT if needed
+                    if seg_mask_frame.shape != pred_frame.shape:
+                        import cv2
+                        seg_mask_frame = cv2.resize(
+                            seg_mask_frame.astype(np.int32),
+                            (pred_frame.shape[1], pred_frame.shape[0]),
+                            interpolation=cv2.INTER_NEAREST
+                        )
+                        # Update in array
+                        seg_masks_np[t] = seg_mask_frame
+
+                    # Compute per-class metrics
+                    frame_class_metrics = self.object_wise_metrics.compute_metrics_per_class(
+                        pred_depth=pred_frame,
+                        gt_depth=gt_frame,
+                        seg_mask=seg_mask_frame,
+                        min_pixels=100
                     )
+                    per_frame_class_metrics.append(frame_class_metrics)
 
-                # Compute per-class metrics
-                class_metrics = self.object_wise_metrics.compute_metrics_per_class(
-                    pred_depth=pred_last,
-                    gt_depth=gt_last,
-                    seg_mask=seg_mask_np,
-                    min_pixels=100
-                )
-
+                # Aggregate across all frames
+                class_metrics = self.object_wise_metrics.aggregate_metrics(per_frame_class_metrics)
                 metrics['object_wise'] = class_metrics
-                logger.info(f"Computed object-wise metrics for {len(class_metrics)} classes")
+                logger.info(f"Computed object-wise metrics for {len(class_metrics)} classes across {T_seg} frames")
 
                 # Log per-class pixel counts
                 if class_metrics:
@@ -832,9 +854,25 @@ class Gear3Tester:
         if len(frame_metrics) > 0:
             logger.info(f"Best frame for sequence {sequence_id}: Frame {best_frame_idx} (AbsRel={best_frame_abs_rel:.4f})")
 
-            # Pass object-wise data if available
-            seg_mask_for_viz = seg_mask_np if self.config.object_wise.get('enabled', False) and 'seg_mask_np' in locals() else None
-            class_metrics_for_viz = class_metrics if self.config.object_wise.get('enabled', False) and 'class_metrics' in locals() else None
+            # Get segmentation and actual frame number for best frame
+            if self.object_wise_enabled and seg_masks_np is not None:
+                if best_frame_idx < len(seg_masks_np):
+                    # Best frame has segmentation - use it
+                    seg_mask_for_viz = seg_masks_np[best_frame_idx]  # [H, W]
+                    class_metrics_for_viz = per_frame_class_metrics[best_frame_idx] if best_frame_idx < len(per_frame_class_metrics) else None
+
+                    # Get actual frame number from frame_indices
+                    actual_frame_number = batch['frame_indices'][0][best_frame_idx] if 'frame_indices' in batch else best_frame_idx
+                    logger.info(f"Best frame batch_idx={best_frame_idx}, actual_frame={actual_frame_number} - showing object mask")
+                else:
+                    seg_mask_for_viz = None
+                    class_metrics_for_viz = None
+                    actual_frame_number = best_frame_idx
+                    logger.info(f"Best frame {best_frame_idx} has no segmentation - showing valid mask instead")
+            else:
+                seg_mask_for_viz = None
+                class_metrics_for_viz = None
+                actual_frame_number = best_frame_idx
 
             self._save_best_frame_visualizations(
                 images[0, best_frame_idx],  # [3, H, W]
@@ -844,7 +882,7 @@ class Gear3Tester:
                 fg_features_all[best_frame_idx],  # [C, patch_h, patch_w]
                 bg_features_all[best_frame_idx],  # [C, patch_h, patch_w]
                 sequence_id,
-                best_frame_idx,
+                actual_frame_number,  # Use actual frame number, not batch index
                 best_frame_abs_rel,
                 fps,  # Add FPS
                 seg_mask_for_viz,  # Add segmentation mask
@@ -873,11 +911,9 @@ class Gear3Tester:
         for col, t in enumerate(frame_indices):
             # Row 0: Image (denormalize ImageNet normalization)
             img = images[t].permute(1, 2, 0).cpu().numpy()
-            # Denormalize ImageNet stats
-            mean = np.array([0.485, 0.456, 0.406])
-            std = np.array([0.229, 0.224, 0.225])
-            img = img * std + mean  # Reverse normalization
-            img = np.clip(img, 0, 1)  # Clip to valid range
+            # Min-Max normalization (FlashDepth original method)
+            img = (img - img.min()) / (img.max() - img.min() + 1e-8)
+            img = np.clip(img, 0, 1)
             img = (img * 255).astype(np.uint8)
             axes[0, col].imshow(img)
             axes[0, col].set_title(f'Frame {t}')
@@ -980,11 +1016,9 @@ class Gear3Tester:
         if isinstance(importance_map, torch.Tensor):
             importance_map = importance_map.float().cpu().numpy()
 
-        # Denormalize ImageNet normalization for image
-        mean = np.array([0.485, 0.456, 0.406])
-        std = np.array([0.229, 0.224, 0.225])
-        image_np = image * std + mean  # Reverse normalization
-        image_np = np.clip(image_np, 0, 1)  # Clip to valid range
+        # Min-Max normalization (FlashDepth original method)
+        image_np = (image * 1.0 - image.min()) / (image.max() - image.min() + 1e-8)
+        image_np = np.clip(image_np, 0, 1)
 
         # Get image size
         img_h, img_w = image_np.shape[:2]

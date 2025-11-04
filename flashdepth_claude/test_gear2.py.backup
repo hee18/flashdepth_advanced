@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Test script for Gear3 Upgrade: Feature-level Metric Depth Learning with FG/BG Masks
+Test script for Gear2: Ablation Study (No FG/BG Separation)
 
-Key differences from Gear3:
-    - Produces FG/BG masks in addition to importance map
-    - Visualizes FG/BG masks separately
-    - Uses Gear3UpgradeMetricHead for prediction
+Key differences from baseline:
+    - No relative depth visualization (features are modulated)
+    - Test on inverse depth metrics
+    - De-canonicalize outputs for final evaluation
 """
 
 import os
@@ -32,7 +32,8 @@ project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
 
 from flashdepth.model import FlashDepth
-from flashdepth.gear3_upgrade_modules import Gear3UpgradeMetricHead
+from flashdepth.gear2_modules import Gear2MetricHead
+from flashdepth.gear3_upgrade_modules import Gear3UpgradeAblationHead
 from dataloaders.combined_dataset import CombinedDataset
 from dataloaders.waymo_segmentation_dataset import WaymoSegmentationDataset, collate_fn as waymo_collate_fn
 from utils.metric_depth_metrics import MetricDepthMetrics, format_metrics
@@ -50,15 +51,14 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-class Gear3UpgradeTester:
+class Gear2Tester:
     """
-    Test harness for Gear3 Upgrade model.
+    Test harness for Gear2 model.
 
     Evaluates on:
         - Inverse depth metrics (TAE, AbsRel, δ1/δ2/δ3)
         - Metric depth visualization (no relative depth)
         - Importance map visualization
-        - FG/BG mask visualization
     """
     def __init__(self, config):
         self.config = config
@@ -73,9 +73,6 @@ class Gear3UpgradeTester:
         # Object-wise evaluation configuration
         self.object_wise_enabled = config.get('object_wise', {}).get('enabled', False)
         self.object_wise_dataset = config.get('object_wise', {}).get('dataset', 'waymo')
-
-        # Frame interval for visualization (only applies to sequence.png, not video)
-        self.frame_interval = None
 
         if self.object_wise_enabled:
             logger.info(f"Object-wise evaluation ENABLED for dataset: {self.object_wise_dataset}")
@@ -93,7 +90,7 @@ class Gear3UpgradeTester:
         self.metrics = MetricDepthMetrics()
 
     def _setup_model(self):
-        """Load trained Gear3 Upgrade model"""
+        """Load trained Gear2 model"""
         # Create base FlashDepth model
         model_config = dict(self.config.model)
         model_config['batch_size'] = 1
@@ -101,45 +98,25 @@ class Gear3UpgradeTester:
 
         model = FlashDepth(**model_config)
 
-        # Add Gear3 Upgrade metric head
+        # Add Gear2 metric head (using Gear3 Upgrade Ablation Head for multi-layer CLS)
         embed_dim = 1024 if model.encoder == 'vitl' else 384
         dpt_dim = 256 if model.encoder == 'vitl' else 64
-        num_heads = 16 if model.encoder == 'vitl' else 6
-        separation_method = self.config.get('separation_method', 'cls_seg')
 
-        model.gear3_upgrade_head = Gear3UpgradeMetricHead(
+        model.gear2_head = Gear3UpgradeAblationHead(
             embed_dim=embed_dim,
-            dpt_dim=dpt_dim,
-            num_heads=num_heads,
-            separation_method=separation_method
+            dpt_dim=dpt_dim
         )
+        logger.info("Using Gear3 Upgrade Ablation Head for multi-layer CLS ablation study")
 
-        # Enable attention weights storage
-        # - 'multi_layer': Enable for multiple blocks (encoder-specific)
-        #   - ViT-L (24 blocks): [3, 10, 16, 22]
-        #   - ViT-S (12 blocks): [2, 5, 8, 11]
-        # - Other methods: Enable only last block
-        if separation_method == 'multi_layer':
-            # Multi-layer: enable attention storage for specified blocks
-            if model.encoder == 'vitl':
-                target_blocks = [3, 10, 16, 22]  # ViT-L
+        # Enable attention weights storage for multi-layer extraction (blocks 3, 10, 16, 22)
+        # Need to store attention from layers 4, 11, 17, 23 for multi-layer CLS extraction
+        target_blocks = [3, 10, 16, 22]  # Blocks 3, 10, 16, 22 (layers 4, 11, 17, 23)
+        for i, block in enumerate(model.pretrained.blocks):
+            if i in target_blocks:
+                block.attn.store_attn_weights = True
+                logger.info(f"Enabled attention weights storage for block {i}")
             else:
-                target_blocks = [2, 5, 8, 11]  # ViT-S
-
-            for i, block in enumerate(model.pretrained.blocks):
-                if i in target_blocks:
-                    block.attn.store_attn_weights = True
-                    logger.info(f"Enabled attention weights storage for block {i}")
-                else:
-                    block.attn.store_attn_weights = False
-        else:
-            # Other methods: enable only last block
-            for i, block in enumerate(model.pretrained.blocks):
-                if i == len(model.pretrained.blocks) - 1:
-                    block.attn.store_attn_weights = True
-                    logger.info(f"Enabled attention weights storage for block {i} (last block)")
-                else:
-                    block.attn.store_attn_weights = False
+                block.attn.store_attn_weights = False
 
         # Load checkpoint
         checkpoint_path = self.config.get('load')
@@ -156,18 +133,8 @@ class Gear3UpgradeTester:
                 else:
                     state_dict = checkpoint
 
-                # Convert gear3_head keys to gear3_upgrade_head for backward compatibility
-                converted_state_dict = {}
-                for key, value in state_dict.items():
-                    if key.startswith('gear3_head.'):
-                        new_key = key.replace('gear3_head.', 'gear3_upgrade_head.', 1)
-                        converted_state_dict[new_key] = value
-                        logger.debug(f"Converted key: {key} -> {new_key}")
-                    else:
-                        converted_state_dict[key] = value
-
                 # Load state dict
-                model.load_state_dict(converted_state_dict, strict=True)
+                model.load_state_dict(state_dict, strict=True)
                 logger.info(f"Loaded checkpoint successfully")
 
                 # Log training info if available
@@ -191,9 +158,6 @@ class Gear3UpgradeTester:
         # Check if single sequence mode
         single_seq_path = self.config.get('single_sequence', None)
 
-        # Check if whole-test mode (default: False)
-        whole_test = self.config.get('whole_test', False)
-
         # Object-wise evaluation: use segmentation datasets
         if self.object_wise_enabled:
             video_length = int(self.config.get('vid_len', 50))  # Ensure integer (Hydra may pass string)
@@ -201,41 +165,14 @@ class Gear3UpgradeTester:
             data_root = self.config.dataset.data_root
 
             if self.object_wise_dataset == 'waymo':
-                # WaymoSegmentationDataset expects data_root to be waymo_seg directory
-                waymo_data_root = str(Path(data_root) / 'waymo_seg')
-
-                # For waymo_seg in objwise mode: use 20 frames (0-19 with annotation)
-                # Override video_length and frame_interval if not explicitly set
-                if 'vid_len' not in self.config:
-                    video_length = 20
-                    logger.info(f"Auto-setting video_length=20 for waymo_seg objwise mode (frames with annotation)")
-
-                # Set frame_interval to 2 for waymo_seg objwise (show every 2nd frame in sequence.png)
-                if self.frame_interval is None:
-                    self.frame_interval = 2
-                    logger.info(f"Auto-setting frame_interval=2 for waymo_seg objwise mode")
-
-                # whole_test controls which sequences to use:
-                # - False (default): Use 'val' split which applies same filtering as WaymoDepth (first 8 scenes only)
-                # - True: Use all sequences without filtering
-                # objwise_mode=True: Only load frames 0-19 with segmentation annotation
                 test_dataset = WaymoSegmentationDataset(
-                    data_root=waymo_data_root,
+                    data_root=data_root,
                     split='val',
                     video_length=video_length,
                     resolution=resolution,
-                    camera_name='FRONT',
-                    objwise_mode=True  # Only use frames with segmentation annotation (0-19)
+                    camera_name=1,  # FRONT camera
+                    use_depth=False  # Use placeholder depth (complex to extract from LiDAR)
                 )
-
-                if whole_test:
-                    # Reload all sequences without filtering
-                    test_dataset.sequences = test_dataset._load_sequences_unfiltered()
-                    logger.info(f"Using all sequences (whole_test=True): {len(test_dataset.sequences)} sequences")
-                else:
-                    # Already loaded with validation filtering (first 8 scenes only)
-                    logger.info(f"Using validation subset (whole_test=False): {len(test_dataset.sequences)} sequences (first 8 scenes, same as training val)")
-
                 collate_fn = waymo_collate_fn
             else:
                 raise ValueError(f"Unknown object-wise dataset: {self.object_wise_dataset}")
@@ -249,7 +186,9 @@ class Gear3UpgradeTester:
             collate_fn = self._collate_fn
         else:
             # Normal mode: use CombinedDataset
-            # Use validation datasets if whole-test is False (default)
+            # Check if whole-test mode (default: False)
+            whole_test = self.config.get('whole_test', False)
+
             if whole_test:
                 test_datasets = self.config.eval.test_datasets
                 logger.info("Using ALL test datasets (whole_test=True)")
@@ -260,7 +199,7 @@ class Gear3UpgradeTester:
                 test_datasets = ['waymo_seg' if d == 'waymo' else d for d in test_datasets]
                 logger.info(f"Using VALIDATION datasets only (whole_test=False): {test_datasets}")
 
-            video_length = int(self.config.get('vid_len', 50))  # Ensure integer (Hydra may pass string)  # Get from config override
+            video_length = int(self.config.get('vid_len', 50))  # Ensure integer (Hydra may pass string)
             resolution = self.config.get('resolution', self.config.eval.test_dataset_resolution)  # Allow resolution override
 
             logger.info(f"Test datasets: {test_datasets}")
@@ -405,10 +344,10 @@ class Gear3UpgradeTester:
                     # Use integer constants for PIL compatibility (2=BILINEAR, 0=NEAREST)
                     img = img.resize(self.resolution, 2)  # 2 = BILINEAR (positional arg)
                     img_array = np.array(img).astype(np.float32) / 255.0
-                    # Normalize (ImageNet stats) - for model input only
+                    # Normalize (ImageNet stats)
                     mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
                     std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-                    img_normalized = (img_array - mean) / std  # This is for model input, not visualization
+                    img_normalized = (img_array - mean) / std
                     img_tensor = torch.from_numpy(img_normalized).permute(2, 0, 1).float()  # [3, H, W], ensure float32
                     images.append(img_tensor)
 
@@ -554,22 +493,16 @@ class Gear3UpgradeTester:
             logger.error(f"Batch is not a dict! Type: {type(batch)}, Content: {batch if not isinstance(batch, torch.Tensor) else 'Tensor'}")
             raise TypeError(f"Expected dict, got {type(batch)}")
 
-        # Handle both 'image' (CombinedDataset) and 'images' (WaymoSegmentationDataset) keys
-        if 'images' in batch:
-            images = batch['images'].to(self.device)  # [1, T, 3, H, W] or [T, 3, H, W]
-            # Add batch dimension if missing (WaymoSegmentationDataset returns [T, 3, H, W])
-            if images.ndim == 4:
-                images = images.unsqueeze(0)  # [1, T, 3, H, W]
-        else:
-            images = batch['image'].to(self.device)  # [1, T, 3, H, W]
-        gt_depth = batch['depth'].to(self.device)  # [1, T, H, W] or [T, H, W] - val split has no channel dim
-
-        # Add batch dimension if missing (WaymoSegmentationDataset returns [T, H, W])
-        if gt_depth.ndim == 3:
-            gt_depth = gt_depth.unsqueeze(0)  # [1, T, H, W]
+        # Preload all data to GPU memory (논문 방법: FPS 측정 시 데이터 전송 시간 제외)
+        # "We preprocess all images and load them onto GPU memory before starting inference"
+        images = batch['image'].to(self.device)  # [1, T, 3, H, W] - 전체 시퀀스를 GPU에 미리 로드
+        gt_depth = batch['depth'].to(self.device)  # [1, T, H, W]
 
         # Add channel dimension if needed
-        if gt_depth.ndim == 4:
+        if gt_depth.ndim == 3:
+            gt_depth = gt_depth.unsqueeze(2)  # [1, T, 1, H, W]
+        elif gt_depth.ndim == 4 and gt_depth.shape[2] > 3:
+            # Already [1, T, H, W], add channel dim
             gt_depth = gt_depth.unsqueeze(2)  # [1, T, 1, H, W]
 
         B, T = images.shape[:2]
@@ -581,8 +514,8 @@ class Gear3UpgradeTester:
         # Storage for predictions
         pred_depths = []
         importance_maps = []
-        fg_mask_list = []
-        bg_mask_list = []
+        fg_features_list = []
+        bg_features_list = []
 
         # Best frame tracking
         best_frame_idx = 0
@@ -596,30 +529,16 @@ class Gear3UpgradeTester:
             self.model.mamba.start_new_sequence()
 
         with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-            img_warmup = images[0, 0].unsqueeze(0)
+            img_warmup = images[0, 0].unsqueeze(0)  # Already on GPU
             encoder_features_warmup = self.model.pretrained.get_intermediate_layers(
                 img_warmup, self.model.intermediate_layer_idx[self.model.encoder]
             )
 
-            # Collect attention weights (multi_layer or last block only)
-            if self.config.get('separation_method', 'cls_seg') == 'multi_layer':
-                # Multi-layer: collect from specified blocks
-                if self.model.encoder == 'vitl':
-                    target_blocks = [3, 10, 16, 22]
-                else:
-                    target_blocks = [2, 5, 8, 11]
-                attention_weights_multi_layer_warmup = [
-                    self.model.pretrained.blocks[i].attn.attn_weights for i in target_blocks
-                ]
-                attention_weights_warmup = None  # Not used in multi_layer mode
-            else:
-                # Other methods: use last block only
-                last_block = self.model.pretrained.blocks[-1]
-                attention_weights_warmup = last_block.attn.attn_weights
-                attention_weights_multi_layer_warmup = None
+            # Extract multi-layer CLS tokens for Gear3 Upgrade Ablation Head
+            cls_tokens_multi_layer_warmup = [
+                encoder_features_warmup[i][:, 0] for i in range(len(encoder_features_warmup))
+            ]
 
-            patch_tokens_warmup = encoder_features_warmup[-1]  # [B, N+1, embed_dim] (includes CLS)
-            cls_token_warmup = patch_tokens_warmup[:, 0]  # [B, embed_dim]
             h_warmup, w_warmup = img_warmup.shape[2:]
             patch_h_warmup = h_warmup // self.model.patch_size
             patch_w_warmup = w_warmup // self.model.patch_size
@@ -630,10 +549,9 @@ class Gear3UpgradeTester:
             )
             path_1_warmup = dpt_features_warmup[-1]
 
-            # Apply Gear3 Upgrade modulation
-            path_1_modulated_warmup, _, _, _, _, _ = self.model.gear3_upgrade_head(
-                patch_tokens_warmup, attention_weights_warmup, [path_1_warmup], patch_h_warmup, patch_w_warmup,
-                cls_token=cls_token_warmup, attention_weights_multi_layer=attention_weights_multi_layer_warmup
+            # Apply Gear2 modulation (Gear3 Upgrade Ablation Head interface)
+            path_1_modulated_warmup, importance_map_warmup, fg_features_warmup, bg_features_warmup, fg_mask_warmup, bg_mask_warmup = self.model.gear2_head(
+                cls_tokens_multi_layer_warmup, [path_1_warmup]
             )
 
             # Apply Mamba temporal processing
@@ -646,11 +564,12 @@ class Gear3UpgradeTester:
             out_warmup = self.model.depth_head.scratch.output_conv1(path_1_temporal_warmup)
             out_warmup = F.interpolate(out_warmup, (h_warmup, w_warmup), mode="bilinear", align_corners=True)
             _ = self.model.depth_head.scratch.output_conv2(out_warmup)
-        del encoder_features_warmup, attention_weights_warmup, patch_tokens_warmup, dpt_features_warmup
+        del encoder_features_warmup, cls_tokens_multi_layer_warmup, dpt_features_warmup
         del path_1_warmup, path_1_modulated_warmup, path_1_temporal_warmup, out_warmup
+        del importance_map_warmup, fg_features_warmup, bg_features_warmup, fg_mask_warmup, bg_mask_warmup
         torch.cuda.empty_cache()
 
-        # FPS measurement (like original FlashDepth)
+        # FPS measurement (논문 방법: 데이터가 GPU에 미리 로드된 상태에서 순수 inference 시간만 측정)
         warmup_frames = min(5, T)  # Warmup frames to skip initial overhead
         start_time = None  # Will start timing after warmup
 
@@ -660,42 +579,27 @@ class Gear3UpgradeTester:
 
         # Process each frame
         for t in range(T):
-            # Start timing after warmup frames (like original FlashDepth)
+            # Start timing after warmup frames (논문: "start timer after a single warmup iteration")
             if t == warmup_frames:
                 torch.cuda.synchronize()
                 import time
                 start_time = time.time()
 
-            img_t = images[0, t]  # [3, H, W]
-            gt_t_inverse = gt_depth_inverse_100[0, t]  # [1, H, W] in 100/m
+            # GPU에서 인덱싱만 (전송 없음, 데이터는 이미 GPU에 로드됨)
+            img_t = images[0, t]  # [3, H, W] - GPU에서 인덱싱만
+            gt_t_inverse = gt_depth_inverse_100[0, t]  # [1, H, W] - GPU에서 인덱싱만
 
-            # Use BFloat16 for forward pass (same as train_gear3.py)
+            # Use BFloat16 for forward pass (same as train_gear2.py)
             with torch.amp.autocast('cuda', dtype=torch.bfloat16):
                 # Extract features from DINOv2
                 encoder_features = self.model.pretrained.get_intermediate_layers(
                     img_t.unsqueeze(0), self.model.intermediate_layer_idx[self.model.encoder]
                 )
 
-                # Collect attention weights (multi_layer or last block only)
-                if self.config.get('separation_method', 'cls_seg') == 'multi_layer':
-                    # Multi-layer: collect from specified blocks
-                    if self.model.encoder == 'vitl':
-                        target_blocks = [3, 10, 16, 22]
-                    else:
-                        target_blocks = [2, 5, 8, 11]
-                    attention_weights_multi_layer = [
-                        self.model.pretrained.blocks[i].attn.attn_weights for i in target_blocks
-                    ]
-                    attention_weights = None  # Not used in multi_layer mode
-                else:
-                    # Other methods: use last block only
-                    last_block = self.model.pretrained.blocks[-1]
-                    attention_weights = last_block.attn.attn_weights
-                    attention_weights_multi_layer = None
-
-                # Get patch tokens from last encoder layer (includes CLS token)
-                patch_tokens = encoder_features[-1]  # [B, N+1, embed_dim]
-                cls_token = patch_tokens[:, 0]  # [B, embed_dim]
+                # Extract multi-layer CLS tokens for Gear3 Upgrade Ablation Head
+                cls_tokens_multi_layer = [
+                    encoder_features[i][:, 0] for i in range(len(encoder_features))
+                ]
 
                 # Get DPT features first (without Mamba)
                 h, w = img_t.shape[1:]
@@ -705,11 +609,9 @@ class Gear3UpgradeTester:
                 )
                 path_1 = dpt_features[-1]
 
-                # Apply Gear3 Upgrade modulation (produces FG/BG masks)
-                # Pass cls_token for cls_seg mode support
-                path_1_modulated, importance_map, fg_features, bg_features, fg_mask, bg_mask = self.model.gear3_upgrade_head(
-                    patch_tokens, attention_weights, [path_1], patch_h, patch_w,
-                    cls_token=cls_token, attention_weights_multi_layer=attention_weights_multi_layer
+                # Apply Gear2 modulation (Gear3 Upgrade Ablation Head interface)
+                path_1_modulated, importance_map, fg_features, bg_features, fg_mask, bg_mask = self.model.gear2_head(
+                    cls_tokens_multi_layer, [path_1]
                 )
 
                 # Apply Mamba temporal processing
@@ -727,7 +629,7 @@ class Gear3UpgradeTester:
                 # Prediction is already positive (Softplus activation in output_conv2)
                 pred_depth_inverse_100 = out  # [1, 1, H, W] in 100/m
 
-                # Interpolate prediction to GT resolution (like train_gear3.py validation)
+                # Interpolate prediction to GT resolution (like train_gear2.py validation)
                 gt_t_shape = gt_t_inverse.shape[-2:]  # GT original resolution
                 if pred_depth_inverse_100.shape[-2:] != gt_t_shape:
                     pred_depth_inverse_100 = F.interpolate(
@@ -737,13 +639,6 @@ class Gear3UpgradeTester:
                 # Convert to metric depth: 100/m -> m
                 pred_depth_metric = 100.0 / (pred_depth_inverse_100[0] + 1e-8)  # [1, H, W]
 
-                # Upsample importance_map to image resolution for smooth visualization
-                # (like train_gear3_upgrade.py does before passing to visualizer)
-                h_full, w_full = img_t.shape[1:]  # Image resolution
-                importance_map_resized = F.interpolate(
-                    importance_map, size=(h_full, w_full), mode='bilinear', align_corners=True
-                )  # [1, 1, H, W] at image resolution
-
             # End timing for FPS measurement (after last frame, like original FlashDepth)
             if t == T - 1 and start_time is not None:
                 torch.cuda.synchronize()
@@ -751,10 +646,11 @@ class Gear3UpgradeTester:
 
             # List append for visualization (outside FPS measurement)
             pred_depths.append(pred_depth_metric)
-            # Save upsampled importance_map (already smooth, no need to interpolate again in visualization)
-            importance_maps.append(importance_map_resized[0])  # [1, H, W] at image resolution
-            fg_mask_list.append(fg_mask[0])
-            bg_mask_list.append(bg_mask[0])
+            # Gear2 returns None for importance_map, fg_features, bg_features
+            if importance_map is not None:
+                importance_maps.append(importance_map[0])
+                fg_features_list.append(fg_features[0])
+                bg_features_list.append(bg_features[0])
 
         # Calculate FPS (like original FlashDepth: exclude warmup frames)
         if start_time is not None:
@@ -769,9 +665,10 @@ class Gear3UpgradeTester:
 
         # Stack predictions
         pred_depths = torch.stack(pred_depths, dim=0)  # [T, 1, H, W] in meters
-        importance_maps = torch.stack(importance_maps, dim=0)  # [T, 1, patch_h, patch_w]
-        fg_mask_all = torch.stack(fg_mask_list, dim=0)  # [T, 1, patch_h, patch_w]
-        bg_mask_all = torch.stack(bg_mask_list, dim=0)  # [T, 1, patch_h, patch_w]
+        # Gear2 doesn't produce importance maps (returns None)
+        importance_maps = torch.stack(importance_maps, dim=0) if importance_maps else None
+        fg_features_all = torch.stack(fg_features_list, dim=0) if fg_features_list else None
+        bg_features_all = torch.stack(bg_features_list, dim=0) if bg_features_list else None
 
         # Convert GT to metric depth for evaluation: 100/m -> m
         gt_depth_metric = 100.0 / (gt_depth_inverse_100[0] + 1e-8)  # [T, 1, H, W] in meters
@@ -787,8 +684,8 @@ class Gear3UpgradeTester:
             pred_frame = pred_depths_cpu[t, 0]  # [H, W]
             gt_frame = gt_depth_metric_cpu[t, 0]  # [H, W]
 
-            # Create valid mask for this frame (like train_gear3 validation)
-            # Use same MAX_DEPTH as Gear3Visualizer (70m)
+            # Create valid mask for this frame (like train_gear2 validation)
+            # Use same MAX_DEPTH as Gear2Visualizer (70m)
             MAX_DEPTH = 70.0
             gt_valid_mask = (gt_frame > 0) & (gt_frame < MAX_DEPTH)  # GT valid pixels
             pred_valid_mask = (pred_frame > 0) & (pred_frame < MAX_DEPTH)  # Filter extreme values
@@ -863,60 +760,44 @@ class Gear3UpgradeTester:
         # Add FPS to metrics
         metrics['fps'] = fps
 
-        # Object-wise evaluation: compute per-class metrics for all frames
-        # Initialize variables
-        seg_masks_np = None  # Will store per-frame segmentations
-        per_frame_class_metrics = []  # Per-frame metrics
-
-        if self.object_wise_enabled and 'segmentations' in batch:
+        # Object-wise evaluation: compute per-class metrics
+        if self.object_wise_enabled and 'segmentation' in batch:
             try:
-                # Get per-frame segmentations
-                seg_masks = batch['segmentations'][0]  # [T, H, W] - batch size is 1
-                T_seg = seg_masks.shape[0]
+                # Get segmentation mask for last frame
+                seg_mask = batch['segmentation'][0]  # [H, W] - batch size is 1
 
-                logger.info(f"Processing {T_seg} frames with segmentation")
+                # Get last frame predictions and GT
+                pred_last = pred_depths_cpu[-1, 0].numpy()  # [H, W] numpy array
+                gt_last = gt_depth_metric_cpu[-1, 0].numpy()  # [H, W] numpy array
+                seg_mask_np = seg_mask.cpu().numpy() if isinstance(seg_mask, torch.Tensor) else seg_mask
 
-                # Convert to numpy
-                seg_masks_np = seg_masks.cpu().numpy() if isinstance(seg_masks, torch.Tensor) else seg_masks
-
-                # Compute metrics for each frame
-                for t in range(T_seg):
-                    pred_frame = pred_depths_cpu[t, 0].numpy()  # [H, W]
-                    gt_frame = gt_depth_metric_cpu[t, 0].numpy()  # [H, W]
-                    seg_mask_frame = seg_masks_np[t]  # [H, W]
-
-                    # Resize segmentation to match pred/GT if needed
-                    if seg_mask_frame.shape != pred_frame.shape:
-                        import cv2
-                        seg_mask_frame = cv2.resize(
-                            seg_mask_frame.astype(np.int32),
-                            (pred_frame.shape[1], pred_frame.shape[0]),
-                            interpolation=cv2.INTER_NEAREST
-                        )
-                        # Update in array
-                        seg_masks_np[t] = seg_mask_frame
-
-                    # Compute per-class metrics
-                    frame_class_metrics = self.object_wise_metrics.compute_metrics_per_class(
-                        pred_depth=pred_frame,
-                        gt_depth=gt_frame,
-                        seg_mask=seg_mask_frame,
-                        min_pixels=100
+                # Resize segmentation to match pred/GT resolution if needed
+                if seg_mask_np.shape != pred_last.shape:
+                    import cv2
+                    seg_mask_np = cv2.resize(
+                        seg_mask_np.astype(np.int32),
+                        (pred_last.shape[1], pred_last.shape[0]),
+                        interpolation=cv2.INTER_NEAREST
                     )
-                    per_frame_class_metrics.append(frame_class_metrics)
 
-                # Aggregate across all frames
-                class_metrics = self.object_wise_metrics.aggregate_metrics(per_frame_class_metrics)
+                # Compute per-class metrics
+                class_metrics = self.object_wise_metrics.compute_metrics_per_class(
+                    pred_depth=pred_last,
+                    gt_depth=gt_last,
+                    seg_mask=seg_mask_np,
+                    min_pixels=100
+                )
+
                 metrics['object_wise'] = class_metrics
-                logger.info(f"Computed object-wise metrics for {len(class_metrics)} classes across {T_seg} frames")
+                logger.info(f"Computed object-wise metrics for {len(class_metrics)} classes")
+
+                # Note: objwise_seq visualization disabled - using best_frame with object mask instead
 
             except Exception as e:
                 logger.error(f"Error computing object-wise metrics: {e}")
                 import traceback
                 traceback.print_exc()
                 metrics['object_wise'] = {}
-                seg_masks_np = None
-                per_frame_class_metrics = []
 
         # Recreate valid_mask on GPU for visualization
         valid_mask = (gt_depth_metric > 0)  # [T, 1, H, W] on GPU
@@ -929,7 +810,6 @@ class Gear3UpgradeTester:
             )
 
         # Save video (GIF or MP4)
-        # Note: frame_interval is NOT applied to video - use all frames
         if self.config.eval.get('out_video', True):
             # Use original model resolution for images (following FlashDepth approach)
             # save_gifs_as_grid/save_grid_to_mp4 will handle downsampling to save_res
@@ -942,69 +822,28 @@ class Gear3UpgradeTester:
         # Save best frame visualizations
         if len(frame_metrics) > 0:
             logger.info(f"Best frame for sequence {sequence_id}: Frame {best_frame_idx} (AbsRel={best_frame_abs_rel:.4f})")
+            # Extract features if available (None for Gear2)
+            importance_map_frame = importance_maps[best_frame_idx, 0] if importance_maps is not None else None
+            fg_features_frame = fg_features_all[best_frame_idx] if fg_features_all is not None else None
+            bg_features_frame = bg_features_all[best_frame_idx] if bg_features_all is not None else None
 
-            # Extract layer_weights for visualization (multi_layer separation only)
-            layer_weights = None
-            separation_method = self.config.get('separation_method', 'cls_seg')
-            logger.info(f"Separation method: {separation_method}")
-
-            if separation_method == 'multi_layer':
-                try:
-                    logger.info(f"Attempting to extract layer_weights...")
-                    logger.info(f"Model has gear3_upgrade_head: {hasattr(self.model, 'gear3_upgrade_head')}")
-                    if hasattr(self.model, 'gear3_upgrade_head'):
-                        # Use same attribute name as training: multi_layer_fusion.fusion_weights
-                        logger.info(f"gear3_upgrade_head has multi_layer_fusion: {hasattr(self.model.gear3_upgrade_head, 'multi_layer_fusion')}")
-                        if hasattr(self.model.gear3_upgrade_head, 'multi_layer_fusion'):
-                            fusion_weights = self.model.gear3_upgrade_head.multi_layer_fusion.fusion_weights
-                            layer_weights = torch.softmax(fusion_weights, dim=0).detach().cpu().numpy()
-                            logger.info(f"Successfully extracted layer_weights: {layer_weights}")
-                        else:
-                            logger.warning(f"gear3_upgrade_head does not have multi_layer_fusion attribute")
-                    else:
-                        logger.warning(f"Model does not have gear3_upgrade_head attribute")
-                except Exception as e:
-                    logger.error(f"Failed to extract layer_weights: {e}")
-                    import traceback
-                    traceback.print_exc()
-            else:
-                logger.info(f"Skipping layer_weights extraction (separation_method={separation_method}, not 'multi_layer')")
-
-            # Get segmentation and actual frame number for best frame
-            if self.object_wise_enabled and seg_masks_np is not None:
-                if best_frame_idx < len(seg_masks_np):
-                    # Best frame has segmentation - use it
-                    seg_mask_for_viz = seg_masks_np[best_frame_idx]  # [H, W]
-                    class_metrics_for_viz = per_frame_class_metrics[best_frame_idx] if best_frame_idx < len(per_frame_class_metrics) else None
-
-                    # Get actual frame number from frame_indices
-                    actual_frame_number = batch['frame_indices'][0][best_frame_idx] if 'frame_indices' in batch else best_frame_idx
-                    logger.info(f"Best frame batch_idx={best_frame_idx}, actual_frame={actual_frame_number} - showing object mask")
-                else:
-                    # Best frame doesn't have segmentation
-                    seg_mask_for_viz = None
-                    class_metrics_for_viz = None
-                    actual_frame_number = best_frame_idx
-                    logger.info(f"Best frame {best_frame_idx} has no segmentation - showing valid mask instead")
-            else:
-                seg_mask_for_viz = None
-                class_metrics_for_viz = None
-                actual_frame_number = best_frame_idx
+            # Pass object-wise data if available
+            seg_mask_for_viz = seg_mask_np if self.config.object_wise.get('enabled', False) and 'seg_mask_np' in locals() else None
+            class_metrics_for_viz = class_metrics if self.config.object_wise.get('enabled', False) and 'class_metrics' in locals() else None
 
             self._save_best_frame_visualizations(
                 images[0, best_frame_idx],  # [3, H, W]
                 pred_depths[best_frame_idx, 0],  # [H, W]
                 gt_depth_metric[best_frame_idx, 0],  # [H, W]
-                importance_maps[best_frame_idx, 0],  # [patch_h, patch_w]
-                fg_mask_all[best_frame_idx],  # [1, patch_h, patch_w]
-                bg_mask_all[best_frame_idx],  # [1, patch_h, patch_w]
+                importance_map_frame,  # [patch_h, patch_w] or None
+                fg_features_frame,  # [C, patch_h, patch_w] or None
+                bg_features_frame,  # [C, patch_h, patch_w] or None
                 sequence_id,
-                actual_frame_number,  # Use actual frame number, not batch index
+                best_frame_idx,
                 best_frame_abs_rel,
                 fps,  # Add FPS
-                seg_mask_for_viz,  # Add segmentation mask (only if matches best_frame)
-                class_metrics_for_viz,  # Add class metrics
-                layer_weights  # Add layer weights
+                seg_mask_for_viz,  # Add segmentation mask
+                class_metrics_for_viz  # Add class metrics
             )
 
         return metrics
@@ -1018,14 +857,7 @@ class Gear3UpgradeTester:
         """
         T = images.shape[0]
         frames_to_show = min(10, T)  # Show up to 10 frames
-
-        # Use frame_interval if set (for waymo_seg objwise), otherwise auto-calculate
-        if self.frame_interval is not None:
-            interval = self.frame_interval
-            logger.info(f"Using frame_interval={interval} for sequence.png visualization")
-        else:
-            interval = max(1, T // frames_to_show)
-
+        interval = max(1, T // frames_to_show)
         frame_indices = list(range(0, T, interval))[:frames_to_show]
 
         # Create figure
@@ -1036,9 +868,11 @@ class Gear3UpgradeTester:
         for col, t in enumerate(frame_indices):
             # Row 0: Image (denormalize ImageNet normalization)
             img = images[t].permute(1, 2, 0).cpu().numpy()
-            # Min-Max normalization (FlashDepth original method)
-            img = (img - img.min()) / (img.max() - img.min() + 1e-8)
-            img = np.clip(img, 0, 1)
+            # Denormalize ImageNet stats
+            mean = np.array([0.485, 0.456, 0.406])
+            std = np.array([0.229, 0.224, 0.225])
+            img = img * std + mean  # Reverse normalization
+            img = np.clip(img, 0, 1)  # Clip to valid range
             img = (img * 255).astype(np.uint8)
             axes[0, col].imshow(img)
             axes[0, col].set_title(f'Frame {t}')
@@ -1048,38 +882,50 @@ class Gear3UpgradeTester:
             MAX_DEPTH = 70.0
             pred = pred_depths[t, 0].cpu().numpy()
             pred_valid = (pred > 0) & (pred < MAX_DEPTH)  # Only <70m
-            pred_display = np.where(pred_valid, pred, np.nan)  # Invalid = NaN
+            pred_display = np.where(pred_valid, pred, np.nan)  # Invalid = NaN (will be black)
             if pred_valid.sum() > 0:
                 pred_vmin = np.nanpercentile(pred_display, 2)
                 pred_vmax = np.nanpercentile(pred_display, 98)
             else:
                 pred_vmin, pred_vmax = 0, 1
             cmap_pred = plt.cm.plasma_r.copy()
-            cmap_pred.set_bad(color='black')  # NaN pixels = black
+            cmap_pred.set_bad(color='black')
             axes[1, col].imshow(pred_display, cmap=cmap_pred, vmin=pred_vmin, vmax=pred_vmax)  # plasma_r: near=bright, far=dark
             axes[1, col].set_title(f'Pred (m)')
             axes[1, col].axis('off')
 
             # Row 2: GT metric depth (invalid pixels = black)
             gt = gt_depths[t, 0].cpu().numpy()
-            gt_valid = (gt > 0) & (gt < MAX_DEPTH)  # Only <70m
-            gt_display = np.where(gt_valid, gt, np.nan)  # Invalid = NaN
+            gt_valid = valid_mask[t, 0].cpu().numpy().astype(bool)
+            # Also filter by MAX_DEPTH
+            gt_valid = gt_valid & (gt > 0) & (gt < MAX_DEPTH)
+            gt_display = np.where(gt_valid, gt, np.nan)  # Invalid = NaN (will be black)
             if gt_valid.sum() > 0:
                 gt_vmin = np.nanpercentile(gt_display, 2)
                 gt_vmax = np.nanpercentile(gt_display, 98)
             else:
                 gt_vmin, gt_vmax = 0, 1
             cmap_gt = plt.cm.plasma_r.copy()
-            cmap_gt.set_bad(color='black')  # NaN pixels = black
+            cmap_gt.set_bad(color='black')
             axes[2, col].imshow(gt_display, cmap=cmap_gt, vmin=gt_vmin, vmax=gt_vmax)  # plasma_r: near=bright, far=dark
             axes[2, col].set_title(f'GT (m)')
             axes[2, col].axis('off')
 
-            # Row 3: Importance map (already upsampled to image resolution in test_sequence)
-            importance_resized = importance_maps[t]  # [1, H, W] already at image resolution
-            importance_display = importance_resized.squeeze().cpu().numpy()  # [H, W]
-            axes[3, col].imshow(importance_display, cmap='jet', vmin=0, vmax=1)
-            axes[3, col].set_title(f'Importance')
+            # Row 3: Importance map (N/A for Gear2, which uses uniform modulation)
+            if importance_maps is not None:
+                importance_patch = importance_maps[t]  # [1, patch_h, patch_w]
+                img_h, img_w = images[t].shape[1:]
+                importance_upsampled = F.interpolate(
+                    importance_patch.unsqueeze(0), size=(img_h, img_w),
+                    mode='bilinear', align_corners=True
+                ).squeeze().cpu().numpy()  # [H, W]
+                axes[3, col].imshow(importance_upsampled, cmap='jet', vmin=0, vmax=1)
+                axes[3, col].set_title(f'Importance')
+            else:
+                # Gear2 doesn't produce importance maps
+                axes[3, col].text(0.5, 0.5, 'N/A\n(Uniform Modulation)',
+                                ha='center', va='center', fontsize=14, color='gray')
+                axes[3, col].set_title(f'Importance')
             axes[3, col].axis('off')
 
         # Add overall title with metrics
@@ -1102,8 +948,8 @@ class Gear3UpgradeTester:
         logger.info(f"Saved visualization: {save_path}")
 
     def _save_best_frame_visualizations(self, image, pred_depth, gt_depth, importance_map,
-                                        fg_mask, bg_mask, sequence_id, frame_idx, abs_rel, fps=None,
-                                        seg_mask=None, class_metrics=None, layer_weights=None):
+                                        fg_features, bg_features, sequence_id, frame_idx, abs_rel, fps=None,
+                                        seg_mask=None, class_metrics=None):
         """
         Save best frame visualization matching train_gear3_upgrade layout
 
@@ -1112,17 +958,17 @@ class Gear3UpgradeTester:
 
         Layout:
             Row 1: Input Image | GT Depth | Pred Depth
-            Row 2: Importance Map | FG Mask | BG Mask
+            Row 2: Importance Map (N/A) | FG Mask (N/A) | BG Mask (N/A)
             Row 3: Valid Mask | Error Map | Metrics
-            Row 4: Depth Distribution (2 cols) | Importance Distribution
+            Row 4: Depth Distribution (2 cols) | Importance Distribution (N/A)
 
         Args:
             image: [3, H, W] - RGB image
             pred_depth: [H, W] - Predicted metric depth
             gt_depth: [H, W] - Ground truth metric depth
-            importance_map: [patch_h, patch_w] - Importance map (0-1 normalized)
-            fg_mask: [1, patch_h, patch_w] - Foreground mask from Gear3 Upgrade head
-            bg_mask: [1, patch_h, patch_w] - Background mask from Gear3 Upgrade head
+            importance_map: None for Gear2 (uniform modulation)
+            fg_features: Not used (Gear2 has no FG/BG separation)
+            bg_features: Not used (Gear2 has no FG/BG separation)
             sequence_id: int - Sequence index
             frame_idx: int - Frame index within sequence
             abs_rel: float - AbsRel metric for this frame
@@ -1138,12 +984,12 @@ class Gear3UpgradeTester:
             pred_depth = pred_depth.float().cpu().numpy()
         if isinstance(gt_depth, torch.Tensor):
             gt_depth = gt_depth.float().cpu().numpy()
-        if isinstance(importance_map, torch.Tensor):
-            importance_map = importance_map.float().cpu().numpy()
 
-        # Min-Max normalization (FlashDepth original method)
-        image_np = (image * 1.0 - image.min()) / (image.max() - image.min() + 1e-8)
-        image_np = np.clip(image_np, 0, 1)
+        # Denormalize ImageNet normalization for image
+        mean = np.array([0.485, 0.456, 0.406])
+        std = np.array([0.229, 0.224, 0.225])
+        image_np = image * std + mean  # Reverse normalization
+        image_np = np.clip(image_np, 0, 1)  # Clip to valid range
 
         # Get image size
         img_h, img_w = image_np.shape[:2]
@@ -1157,31 +1003,6 @@ class Gear3UpgradeTester:
         # Calculate error (only where both GT and Pred are valid)
         abs_error = np.abs(pred_depth - gt_depth)
         abs_error_masked = np.where(error_valid_mask, abs_error, np.nan)
-
-        # Calculate importance statistics
-        imp_mean = importance_map.mean()
-        imp_std = importance_map.std()
-
-        # Extract FG/BG masks from importance map (binary thresholding)
-        # Use mean threshold to separate foreground from background (SAME AS test_gear3.py)
-        fg_mask_binary = (importance_map >= imp_mean).astype(np.float32)
-        bg_mask_binary = (importance_map < imp_mean).astype(np.float32)
-
-        # Upsample binary masks with bilinear for smoother visualization (SAME AS test_gear3.py)
-        # Bilinear interpolation of binary masks creates smooth boundaries
-        fg_mask_upsampled = F.interpolate(
-            torch.from_numpy(fg_mask_binary).unsqueeze(0).unsqueeze(0),
-            size=(img_h, img_w),
-            mode='bilinear',
-            align_corners=True
-        ).squeeze().numpy()
-
-        bg_mask_upsampled = F.interpolate(
-            torch.from_numpy(bg_mask_binary).unsqueeze(0).unsqueeze(0),
-            size=(img_h, img_w),
-            mode='bilinear',
-            align_corners=True
-        ).squeeze().numpy()
 
         # Create figure with 4x3 grid layout matching train_gear3_upgrade
         fig = plt.figure(figsize=(15, 16))
@@ -1197,7 +1018,7 @@ class Gear3UpgradeTester:
 
         # 2. Ground Truth Depth (invalid pixels = black)
         ax2 = fig.add_subplot(gs[0, 1])
-        gt_display = np.where(gt_valid_mask, gt_depth, np.nan)  # Invalid = NaN
+        gt_display = np.where(gt_valid_mask, gt_depth, np.nan)  # Invalid = NaN (will be black)
         if gt_valid_mask.sum() > 0:
             vmin = np.nanpercentile(gt_display, 2)
             vmax = np.nanpercentile(gt_display, 98)
@@ -1212,7 +1033,7 @@ class Gear3UpgradeTester:
 
         # 3. Predicted Metric Depth (invalid pixels = black)
         ax3 = fig.add_subplot(gs[0, 2])
-        pred_display = np.where(pred_valid_mask, pred_depth, np.nan)  # Invalid = NaN
+        pred_display = np.where(pred_valid_mask, pred_depth, np.nan)  # Invalid = NaN (will be black)
         cmap_pred = plt.cm.plasma_r.copy()
         cmap_pred.set_bad(color='black')  # NaN pixels = black
         im3 = ax3.imshow(pred_display, cmap=cmap_pred, vmin=vmin, vmax=vmax)  # plasma_r: near=bright, far=dark
@@ -1220,42 +1041,33 @@ class Gear3UpgradeTester:
         ax3.axis('off')
         plt.colorbar(im3, ax=ax3, fraction=0.046, pad=0.04)
 
-        # ==================== Row 2: Importance, FG, BG ====================
+        # ==================== Row 2: Importance, FG, BG (All N/A for Gear2) ====================
 
-        # 4. Importance Map (upsampled with bilinear for smooth visualization)
+        # 4. Importance Map → N/A for Gear2
         ax4 = fig.add_subplot(gs[1, 0])
-        importance_upsampled = F.interpolate(
-            torch.from_numpy(importance_map).unsqueeze(0).unsqueeze(0),
-            size=(img_h, img_w),
-            mode='bilinear',
-            align_corners=True
-        ).squeeze().numpy()
-        im4 = ax4.imshow(importance_upsampled, cmap='jet', vmin=0, vmax=1)
-        ax4.set_title(f'Importance Map\nmean={imp_mean:.3f}, std={imp_std:.3f}',
-                     fontsize=14, fontweight='bold')
+        ax4.text(0.5, 0.5, 'No Importance Map\n\nUniform Modulation',
+                ha='center', va='center', transform=ax4.transAxes,
+                fontsize=16, fontweight='bold',
+                bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.8))
+        ax4.set_title('Importance Map (N/A)', fontsize=14, fontweight='bold')
         ax4.axis('off')
-        plt.colorbar(im4, ax=ax4, fraction=0.046, pad=0.04)
 
-        # 5. FG Mask (Red overlay)
+        # 5. FG Mask → N/A for Gear2
         ax5 = fig.add_subplot(gs[1, 1])
-        ax5.imshow(image_np)
-        # Create FG overlay (Red channel only)
-        fg_overlay = np.zeros((*fg_mask_upsampled.shape, 3))
-        fg_overlay[..., 0] = fg_mask_upsampled  # Red channel
-        ax5.imshow(fg_overlay, alpha=0.5)
-        fg_ratio = fg_mask_binary.mean() * 100  # Use binary mask for ratio
-        ax5.set_title(f'FG Mask (Red)\n{fg_ratio:.1f}%', fontsize=14, fontweight='bold')
+        ax5.text(0.5, 0.5, 'No FG/BG Separation\n\nGear2 Ablation',
+                ha='center', va='center', transform=ax5.transAxes,
+                fontsize=16, fontweight='bold',
+                bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.8))
+        ax5.set_title('FG Mask (N/A)', fontsize=14, fontweight='bold')
         ax5.axis('off')
 
-        # 6. BG Mask (Blue overlay)
+        # 6. BG Mask → N/A for Gear2
         ax6 = fig.add_subplot(gs[1, 2])
-        ax6.imshow(image_np)
-        # Create BG overlay (Blue channel only)
-        bg_overlay = np.zeros((*bg_mask_upsampled.shape, 3))
-        bg_overlay[..., 2] = bg_mask_upsampled  # Blue channel
-        ax6.imshow(bg_overlay, alpha=0.5)
-        bg_ratio = bg_mask_binary.mean() * 100  # Use binary mask for ratio
-        ax6.set_title(f'BG Mask (Blue)\n{bg_ratio:.1f}%', fontsize=14, fontweight='bold')
+        ax6.text(0.5, 0.5, 'No FG/BG Separation\n\nGear2 Ablation',
+                ha='center', va='center', transform=ax6.transAxes,
+                fontsize=16, fontweight='bold',
+                bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.8))
+        ax6.set_title('BG Mask (N/A)', fontsize=14, fontweight='bold')
         ax6.axis('off')
 
         # ==================== Row 3: Valid/Object Mask, Error, Metrics ====================
@@ -1264,39 +1076,18 @@ class Gear3UpgradeTester:
         ax7 = fig.add_subplot(gs[2, 0])
         if seg_mask is None:
             # Non-object-wise mode: show GT Valid Mask (valid=white, invalid=black)
-            logger.info(f"[VISUALIZATION] seg_mask is None, showing GT Valid Mask")
             gt_valid_ratio = gt_valid_mask.sum() / gt_valid_mask.size
             ax7.imshow(gt_valid_mask.astype(np.uint8), cmap='gray', vmin=0, vmax=1, interpolation='nearest')
             ax7.set_title(f'GT Valid Mask ({gt_valid_ratio*100:.1f}%)\ninvalid: black',
                          fontsize=12, fontweight='bold')
             ax7.axis('off')
         else:
-            # Object-wise mode: show Object Mask (only dynamic objects)
-            logger.info(f"[VISUALIZATION] seg_mask shape: {seg_mask.shape}")
-            logger.info(f"[VISUALIZATION] seg_mask dtype: {seg_mask.dtype}")
-            logger.info(f"[VISUALIZATION] seg_mask unique values: {np.unique(seg_mask)}")
-            logger.info(f"[VISUALIZATION] seg_mask min: {seg_mask.min()}, max: {seg_mask.max()}")
-            logger.info(f"[VISUALIZATION] seg_mask > 0 count: {(seg_mask > 0).sum()}")
-
-            # Waymo object class IDs (dynamic objects + important static objects)
-            # Based on WAYMO_OBJECT_CLASSES in utils/object_wise_evaluation.py
-            waymo_object_class_ids = [1, 2, 3, 4, 5, 6, 7, 8, 9]
-            # 1: vehicle, 2: pedestrian, 3: sign, 4: cyclist, 5: traffic_light,
-            # 6: pole, 7: construction_cone, 8: bicycle, 9: motorcycle
-
-            # Create object mask: include dynamic objects and important static objects
-            object_mask = np.zeros_like(seg_mask, dtype=np.uint8)
-            for class_id in waymo_object_class_ids:
-                object_mask |= (seg_mask == class_id).astype(np.uint8)
-
+            # Object-wise mode: show Object Mask
+            object_mask = (seg_mask > 0).astype(np.uint8)
             ax7.imshow(object_mask, cmap='gray', vmin=0, vmax=1, interpolation='nearest')
             object_ratio = object_mask.sum() / object_mask.size
-            # Count only object classes present in this frame
-            num_object_classes = len([cid for cid in waymo_object_class_ids if (seg_mask == cid).any()])
-
-            logger.info(f"[VISUALIZATION] object_mask sum: {object_mask.sum()}, ratio: {object_ratio*100:.1f}%, num_object_classes: {num_object_classes}")
-
-            ax7.set_title(f'Object Mask\n{object_ratio*100:.1f}% ({object_mask.sum():,} pixels)\n{num_object_classes} object classes',
+            num_classes = len(np.unique(seg_mask[seg_mask > 0])) if (seg_mask > 0).any() else 0
+            ax7.set_title(f'Object Mask\n{object_ratio*100:.1f}% ({object_mask.sum():,} pixels)\n{num_classes} classes',
                          fontsize=14, fontweight='bold')
             ax7.axis('off')
 
@@ -1322,23 +1113,11 @@ class Gear3UpgradeTester:
                 fontweight='bold')
         y_pos -= 0.12
 
-        # FG:BG ratio
-        ax9.text(0.05, y_pos, f'FG:BG = {fg_ratio:.1f}:{bg_ratio:.1f}', fontsize=10,
-                transform=ax9.transAxes, bbox=dict(boxstyle="round", facecolor='lightcyan'))
-        y_pos -= 0.10
-
         # FPS if available
         if fps is not None:
             ax9.text(0.05, y_pos, f'FPS: {fps:.1f}', fontsize=10,
                     transform=ax9.transAxes, bbox=dict(boxstyle="round", facecolor='lightgreen'))
             y_pos -= 0.10
-
-        # Layer weights if available (multi_layer separation only)
-        if layer_weights is not None:
-            layer_str = ':'.join([f'{w:.3f}' for w in layer_weights])
-            ax9.text(0.05, y_pos, f'Layer weights: {layer_str}', fontsize=9,
-                    transform=ax9.transAxes, bbox=dict(boxstyle="round", facecolor='lightyellow'))
-            y_pos -= 0.08
 
         # Depth metrics (computed on pixels where both GT and Pred are valid)
         if error_valid_mask.sum() > 0:
@@ -1373,6 +1152,38 @@ class Gear3UpgradeTester:
                     transform=ax9.transAxes, bbox=dict(boxstyle="round", facecolor='lightblue'))
             y_pos -= 0.08
 
+        # Per-class pixel counts (if available)
+        if class_metrics is not None and len(class_metrics) > 0:
+            # Add separator
+            y_pos -= 0.02
+            ax9.text(0.05, y_pos, '─' * 30, fontsize=8, transform=ax9.transAxes)
+            y_pos -= 0.06
+
+            # Add header
+            ax9.text(0.05, y_pos, 'Top 5 Classes (Pixels):', fontsize=9,
+                    transform=ax9.transAxes, fontweight='bold',
+                    bbox=dict(boxstyle="round", facecolor='lightyellow'))
+            y_pos -= 0.08
+
+            # Sort by pixel count and show top 5
+            sorted_classes = sorted(
+                class_metrics.items(),
+                key=lambda x: x[1].get('num_pixels', 0),
+                reverse=True
+            )[:5]
+
+            total_pixels = seg_mask.size if seg_mask is not None else 1
+
+            for class_name, metrics_dict in sorted_classes:
+                num_pixels = metrics_dict.get('num_pixels', 0)
+                percent = 100.0 * num_pixels / total_pixels
+                # Shorten class name if too long
+                display_name = class_name[:12] + '...' if len(class_name) > 15 else class_name
+                ax9.text(0.05, y_pos, f'{display_name}: {percent:.1f}%',
+                        fontsize=8, transform=ax9.transAxes,
+                        bbox=dict(boxstyle="round", facecolor='lavender', alpha=0.7))
+                y_pos -= 0.06
+
         ax9.set_title('Depth Metrics', fontsize=14, fontweight='bold')
         ax9.axis('off')
 
@@ -1380,9 +1191,9 @@ class Gear3UpgradeTester:
 
         # 10. Depth Distribution Histogram
         ax10 = fig.add_subplot(gs[3, :2])
-        if error_valid_mask.sum() > 0:
-            gt_valid = gt_depth[error_valid_mask]
-            pred_valid = pred_depth[error_valid_mask]
+        if valid_mask.sum() > 0:
+            gt_valid = gt_depth[valid_mask]
+            pred_valid = pred_depth[valid_mask]
 
             bins = np.linspace(min(gt_valid.min(), pred_valid.min()),
                               max(gt_valid.max(), pred_valid.max()), 50)
@@ -1397,33 +1208,17 @@ class Gear3UpgradeTester:
             ax10.legend(fontsize=12)
             ax10.grid(True, alpha=0.3)
 
-        # 11. Importance Distribution
+        # 11. Importance Distribution → N/A for Gear2
         ax11 = fig.add_subplot(gs[3, 2])
-        importance_flat = importance_map.flatten()
-
-        # Handle case where all values are identical (std=0)
-        if imp_std < 1e-6:
-            # Just show a vertical line at the constant value
-            ax11.axvline(imp_mean, color='purple', linestyle='-', linewidth=3,
-                        label=f'Constant: {imp_mean:.3f}')
-            ax11.set_xlim(max(0, imp_mean - 0.1), min(1, imp_mean + 0.1))
-            ax11.text(0.5, 0.5, f'All pixels = {imp_mean:.3f}\n(std = {imp_std:.6f})',
-                     ha='center', va='center', transform=ax11.transAxes,
-                     fontsize=14, bbox=dict(boxstyle='round', facecolor='yellow', alpha=0.5))
-        else:
-            # Normal histogram
-            ax11.hist(importance_flat, bins=50, alpha=0.7, color='purple', density=True)
-            ax11.axvline(imp_mean, color='red', linestyle='--', linewidth=2,
-                        label=f'Mean: {imp_mean:.3f}')
-
-        ax11.set_xlabel('Importance Value', fontsize=12)
-        ax11.set_ylabel('Density', fontsize=12)
-        ax11.set_title('Importance Distribution', fontsize=14, fontweight='bold')
-        ax11.legend(fontsize=10)
-        ax11.grid(True, alpha=0.3)
+        ax11.text(0.5, 0.5, 'No Importance Map\n\nUniform Modulation\n(Same gamma/beta for all pixels)',
+                 ha='center', va='center', transform=ax11.transAxes,
+                 fontsize=14, fontweight='bold',
+                 bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.8))
+        ax11.set_title('Importance Distribution (N/A)', fontsize=14, fontweight='bold')
+        ax11.axis('off')
 
         # Overall title
-        plt.suptitle(f'Gear3 Upgrade: Sequence {sequence_id} Best Frame {frame_idx}',
+        plt.suptitle(f'Gear2 (Ablation): Sequence {sequence_id} Best Frame {frame_idx}',
                     fontsize=16, fontweight='bold')
 
         # Save with same naming convention
@@ -1431,7 +1226,7 @@ class Gear3UpgradeTester:
         plt.savefig(save_path, dpi=150, bbox_inches='tight', facecolor='white')
         plt.close(fig)
 
-        logger.info(f"Saved Gear3 Upgrade best frame visualization: {save_path}")
+        logger.info(f"Saved Gear2 best frame visualization: {save_path}")
 
     def _aggregate_metrics(self, all_metrics):
         """Aggregate metrics across sequences"""
@@ -1450,7 +1245,7 @@ class Gear3UpgradeTester:
         return aggregated
 
 
-@hydra.main(version_base=None, config_path="configs/gear3_upgrade", config_name="config")
+@hydra.main(version_base=None, config_path="configs/gear2", config_name="config")
 def main(config: DictConfig):
     """Main entry point"""
     import os
@@ -1458,7 +1253,7 @@ def main(config: DictConfig):
     # Override config for testing
     config.inference = True
 
-    tester = Gear3UpgradeTester(config)
+    tester = Gear2Tester(config)
     tester.test()
 
 

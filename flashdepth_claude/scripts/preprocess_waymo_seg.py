@@ -93,10 +93,17 @@ def process_sequence(context_name, parquet_root, output_root, camera_id=1):
         seg_df = seg_table.to_pandas()
 
         # Filter by camera
-        img_camera_df = img_df[img_df['key.camera_name'] == camera_id].reset_index(drop=True)
-        seg_camera_df = seg_df[seg_df['key.camera_name'] == camera_id].reset_index(drop=True)
+        img_camera_df = img_df[img_df['key.camera_name'] == camera_id].copy()
+        seg_camera_df = seg_df[seg_df['key.camera_name'] == camera_id].copy()
 
-        num_frames = len(img_camera_df)
+        # CRITICAL: Match by timestamp, not by sequential index!
+        # Set timestamp as index for proper matching
+        img_camera_df = img_camera_df.set_index('key.frame_timestamp_micros')
+        seg_camera_df = seg_camera_df.set_index('key.frame_timestamp_micros')
+
+        # Get sorted timestamps from image data (this is our ground truth)
+        img_timestamps = sorted(img_camera_df.index)
+        num_frames = len(img_timestamps)
 
         if num_frames == 0:
             logger.warning(f"No frames found for camera {camera_id} in {context_name}")
@@ -114,54 +121,68 @@ def process_sequence(context_name, parquet_root, output_root, camera_id=1):
 
         logger.info(f"Found {num_frames} frames for {camera_str} camera")
 
-        # Process each frame
-        for frame_idx in tqdm(range(num_frames), desc=f"{context_name[:20]}.../{camera_str}"):
-            # Extract RGB
-            img_row = img_camera_df.iloc[frame_idx]
+        # Build segmentation timestamp lookup
+        seg_timestamps = set(seg_camera_df.index)
+        logger.info(f"Found {len(seg_timestamps)} segmentation frames (matched by timestamp)")
+
+        # Get timestamps that have both image and segmentation
+        valid_timestamps = sorted(set(img_timestamps) & seg_timestamps)
+        logger.info(f"Found {len(valid_timestamps)} frames with valid segmentation")
+
+        if len(valid_timestamps) == 0:
+            logger.warning(f"No frames with segmentation found for {context_name}")
+            return False
+
+        # Step 1: Save RGB for ALL frames
+        rgb_count = 0
+        for timestamp in tqdm(img_timestamps, desc=f"{context_name[:20]}.../{camera_str} RGB"):
+            frame_idx = img_timestamps.index(timestamp)
+
+            # Extract RGB by timestamp
+            img_row = img_camera_df.loc[timestamp]
             img_bytes = img_row['[CameraImageComponent].image']
             image = Image.open(io.BytesIO(img_bytes))
 
-            # Save as JPEG
+            # Save as JPEG with original frame index
             output_path = output_rgb_dir / f'{frame_idx:04d}.jpg'
             image.save(output_path, 'JPEG', quality=95)
+            rgb_count += 1
 
-            # Extract segmentation
-            if frame_idx < len(seg_camera_df):
-                seg_row = seg_camera_df.iloc[frame_idx]
-                seg_bytes = seg_row['[CameraSegmentationLabelComponent].panoptic_label']
-                divisor = seg_row['[CameraSegmentationLabelComponent].panoptic_label_divisor']
+        logger.info(f"Saved {rgb_count} RGB frames (all frames)")
 
-                # Load panoptic label
-                seg_img = Image.open(io.BytesIO(seg_bytes))
-                panoptic_label = np.array(seg_img).astype(np.int64)
+        # Step 2: Save segmentation only for frames with valid segmentation
+        seg_count = 0
+        for timestamp in tqdm(valid_timestamps, desc=f"{context_name[:20]}.../{camera_str} SEG"):
+            frame_idx = img_timestamps.index(timestamp)
 
-                # Extract semantic class: semantic_class = panoptic_label // divisor
-                semantic_class = panoptic_label // divisor
+            # Extract segmentation by timestamp
+            seg_row = seg_camera_df.loc[timestamp]
+            seg_bytes = seg_row['[CameraSegmentationLabelComponent].panoptic_label']
+            divisor = seg_row['[CameraSegmentationLabelComponent].panoptic_label_divisor']
 
-                # Convert to uint8 (0-18 range for Waymo)
-                semantic_class = semantic_class.astype(np.uint8)
+            # Load panoptic label
+            seg_img = Image.open(io.BytesIO(seg_bytes))
+            panoptic_label = np.array(seg_img).astype(np.int64)
 
-                # Save as PNG
-                output_path = output_seg_dir / f'{frame_idx:04d}.png'
-                Image.fromarray(semantic_class).save(output_path)
-            else:
-                # Missing segmentation: create zero-filled
-                logger.warning(f"Missing segmentation for frame {frame_idx}, using zeros")
-                h, w = image.size[1], image.size[0]  # PIL uses (width, height)
-                zero_seg = np.zeros((h, w), dtype=np.uint8)
-                output_path = output_seg_dir / f'{frame_idx:04d}.png'
-                Image.fromarray(zero_seg).save(output_path)
+            # Extract semantic class: semantic_class = panoptic_label // divisor
+            semantic_class = panoptic_label // divisor
+
+            # Convert to uint8 (0-18 range for Waymo)
+            semantic_class = semantic_class.astype(np.uint8)
+
+            # Save as PNG with original frame index
+            output_path = output_seg_dir / f'{frame_idx:04d}.png'
+            Image.fromarray(semantic_class).save(output_path)
+            seg_count += 1
+
+        logger.info(f"Saved {seg_count} segmentation frames (indices may be non-contiguous)")
 
         # Extract depth from lidar_camera_projection parquet
         lidar_proj_file = parquet_root / 'lidar_camera_projection' / f'{context_name}.parquet'
 
         if not lidar_proj_file.exists():
             logger.warning(f"LiDAR projection file not found: {lidar_proj_file}")
-            logger.warning("Creating zero-filled depth files")
-            for frame_idx in range(num_frames):
-                empty_depth = np.zeros((0, 3), dtype=np.float32)
-                output_path = output_depth_dir / f'{frame_idx:04d}.npy'
-                np.save(output_path, empty_depth)
+            logger.warning("Skipping depth extraction")
         else:
             logger.info(f"Extracting depth from LiDAR camera projections...")
 
@@ -169,17 +190,14 @@ def process_sequence(context_name, parquet_root, output_root, camera_id=1):
             lidar_proj_table = pq.read_table(lidar_proj_file)
             lidar_proj_df = lidar_proj_table.to_pandas()
 
-            # Filter by TOP laser (name=1)
+            # Filter by TOP laser (name=1) and match by timestamp
             # Note: Each row contains projections for all cameras in 6-channel range image
             # Channels 0-2 are for FRONT camera (camera_id=1)
-            lidar_top_df = lidar_proj_df[lidar_proj_df['key.laser_name'] == 1].reset_index(drop=True)
+            lidar_top_df = lidar_proj_df[lidar_proj_df['key.laser_name'] == 1].copy()
+            lidar_top_df = lidar_top_df.set_index('key.frame_timestamp_micros')
 
             if len(lidar_top_df) == 0:
                 logger.warning(f"No LiDAR projections found for TOP laser")
-                for frame_idx in range(num_frames):
-                    empty_depth = np.zeros((0, 3), dtype=np.float32)
-                    output_path = output_depth_dir / f'{frame_idx:04d}.npy'
-                    np.save(output_path, empty_depth)
             else:
                 # Determine channel offset for this camera
                 # For FRONT (camera_id=1): use channels 0-2
@@ -190,17 +208,26 @@ def process_sequence(context_name, parquet_root, output_root, camera_id=1):
                     logger.warning(f"Camera {camera_id} channel mapping not implemented, using FRONT channels")
                     channel_offset = 0
 
-                # Extract depth for each frame
+                # Build LiDAR timestamp lookup
+                lidar_timestamps = set(lidar_top_df.index)
+                logger.info(f"Found {len(lidar_timestamps)} LiDAR frames (matched by timestamp)")
+
+                # Step 3: Extract depth for ALL frames
                 total_points = 0
-                for frame_idx in range(num_frames):
-                    if frame_idx >= len(lidar_top_df):
-                        # No LiDAR data for this frame
+                depth_matched_count = 0
+                for timestamp in tqdm(img_timestamps, desc=f"{context_name[:20]}.../{camera_str} DEPTH"):
+                    # Find original frame index
+                    frame_idx = img_timestamps.index(timestamp)
+
+                    if timestamp not in lidar_timestamps:
+                        # No LiDAR data for this timestamp - save empty depth
                         empty_depth = np.zeros((0, 3), dtype=np.float32)
                         output_path = output_depth_dir / f'{frame_idx:04d}.npy'
                         np.save(output_path, empty_depth)
                         continue
 
-                    row = lidar_top_df.iloc[frame_idx]
+                    row = lidar_top_df.loc[timestamp]
+                    depth_matched_count += 1
 
                     # Extract range image (6 channels)
                     ri_values = row['[LiDARCameraProjectionComponent].range_image_return1.values']
@@ -228,16 +255,16 @@ def process_sequence(context_name, parquet_root, output_root, camera_id=1):
                     # Stack to (N, 3) format: [x_pixel, y_pixel, depth_meters]
                     sparse_depth = np.stack([x_valid, y_valid, depth_valid], axis=1).astype(np.float32)
 
-                    # Save sparse depth
+                    # Save sparse depth with original frame index
                     output_path = output_depth_dir / f'{frame_idx:04d}.npy'
                     np.save(output_path, sparse_depth)
 
                     total_points += len(sparse_depth)
 
-                avg_points = total_points / num_frames if num_frames > 0 else 0
-                logger.info(f"Extracted depth for {num_frames} frames (avg {avg_points:.0f} points/frame)")
+                avg_points = total_points / depth_matched_count if depth_matched_count > 0 else 0
+                logger.info(f"Matched {depth_matched_count}/{len(img_timestamps)} frames with depth by timestamp (avg {avg_points:.0f} points/frame)")
 
-        logger.info(f"✓ Successfully processed {context_name} ({num_frames} frames)")
+        logger.info(f"✓ Successfully processed {context_name} (RGB/Depth: {num_frames}, Seg: {seg_count})")
         return True
 
     except Exception as e:

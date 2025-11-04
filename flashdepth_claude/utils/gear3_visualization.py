@@ -75,9 +75,14 @@ class Gear3Visualizer:
             # Use first batch and first frame for visualization
             # Handle both [B, T, ...] and [B, ...] formats
             if images.ndim == 5:  # [B, T, C, H, W]
-                input_img = images[0, 0].cpu().numpy().transpose(1, 2, 0)  # [H, W, 3]
+                input_img = images[0, 0].float().cpu().numpy().transpose(1, 2, 0)  # [H, W, 3]
             else:  # [B, C, H, W]
-                input_img = images[0].cpu().numpy().transpose(1, 2, 0)  # [H, W, 3]
+                input_img = images[0].float().cpu().numpy().transpose(1, 2, 0)  # [H, W, 3]
+
+            # Min-Max normalization (FlashDepth original method)
+            # This automatically stretches contrast without manual denormalization
+            input_img = (input_img - input_img.min()) / (input_img.max() - input_img.min() + 1e-8)
+            input_img = np.clip(input_img, 0, 1)
 
             if gt_depth.ndim == 4:  # [B, T, H, W] or [B, 1, H, W]
                 gt_depth_frame = gt_depth[0, 0].cpu().numpy()  # [H, W]
@@ -93,9 +98,6 @@ class Gear3Visualizer:
                 importance_frame = importance_map[0, 0].cpu().numpy()  # [H, W]
             else:  # [B, H, W]
                 importance_frame = importance_map[0].cpu().numpy()  # [H, W]
-
-            # Normalize input image for display
-            input_img = np.clip((input_img + 1) / 2, 0, 1)  # Assuming normalized input
 
             # Ensure all frames are 2D
             while gt_depth_frame.ndim > 2:

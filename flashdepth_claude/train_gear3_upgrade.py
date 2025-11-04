@@ -763,8 +763,8 @@ class Gear3UpgradeTrainer:
 
                         # Move tensors to CPU for visualization (only first batch, first frame)
                         sample_batch = (
-                            images[:1, :1].cpu(),  # [1, 1, 3, H, W]
-                            gt_depth_metric[:1].cpu(),  # [1, 1, H, W]
+                            images[:1, :1].float().cpu(),  # [1, 1, 3, H, W] - convert BFloat16 to Float32 first
+                            gt_depth_metric[:1].float().cpu(),  # [1, 1, H, W]
                             dataset_idx
                         )
                         model_outputs_cpu = {
