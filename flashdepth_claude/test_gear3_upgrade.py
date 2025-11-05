@@ -443,13 +443,14 @@ class Gear3UpgradeTester:
         if len(batch) == 0:
             return None
 
-        # CombinedDataset returns (images, depths, dataset_name) tuple for val/test splits
+        # CombinedDataset returns (images, depths, focal_lengths, dataset_name) tuple for val/test splits
         # Convert to dict format for easier access
         if len(batch) > 0 and isinstance(batch[0], tuple):
-            images, depths, names = zip(*batch)
+            images, depths, focal_lengths, names = zip(*batch)
             return {
                 'image': torch.stack(images, dim=0),
                 'depth': torch.stack(depths, dim=0),
+                'focal_lengths': torch.stack(focal_lengths, dim=0),
                 'dataset_name': names
             }
 
@@ -563,6 +564,7 @@ class Gear3UpgradeTester:
         else:
             images = batch['image'].to(self.device)  # [1, T, 3, H, W]
         gt_depth = batch['depth'].to(self.device)  # [1, T, H, W] or [T, H, W] - val split has no channel dim
+        focal_lengths = batch['focal_lengths'].to(self.device)  # [1, T]
 
         # Add batch dimension if missing (WaymoSegmentationDataset returns [T, H, W])
         if gt_depth.ndim == 3:
@@ -577,6 +579,13 @@ class Gear3UpgradeTester:
 
         # Dataloader gives inverse depth (1/m), scale to 100/m for training
         gt_depth_inverse_100 = gt_depth * 100.0  # [1, T, 1, H, W] in 100/m
+
+        # Apply canonical transformation to GT (for fair comparison with model trained in canonical space)
+        CANONICAL_FX = self.config.get('canonical_focal_length', 1000.0)
+        use_canonical = self.config.get('use_canonical_space', False)
+        if use_canonical:
+            fx_actual = focal_lengths.view(1, T, 1, 1, 1)
+            gt_depth_inverse_100 = gt_depth_inverse_100 * (CANONICAL_FX / fx_actual)
 
         # Storage for predictions
         pred_depths = []
@@ -725,7 +734,13 @@ class Gear3UpgradeTester:
                 out = self.model.depth_head.scratch.output_conv2(out)  # [1, 1, H, W]
 
                 # Prediction is already positive (Softplus activation in output_conv2)
-                pred_depth_inverse_100 = out  # [1, 1, H, W] in 100/m
+                pred_depth_inverse_100 = out  # [1, 1, H, W] in 100/m_canonical
+
+                # De-canonicalization: convert from canonical space to actual metric space
+                if use_canonical:
+                    # pred_inverse_actual = pred_inverse_canonical * (fx_actual / CANONICAL_FX)
+                    fx_t = focal_lengths[0, t]  # Focal length for this frame
+                    pred_depth_inverse_100 = pred_depth_inverse_100 * (fx_t / CANONICAL_FX)
 
                 # Interpolate prediction to GT resolution (like train_gear3.py validation)
                 gt_t_shape = gt_t_inverse.shape[-2:]  # GT original resolution

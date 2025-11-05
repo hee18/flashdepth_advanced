@@ -8,11 +8,12 @@ import math
 
 from .depthanything_preprocess import _load_and_process_image, _load_and_process_depth
 from .base_dataset_pairs import BaseDatasetPairs
+from utils.dataset_intrinsics import get_intrinsics_info, validate_focal_length, get_fallback_fx
 
 
 class CombinedDataset(Dataset):
     def __init__(self, root_dir, enable_dataset_flags, resolution=None, split='train',
-                 video_length=8, seed=42, tmp_res=None, color_aug=False):
+                 video_length=8, seed=42, tmp_res=None, color_aug=False, strict_focal_length=True):
         '''
         enable_dataset_flags: list of datasets to use; e.g. ['spring', 'mvs-synth', 'urbansyn', 'eth3d', 'waymo', 'waymo_seg']
 
@@ -56,13 +57,15 @@ class CombinedDataset(Dataset):
         torch.manual_seed(seed)
 
 
-        
+
         cache_dir = './dataloaders/pairs_cache' if split != 'test' else None
 
         self.pairslist = {}
         self.depth_read_list = {}
         self.reshape_list = {}
+        self.focal_length_getter_list = {}  # Store focal length getters for each dataset
         self.tmp_res = tmp_res
+        self.strict_focal_length = strict_focal_length  # Validate focal lengths strictly
 
 
         for dataset_name in enable_dataset_flags:
@@ -70,6 +73,12 @@ class CombinedDataset(Dataset):
             self.pairslist[dataset_name] = dataset.pairs
             self.depth_read_list[dataset_name] = dataset.depth_read
             self.reshape_list[dataset_name] = dataset.reshape_list
+
+            # Store focal length getter method if dataset has it, otherwise None
+            if hasattr(dataset, 'get_focal_length'):
+                self.focal_length_getter_list[dataset_name] = dataset.get_focal_length
+            else:
+                self.focal_length_getter_list[dataset_name] = None
 
         if resolution == 'base':
             if split == 'train':
@@ -132,13 +141,111 @@ class CombinedDataset(Dataset):
             logging.info(f"enabled datasets for {split}: {enable_dataset_flags}")
             logging.info(f"length of combined dataset: {len(self.pairs)}")
 
-      
+
         self.video_length = video_length
         self.split = split
 
-        
+    def _get_focal_length(self, dataset_idx, pair, image_shape):
+        """
+        Get focal length for a given pair from a dataset.
 
-        
+        Args:
+            dataset_idx (str): Dataset name
+            pair (dict): Data pair with 'image' and 'depth' paths
+            image_shape (tuple): (H, W) image shape after preprocessing
+
+        Returns:
+            float: Focal length in pixels
+
+        Raises:
+            RuntimeError: If strict_focal_length=True and focal length cannot be retrieved
+        """
+        error_info = None  # Track error for strict mode
+
+        # Try dataset-specific getter first
+        if self.focal_length_getter_list[dataset_idx] is not None:
+            try:
+                fx = self.focal_length_getter_list[dataset_idx](pair, image_shape)
+                validated_fx = validate_focal_length(fx, image_shape[1], dataset_idx)
+                if validated_fx != fx:
+                    logging.warning(f"[{dataset_idx}] Focal length {fx:.1f} failed validation, using {validated_fx:.1f}")
+                return validated_fx
+            except Exception as e:
+                error_info = f"Dataset-specific getter failed: {e}"
+                logging.warning(f"[{dataset_idx}] {error_info}")
+
+        # Fallback: use central registry
+        intrinsics_info = get_intrinsics_info(dataset_idx)
+
+        if intrinsics_info is None:
+            # No info available
+            if self.strict_focal_length:
+                raise RuntimeError(
+                    f"\n{'='*80}\n"
+                    f"FOCAL LENGTH ERROR\n"
+                    f"{'='*80}\n"
+                    f"Dataset: {dataset_idx}\n"
+                    f"Image path: {pair.get('image', 'N/A')}\n"
+                    f"Depth path: {pair.get('depth', 'N/A')}\n"
+                    f"Image shape: {image_shape}\n"
+                    f"Error: No intrinsics info available in registry\n"
+                    f"Previous error: {error_info or 'N/A'}\n"
+                    f"\nPlease check:\n"
+                    f"1. Dataset intrinsics are correctly defined in utils/dataset_intrinsics.py\n"
+                    f"2. Dataset implements get_focal_length() method\n"
+                    f"3. Intrinsic files exist and are accessible\n"
+                    f"{'='*80}\n"
+                )
+            fx = get_fallback_fx(image_shape[1])
+            logging.debug(f"[{dataset_idx}] No intrinsics info, using fallback fx={fx:.1f}")
+            return fx
+
+        # Handle different intrinsic types
+        intrinsic_type = intrinsics_info['type']
+
+        if intrinsic_type == 'fixed':
+            fx = intrinsics_info['fx']
+            return validate_focal_length(fx, image_shape[1], dataset_idx)
+
+        elif intrinsic_type == 'computed':
+            # Compute from formula (e.g., DynamicReplica: fx = width / 2)
+            if 'formula' in intrinsics_info:
+                width = image_shape[1]
+                if dataset_idx in ['dynamicreplica', 'replica']:
+                    fx = width / 2.0
+                else:
+                    # Generic fallback
+                    fx = get_fallback_fx(width)
+                return validate_focal_length(fx, width, dataset_idx)
+
+        # For per_frame, per_sequence, per_image types:
+        # Dataset should implement get_focal_length()
+        # If not implemented and strict mode, raise error
+        if self.strict_focal_length:
+            raise RuntimeError(
+                f"\n{'='*80}\n"
+                f"FOCAL LENGTH ERROR\n"
+                f"{'='*80}\n"
+                f"Dataset: {dataset_idx}\n"
+                f"Image path: {pair.get('image', 'N/A')}\n"
+                f"Depth path: {pair.get('depth', 'N/A')}\n"
+                f"Image shape: {image_shape}\n"
+                f"Intrinsic type: {intrinsic_type}\n"
+                f"Error: Dataset requires get_focal_length() implementation but it failed\n"
+                f"Previous error: {error_info or 'N/A'}\n"
+                f"\nPlease check:\n"
+                f"1. Dataset correctly implements get_focal_length() method\n"
+                f"2. Intrinsic files exist at expected paths\n"
+                f"3. File format matches expected structure\n"
+                f"{'='*80}\n"
+            )
+
+        fx = get_fallback_fx(image_shape[1])
+        logging.warning(
+            f"[{dataset_idx}] Type '{intrinsic_type}' requires dataset implementation, "
+            f"using fallback fx={fx:.1f}"
+        )
+        return fx
 
     def __len__(self):
         return len(self.pairs)
@@ -155,6 +262,7 @@ class CombinedDataset(Dataset):
 
             images = []
             depths = []
+            focal_lengths = []
             for pair in scene:
                 # Debug: check if pair is string or dict
                 if isinstance(pair, str):
@@ -168,8 +276,13 @@ class CombinedDataset(Dataset):
                     # Keep GT at ORIGINAL resolution (like original FlashDepth)
                     # Prediction will be interpolated to GT resolution during validation
 
+                    # Get focal length for this frame
+                    image_shape = image.shape[1:]  # (H, W) from (C, H, W)
+                    fx = self._get_focal_length(dataset_idx, pair, image_shape)
+
                     images.append(image)
                     depths.append(torch.from_numpy(depth).float()) # Keep original resolution
+                    focal_lengths.append(fx)
                 except Exception as e:
                     print(f"Error loading validation pair: {e}")
                     continue
@@ -180,7 +293,8 @@ class CombinedDataset(Dataset):
                 return None
 
             return_name = dataset_idx
-            return torch.stack(images).float(), torch.stack(depths).float(), return_name
+            focal_lengths_tensor = torch.tensor(focal_lengths, dtype=torch.float32)
+            return torch.stack(images).float(), torch.stack(depths).float(), focal_lengths_tensor, return_name
 
 
         elif self.split == 'test':
@@ -194,15 +308,22 @@ class CombinedDataset(Dataset):
 
             images = []
             depths = []
+            focal_lengths = []
             for pair in scene:
                 image, _current_crop = _load_and_process_image(pair['image'], **self.reshape_list[dataset_idx])
                 depth = self.depth_read_list[dataset_idx](pair['depth'], is_inverse=True) # Load inverse depth (1/m) for testing
 
+                # Get focal length for this frame
+                image_shape = image.shape[1:]  # (H, W) from (C, H, W)
+                fx = self._get_focal_length(dataset_idx, pair, image_shape)
+
                 images.append(image)
                 depths.append(torch.from_numpy(depth).float()) # not resizing depth, using original resolution like train
+                focal_lengths.append(fx)
 
             return_name = os.path.join(dataset_idx, pair['scene_name'])
-            return torch.stack(images).float(), torch.stack(depths).float(), return_name
+            focal_lengths_tensor = torch.tensor(focal_lengths, dtype=torch.float32)
+            return torch.stack(images).float(), torch.stack(depths).float(), focal_lengths_tensor, return_name
 
 
         # dataset_idx: i-th dataset; e.g. pointodyssey is 0, spring is 1...etc
@@ -265,9 +386,10 @@ class CombinedDataset(Dataset):
         # Load all frames in sequence
         images = []
         depths = []
+        focal_lengths = []
         # Transform scene-relative indices to dataset-relative indices
         sequence_indices = [scene_start_idx + s for s in sequence_indices]
-        for seq_i, seq_idx in enumerate(sequence_indices):        
+        for seq_i, seq_idx in enumerate(sequence_indices):
             try:
                 # pair = self.pairslist[dataset_idx][seq_idx]
                 pair = dataset_list[seq_idx]
@@ -280,12 +402,19 @@ class CombinedDataset(Dataset):
             print_depth_minmax = False #seq_i == 0
             depth = self.depth_read_list[dataset_idx](pair['depth'], is_inverse=True, print_minmax=print_depth_minmax) # Load inverse depth (1/m) for training
             depth = _load_and_process_depth(depth, image.shape, _current_crop, **self.reshape_list[dataset_idx])
+
+            # Get focal length for this frame
+            image_shape = image.shape[1:]  # (H, W) from (C, H, W)
+            fx = self._get_focal_length(dataset_idx, pair, image_shape)
+
             images.append(image)
             depths.append(depth)
-            
+            focal_lengths.append(fx)
+
         try:
             images = torch.stack(images, dim=0)  # [T, C, H, W]
             depths = torch.stack(depths, dim=0) if self.split != 'test' else None  # [T, H, W]
+            focal_lengths_tensor = torch.tensor(focal_lengths, dtype=torch.float32)  # [T]
         except Exception as e:
             print(f"Error stacking tensors in dataset {dataset_idx}: {e}")
             print(f"Images length: {len(images)}")
@@ -295,6 +424,6 @@ class CombinedDataset(Dataset):
             if self.split != 'test' and len(depths) > 0:
                 print(f"Depth shapes: {[d.shape if hasattr(d, 'shape') else type(d) for d in depths]}")
             raise e
-        
-        return images.float(), depths, dataset_idx #, pair['scene_name'] #, pair['scene_name'] #, pair['scene_name']
+
+        return images.float(), depths, focal_lengths_tensor, dataset_idx #, pair['scene_name'] #, pair['scene_name'] #, pair['scene_name']
        

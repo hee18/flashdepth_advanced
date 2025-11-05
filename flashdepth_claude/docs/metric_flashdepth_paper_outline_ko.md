@@ -8,9 +8,9 @@
 
 ## 초록
 
-본 논문은 원본 FlashDepth를 확장한 **Metric-FlashDepth**를 제안한다. 기존 FlashDepth는 상대적 깊이(relative depth)만 추정하여 실세계 거리 측정이 불가능했으나, 본 연구는 경량 모듈을 추가하여 메트릭 깊이(metric depth) 추정을 가능하게 하면서도 실시간 성능(~10 FPS)을 유지한다. 특히, **다층 CLS 토큰 융합(Multi-layer CLS Fusion)** 기법을 통해 DINOv2의 계층적 의미 정보를 활용하고, **중요도 기반 전경/배경 분리(Importance-weighted FG/BG Separation)**로 객체 중심의 깊이 정확도를 크게 향상시켰다. TartanAir, MVS-Synth 등 5개 데이터셋 실험 결과, 기존 단일 레이어 방식 대비 절대 상대 오차(AbsRel)가 평균 15% 감소하였으며, 특히 동적 객체 영역에서 25% 이상의 정확도 향상을 달성하였다.
+본 논문은 원본 FlashDepth를 확장한 **Metric-FlashDepth**를 제안한다. 기존 FlashDepth는 상대적 깊이(relative depth)만 추정하여 실세계 거리 측정이 불가능했으나, 본 연구는 경량 모듈을 추가하여 메트릭 깊이(metric depth) 추정을 가능하게 하면서도 실시간 성능(**~15 FPS on RTX A6000**)을 유지한다. 특히, **다층 CLS 토큰 융합(Multi-layer CLS Fusion)** 기법을 통해 DINOv2의 계층적 의미 정보를 활용하고, **Canonical Space Normalization**으로 다양한 카메라 intrinsic에 강건한 학습을 달성하며, **중요도 기반 전경/배경 분리(Importance-weighted FG/BG Separation)**로 객체 중심의 깊이 정확도를 크게 향상시켰다. TartanAir, MVS-Synth 등 5개 데이터셋 실험 결과, 기존 단일 레이어 방식 대비 절대 상대 오차(AbsRel)가 평균 15% 감소하였으며, 특히 동적 객체 영역에서 25% 이상의 정확도 향상을 달성하였다.
 
-**핵심 키워드**: 메트릭 깊이 추정, 실시간 비디오 처리, DINOv2, Mamba2, FG/BG 분리, 다층 융합
+**핵심 키워드**: 메트릭 깊이 추정, 실시간 비디오 처리, DINOv2, Mamba2, FG/BG 분리, 다층 융합, Canonical Space
 
 ---
 
@@ -36,9 +36,14 @@
 
 본 연구는 다음과 같은 핵심 기여를 제시한다:
 
-#### (1) 경량 메트릭 깊이 헤드
+#### (1) Canonical Space Normalization ⭐ **[NEW]**
+- **문제**: 다양한 카메라 focal length (fx=320~2000) → 동일 물체가 다른 pixel size
+- **해결**: 모든 데이터를 "표준 카메라" (canonical_fx=1000)로 정규화
+- **효과**: 카메라 불변 학습, 다양한 intrinsic에 강건
+
+#### (1-2) 경량 메트릭 깊이 헤드
 - **추가 파라미터**: 약 2.1M (~0.6% 증가)
-- **성능 유지**: 기존 10.89 FPS 유지 (waymo_seg 200 프레임 기준)
+- **성능 유지**: **15+ FPS** (RTX A6000, 518×518 기준)
 - **직접 메트릭 출력**: GSP 후처리 불필요
 
 #### (2) 다층 CLS 토큰 융합 (Multi-layer CLS Fusion)
@@ -54,7 +59,9 @@ Layer 23 (최종): 추상적 의미 (장면 이해)
 **학습 가능한 가중치 융합**으로 작업에 최적화된 계층 조합 자동 학습
 
 #### (3) 중요도 기반 전경/배경 분리
-- **중요도 맵(Importance Map)**: 다층 attention 융합으로 생성
+- **중요도 맵(Importance Map)**: 다층 attention 융합으로 생성 (raw attention weights 직접 사용)
+- **Register Token 제거**: 3×3 local inpainting으로 DINOv2 register token 영향 제거
+- **Robust Normalization**: Percentile normalization (1-99)으로 outlier에 강건
 - **전경/배경 특징 추출**: 중요도 기반 가중 풀링으로 semantic한 분리
 - **공간 적응 변조**: FiLM 스타일 변조로 픽셀별 다른 스케일/시프트 적용
 
@@ -79,8 +86,9 @@ Layer 23 (최종): 추상적 의미 (장면 이해)
 - **AdaBins**: Adaptive bins for metric depth
 - **BTS**: Big to Small network
 - **ZoeDepth**: Zero-shot metric depth with relative depth models
+- **Metric3D v2 (CVPR 2024)**: Canonical space normalization으로 카메라 불변 학습 ⭐
 
-**한계**: 느린 속도 (2-5 FPS), 단일 이미지 처리
+**한계**: 느린 속도 (2-5 FPS), 단일 이미지 처리 (Metric3D v2 제외)
 
 ### 2.2 Vision Transformer
 
@@ -192,17 +200,35 @@ class MultiLayerCLSNetwork(nn.Module):
 
 ```python
 def process_attention_to_importance(attn, patch_h, patch_w):
-    # CLS→Patch attention 추출
+    # 1. CLS→Patch attention 추출 (semantic importance)
     cls_to_patch = attn[:, :, 0, 1:]  # [B, 16, 1369]
 
-    # 헤드 평균
-    importance = cls_to_patch.mean(dim=1)  # [B, 1369]
+    # 2. 헤드 평균
+    attn_scores = cls_to_patch.mean(dim=1)  # [B, 1369]
+    attn_map = attn_scores.reshape(B, 1, patch_h, patch_w)
 
-    # 공간 재구성
-    importance = importance.reshape(B, 1, patch_h, patch_w)
+    # 3. Register Token 제거 ⭐ [NEW]
+    # DINOv2 has 1 register patch with extreme attention
+    max_val = attn_map.max()
+    outlier_mask = (attn_map == max_val)
+    # 3×3 local average inpainting
+    kernel_3x3 = torch.ones(1, 1, 3, 3) / 9.0
+    attn_smoothed = F.conv2d(attn_map, kernel_3x3, padding=1)
+    attn_map = torch.where(outlier_mask, attn_smoothed, attn_map)
 
-    return importance
+    # 4. Percentile Normalization (1-99) ⭐ [NEW]
+    # More robust than min-max: reduces sensitivity to outliers
+    attn_p1 = torch.quantile(attn_map, 0.01)
+    attn_p99 = torch.quantile(attn_map, 0.99)
+    importance = (attn_map - attn_p1) / (attn_p99 - attn_p1 + 1e-8)
+    importance = torch.clamp(importance, 0.0, 1.0)
+
+    return importance  # [B, 1, H, W], range [0, 1]
 ```
+
+**핵심 개선사항**:
+- **Register Token 제거**: DINOv2의 extreme attention outlier를 3×3 inpainting으로 제거
+- **Percentile Normalization**: Min-max보다 robust (1-99 percentile 사용)
 
 #### 3.3.2 다층 융합
 
@@ -362,41 +388,44 @@ for t in range(T):
 
 ### 3.7 Loss Function
 
-#### 3.7.1 Inverse Depth L1 Loss
+#### 3.7.1 Inverse Depth L1 Loss (Canonical Space) ⭐ **[UPDATED]**
 
 ```python
-# GT를 역깊이로 변환 (100/m 스케일)
-gt_inverse = 100.0 / gt_depth  # [m] → [100/m]
+CANONICAL_FX = 1000.0
 
-# 유효 마스크: 0-200m 범위
-MIN_INVERSE = 0.5  # 200m
-MAX_INVERSE = 1000  # 0.1m
-valid_mask = (gt_inverse > MIN_INVERSE) & (gt_inverse < MAX_INVERSE)
+# GT를 canonical space inverse depth로 변환
+gt_depth_metric = 1.0 / (gt_depth + 1e-8)  # Inverse → metric
+gt_metric_canonical = gt_depth_metric * (fx / CANONICAL_FX)  # Canonical
+gt_inverse_canonical = 100.0 / (gt_metric_canonical + 1e-8)  # 100/m scale
+
+# 유효 마스크: 0-200m 범위 (canonical space)
+MIN_INVERSE = 100.0 / 200.0  # 0.5
+valid_mask = (gt_inverse_canonical > MIN_INVERSE)
 
 # L1 loss
-loss = torch.abs(pred_inverse - gt_inverse)[valid_mask].mean()
+loss = torch.abs(pred_inverse - gt_inverse_canonical)[valid_mask].mean()
 ```
 
 **역깊이 사용 이유**:
 1. **수치 안정성**: 먼 객체(200m)와 가까운 객체(1m)의 loss 균형
-2. **선형성**: 시차(disparity)와 선형 관계 → 학습 용이
+2. **균일한 gradient**: 모든 거리에서 동일한 learning rate 효과
 3. **문헌 표준**: 단안 깊이 추정 분야 표준 접근법
 
-#### 3.7.2 Warmup Threshold Strategy
+**Canonical space 사용 이유** ⭐ **[NEW]**:
+1. **카메라 불변**: Focal length 정규화로 다양한 카메라 대응
+2. **학습 안정성**: GT target이 fx에 따라 일관되게 정규화
+3. **검증된 방법**: Metric3D v2와 동일 (CVPR 2024)
 
-초기 학습 불안정성 방지:
+#### 3.7.2 Valid Depth Range: **200m** ⭐ **[UPDATED]**
 
-```python
-# 첫 100 step: 넓은 범위 허용
-if step < 100:
-    threshold = 200.0  # 0-200m
-else:
-    threshold = 70.0   # 0-70m (최종)
-```
+**이전**: 70m (KITTI/NYU 기준)
+**현재**: **200m** (TartanAir/Outdoor 기준)
 
 **이유**:
-- 초기: 넓은 범위로 gradient 확보
-- 후기: 좁은 범위로 정밀도 향상
+- TartanAir: 대부분 장면 < 200m
+- Spring: 실외 장면 커버
+- Waymo: 자율주행 범위 포함
+- 무한대 depth outliers 제거 (10^9 m)
 
 ---
 
@@ -424,13 +453,17 @@ GPUs: 2× RTX A6000 (48GB each)
 DDP: DistributedDataParallel (rank 0, 1)
 
 # 하이퍼파라미터
-batch_size: 2 per GPU (effective 4)
+batch_size: 20 per GPU (effective 40 with DDP)
 video_length: 5 frames
 resolution: 518×518
 iterations: 40,000
 learning_rate: 1.0e-4 (cosine annealing)
 weight_decay: 1.0e-6
 precision: BFloat16
+
+# Canonical space ⭐ [NEW]
+canonical_focal_length: 1000.0
+use_canonical_space: true
 
 # 학습 모듈
 trainable_modules:
@@ -461,12 +494,13 @@ frozen_modules:
 
 ### 4.2 비교 방법
 
-| 방법 | 깊이 유형 | 파라미터 | FPS | 설명 |
-|------|----------|----------|-----|------|
-| **FlashDepth** | Relative | 330M | 10.9 | 원본 (baseline) |
-| **FlashDepth + GSP** | Metric | 330M + 0.26M | 10.5 | 후처리 스케일 변환 |
-| **Gear3 (Single Layer)** | Metric | 339M | 10.2 | Layer 23만 사용 |
-| **Metric-FlashDepth (Ours)** | Metric | 337M | 10.9 | 다층 융합 |
+| 방법 | 깊이 유형 | Canonical | 파라미터 | FPS (A6000) | 설명 |
+|------|----------|-----------|----------|-------------|------|
+| **FlashDepth** | Relative | ❌ | 330M | 10.9 | 원본 (baseline) |
+| **FlashDepth + GSP** | Metric | ❌ | 330M + 0.26M | 10.5 | 후처리 스케일 변환 |
+| **Gear2 (Single Layer)** | Metric | ❌ | 339M | 12 | Layer 23만 (ablation) |
+| **Gear3 (Median Split)** | Metric | ❌ | 339M | 12 | Median FG/BG (ablation) |
+| **Metric-FlashDepth (Ours)** | Metric | ✅ | **337M** | **15+** | Multi-layer + Canonical |
 
 ### 4.3 정량적 결과
 

@@ -646,9 +646,10 @@ class Gear2Trainer:
                     model = self.model.module if isinstance(self.model, DDP) else self.model
 
                     # Unpack and move to device (batch is still on CPU from dataloader)
-                    images, gt_depth, dataset_idx = batch
+                    images, gt_depth, focal_lengths, dataset_idx = batch
                     images = images.to(self.device)
                     gt_depth = gt_depth.to(self.device)
+                    focal_lengths = focal_lengths.to(self.device)
 
                     if gt_depth.ndim == 3:
                         gt_depth = gt_depth.unsqueeze(1)
@@ -775,10 +776,11 @@ class Gear2Trainer:
 
     def train_step(self, batch):
         """Single training step with BFloat16 autocast"""
-        # Unpack batch
-        images, gt_depth, dataset_idx = batch
+        # Unpack batch (updated to include focal_lengths)
+        images, gt_depth, focal_lengths, dataset_idx = batch
         images = images.to(self.device)
         gt_depth = gt_depth.to(self.device)
+        focal_lengths = focal_lengths.to(self.device)  # Shape: (B, T)
 
         # Add channel dimension if needed
         if gt_depth.ndim == 3:
@@ -786,7 +788,6 @@ class Gear2Trainer:
         elif gt_depth.ndim == 4 and gt_depth.shape[1] != 1:
             gt_depth = gt_depth.unsqueeze(2)
 
-        focal_length = 1000.0
         B, T = images.shape[:2]
 
         # Get the actual model (unwrap DDP if needed)
@@ -805,6 +806,22 @@ class Gear2Trainer:
         if self.global_step < 5:
             self.logger.info(f"DEBUG - After scaling to 100/m: min={gt_depth_inverse_100.min():.4f}, max={gt_depth_inverse_100.max():.4f}")
             self.logger.info(f"DEBUG - Valid pixels: {(gt_depth_inverse_100 > 0).sum()}")
+
+        # Apply canonical space transformation if enabled
+        if self.config.get('use_canonical_space', False):
+            CANONICAL_FX = self.config.get('canonical_focal_length', 1000.0)
+
+            # Transform inverse depth directly to canonical space
+            # inverse_canonical = inverse_actual * (CANONICAL_FX / fx_actual)
+            # Math: depth_canonical = depth_actual * (fx_actual / CANONICAL_FX)
+            #       1/depth_canonical = (CANONICAL_FX / fx_actual) * (1/depth_actual)
+            fx_actual = focal_lengths.view(B, T, 1, 1, 1)
+            gt_depth_inverse_100 = gt_depth_inverse_100 * (CANONICAL_FX / fx_actual)
+
+            if self.global_step < 5:
+                self.logger.info(f"DEBUG - Canonical space enabled (CANONICAL_FX={CANONICAL_FX})")
+                self.logger.info(f"DEBUG - fx_actual range: {fx_actual.min():.1f} - {fx_actual.max():.1f}")
+                self.logger.info(f"DEBUG - After canonical transform: min={gt_depth_inverse_100.min():.4f}, max={gt_depth_inverse_100.max():.4f}")
 
         # Forward pass following original FlashDepth pattern (whole sequence at once)
         # Initialize Mamba sequence (critical for temporal processing!)
@@ -954,9 +971,9 @@ class Gear2Trainer:
             if batch is None:
                 continue
 
-            # Unpack batch
-            images, gt_depth, dataset_idx = batch
-            
+            # Unpack batch (updated to include focal_lengths)
+            images, gt_depth, focal_lengths, dataset_idx = batch
+
             # Get dataset name for this batch (before frame loop)
             if isinstance(dataset_idx, str):
                 current_dataset = dataset_idx
@@ -971,6 +988,7 @@ class Gear2Trainer:
             with torch.amp.autocast('cuda', dtype=torch.bfloat16):
                 images = images.to(self.device)
                 gt_depth = gt_depth.to(self.device)
+                focal_lengths = focal_lengths.to(self.device)  # Shape: (B, T)
 
                 # Add channel dimension if needed
                 if gt_depth.ndim == 3:
@@ -982,6 +1000,14 @@ class Gear2Trainer:
 
                 # GT depth from dataloader is inverse depth (1/m), scale to 100/m
                 gt_depth_inverse_100 = gt_depth * 100.0  # (1/m) * 100 = 100/m
+
+                # Apply canonical space transformation if enabled
+                if self.config.get('use_canonical_space', False):
+                    CANONICAL_FX = self.config.get('canonical_focal_length', 1000.0)
+
+                    # Transform inverse depth directly to canonical space
+                    fx_actual = focal_lengths.view(B, T, 1, 1, 1)
+                    gt_depth_inverse_100 = gt_depth_inverse_100 * (CANONICAL_FX / fx_actual)
 
                 # Process all frames in sequence (like original FlashDepth)
                 frame_losses = []

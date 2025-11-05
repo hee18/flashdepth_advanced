@@ -3,6 +3,7 @@ import cv2
 import torch
 import numpy as np
 import logging
+import json
 from .base_dataset_pairs import BaseDatasetPairs
 
 class MvsSynthDepth(BaseDatasetPairs):
@@ -60,3 +61,34 @@ class MvsSynthDepth(BaseDatasetPairs):
             inverse_depth = torch.from_numpy(inverse_depth).float()
 
         return inverse_depth
+
+    def get_focal_length(self, pair, image_shape):
+        """
+        Get focal length for MVS-Synth dataset.
+
+        MVS-Synth provides per-frame intrinsics in poses/*.json files.
+        Each JSON contains: f_x, f_y, c_x, c_y
+
+        Args:
+            pair (dict): Data pair with 'image' and 'depth' paths
+            image_shape (tuple): (H, W) image shape
+
+        Returns:
+            float: Focal length in pixels
+        """
+        # Extract frame number from image path (e.g., /path/to/scene/images/0001.png)
+        img_path = pair['image']
+        frame_number = os.path.basename(img_path).split('.png')[0]
+
+        # Read pose file
+        scene_dir = os.path.dirname(os.path.dirname(img_path))  # Go up from images/ to scene/
+        pose_path = os.path.join(scene_dir, 'poses', f'{frame_number}.json')
+
+        try:
+            with open(pose_path, 'r') as f:
+                pose_data = json.load(f)
+            fx = float(pose_data['f_x'])
+            return fx
+        except Exception as e:
+            logging.warning(f"Error reading pose from {pose_path}: {e}, using typical fx=1156.0")
+            return 1156.0

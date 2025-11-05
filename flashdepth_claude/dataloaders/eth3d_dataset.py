@@ -78,3 +78,71 @@ class Eth3dDepth(BaseDatasetPairs):
             inverse_depth = torch.from_numpy(inverse_depth).float()
 
         return inverse_depth
+
+    def get_focal_length(self, pair, image_shape):
+        """
+        Get focal length for ETH3D dataset.
+
+        ETH3D provides per-image intrinsics in cameras.txt (COLMAP format).
+        Format: CAMERA_ID MODEL WIDTH HEIGHT fx fy cx cy
+
+        Args:
+            pair (dict): Data pair with 'image' and 'depth' paths
+            image_shape (tuple): (H, W) image shape
+
+        Returns:
+            float: Focal length in pixels
+        """
+        # Extract scene directory and image name
+        img_path = pair['image']
+        scene_dir = os.path.dirname(os.path.dirname(os.path.dirname(img_path)))  # Go up from images/dslr_images to scene/
+        img_name = os.path.basename(img_path)
+
+        # Read cameras.txt and images.txt
+        cameras_path = os.path.join(scene_dir, 'dslr_calibration_undistorted', 'cameras.txt')
+        images_path = os.path.join(scene_dir, 'dslr_calibration_undistorted', 'images.txt')
+
+        try:
+            # Parse cameras.txt to get camera parameters
+            cameras = {}
+            with open(cameras_path, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith('#') or not line:
+                        continue
+                    parts = line.split()
+                    camera_id = int(parts[0])
+                    model = parts[1]
+                    if model == 'PINHOLE':
+                        fx = float(parts[4])
+                        cameras[camera_id] = fx
+
+            # Parse images.txt to find camera_id for current image
+            with open(images_path, 'r') as f:
+                lines = f.readlines()
+                for i in range(len(lines)):
+                    line = lines[i].strip()
+                    if line.startswith('#') or not line:
+                        continue
+                    parts = line.split()
+                    if len(parts) >= 10:
+                        # IMAGE_ID QW QX QY QZ TX TY TZ CAMERA_ID NAME
+                        # NAME format: dslr_images_undistorted/DSC_0323.JPG
+                        name = parts[9]
+                        # Check if basename matches (handle both with and without path)
+                        if name == img_name or os.path.basename(name) == img_name:
+                            camera_id = int(parts[8])
+                            fx = cameras[camera_id]
+                            return fx
+
+            # If not found, use first camera as fallback
+            if cameras:
+                fx = list(cameras.values())[0]
+                logging.warning(f"Camera for {img_name} not found in images.txt, using first camera fx={fx:.1f}")
+                return fx
+
+            raise ValueError(f"No cameras found in {cameras_path}")
+        except Exception as e:
+            logging.warning(f"Error reading camera from {cameras_path}: {e}, using fallback")
+            # Fallback: typical value for 6048×4032 with ~50° FOV
+            return image_shape[1] * 0.8

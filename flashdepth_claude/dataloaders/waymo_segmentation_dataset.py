@@ -23,6 +23,8 @@ from PIL import Image
 import torch
 from torch.utils.data import Dataset
 import logging
+import pandas as pd
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -285,6 +287,42 @@ class WaymoSegmentationDataset(Dataset):
     def __len__(self):
         return len(self.sequences)
 
+    def get_focal_length(self, sequence_name):
+        """
+        Get focal length for Waymo Segmentation dataset.
+
+        Waymo provides per-sequence intrinsics in camera_calibration/*.parquet files.
+        Fields: f_u (fx), f_v (fy), c_u (cx), c_v (cy), and distortion coefficients.
+
+        Args:
+            sequence_name (str): Sequence name (e.g., 'segment-XXXXX')
+
+        Returns:
+            float: Focal length in pixels
+        """
+        # Find sequence directory
+        seq_dir = self.waymo_root / sequence_name
+
+        # Read camera calibration file
+        calib_path = seq_dir / 'camera_calibration' / f'{sequence_name}_{self.camera_name}.parquet'
+
+        try:
+            calib_df = pd.read_parquet(calib_path)
+            # Waymo uses full field names with component prefix
+            fx = float(calib_df['[CameraCalibrationComponent].intrinsic.f_u'].iloc[0])  # All frames in sequence share same intrinsics
+            return fx
+        except KeyError:
+            # Try alternative field name (older format)
+            try:
+                fx = float(calib_df['f_u'].iloc[0])
+                return fx
+            except Exception as e:
+                logger.warning(f"Error reading calibration from {calib_path}: {e}, using typical fx=2059.0")
+                return 2059.0
+        except Exception as e:
+            logger.warning(f"Error reading calibration from {calib_path}: {e}, using typical fx=2059.0")
+            return 2059.0
+
     def __getitem__(self, idx):
         """
         Get a sequence with images, depth, and segmentation.
@@ -308,6 +346,7 @@ class WaymoSegmentationDataset(Dataset):
             images = []
             depths = []
             segmentations = []
+            focal_lengths = []  # Track focal lengths for each frame
             valid_frame_indices = []  # Track which frames have valid segmentation
 
             for frame_idx in frame_indices:
@@ -387,10 +426,14 @@ class WaymoSegmentationDataset(Dataset):
                 seg_mask_np = np.array(seg_mask).astype(np.uint8)
                 seg_mask = torch.from_numpy(seg_mask_np)
 
+                # Get focal length for this sequence (same for all frames in sequence)
+                fx = self.get_focal_length(sequence_name)
+
                 # CRITICAL: Append in same order - image, depth, seg from SAME frame_idx
                 images.append(image)
                 depths.append(depth_map)
                 segmentations.append(seg_mask)
+                focal_lengths.append(fx)
                 valid_frame_indices.append(frame_idx)
 
             # Check if we have any valid frames
@@ -402,6 +445,7 @@ class WaymoSegmentationDataset(Dataset):
             images = torch.stack(images, dim=0)  # (T, 3, H, W)
             depths = torch.stack(depths, dim=0)  # (T, H, W)
             segmentations = torch.stack(segmentations, dim=0)  # (T, H, W)
+            focal_lengths_tensor = torch.tensor(focal_lengths, dtype=torch.float32)  # (T,)
 
             logger.info(f"[DATASET] {sequence_name}: Loaded {len(images)} frames with segmentation (frames {valid_frame_indices})")
 
@@ -409,6 +453,7 @@ class WaymoSegmentationDataset(Dataset):
                 'images': images,
                 'depth': depths,
                 'segmentations': segmentations,  # Changed to plural - per-frame
+                'focal_lengths': focal_lengths_tensor,  # Focal lengths for each frame
                 'sequence_name': sequence_name,
                 'frame_indices': valid_frame_indices  # Actual frame numbers
             }

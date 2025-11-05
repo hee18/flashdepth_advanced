@@ -88,6 +88,47 @@ class SintelDepth(BaseDatasetPairs):
         inverse_depth = 1 / depth
         inverse_depth[sky_mask] = 0
         inverse_depth[invalid_mask] = -1
-        
+
         return inverse_depth
+
+    def get_focal_length(self, pair, image_shape):
+        """
+        Get focal length for Sintel dataset.
+
+        Sintel provides per-frame intrinsics in cam_data/training/camdata_left/*.cam files.
+        Binary format:
+          - TAG_FLOAT (float32): validation value (202021.25)
+          - Intrinsic matrix M: 9 float64 values (3×3)
+          - Extrinsic matrix N: 12 float64 values (3×4) [not used]
+
+        Args:
+            pair (dict): Data pair with 'image' and 'depth' paths
+            image_shape (tuple): (H, W) image shape
+
+        Returns:
+            float: Focal length in pixels
+        """
+        # Extract frame info from image path (e.g., .../clean/scene_name/frame_0001.png)
+        img_path = pair['image']
+
+        # Read camera file
+        cam_path = img_path.replace('images/training/clean', 'cam_data/training/camdata_left').replace('.png', '.cam')
+
+        try:
+            with open(cam_path, 'rb') as f:
+                # Read TAG_FLOAT validation value (float32)
+                tag_val = np.fromfile(f, dtype=np.float32, count=1)[0]
+                if abs(tag_val - TAG_FLOAT) > 0.01:  # Allow small floating point error
+                    logging.warning(f"Unexpected tag in {cam_path}: {tag_val} (expected {TAG_FLOAT})")
+
+                # Read intrinsic matrix M (9 float64 values, reshape to 3×3)
+                M = np.fromfile(f, dtype=np.float64, count=9).reshape(3, 3)
+                fx = float(M[0, 0])
+
+                # Note: Extrinsic matrix N (12 float64) follows but we don't need it
+                return fx
+        except Exception as e:
+            logging.warning(f"Error reading camera from {cam_path}: {e}, using fallback")
+            # Fallback: typical value for 1024×436 with ~50° FOV
+            return image_shape[1] * 0.9
 

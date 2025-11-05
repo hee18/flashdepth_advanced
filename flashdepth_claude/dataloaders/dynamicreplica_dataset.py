@@ -9,6 +9,8 @@ from PIL import Image
 import h5py
 import torch.distributed as dist
 import pickle
+import json
+import gzip
 from .base_dataset_pairs import BaseDatasetPairs
 
 
@@ -20,6 +22,9 @@ class DynamicReplicaDepth(BaseDatasetPairs):
         # Set default parameters
         self.reshape_list['resolution'] = (1280,720)
         self.reshape_list['stride'] = 2
+
+        # Load focal lengths from annotation file
+        self.focal_length_cache = self._load_focal_lengths(root_dir)
        
 
     def get_cache_path(self, cache_dir):
@@ -87,3 +92,85 @@ class DynamicReplicaDepth(BaseDatasetPairs):
             inverse_depth = torch.from_numpy(inverse_depth).float()
 
         return inverse_depth
+
+    def _load_focal_lengths(self, root_dir):
+        """
+        Load focal lengths from frame_annotations_train.jgz file.
+
+        The annotation file contains per-frame camera intrinsics in NDC (Normalized Device Coordinates) format.
+        We convert NDC focal length to pixel coordinates:
+        fx_pixel = fx_ndc × width / 2
+
+        Returns:
+            dict: Mapping from image path to focal length in pixels
+        """
+        annotation_path = os.path.join(root_dir, 'dynamicreplica', 'frame_annotations_train.jgz')
+        focal_length_cache = {}
+
+        if not os.path.exists(annotation_path):
+            logging.warning(f"DynamicReplica annotation file not found: {annotation_path}")
+            return focal_length_cache
+
+        try:
+            logging.info(f"Loading DynamicReplica focal lengths from {annotation_path}")
+            with gzip.open(annotation_path, 'rt', encoding='utf-8') as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    frame_data = json.loads(line)
+
+                    # Get image path and size
+                    image_path = frame_data['image']['path']
+                    width = frame_data['image']['size'][1]  # [height, width]
+
+                    # Get NDC focal length
+                    viewpoint = frame_data.get('viewpoint', {})
+                    focal_length_ndc = viewpoint.get('focal_length', [None, None])
+                    fx_ndc = focal_length_ndc[0]
+
+                    if fx_ndc is not None:
+                        # Convert NDC to pixel coordinates
+                        fx_pixel = fx_ndc * width / 2.0
+                        focal_length_cache[image_path] = fx_pixel
+
+            logging.info(f"Loaded {len(focal_length_cache)} focal lengths from DynamicReplica annotations")
+
+        except Exception as e:
+            logging.error(f"Error loading DynamicReplica focal lengths: {e}")
+
+        return focal_length_cache
+
+    def get_focal_length(self, pair, image_shape):
+        """
+        Get focal length for DynamicReplica dataset.
+
+        Reads from annotation file (frame_annotations_train.jgz) which contains
+        per-frame intrinsics in NDC format. Converts to pixel coordinates:
+        fx_pixel = fx_ndc × width / 2
+
+        Fallback: fx = width / 2.0 if annotation not found
+
+        Args:
+            pair (dict): Data pair with 'image' key containing image path
+            image_shape (tuple): (H, W) image shape
+
+        Returns:
+            float: Focal length in pixels
+        """
+        # Try to get from cache first
+        img_path = pair.get('image', '')
+
+        # Extract relative path from full path
+        # annotation uses format: "sequence_name/images/filename.png"
+        if 'dynamicreplica' in img_path:
+            # Extract path relative to dynamicreplica/train/
+            parts = img_path.split('dynamicreplica/train/')
+            if len(parts) > 1:
+                relative_path = parts[1]
+                if relative_path in self.focal_length_cache:
+                    return self.focal_length_cache[relative_path]
+
+        # Fallback: use default pinhole model
+        height, width = image_shape
+        fx = width / 2.0
+        return fx

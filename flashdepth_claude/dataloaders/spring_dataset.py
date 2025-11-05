@@ -79,6 +79,31 @@ class SpringDepth(BaseDatasetPairs):
 
             return depth
 
+    def get_focal_length(self, pair, image_shape):
+        """
+        Get focal length for Spring dataset.
+
+        Spring provides per-frame intrinsics in cam_data/intrinsics.txt.
+        Each line contains: fx fy cx cy
+
+        Args:
+            pair (dict): Data pair with 'image' and 'depth' paths
+            image_shape (tuple): (H, W) image shape
+
+        Returns:
+            float: Focal length in pixels
+        """
+        # Extract frame index from image path (e.g., frame_left_0001.png -> 0)
+        img_path = pair['image']
+        index = int(os.path.basename(img_path).split('left_')[1].split('.')[0]) - 1  # 1-indexed
+
+        # Read intrinsics file
+        intrinsics_path = os.path.dirname(img_path.replace('frame_left', 'cam_data')) + '/intrinsics.txt'
+        intrinsics = np.loadtxt(intrinsics_path)
+        fx = intrinsics[index][0]
+
+        return fx
+
     def get_cache_path(self, cache_dir):
         return os.path.join(cache_dir, f'spring_pairs_{self.split}.pkl')
 

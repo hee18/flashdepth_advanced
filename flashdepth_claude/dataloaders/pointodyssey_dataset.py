@@ -85,6 +85,38 @@ class PointOdysseyDepth(BaseDatasetPairs):
 
         return inverse_depth
 
+    def get_focal_length(self, pair, image_shape):
+        """
+        Get focal length for PointOdyssey dataset.
+
+        PointOdyssey provides per-frame intrinsics in info_extracted/intrinsics.npy.
+        NumPy array of 3×3 intrinsic matrices, one per frame.
+
+        Args:
+            pair (dict): Data pair with 'image' and 'depth' paths
+            image_shape (tuple): (H, W) image shape
+
+        Returns:
+            float: Focal length in pixels
+        """
+        # Extract frame index from image path (e.g., rgb_0001.jpg)
+        img_path = pair['image']
+        frame_idx = int(os.path.basename(img_path).split('_')[1].split('.')[0])
+
+        # Read intrinsics file
+        scene_dir = os.path.dirname(os.path.dirname(img_path))  # Go up from rgbs/ to scene/
+        intrinsics_path = os.path.join(scene_dir, 'info_extracted', 'intrinsics.npy')
+
+        try:
+            intrinsics = np.load(intrinsics_path)  # Shape: [N, 3, 3]
+            K = intrinsics[frame_idx]
+            fx = float(K[0, 0])
+            return fx
+        except Exception as e:
+            logging.warning(f"Error reading intrinsics from {intrinsics_path}: {e}, using fallback")
+            # Fallback: typical value for 960×540 with ~60° FOV
+            return image_shape[1] * 0.7
+
 if __name__ == '__main__':
     dataset = PointOdysseyDepth(root_dir='/root/gene/data/pointodyssey', split='train')
     print(len(dataset))

@@ -118,3 +118,21 @@ class TartanairDepth(BaseDatasetPairs):
                 depth = torch.from_numpy(depth).float()
 
             return depth
+
+    def get_focal_length(self, pair, image_shape):
+        """
+        Get focal length for TartanAir dataset.
+
+        TartanAir uses fixed camera intrinsics:
+        - V1: 640×480, fx=fy=320, cx=320, cy=240
+        - V2: 640×640, fx=fy=320, cx=cy=320
+        Both versions use fx=320 pixels with 90° FOV.
+
+        Args:
+            pair (dict): Data pair (not used, TartanAir has fixed intrinsics)
+            image_shape (tuple): (H, W) image shape (not used)
+
+        Returns:
+            float: Focal length in pixels (always 320.0)
+        """
+        return 320.0

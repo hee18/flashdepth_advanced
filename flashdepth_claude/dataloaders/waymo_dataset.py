@@ -1,6 +1,7 @@
 import os
 import numpy as np
 import logging
+import pandas as pd
 from .base_dataset_pairs import BaseDatasetPairs
 
 
@@ -63,6 +64,52 @@ class WaymoDepth(BaseDatasetPairs):
         inverse_depth = np.where(depth_map > 0, 1.0 / depth_map, -1)
 
         return inverse_depth
+
+    def get_focal_length(self, pair, image_shape):
+        """
+        Get focal length for Waymo dataset.
+
+        Waymo provides per-sequence intrinsics in camera_calibration/*.parquet files.
+        Fields: f_u (fx), f_v (fy), c_u (cx), c_v (cy), and distortion coefficients.
+
+        Args:
+            pair (dict): Data pair with 'image' and 'depth' paths
+            image_shape (tuple): (H, W) image shape
+
+        Returns:
+            float: Focal length in pixels
+        """
+        # Extract sequence name from path (e.g., segment-XXXXX)
+        img_path = pair['image']
+        # Path format: .../waymo/val/segment-XXXXX/FRONT/rgb/original/0000.jpg
+        parts = img_path.split('/')
+        sequence_idx = [i for i, p in enumerate(parts) if p.startswith('segment-')]
+        if not sequence_idx:
+            # Fallback to typical value
+            logging.warning(f"Could not extract sequence name from {img_path}, using typical fx=2059.0")
+            return 2059.0
+
+        sequence_name = parts[sequence_idx[0]]
+
+        # Read camera calibration file
+        calib_path = os.path.join('/'.join(parts[:sequence_idx[0]+1]), 'camera_calibration', f'{sequence_name}_FRONT.parquet')
+
+        try:
+            calib_df = pd.read_parquet(calib_path)
+            # Waymo uses full field names with component prefix
+            fx = float(calib_df['[CameraCalibrationComponent].intrinsic.f_u'].iloc[0])  # All frames in sequence share same intrinsics
+            return fx
+        except KeyError:
+            # Try alternative field name (older format)
+            try:
+                fx = float(calib_df['f_u'].iloc[0])
+                return fx
+            except Exception as e:
+                logging.warning(f"Error reading calibration from {calib_path}: {e}, using typical fx=2059.0")
+                return 2059.0
+        except Exception as e:
+            logging.warning(f"Error reading calibration from {calib_path}: {e}, using typical fx=2059.0")
+            return 2059.0
 
     def get_cache_path(self, cache_dir):
         # Use different cache files for waymo and waymo_seg
