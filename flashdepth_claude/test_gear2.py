@@ -893,9 +893,10 @@ class Gear2Tester:
         interval = max(1, T // frames_to_show)
         frame_indices = list(range(0, T, interval))[:frames_to_show]
 
-        # Create figure
-        fig, axes = plt.subplots(4, frames_to_show, figsize=(frames_to_show * 3, 12))
-        if frames_to_show == 1:
+        # Create figure with actual number of frames (not frames_to_show)
+        actual_frames = len(frame_indices)
+        fig, axes = plt.subplots(4, actual_frames, figsize=(actual_frames * 3, 12))
+        if actual_frames == 1:
             axes = axes.reshape(-1, 1)
 
         for col, t in enumerate(frame_indices):
@@ -1220,9 +1221,9 @@ class Gear2Tester:
 
         # 10. Depth Distribution Histogram
         ax10 = fig.add_subplot(gs[3, :2])
-        if valid_mask.sum() > 0:
-            gt_valid = gt_depth[valid_mask]
-            pred_valid = pred_depth[valid_mask]
+        if error_valid_mask.sum() > 0:
+            gt_valid = gt_depth[error_valid_mask]
+            pred_valid = pred_depth[error_valid_mask]
 
             bins = np.linspace(min(gt_valid.min(), pred_valid.min()),
                               max(gt_valid.max(), pred_valid.max()), 50)

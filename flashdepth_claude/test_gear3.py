@@ -835,9 +835,11 @@ class Gear3Tester:
 
         # Visualize
         if self.config.eval.get('save_grid', True):
+            # Get actual frame numbers if available (for waymo_seg sparse segmentation)
+            frame_numbers = batch.get('frame_indices', [None])[0] if 'frame_indices' in batch else None
             self._visualize_sequence(
                 images[0], pred_depths, gt_depth_metric, importance_maps,
-                valid_mask, sequence_id, metrics, fps
+                valid_mask, sequence_id, metrics, fps, frame_numbers=frame_numbers
             )
 
         # Save video (GIF or MP4)
@@ -892,23 +894,34 @@ class Gear3Tester:
         return metrics
 
     def _visualize_sequence(self, images, pred_depths, gt_depths, importance_maps,
-                           valid_mask, sequence_id, metrics, fps=None):
+                           valid_mask, sequence_id, metrics, fps=None, frame_numbers=None):
         """
         Create visualization grid for a sequence.
 
         Rows: Image, Metric Depth (Prediction), Metric Depth (GT), Importance Map
+
+        Args:
+            frame_numbers: Optional list of actual frame numbers (from batch['frame_indices'])
         """
         T = images.shape[0]
-        frames_to_show = min(10, T)  # Show up to 10 frames
-        interval = max(1, T // frames_to_show)
+        # For waymo_seg objwise: interval=2, max 10 frames (regardless of actual frame numbers)
+        interval = 2
+        frames_to_show = min(10, (T + interval - 1) // interval)  # Ceiling division
         frame_indices = list(range(0, T, interval))[:frames_to_show]
 
-        # Create figure
-        fig, axes = plt.subplots(4, frames_to_show, figsize=(frames_to_show * 3, 12))
-        if frames_to_show == 1:
+        # Create figure with actual number of frames (not frames_to_show)
+        actual_frames = len(frame_indices)
+        fig, axes = plt.subplots(4, actual_frames, figsize=(actual_frames * 3, 12))
+        if actual_frames == 1:
             axes = axes.reshape(-1, 1)
 
         for col, t in enumerate(frame_indices):
+            # Determine frame label (use actual frame number if available)
+            if frame_numbers is not None and t < len(frame_numbers):
+                frame_label = f'Frame {frame_numbers[t]}'
+            else:
+                frame_label = f'Frame {t}'
+
             # Row 0: Image (denormalize ImageNet normalization)
             img = images[t].permute(1, 2, 0).cpu().numpy()
             # Min-Max normalization (FlashDepth original method)
@@ -916,7 +929,7 @@ class Gear3Tester:
             img = np.clip(img, 0, 1)
             img = (img * 255).astype(np.uint8)
             axes[0, col].imshow(img)
-            axes[0, col].set_title(f'Frame {t}')
+            axes[0, col].set_title(frame_label)
             axes[0, col].axis('off')
 
             # Row 1: Predicted metric depth (invalid pixels = black)
@@ -1262,9 +1275,9 @@ class Gear3Tester:
 
         # 10. Depth Distribution Histogram
         ax10 = fig.add_subplot(gs[3, :2])
-        if valid_mask.sum() > 0:
-            gt_valid = gt_depth[valid_mask]
-            pred_valid = pred_depth[valid_mask]
+        if error_valid_mask.sum() > 0:
+            gt_valid = gt_depth[error_valid_mask]
+            pred_valid = pred_depth[error_valid_mask]
 
             bins = np.linspace(min(gt_valid.min(), pred_valid.min()),
                               max(gt_valid.max(), pred_valid.max()), 50)

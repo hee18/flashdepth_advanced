@@ -158,11 +158,18 @@ class WaymoSegmentationDataset(Dataset):
 
             num_frames = len(rgb_files)
 
-            # Check file count consistency
-            if num_frames != len(seg_files) or num_frames != len(depth_files):
+            # Check file count consistency (sparse segmentation: RGB=Depth, Seg<=RGB)
+            if num_frames != len(depth_files):
                 logger.warning(
-                    f"Mismatch in file counts for {seq_dir.name}: "
-                    f"RGB={num_frames}, Seg={len(seg_files)}, Depth={len(depth_files)}, skipping"
+                    f"RGB/Depth mismatch for {seq_dir.name}: "
+                    f"RGB={num_frames}, Depth={len(depth_files)}, skipping"
+                )
+                continue
+
+            # For sparse segmentation datasets, seg count can be less than rgb count
+            if len(seg_files) == 0:
+                logger.warning(
+                    f"No segmentation files for {seq_dir.name}, skipping"
                 )
                 continue
 
@@ -231,22 +238,27 @@ class WaymoSegmentationDataset(Dataset):
 
             num_frames = len(rgb_files)
 
-            # Verify all have same number of files
-            if len(seg_files) != num_frames or len(depth_files) != num_frames:
-                logger.warning(f"Mismatch in file counts for {seq_dir.name}: "
-                             f"RGB={num_frames}, Seg={len(seg_files)}, Depth={len(depth_files)}, skipping")
+            # Check file count consistency (sparse segmentation: RGB=Depth, Seg<=RGB)
+            if num_frames != len(depth_files):
+                logger.warning(f"RGB/Depth mismatch for {seq_dir.name}: "
+                             f"RGB={num_frames}, Depth={len(depth_files)}, skipping")
                 continue
 
-            # For objwise mode: only use frames 0-19 (those with segmentation annotation)
-            # Waymo Open Dataset only provides segmentation for first ~20 frames
+            # For sparse segmentation datasets, seg count can be less than rgb count
+            if len(seg_files) == 0:
+                logger.warning(f"No segmentation files for {seq_dir.name}, skipping")
+                continue
+
+            # For objwise mode: use ALL frames that have segmentation (ignore video_length)
             if self.objwise_mode:
-                # Use frames 0-19 (20 frames total) as a single sequence
-                frame_indices = list(range(0, min(20, num_frames)))
-                if len(frame_indices) >= 5:  # Minimum sequence length
-                    sequences.append((seq_dir, num_frames, frame_indices))
-                    logger.info(f"Objwise mode: {seq_dir.name} using frames 0-19 ({len(frame_indices)} frames with segmentation)")
+                # Extract actual frame indices from segmentation filenames
+                seg_frame_indices = sorted([int(f.stem) for f in seg_files])
+
+                if len(seg_frame_indices) >= 5:  # Minimum sequence length
+                    sequences.append((seq_dir, num_frames, seg_frame_indices))
+                    logger.info(f"Objwise mode: {seq_dir.name} using {len(seg_frame_indices)} frames with segmentation")
                 else:
-                    logger.warning(f"Sequence {seq_dir.name} has only {len(frame_indices)} frames with segmentation (< 5), skipping")
+                    logger.warning(f"Sequence {seq_dir.name} has only {len(seg_frame_indices)} frames with segmentation (< 5), skipping")
             else:
                 # Normal mode: create sliding window sequences
                 # Use available frames (min of num_frames and video_length)
