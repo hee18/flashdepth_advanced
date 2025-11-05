@@ -416,15 +416,19 @@ loss = torch.abs(pred_inverse - gt_inverse_canonical)[valid_mask].mean()
 2. **학습 안정성**: GT target이 fx에 따라 일관되게 정규화
 3. **검증된 방법**: Metric3D v2와 동일 (CVPR 2024)
 
-#### 3.7.2 Valid Depth Range: **200m** ⭐ **[UPDATED]**
+#### 3.7.2 Valid Depth Range: **70m** (with 200m warmup)
 
-**이전**: 70m (KITTI/NYU 기준)
-**현재**: **200m** (TartanAir/Outdoor 기준)
+**학습 전략**:
+```python
+if step < 100:
+    MIN_INVERSE_DEPTH = 100.0 / 200.0  # Warmup: 200m threshold
+else:
+    MIN_INVERSE_DEPTH = 100.0 / 70.0   # Normal: 70m threshold
+```
 
 **이유**:
-- TartanAir: 대부분 장면 < 200m
-- Spring: 실외 장면 커버
-- Waymo: 자율주행 범위 포함
+- **Warmup (첫 100 step)**: 넓은 범위(200m)로 gradient 확보
+- **Normal**: 70m threshold로 정밀도 향상 (KITTI/NYU 표준)
 - 무한대 depth outliers 제거 (10^9 m)
 
 ---
@@ -453,7 +457,7 @@ GPUs: 2× RTX A6000 (48GB each)
 DDP: DistributedDataParallel (rank 0, 1)
 
 # 하이퍼파라미터
-batch_size: 20 per GPU (effective 40 with DDP)
+batch_size: 2 per GPU (effective 4 with DDP)
 video_length: 5 frames
 resolution: 518×518
 iterations: 40,000
