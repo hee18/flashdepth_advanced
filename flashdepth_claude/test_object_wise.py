@@ -184,10 +184,10 @@ class ObjectWiseEvaluator:
                         cls_token = None
 
                         if hasattr(model.gear3_head, 'multi_layer_fusion'):
-                            # Multi-layer separation method
+                            # Multi-layer separation method - DPT intermediate layers
                             attention_weights_multi_layer = [
                                 model.pretrained.blocks[i].attn.attn_weights
-                                for i in [3, 10, 16, 22]
+                                for i in [4, 11, 17, 23]
                             ]
                         else:
                             # CLS token separation method

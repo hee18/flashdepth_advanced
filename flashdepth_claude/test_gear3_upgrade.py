@@ -142,16 +142,16 @@ class Gear3UpgradeTester:
         )
 
         # Enable attention weights storage
-        # - 'multi_layer': Enable for multiple blocks (encoder-specific)
-        #   - ViT-L (24 blocks): [3, 10, 16, 22]
-        #   - ViT-S (12 blocks): [2, 5, 8, 11]
+        # - 'multi_layer': Use same blocks as DPT intermediate layers (model.intermediate_layer_idx)
+        #   - ViT-L (24 blocks): [4, 11, 17, 23] - matches DPT layer inputs
+        #   - ViT-S (12 blocks): [2, 5, 8, 11] - matches DPT layer inputs
         # - Other methods: Enable only last block
         if separation_method == 'multi_layer':
-            # Multi-layer: enable attention storage for specified blocks
+            # Multi-layer: enable attention storage for DPT intermediate layer blocks
             if model.encoder == 'vitl':
-                target_blocks = [3, 10, 16, 22]  # ViT-L
+                target_blocks = [4, 11, 17, 23]  # ViT-L - DPT intermediate layers
             else:
-                target_blocks = [2, 5, 8, 11]  # ViT-S
+                target_blocks = [2, 5, 8, 11]  # ViT-S - DPT intermediate layers
 
             for i, block in enumerate(model.pretrained.blocks):
                 if i in target_blocks:
@@ -668,9 +668,9 @@ class Gear3UpgradeTester:
 
             # Collect attention weights (multi_layer or last block only)
             if self.config.get('separation_method', 'cls_seg') == 'multi_layer':
-                # Multi-layer: collect from specified blocks
+                # Multi-layer: collect from DPT intermediate layer blocks
                 if self.model.encoder == 'vitl':
-                    target_blocks = [3, 10, 16, 22]
+                    target_blocks = [4, 11, 17, 23]
                 else:
                     target_blocks = [2, 5, 8, 11]
                 attention_weights_multi_layer_warmup = [
@@ -743,9 +743,9 @@ class Gear3UpgradeTester:
 
                 # Collect attention weights (multi_layer or last block only)
                 if self.config.get('separation_method', 'cls_seg') == 'multi_layer':
-                    # Multi-layer: collect from specified blocks
+                    # Multi-layer: collect from DPT intermediate layer blocks
                     if self.model.encoder == 'vitl':
-                        target_blocks = [3, 10, 16, 22]
+                        target_blocks = [4, 11, 17, 23]
                     else:
                         target_blocks = [2, 5, 8, 11]
                     attention_weights_multi_layer = [

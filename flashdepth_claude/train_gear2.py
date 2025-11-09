@@ -349,9 +349,9 @@ class Gear2Trainer:
                 else:
                     self.logger.warning(f"Hybrid checkpoint {hybrid_path} not found! Using Phase 1 ViT-DPT weights.")
 
-        # Enable attention weights storage for multi-layer extraction (blocks 3, 10, 16, 22)
-        # Need to store attention from layers 4, 11, 17, 23 for multi-layer CLS extraction
-        target_blocks = [3, 10, 16, 22]  # Blocks 3, 10, 16, 22 (layers 4, 11, 17, 23)
+        # Enable attention weights storage for multi-layer extraction (DPT intermediate layers)
+        # Need to store attention from blocks 4, 11, 17, 23 - same as model.intermediate_layer_idx['vitl']
+        target_blocks = [4, 11, 17, 23]  # Blocks matching DPT intermediate layers
         for i, block in enumerate(model.pretrained.blocks):
             if i in target_blocks:
                 block.attn.store_attn_weights = True

@@ -255,6 +255,16 @@ class CombinedDataset(Dataset):
             dataset_idx, scene_idx = self.pairs[idx]
             scene = self.pairslist[dataset_idx][scene_idx]
 
+            # Handle both scene formats:
+            # 1. List of frame dicts (proper scene structure)
+            # 2. Single frame dict (flat structure)
+            if isinstance(scene, dict):
+                # Single frame - wrap in list
+                scene = [scene]
+            elif not isinstance(scene, list):
+                logging.error(f"Unexpected scene type: {type(scene)}, dataset: {dataset_idx}, scene_idx: {scene_idx}")
+                return None
+
             # Apply video_length limit for validation to ensure consistent batch sizes
             if len(scene) > self.video_length:
                 scene = scene[:self.video_length]

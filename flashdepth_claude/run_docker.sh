@@ -45,6 +45,7 @@ show_usage() {
     echo "  test_gear3_objwise  Start Gear3 object-wise evaluation (Waymo segmentation)"
     echo "  test_gear3_upgrade_objwise  Start Gear3 Upgrade object-wise evaluation"
     echo "  test_original_flashdepth  Test original FlashDepth (without Gear modules) for comparison"
+    echo "  test_multilayer_viz  Multi-layer importance visualization (다층 레이어 Importance 시각화)"
     echo "  shell       Start interactive shell in container"
     echo "  clean       Remove containers and images"
     echo "  logs        Show container logs"
@@ -54,6 +55,7 @@ show_usage() {
     echo "  --workers NUM         Set number of DataLoader workers (default: 8)"
     echo "  --epochs NUM          Set number of training iterations (default: 60001)"
     echo "  --gpu ID              Set GPU ID (default: 0)"
+    echo "  --seed NUM            Set random seed for reproducibility (default: 23)"
     echo "  --results-dir PATH    Set results directory (default: train_results/results_1)"
     echo "  --flashdepth-checkpoint PATH  Set FlashDepth pretrained weights path"
     echo "  --gear-checkpoint PATH  Set Gear-S Phase 1 checkpoint path (required for --config-variant hybrid)"
@@ -101,6 +103,7 @@ show_usage() {
     echo "  $0 test_gear3_objwise --dataset waymo_seg --config-variant l --gpu 1  # Object-wise evaluation on Waymo"
     echo "  $0 test_gear3_upgrade_objwise --dataset waymo_seg --config-variant l --separation kmeans --gpu 2  # Gear3 Upgrade object-wise"
     echo "  $0 train_gear2_ddp --config-variant hybrid --gear-checkpoint train_results/gear2_s/best.pth  # Hybrid training with Gear-S weights"
+    echo "  $0 test_multilayer_viz --gpu 0 --seed 23    # Multi-layer importance visualization (다층 레이어 시각화)"
     echo "  $0 test_original_flashdepth --gpu 0  # Test original FlashDepth (ViT-L)"
     echo "  DATASET=waymo $0 test_original_flashdepth --gpu 1  # Test on Waymo dataset"
     echo "  $0 test_original_flashdepth --config flashdepth-s --gpu 0  # Use ViT-S variant (smaller/faster)"
@@ -115,6 +118,7 @@ BATCH_SIZE=3
 WORKERS=8      # Optimized for 96 CPU cores, prevents I/O bottleneck
 TOTAL_ITERS=40001
 GPU_ID=0
+SEED=23        # Random seed for reproducibility
 RESULTS_DIR="train_results/results_1"
 FLASHDEPTH_CHECKPOINT="configs/flashdepth-l/iter_10001.pth"
 GEAR_CHECKPOINT=""  # Gear-S Phase 1 checkpoint (required for hybrid only)
@@ -137,7 +141,7 @@ USE_CANONICAL="true"  # Use canonical focal length normalization (default: true)
 USER_BATCH_SIZE=""  # Track if user explicitly set batch size
 while [[ $# -gt 0 ]]; do
     case $1 in
-        build|train|test|train_gear2|train_gear2_ddp|test_gear2|train_gear3|train_gear3_ddp|test_gear3|train_gear3_upgrade|train_gear3_upgrade_ddp|test_gear3_upgrade|test_gear2_objwise|test_gear3_objwise|test_gear3_upgrade_objwise|test_original_flashdepth|shell|clean|logs)
+        build|train|test|train_gear2|train_gear2_ddp|test_gear2|train_gear3|train_gear3_ddp|test_gear3|train_gear3_upgrade|train_gear3_upgrade_ddp|test_gear3_upgrade|test_gear2_objwise|test_gear3_objwise|test_gear3_upgrade_objwise|test_original_flashdepth|test_multilayer_viz|shell|clean|logs)
             COMMAND="$1"
             shift
             ;;
@@ -156,6 +160,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --gpu)
             GPU_ID="$2"
+            shift 2
+            ;;
+        --seed)
+            SEED="$2"
             shift 2
             ;;
         --results-dir)
@@ -1063,6 +1071,40 @@ case $COMMAND in
         docker compose rm -f
         docker image rm flashdepth:latest 2>/dev/null || true
         echo "Cleanup completed!"
+        ;;
+
+    test_multilayer_viz)
+        echo "Starting Multi-Layer Importance Visualization..."
+        echo "다층 레이어 Importance Map & FG Mask 시각화 시작..."
+        echo "Configuration:"
+        echo "  - GPU: $GPU_ID"
+        echo "  - Data root: /data/datasets"
+        echo "  - Checkpoint: configs/flashdepth-l/iter_10001.pth"
+        echo "  - Output directory: /workspace/test_results/multilayer_viz"
+        echo "  - Resolution: 518"
+        echo "  - Seed: $SEED"
+        echo ""
+
+        # Clean cache files to avoid path mismatches
+        echo "Cleaning cache files..."
+        rm -f dataloaders/pairs_cache/*.pkl
+
+        # Run visualization
+        docker compose run --rm \
+            -e CUDA_VISIBLE_DEVICES="$GPU_ID" \
+            flashdepth \
+            python test_multilayer_visualization.py \
+                --gpu 0 \
+                --data-root /data/datasets \
+                --checkpoint configs/flashdepth-l/iter_10001.pth \
+                --output-dir test_results/multilayer_viz \
+                --resolution 518 \
+                --seed $SEED
+
+        echo ""
+        echo "Multi-layer visualization completed!"
+        echo "Results saved in: test_results/multilayer_viz/"
+        echo "  - Analysis grids: test_results/multilayer_viz/combination_analysis/"
         ;;
 
     logs)

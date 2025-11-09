@@ -351,14 +351,14 @@ class Gear3UpgradeTrainer:
                     self.logger.warning(f"Hybrid checkpoint {hybrid_path} not found! Using Phase 1 ViT-DPT weights.")
 
         # Enable attention weights storage
-        # - 'multi_layer': Enable for multiple blocks (encoder-specific)
-        #   - ViT-L (24 blocks): [3, 10, 16, 22]
-        #   - ViT-S (12 blocks): [2, 5, 8, 11]
+        # - 'multi_layer': Use same blocks as DPT intermediate layers (model.intermediate_layer_idx)
+        #   - ViT-L (24 blocks): [4, 11, 17, 23] - matches DPT layer inputs
+        #   - ViT-S (12 blocks): [2, 5, 8, 11] - matches DPT layer inputs
         # - Others: Enable ONLY for last block (saves memory)
         if separation_method == 'multi_layer':
-            # Use encoder-specific block indices for proportional coverage
+            # Use encoder-specific block indices matching DPT intermediate layers
             multi_layer_blocks = {
-                'vitl': [3, 10, 16, 22],
+                'vitl': [4, 11, 17, 23],
                 'vits': [2, 5, 8, 11]
             }
             target_blocks = multi_layer_blocks[model.encoder]

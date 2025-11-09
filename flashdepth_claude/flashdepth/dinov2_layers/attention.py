@@ -122,54 +122,106 @@ class MemEffAttention(Attention):
         return x
 
 
-from flash_attn import flash_attn_func
-class CrossAttention(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        num_heads: int = 8,
-        qkv_bias: bool = False,
-        proj_bias: bool = True,
-        zero_init: bool = False,
-    ) -> None:
-        super().__init__()
-        self.num_heads = num_heads
-        head_dim = dim // num_heads
-        self.scale = head_dim**-0.5
+try:
+    from flash_attn import flash_attn_func
+    FLASH_ATTN_AVAILABLE = True
+except ImportError:
+    FLASH_ATTN_AVAILABLE = False
+    logger.warning("flash_attn not available, using fallback CrossAttention")
 
-        self.q = nn.Linear(dim, dim, bias=qkv_bias)
-        self.kv = nn.Linear(dim, dim * 2, bias=qkv_bias)
-        self.proj = nn.Linear(dim, dim, bias=proj_bias)
+if FLASH_ATTN_AVAILABLE:
+    class CrossAttention(nn.Module):
+        def __init__(
+            self,
+            dim: int,
+            num_heads: int = 8,
+            qkv_bias: bool = False,
+            proj_bias: bool = True,
+            zero_init: bool = False,
+        ) -> None:
+            super().__init__()
+            self.num_heads = num_heads
+            head_dim = dim // num_heads
+            self.scale = head_dim**-0.5
 
-        if zero_init:
-            nn.init.zeros_(self.proj.weight)
-            nn.init.zeros_(self.proj.bias)
+            self.q = nn.Linear(dim, dim, bias=qkv_bias)
+            self.kv = nn.Linear(dim, dim * 2, bias=qkv_bias)
+            self.proj = nn.Linear(dim, dim, bias=proj_bias)
 
-    def forward(self, x: Tensor, context: Tensor, attn_bias=None) -> Tensor:
-        """
-        Args:
-            x: Query input of shape (B, N, C)
-            context: Key/Value input of shape (B, M, C)
-            attn_bias: Optional attention bias tensor
-        """
- 
-        B, N, C = x.shape
-        _, M, _ = context.shape
+            if zero_init:
+                nn.init.zeros_(self.proj.weight)
+                nn.init.zeros_(self.proj.bias)
 
-        # Project and reshape q to [B, N, num_heads, head_dim]
-        q = self.q(x).reshape(B, N, self.num_heads, C // self.num_heads)
-        
-        # Project and reshape kv to [B, M, 2, num_heads, head_dim]
-        kv = self.kv(context).reshape(B, M, 2, self.num_heads, C // self.num_heads)
-        k, v = unbind(kv, 2)  
+        def forward(self, x: Tensor, context: Tensor, attn_bias=None) -> Tensor:
+            """
+            Args:
+                x: Query input of shape (B, N, C)
+                context: Key/Value input of shape (B, M, C)
+                attn_bias: Optional attention bias tensor
+            """
 
-        #x = memory_efficient_attention(q, k, v)
-        x = flash_attn_func(q,k,v) # flash attention allows different sequence length for q and k without mask
-       
-        x = x.reshape(B, N, C)
+            B, N, C = x.shape
+            _, M, _ = context.shape
 
-        x = self.proj(x)
-        return x
+            # Project and reshape q to [B, N, num_heads, head_dim]
+            q = self.q(x).reshape(B, N, self.num_heads, C // self.num_heads)
+
+            # Project and reshape kv to [B, M, 2, num_heads, head_dim]
+            kv = self.kv(context).reshape(B, M, 2, self.num_heads, C // self.num_heads)
+            k, v = unbind(kv, 2)
+
+            #x = memory_efficient_attention(q, k, v)
+            x = flash_attn_func(q,k,v) # flash attention allows different sequence length for q and k without mask
+
+            x = x.reshape(B, N, C)
+
+            x = self.proj(x)
+            return x
+else:
+    # Fallback CrossAttention using standard attention
+    class CrossAttention(nn.Module):
+        def __init__(
+            self,
+            dim: int,
+            num_heads: int = 8,
+            qkv_bias: bool = False,
+            proj_bias: bool = True,
+            zero_init: bool = False,
+        ) -> None:
+            super().__init__()
+            self.num_heads = num_heads
+            head_dim = dim // num_heads
+            self.scale = head_dim**-0.5
+
+            self.q = nn.Linear(dim, dim, bias=qkv_bias)
+            self.kv = nn.Linear(dim, dim * 2, bias=qkv_bias)
+            self.proj = nn.Linear(dim, dim, bias=proj_bias)
+
+            if zero_init:
+                nn.init.zeros_(self.proj.weight)
+                nn.init.zeros_(self.proj.bias)
+
+        def forward(self, x: Tensor, context: Tensor, attn_bias=None) -> Tensor:
+            """
+            Fallback implementation using standard PyTorch attention
+            """
+            B, N, C = x.shape
+            _, M, _ = context.shape
+
+            # Project
+            q = self.q(x).reshape(B, N, self.num_heads, C // self.num_heads).transpose(1, 2)  # [B, num_heads, N, head_dim]
+            kv = self.kv(context).reshape(B, M, 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+            k, v = kv[0], kv[1]  # Each: [B, num_heads, M, head_dim]
+
+            # Standard scaled dot-product attention
+            attn = (q @ k.transpose(-2, -1)) * self.scale
+            if attn_bias is not None:
+                attn = attn + attn_bias
+            attn = attn.softmax(dim=-1)
+
+            x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+            x = self.proj(x)
+            return x
 
 
 class VanillaLinearAttention(nn.Module):
