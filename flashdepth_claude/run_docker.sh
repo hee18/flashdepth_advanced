@@ -41,6 +41,8 @@ show_usage() {
     echo "  train_gear3_upgrade Start Gear3 Upgrade training (single GPU) - Enhanced FG/BG separation"
     echo "  train_gear3_upgrade_ddp Start Gear3 Upgrade training with 2 GPUs (GPU 0,1)"
     echo "  test_gear3_upgrade  Start Gear3 Upgrade testing (supports --separation option)"
+    echo "  train_gear5     Start Gear5 training - Two-stage Global + FG modulation (supports --step 1,2)"
+    echo "  test_gear5      Start Gear5 testing (supports --step 1 or 2)"
     echo "  test_gear2_objwise  Start Gear2 object-wise evaluation (Waymo segmentation)"
     echo "  test_gear3_objwise  Start Gear3 object-wise evaluation (Waymo segmentation)"
     echo "  test_gear3_upgrade_objwise  Start Gear3 Upgrade object-wise evaluation"
@@ -64,6 +66,8 @@ show_usage() {
     echo "  --config-variant VARIANT  Set Gear config variant: l, s, hybrid (default: l for Stage 1)"
     echo "  --nuscenes            Enable nuScenes fine-tuning mode (Stage 3)"
     echo "  --separation METHOD  Set FG/BG separation method: cls_seg, kmeans, multi_layer (default: cls_seg)"
+    echo "  --step STEPS         Set Gear5 training/testing step: 1, 2, or 1,2 (default: 1)"
+    echo "  --step1-checkpoint PATH  Set Step 1 checkpoint path for Gear5 Step 2 training"
     echo "  --dataset DATASET     Set object-wise evaluation dataset: waymo (default: waymo)"
     echo "  --resolution MODE    Set resolution mode for testing: base (518x518), 2k (1918x1078) (default: base)"
     echo "  --config VARIANT     Set FlashDepth config: flashdepth, flashdepth-l, flashdepth-s (default: flashdepth-l)"
@@ -125,6 +129,8 @@ MEASURE_FPS="true"
 CONFIG_VARIANT="l"  # Gear config variant: l (Stage 1 ViT-L), s (Stage 1 ViT-S), hybrid (Stage 2)
 NUSCENES="false"  # nuScenes fine-tuning mode (Stage 3)
 SEPARATION_METHOD="multi_layer"  # FG/BG separation method for Gear3 Upgrade (cls_seg, kmeans, multi_layer)
+GEAR5_STEP="1"  # Gear5 training/testing step: 1, 2, or "1,2" (default: 1)
+STEP1_CHECKPOINT=""  # Step 1 checkpoint path (required for Gear5 Step 2 training)
 CONFIG="flashdepth-l"  # FlashDepth config variant (flashdepth, flashdepth-l, flashdepth-s)
 INVERSE="false"  # Inverse colormap for depth visualization (original FlashDepth only)
 OBJWISE_DATASET=""  # Dataset for evaluation (waymo) - empty means use config default
@@ -196,6 +202,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --separation)
             SEPARATION_METHOD="$2"
+            shift 2
+            ;;
+        --step)
+            GEAR5_STEP="$2"
+            shift 2
+            ;;
+        --step1-checkpoint)
+            STEP1_CHECKPOINT="$2"
             shift 2
             ;;
         --dataset)
@@ -958,6 +972,79 @@ case $COMMAND in
 
         if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
             TEST_CMD="$TEST_CMD load=$FLASHDEPTH_CHECKPOINT"
+        fi
+
+        CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm flashdepth $TEST_CMD
+        ;;
+
+    train_gear5)
+        echo "Starting Gear5 training - Two-Stage Global + FG Modulation..."
+        echo "Configuration:"
+        echo "  - Step: $GEAR5_STEP"
+        echo "  - Batch size: $BATCH_SIZE"
+        echo "  - Workers: $WORKERS"
+        echo "  - GPU: $GPU_ID"
+        echo "  - Results directory: $RESULTS_DIR"
+        echo "  - FlashDepth checkpoint: $FLASHDEPTH_CHECKPOINT"
+        if [ -n "$STEP1_CHECKPOINT" ]; then
+            echo "  - Step 1 checkpoint: $STEP1_CHECKPOINT (for Step 2 training)"
+        fi
+        echo ""
+
+        # Build train_gear5 command
+        DOCKER_CMD="CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm flashdepth python train_gear5.py \
+            --config-path configs/gear5 \
+            --config-name config \
+            dataset.data_root=/data/datasets \
+            training.batch_size=$BATCH_SIZE \
+            training.workers=$WORKERS \
+            training.iterations=$TOTAL_ITERS \
+            step=$GEAR5_STEP \
+            +results_dir=$RESULTS_DIR"
+
+        # Add FlashDepth checkpoint (ViT + DPT pretrained weights)
+        if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
+            DOCKER_CMD="$DOCKER_CMD load=$FLASHDEPTH_CHECKPOINT"
+        fi
+
+        # Add Step 1 checkpoint for Step 2 training
+        if [ -n "$STEP1_CHECKPOINT" ]; then
+            DOCKER_CMD="$DOCKER_CMD step1_checkpoint=$STEP1_CHECKPOINT"
+        fi
+
+        eval $DOCKER_CMD
+        ;;
+
+    test_gear5)
+        echo "Starting Gear5 testing..."
+        echo "Configuration:"
+        echo "  - Step: $GEAR5_STEP"
+        echo "  - Video length: $VID_LEN"
+        echo "  - Frame interval: $FRAME_INTERVAL"
+        echo "  - GPU: $GPU_ID"
+        echo "  - Results directory: $RESULTS_DIR"
+        echo "  - Checkpoint: $FLASHDEPTH_CHECKPOINT"
+        echo ""
+
+        # Build test_gear5 command
+        TEST_CMD="python test_gear5.py \
+            --config-path configs/gear5 \
+            --config-name config \
+            dataset.data_root=/data/datasets \
+            step=$GEAR5_STEP \
+            +results_dir=$RESULTS_DIR \
+            +gpu=$GPU_ID \
+            +vid_len=$VID_LEN \
+            +frame_interval=$FRAME_INTERVAL"
+
+        # Add checkpoint
+        if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
+            TEST_CMD="$TEST_CMD load=$FLASHDEPTH_CHECKPOINT"
+        fi
+
+        # Add Step 1 checkpoint for Step 2 testing
+        if [ "$GEAR5_STEP" = "2" ] && [ -n "$STEP1_CHECKPOINT" ]; then
+            TEST_CMD="$TEST_CMD step1_checkpoint=$STEP1_CHECKPOINT"
         fi
 
         CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm flashdepth $TEST_CMD

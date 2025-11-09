@@ -1,0 +1,100 @@
+# Gear5 Configuration - Two-Stage Global + Foreground Modulation
+# Step 1: Global Scale & Shift Prediction from multi-layer CLS tokens (518×518)
+# Step 2: Foreground-only modulation on globally-modulated features (518×518)
+
+# General settings
+config_dir: null # overwrite by --config-path
+inference: false
+load: configs/flashdepth-l/iter_10001.pth  # FlashDepth-L pretrained weights (ViT + DPT)
+step: 1  # Training step (1 or 2)
+step1_checkpoint: null  # For Step 2: path to trained Step 1 checkpoint
+
+# Canonical space settings
+canonical_focal_length:
+  base: 500.0   # For 518×518 resolution
+  2k: 1500.0    # For 2K resolution
+use_canonical_space: true  # ENABLED - all training data normalized to canonical focal length
+
+# ========== Gear5 Specific Settings ==========
+# Step 1: Uses multi-layer CLS tokens [4, 11, 17, 23] for global GSP
+# Step 2: Uses multi-layer attention [4, 11, 17, 23] for FG mask generation
+# No separation_method config needed (hardcoded to multi_layer architecture)
+
+# Dataset configuration
+dataset:
+  data_root: null # change data path
+  resolution: 'base'  # 518x518
+  video_length: 5
+  train_datasets: [mvs-synth, dynamicreplica, tartanair, pointodyssey, spring]
+  val_datasets: [sintel, waymo_seg]
+
+# Training configuration
+training:
+  batch_size: 20  # Per GPU (effective 40 with 2 GPUs in DDP)
+  workers: 8      # Optimized for 96 CPU cores
+  iterations: 40001
+  save_freq: 5000
+  val_freq: 1000  # Validation every 1k steps
+  log_freq: 100
+  wandb: false
+  wandb_name: "gear5_step1"  # Update to gear5_step2 for Step 2
+
+  # Learning rates (step-specific)
+  # Step 1: GSP (1e-4) + Mamba (1e-4) + Final (1e-4)
+  # Step 2: FG modulation (1e-4) + Mamba (5e-5, lower) + Final (5e-5)
+  gsp_lr: 1.0e-4      # Step 1: Global GSP learning rate
+  fg_mod_lr: 1.0e-4   # Step 2: FG modulation learning rate
+  mamba_lr: 1.0e-4    # Step 1: Mamba LR; Step 2: 5e-5 (lower for fine-tuning)
+  output_lr: 1.0e-4   # Step 1: Output head LR; Step 2: 5e-5
+  weight_decay: 1.0e-6
+
+  # FPS measurement
+  measure_fps: true
+  fps_log_freq: 100
+
+# Model configuration
+model:
+  # ViT configuration
+  vit_size: "vitl"
+  patch_size: 14
+  attn_class: "MemEffAttention"
+
+  # Mamba configuration
+  use_mamba: true
+  mamba_type: "add"
+  num_mamba_layers: 4
+  downsample_mamba: [0.1]
+  mamba_pos_embed: null
+  mamba_in_dpt_layer: [1]
+  mamba_d_conv: 4
+  mamba_d_state: 256
+  use_hydra: false
+  use_transformer_rnn: false
+  use_xlstm: false
+
+# Hybrid model (not used)
+hybrid_configs:
+  use_hybrid: false
+
+# Evaluation configuration
+eval:
+  compile: false
+  metrics: true
+  save_grid: true
+  outfolder: "test_gear5"
+  test_datasets: [sintel]
+  test_dataset_resolution: 'base'
+  random_input: null
+  out_video: true
+  out_mp4: false
+  save_res: 518
+  video_fps: 24
+  gif_duration: 110
+  save_depth_npy: false
+  save_vis_map: false  # Set true to save importance maps and FG masks
+  dummy_timing: false
+
+# Object-wise evaluation configuration
+object_wise:
+  enabled: false  # Enable object-wise evaluation (set via CLI: object_wise.enabled=true)
+  dataset: waymo_seg  # Dataset type for object-wise eval: waymo_seg, sintel
