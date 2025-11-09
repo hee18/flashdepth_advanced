@@ -30,7 +30,7 @@ class Gear2Visualizer:
         plt.style.use('default')
         sns.set_palette("husl")
 
-    def create_validation_summary(self, sample_batch, model_outputs, step, save_name=None, prefix="validation", fps=None, loss_dict=None, dataset_name=None):
+    def create_validation_summary(self, sample_batch, model_outputs, step, save_name=None, prefix="validation", fps=None, loss_dict=None, dataset_name=None, config=None):
         """
         Create a comprehensive validation summary for Gear2
 
@@ -55,7 +55,7 @@ class Gear2Visualizer:
             fig: Matplotlib figure object
         """
         try:
-            images, gt_depth, dataset_idx = sample_batch
+            images, gt_depth, dataset_idx, focal_lengths = sample_batch
             pred_depth = model_outputs['pred_depth']
             importance_map = model_outputs.get('importance_map', None)  # Will be None for Gear2
 
@@ -95,21 +95,89 @@ class Gear2Visualizer:
             while pred_depth_frame.ndim > 2:
                 pred_depth_frame = pred_depth_frame[0]
 
-            # Create two separate masks:
-            # 1. Metrics mask: 70m threshold (same as training loss)
-            # 2. Visualization mask: No upper limit (show all depths)
-            MAX_DEPTH_METRICS = 70.0  # For metrics calculation (100/70 = 1.43 inverse depth threshold)
+            # Create valid masks based on canonical space (70m threshold)
+            if 'canonical_gt_valid' in model_outputs:
+                canonical_gt_valid = model_outputs['canonical_gt_valid'][0, 0].cpu().numpy()
+                canonical_pred_valid = model_outputs['canonical_pred_valid'][0, 0].cpu().numpy()
 
-            # Metrics mask: 70m threshold for fair comparison with training
-            gt_valid_metrics = (gt_depth_frame > 0) & (gt_depth_frame < MAX_DEPTH_METRICS)
-            pred_valid_metrics = (pred_depth_frame > 0) & (pred_depth_frame < MAX_DEPTH_METRICS)
-            valid_mask_metrics = gt_valid_metrics & pred_valid_metrics
+                # Metrics: GT valid + Pred outlier filtering (Option 1)
+                # Filter out unreasonable predictions (NaN, Inf, >200m)
+                MAX_DEPTH_OUTLIER = 200.0
+                pred_outlier_mask = (pred_depth_frame > 0) & (pred_depth_frame < MAX_DEPTH_OUTLIER)
+                valid_mask_metrics = canonical_gt_valid & pred_outlier_mask
 
-            # Visualization mask: Filter out invalid values (<=0) and extreme outliers (>1000m)
-            MAX_DEPTH_VIS = 1000.0  # Same as TartanAir's maximum valid depth
-            gt_valid_vis = (gt_depth_frame > 0) & (gt_depth_frame < MAX_DEPTH_VIS)
-            pred_valid_vis = (pred_depth_frame > 0) & (pred_depth_frame < MAX_DEPTH_VIS)
-            valid_mask_vis = gt_valid_vis & pred_valid_vis
+                # Visualization: GT uses GT valid
+                valid_mask_gt_vis = canonical_gt_valid
+
+                # Check if dataset is sparse (< 50% valid GT pixels)
+                gt_exists = (gt_depth_frame > 0)
+                gt_density = gt_exists.sum() / gt_exists.size
+                is_sparse = gt_density < 0.5
+
+                if is_sparse:
+                    # Sparse dataset (waymo_seg): Apply height mask + fill sparse gaps
+                    # 1. Find valid scan height range from GT
+                    valid_pixels_per_row = gt_exists.sum(axis=1)  # [H]
+                    min_valid_pixels_threshold = 10  # At least 10 GT pixels per row
+                    valid_rows = valid_pixels_per_row >= min_valid_pixels_threshold
+                    valid_row_indices = np.where(valid_rows)[0]
+
+                    if len(valid_row_indices) > 0:
+                        min_valid_row = valid_row_indices.min()
+                        max_valid_row = valid_row_indices.max()
+                        height_mask = np.zeros_like(gt_depth_frame, dtype=bool)
+                        height_mask[min_valid_row:max_valid_row+1, :] = True
+                    else:
+                        height_mask = np.ones_like(gt_depth_frame, dtype=bool)
+
+                    # 2. GT missing mask (sparse LiDAR gaps)
+                    gt_missing = ~gt_exists
+
+                    # 3. Final: Within height AND (GT valid OR (GT missing AND Pred valid))
+                    valid_mask_pred_vis = height_mask & (canonical_gt_valid | (gt_missing & canonical_pred_valid))
+                else:
+                    # Dense dataset (sintel): Just use GT valid mask
+                    valid_mask_pred_vis = canonical_gt_valid
+
+                # Valid Mask visualization: GT valid only (shows actual evaluation region)
+                valid_mask_vis = canonical_gt_valid
+            else:
+                # Backward compatibility: create masks in actual space
+                MAX_DEPTH = 70.0
+                MAX_DEPTH_OUTLIER = 200.0
+                gt_valid = (gt_depth_frame > 0) & (gt_depth_frame < MAX_DEPTH)
+                pred_valid = (pred_depth_frame > 0) & (pred_depth_frame < MAX_DEPTH)
+                pred_outlier_mask = (pred_depth_frame > 0) & (pred_depth_frame < MAX_DEPTH_OUTLIER)
+                valid_mask_metrics = gt_valid & pred_outlier_mask
+                valid_mask_gt_vis = gt_valid
+
+                # Check if dataset is sparse
+                gt_exists = (gt_depth_frame > 0)
+                gt_density = gt_exists.sum() / gt_exists.size
+                is_sparse = gt_density < 0.5
+
+                if is_sparse:
+                    # Sparse: height mask + fill sparse gaps
+                    valid_pixels_per_row = gt_exists.sum(axis=1)
+                    min_valid_pixels_threshold = 10
+                    valid_rows = valid_pixels_per_row >= min_valid_pixels_threshold
+                    valid_row_indices = np.where(valid_rows)[0]
+
+                    if len(valid_row_indices) > 0:
+                        min_valid_row = valid_row_indices.min()
+                        max_valid_row = valid_row_indices.max()
+                        height_mask = np.zeros_like(gt_depth_frame, dtype=bool)
+                        height_mask[min_valid_row:max_valid_row+1, :] = True
+                    else:
+                        height_mask = np.ones_like(gt_depth_frame, dtype=bool)
+
+                    gt_missing = ~gt_exists
+                    valid_mask_pred_vis = height_mask & (gt_valid | (gt_missing & pred_valid))
+                else:
+                    # Dense: just use GT valid mask
+                    valid_mask_pred_vis = gt_valid
+
+                valid_mask_vis = gt_valid
 
             if valid_mask_metrics.sum() > 0:
                 gt_valid = gt_depth_frame[valid_mask_metrics]
@@ -123,7 +191,8 @@ class Gear2Visualizer:
             # Use metrics mask for statistics (70m threshold)
             num_valid_metrics = valid_mask_metrics.sum()
             valid_ratio_metrics = num_valid_metrics / valid_mask_metrics.size
-            valid_ratio_vis = valid_mask_vis.sum() / valid_mask_vis.size
+            valid_ratio_gt_vis = valid_mask_gt_vis.sum() / valid_mask_gt_vis.size
+            valid_ratio_pred_vis = valid_mask_pred_vis.sum() / valid_mask_pred_vis.size
             abs_error = np.abs(pred_depth_frame - gt_depth_frame)
             abs_error_masked = np.where(valid_mask_metrics, abs_error, np.nan)  # Metrics use 70m threshold
 
@@ -146,18 +215,18 @@ class Gear2Visualizer:
 
             if is_sparse_dataset:
                 # Sparse depth: show valid pixels only (no inpainting)
-                # Use vis mask (no 70m limit) for visualization
+                # Use GT vis mask (canonical_gt_valid with 70m limit)
                 _, gt_dense_vis, gt_info = create_sparse_depth_vis_no_inpaint(
-                    gt_depth_frame, valid_mask_vis, colormap='plasma_r', percentile_range=(2, 98)
+                    gt_depth_frame, valid_mask_gt_vis, colormap='plasma_r', percentile_range=(2, 98)
                 )
                 im2 = ax2.imshow(gt_dense_vis)
-                ax2.set_title(f'GT Depth (Sparse)\n{valid_ratio_vis*100:.1f}% valid\n(Metrics: {valid_ratio_metrics*100:.1f}%)',
+                ax2.set_title(f'GT Depth (Sparse)\n{valid_ratio_gt_vis*100:.1f}% valid\n(Metrics: {valid_ratio_metrics*100:.1f}%)',
                              fontsize=12, fontweight='bold')
                 vmin, vmax = gt_info['vmin'], gt_info['vmax']
             else:
                 # Dense depth: use standard visualization (invalid pixels = black)
-                gt_display = np.where(valid_mask_vis, gt_depth_frame, np.nan)  # Invalid = NaN (will be black)
-                if valid_mask_vis.sum() > 0:
+                gt_display = np.where(valid_mask_gt_vis, gt_depth_frame, np.nan)  # Invalid = NaN (will be black)
+                if valid_mask_gt_vis.sum() > 0:
                     vmin = np.nanpercentile(gt_display, 2)
                     vmax = np.nanpercentile(gt_display, 98)
                 else:
@@ -174,21 +243,17 @@ class Gear2Visualizer:
             # 3. Predicted Metric Depth (with sparse depth handling)
             ax3 = fig.add_subplot(gs[0, 2])
 
+            # Apply valid_mask_pred_vis to pred visualization (both sparse and dense)
+            pred_display = np.where(valid_mask_pred_vis, pred_depth_frame, np.nan)  # Invalid = NaN (will be black)
+            cmap_pred = plt.cm.plasma_r.copy()
+            cmap_pred.set_bad(color='black')  # NaN pixels = black
+            im3 = ax3.imshow(pred_display, cmap=cmap_pred, vmin=vmin, vmax=vmax)  # plasma_r: near=bright, far=dark
+            mae_str = f'{np.nanmean(abs_error_masked):.3f}m' if has_valid_pixels else 'N/A'
+
             if is_sparse_dataset:
-                # Pred depth is already dense (model predicts all pixels), just visualize directly
-                cmap_pred = plt.cm.plasma_r.copy()
-                cmap_pred.set_bad(color='black')
-                im3 = ax3.imshow(pred_depth_frame, cmap=cmap_pred, vmin=vmin, vmax=vmax)  # plasma_r: near=bright, far=dark
-                mae_str = f'{np.nanmean(abs_error_masked):.3f}m' if has_valid_pixels else 'N/A'
                 ax3.set_title(f'Pred Depth\nMAE: {mae_str}',
                              fontsize=12, fontweight='bold')
             else:
-                # Dense depth: use standard visualization (invalid pixels = black)
-                pred_display = np.where(valid_mask_vis, pred_depth_frame, np.nan)  # Invalid = NaN (will be black)
-                cmap_pred = plt.cm.plasma_r.copy()
-                cmap_pred.set_bad(color='black')  # NaN pixels = black
-                im3 = ax3.imshow(pred_display, cmap=cmap_pred, vmin=vmin, vmax=vmax)  # plasma_r: near=bright, far=dark
-                mae_str = f'{np.nanmean(abs_error_masked):.3f}m' if has_valid_pixels else 'N/A'
                 ax3.set_title(f'Predicted Metric Depth (m)\nMAE: {mae_str}',
                              fontsize=12, fontweight='bold')
 
@@ -226,12 +291,12 @@ class Gear2Visualizer:
 
             # ==================== Row 3: Valid Mask, Error, Metrics & Training Info ====================
 
-            # 7. Valid Mask (for metrics calculation, 70m threshold)
+            # 7. Valid Mask (GT valid only, shows actual evaluation region)
             # valid=white, invalid=black
             ax7 = fig.add_subplot(gs[2, 0])
-            ax7.imshow(valid_mask_metrics.astype(np.uint8), cmap='gray', vmin=0, vmax=1)
-            valid_ratio_pct = (valid_mask_metrics.sum() / valid_mask_metrics.size) * 100
-            ax7.set_title(f'Valid Mask ({valid_ratio_pct:.1f}%)\ninvalid: black',
+            ax7.imshow(valid_mask_vis.astype(np.uint8), cmap='gray', vmin=0, vmax=1)
+            valid_ratio_pct = (valid_mask_vis.sum() / valid_mask_vis.size) * 100
+            ax7.set_title(f'Valid Mask ({valid_ratio_pct:.1f}%)\nGT valid only',
                          fontsize=12, fontweight='bold')
             ax7.axis('off')
 
@@ -272,6 +337,32 @@ class Gear2Visualizer:
                 dataset_str = str(dataset_idx)
             ax9.text(0.05, y_pos, f'Dataset: {dataset_str}', fontsize=11, transform=ax9.transAxes)
             y_pos -= 0.10
+
+            # Focal length and depth range info (resized)
+            if focal_lengths is not None and torch.is_tensor(focal_lengths):
+                # Extract first batch, first/middle frame
+                fx_value = focal_lengths[0, 0].item() if focal_lengths.ndim >= 2 else focal_lengths[0].item()
+
+                # Show valid GT range (canonical 70m in actual space)
+                use_canonical = config.get('use_canonical_space', False) if config is not None else False
+                if use_canonical:
+                    # Get canonical focal length from config
+                    canonical_fx_config = config.get('canonical_focal_length', 1000.0)
+                    if hasattr(canonical_fx_config, 'get'):
+                        resolution = config['dataset']['resolution']
+                        CANONICAL_FX = float(canonical_fx_config.get(resolution, canonical_fx_config.get('base', 500.0)))
+                    else:
+                        CANONICAL_FX = float(canonical_fx_config)
+                    # depth_canonical = depth_actual * (CANONICAL_FX / fx_actual) = 70
+                    # Therefore: depth_actual = 70 * (fx_actual / CANONICAL_FX)
+                    valid_gt_max = 70.0 * (fx_value / CANONICAL_FX)
+                    ax9.text(0.05, y_pos, f'resized_fx: {fx_value:.1f}, valid_gt_max: {valid_gt_max:.3f}m', fontsize=10,
+                            transform=ax9.transAxes, bbox=dict(boxstyle="round", facecolor='lightyellow'))
+                else:
+                    # No canonical space
+                    ax9.text(0.05, y_pos, f'resized_fx: {fx_value:.1f}, valid_gt_max: 70.000m', fontsize=10,
+                            transform=ax9.transAxes, bbox=dict(boxstyle="round", facecolor='lightyellow'))
+                y_pos -= 0.10
 
             # FG:BG ratio → N/A for Gear2
             ax9.text(0.05, y_pos, f'FG:BG = N/A', fontsize=10,

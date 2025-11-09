@@ -82,6 +82,16 @@ class ObjectWiseMetrics:
         255: 'ignore'
     }
 
+    # UrbanSyn class IDs (uses Cityscapes 19-class standard)
+    # Same as Cityscapes trainId format
+    URBANSYN_CLASSES = {
+        0: 'road', 1: 'sidewalk', 2: 'building', 3: 'wall', 4: 'fence',
+        5: 'pole', 6: 'traffic_light', 7: 'traffic_sign', 8: 'vegetation',
+        9: 'terrain', 10: 'sky', 11: 'person', 12: 'rider', 13: 'car',
+        14: 'truck', 15: 'bus', 16: 'train', 17: 'motorcycle', 18: 'bicycle',
+        255: 'ignore'
+    }
+
 
     # Object class names (dynamic, movable objects) for visualization
     # These classes will be visualized in test_object_wise
@@ -107,13 +117,18 @@ class ObjectWiseMetrics:
         'vehicle', 'pedestrian', 'cyclist', 'bicycle', 'motorcycle'
     }
 
+    URBANSYN_OBJECT_CLASSES = {
+        'person', 'rider', 'car', 'truck', 'bus', 'train',
+        'motorcycle', 'bicycle'
+    }
+
 
     def __init__(self, dataset_type: str = 'kitti'):
         """
         Initialize object-wise metrics calculator.
 
         Args:
-            dataset_type: Dataset type ('kitti', 'cityscapes', 'nyu', 'vkitti2', 'waymo')
+            dataset_type: Dataset type ('kitti', 'cityscapes', 'nyu', 'vkitti2', 'waymo', 'urbansyn')
                          Also accepts '_seg' variants (e.g., 'waymo_seg')
         """
         # Normalize dataset type: remove _seg suffix
@@ -134,6 +149,9 @@ class ObjectWiseMetrics:
         elif self.dataset_type == 'waymo':
             self.classes = self.WAYMO_CLASSES
             self.object_classes = self.WAYMO_OBJECT_CLASSES
+        elif self.dataset_type == 'urbansyn':
+            self.classes = self.URBANSYN_CLASSES
+            self.object_classes = self.URBANSYN_OBJECT_CLASSES
         else:
             raise ValueError(f"Unknown dataset type: {self.dataset_type} (original: {dataset_type})")
 

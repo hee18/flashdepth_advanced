@@ -55,8 +55,8 @@ class Unreal4kDepth(BaseDatasetPairs):
     def depth_read(self, path, return_torch=False, **kwargs):
         # unrealstereo4k provides disparity maps, would need to use baseline and focal length to get depth for training,
         # but for evaluation we align the scale so it doesn't matter
-        inverse_depth = np.load(path) 
-        
+        inverse_depth = np.load(path)
+
         invalid_mask = np.logical_or.reduce((
             np.isinf(inverse_depth),
             np.isnan(inverse_depth),
@@ -68,10 +68,34 @@ class Unreal4kDepth(BaseDatasetPairs):
                         f"inf: {np.isinf(inverse_depth).sum()}, "
                         f"nan: {np.isnan(inverse_depth).sum()}, "
                         f"<0: {(inverse_depth < 0).sum()}")
-            
+
         inverse_depth[invalid_mask] = -1
-        
+
         if return_torch:
             inverse_depth = torch.from_numpy(inverse_depth).float()
 
         return inverse_depth
+
+    def get_focal_length(self, pair, image_shape):
+        """
+        Get focal length for UnrealStereo4K dataset.
+
+        UnrealStereo4K has intrinsics in Extrinsics0/*.txt files (first line).
+        Format: fx fy cx cy baseline width height ...
+        All scenes use the same intrinsics: fx=1920 for 3840x2160 resolution.
+
+        Args:
+            pair (dict): Data pair containing scene name
+            image_shape (tuple): (H, W) image shape AFTER resizing
+
+        Returns:
+            float: Focal length in pixels for current image shape
+        """
+        # UnrealStereo4K uses fixed intrinsics: fx=1920 for original 3840x2160 resolution
+        original_fx = 1920.0
+        original_width = 3840
+
+        # Scale to current image width
+        current_width = image_shape[1]
+        fx_scaled = original_fx * (current_width / original_width)
+        return fx_scaled

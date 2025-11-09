@@ -95,13 +95,18 @@ class UrbanSynDepth(BaseDatasetPairs):
         Get focal length for UrbanSyn dataset.
 
         UrbanSyn has a single camera_metadata.json at the root.
-        All frames share the same intrinsics (loaded in __init__).
+        All frames share the same intrinsics (loaded in __init__ for 2048×1024 resolution).
 
         Args:
             pair (dict): Data pair (not used)
-            image_shape (tuple): (H, W) image shape (not used)
+            image_shape (tuple): (H, W) image shape AFTER resizing
 
         Returns:
-            float: Focal length in pixels
+            float: Focal length in pixels for current image shape
         """
-        return self.camera_fx
+        # self.camera_fx is computed for original 2048 width
+        # Scale to current image width
+        original_width = 2048
+        current_width = image_shape[1]
+        fx_scaled = self.camera_fx * (current_width / original_width)
+        return fx_scaled

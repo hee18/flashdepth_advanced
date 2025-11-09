@@ -451,6 +451,203 @@ total_loss = depth_loss  # Log L1 loss on inverse depth
 3. **Test metrics**: `0 < depth < 70m` 필터링 (지표 계산용)
 4. **Visualization**: 제한 없음 (모든 depth 범위 표시, 단 지표는 70m 이하만)
 
+### Valid Mask Logic (2025-11-07 업데이트) ⭐
+
+**핵심 원칙**: Loss는 **GT valid 영역에서만** 계산하되, **극단적인 pred outlier만 제외**
+
+**이전 방식 (잘못됨)**:
+```python
+# WRONG: Pred도 70m 이하여야 loss 계산
+gt_valid_mask = (gt_depth_inverse_flat > MIN_INVERSE_DEPTH)  # GT < 70m
+pred_valid_mask = (pred_depth_inverse_flat > MIN_INVERSE_DEPTH)  # Pred < 70m
+valid_mask = gt_valid_mask & pred_valid_mask  # ← 모델이 loss 회피 가능! ❌
+```
+
+**문제점**:
+- 모델이 70m 이상을 예측하면 해당 픽셀에서 loss가 계산되지 않음
+- 모델이 나쁜 예측을 하면 오히려 loss가 줄어드는 역효과
+
+**현재 방식 (올바름)**:
+```python
+# CORRECT: GT valid + Pred outlier filtering only
+gt_valid_mask = (gt_depth_inverse_flat > MIN_INVERSE_DEPTH)  # GT < 70m
+
+# Outlier mask: 극단적인 예측만 제외 (>200m는 학습 불안정)
+MAX_DEPTH_OUTLIER = 200.0
+MIN_INVERSE_OUTLIER = 100.0 / MAX_DEPTH_OUTLIER  # ≈ 0.5
+pred_outlier_mask = (pred_depth_inverse_flat > MIN_INVERSE_OUTLIER)  # Pred < 200m
+
+# Final mask: GT valid AND pred not extreme outlier
+valid_mask = gt_valid_mask & pred_outlier_mask  # ✅
+```
+
+**장점**:
+1. ✅ **GT valid 영역 모두 학습**: GT가 있는 모든 픽셀에서 loss 계산
+2. ✅ **모델이 loss 회피 불가**: 나쁜 예측도 loss에 반영됨
+3. ✅ **극단값만 제외**: >200m 예측만 필터링 (학습 안정성)
+4. ✅ **합리적인 학습**: GT 70~200m 예측에도 패널티 (잘못된 예측)
+
+**적용 위치**:
+- ✅ `train_gear2.py`: train_step() line 940-948, validate() line 1118-1130
+- ✅ `train_gear3.py`: train_step() line 912-920, validate() line 1086-1098
+- ✅ `train_gear3_upgrade.py`: train_step() line 1031-1039, validate() line 1247-1259
+
+**시각화 지표도 동일**:
+- Validation 시 표시되는 MAE, AbsRel, δ1 등도 동일한 mask 사용
+- `gt_valid_mask & pred_outlier_mask` 영역에서만 계산
+
+---
+
+## Canonical Space (선택사항)
+
+### 개념 및 동기
+
+**문제**: 서로 다른 초점거리(fx)를 가진 카메라로 촬영된 이미지들을 학습할 때, 같은 크기의 물체라도 fx에 따라 다른 metric depth로 해석되어야 합니다.
+
+**해결책**: 모든 이미지를 **고정된 canonical fx 기준**으로 변환하여 학습합니다. 이를 통해 모델은 "canonical fx로 촬영했다면 몇 m로 보일까?"를 학습하게 됩니다.
+
+### 핵심 원리
+
+**Pinhole Camera 모델**:
+```
+pixel_size = fx × (object_size / depth)
+```
+
+**같은 이미지** (같은 pixel_size) 조건:
+```
+fx₁ / depth₁ = fx₂ / depth₂
+depth₂ = depth₁ × (fx₂ / fx₁)
+```
+
+**예시**:
+- fx=500으로 촬영한 3m 거리의 자동차
+- 만약 fx=1000으로 촬영했다면? → **6m여야 같은 크기!**
+- 계산: `depth_canonical = 3 × (1000/500) = 6m` ✅
+
+**물리적 직관**:
+- fx↓ (광각) → 물체가 작게 보임
+- Canonical fx↑로 해석 → 같은 크기 얻으려면 물체가 더 멀어야 함
+- **depth_canonical > depth_actual** (when fx_actual < CANONICAL_FX)
+
+### 올바른 수식 (2025-11-07 수정)
+
+**Critical Bug Fix**: 이전 구현에서 inverse depth canonicalization 수식이 **정반대**로 되어 있었습니다!
+
+#### Metric Depth Canonicalization (올바름)
+```python
+depth_canonical = depth_actual * (CANONICAL_FX / fx_actual)
+```
+
+#### Inverse Depth Canonicalization (수정됨!)
+
+**수학적 유도**:
+```
+inverse_canonical = 1 / depth_canonical
+                  = 1 / [depth_actual × (CANONICAL_FX / fx_actual)]
+                  = (fx_actual / CANONICAL_FX) × (1 / depth_actual)
+                  = inverse_actual × (fx_actual / CANONICAL_FX)  ← 핵심!
+```
+
+**올바른 코드**:
+```python
+# GT depth from dataloader is inverse depth (1/m)
+gt_depth_inverse_100 = gt_depth * 100.0  # Scale to 100/m
+
+# Apply canonical space transformation
+if self.config.get('use_canonical_space', False):
+    CANONICAL_FX = 1000.0  # or from config
+    fx_actual = focal_lengths.view(B, T, 1, 1, 1)
+
+    # CORRECT: inverse_canonical = inverse_actual × (fx_actual / CANONICAL_FX)
+    gt_depth_inverse_100 = gt_depth_inverse_100 * (fx_actual / CANONICAL_FX)  ✅
+```
+
+**틀린 코드 (이전)**:
+```python
+# WRONG (이전 구현 - 2025-11-07 이전)
+gt_depth_inverse_100 = gt_depth_inverse_100 * (CANONICAL_FX / fx_actual)  ❌
+# → 수식이 반대로 되어 학습이 불가능했음!
+```
+
+### 검증 예시
+
+**Scenario**: fx=500, depth=4.5m → canonical fx=1000에서는?
+
+| Step | 올바른 값 | 틀린 코드 (이전) |
+|------|-----------|-----------------|
+| 1. depth_canonical | 4.5 × (1000/500) = **9m** ✅ | - |
+| 2. inverse_actual | 1/4.5 = 0.2222 | 0.2222 |
+| 3. inverse_canonical | 0.2222 × (500/1000) = **0.1111** ✅ | 0.2222 × (1000/500) = 0.4444 ❌ |
+| 4. 역변환 확인 | 1/0.1111 = **9m** ✅ | 1/0.4444 = **2.25m** ❌ |
+
+**결과**: 틀린 코드는 9m여야 할 값을 2.25m로 계산 → 학습 불가능!
+
+### 일반적인 실수
+
+❌ **실수 1**: Metric depth 수식을 inverse depth에 그대로 적용
+```python
+# WRONG: Metric depth 수식을 inverse depth에 사용
+inverse_canonical = inverse_actual * (CANONICAL_FX / fx_actual)  ❌
+```
+
+✅ **올바름**: Inverse depth는 역수이므로 비율도 역수
+```python
+# CORRECT: fx 비율을 inverse로
+inverse_canonical = inverse_actual * (fx_actual / CANONICAL_FX)  ✅
+```
+
+❌ **실수 2**: "depth가 커지면 inverse depth도 커진다"
+- ❌ **틀림**: depth와 inverse depth는 **반비례** 관계!
+- ✅ **맞음**: depth↑ → inverse depth↓
+
+❌ **실수 3**: Canonical fx가 크면 GT depth도 커진다고 착각
+- ❌ **틀림**: fx는 카메라 파라미터, 실제 거리와 무관
+- ✅ **맞음**: fx↑로 **해석**하면 같은 이미지에서 거리가 더 멀어 보임
+
+### Visualization: resized_max 의미
+
+**이전**: GT depth의 최대값만 표시
+```
+resized_fx: 500, resized_max: 4.5
+```
+
+**현재**: Canonical 70m threshold가 actual fx에서 몇 m인지 표시
+```
+resized_fx: 500, resized_max: 4.5, canon_70m→actual: 35.0m
+```
+
+**의미**:
+- Canonical space에서 70m threshold (valid range)
+- fx=500에서는 35m까지만 valid
+- fx=2000에서는 140m까지 valid
+- 공식: `actual_70m = 70 × (fx_actual / CANONICAL_FX)`
+
+### 사용 방법
+
+**Config 설정**:
+```yaml
+# Enable canonical space transformation
+use_canonical_space: true
+canonical_focal_length: 1000.0  # or resolution-dependent dict
+```
+
+**Resolution-dependent config**:
+```yaml
+canonical_focal_length:
+  base: 500.0    # 518×518
+  '2k': 1000.0   # 2K resolution
+```
+
+**학습 효과**:
+- ✅ 다양한 fx 카메라 데이터를 일관되게 학습
+- ✅ Test 시 임의의 fx에 대해 de-canonicalization 수행
+- ✅ Metric depth 정확도 향상 (fx-invariant learning)
+
+**주의사항**:
+- ⚠️ 2025-11-07 이전 checkpoint는 **틀린 수식**으로 학습됨 → 재학습 필요!
+- ⚠️ De-canonicalization은 올바르게 구현되어 있었음 (test 코드)
+- ⚠️ Config에서 `use_canonical_space: true` 설정 필요 (기본값: false)
+
 ---
 
 ## 사용 방법

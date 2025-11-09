@@ -126,13 +126,21 @@ class TartanairDepth(BaseDatasetPairs):
         TartanAir uses fixed camera intrinsics:
         - V1: 640×480, fx=fy=320, cx=320, cy=240
         - V2: 640×640, fx=fy=320, cx=cy=320
-        Both versions use fx=320 pixels with 90° FOV.
+        Both versions use fx=320 pixels with 90° FOV at original 640 width.
 
         Args:
             pair (dict): Data pair (not used, TartanAir has fixed intrinsics)
-            image_shape (tuple): (H, W) image shape (not used)
+            image_shape (tuple): (H, W) image shape AFTER resizing
 
         Returns:
-            float: Focal length in pixels (always 320.0)
+            float: Focal length in pixels for current image shape
         """
-        return 320.0
+        # Original intrinsics for 640 width
+        fx_original = 320.0
+        original_width = 640
+
+        # Scale focal length to current image width
+        current_width = image_shape[1]
+        fx_scaled = fx_original * (current_width / original_width)
+
+        return fx_scaled

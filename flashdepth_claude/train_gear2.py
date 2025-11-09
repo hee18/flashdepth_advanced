@@ -104,7 +104,28 @@ class Gear2Trainer:
         # Setup logging (only rank 0)
         # Force immediate flush after each log
         class FlushFileHandler(logging.FileHandler):
-            def emit(self, record):
+        
+    def _get_canonical_focal_length(self):
+        """
+        Get canonical focal length based on current resolution.
+
+        Returns:
+            float: Canonical focal length
+        """
+        canonical_fx_config = self.config.get('canonical_focal_length', 1000.0)
+
+        # If config is a dict (resolution-dependent), select based on current resolution
+        # Check for dict-like object (handles both dict and OmegaConf DictConfig)
+        if hasattr(canonical_fx_config, 'get'):
+            resolution = self.config['dataset']['resolution']
+            canonical_fx = canonical_fx_config.get(resolution, canonical_fx_config.get('base', 500.0))
+            return float(canonical_fx)
+        else:
+            # Legacy: single value for all resolutions
+            return float(canonical_fx_config)
+
+
+    def emit(self, record):
                 super().emit(record)
                 self.flush()  # Flush immediately
 
@@ -662,6 +683,15 @@ class Gear2Trainer:
                     # Get batch size for Mamba initialization
                     B, T = images.shape[:2]
 
+                    # Apply canonical space transformation if enabled (for visualization consistency)
+                    if self.config.get('use_canonical_space', False):
+                        CANONICAL_FX = self._get_canonical_focal_length()
+
+                        # Transform inverse depth directly to canonical space
+                        # inverse_canonical = inverse_actual * (fx_actual / CANONICAL_FX)
+                        fx_actual = focal_lengths.view(B, T, 1, 1, 1)
+                        gt_depth_inverse_100 = gt_depth_inverse_100 * (fx_actual / CANONICAL_FX)
+
                     # Initialize Mamba sequence for temporal processing
                     if hasattr(model, 'mamba'):
                         model.mamba.start_new_sequence()
@@ -723,7 +753,8 @@ class Gear2Trainer:
                         sample_batch = (
                             images[:1, :1].float().cpu(),  # [1, 1, 3, H, W] - convert BFloat16 to Float32 first
                             gt_depth_metric[:1].float().cpu(),  # [1, 1, H, W] (already has channel dim)
-                            dataset_idx
+                            dataset_idx,
+                            focal_lengths[:1, :1].float().cpu()  # [1, 1] - resized focal length
                         )
                         model_outputs_cpu = {
                             'pred_depth': pred_depth_metric[:1].cpu(),  # [1, 1, H, W]
@@ -735,7 +766,7 @@ class Gear2Trainer:
 
                         # Pass loss_dict for visualization
                         self.train_visualizer.create_validation_summary(
-                            sample_batch, model_outputs_cpu, step, prefix="training", fps=current_fps, loss_dict=loss_dict
+                            sample_batch, model_outputs_cpu, step, prefix="training", fps=current_fps, loss_dict=loss_dict, config=self.config
                         )
 
                     self._set_train_mode()
@@ -809,14 +840,14 @@ class Gear2Trainer:
 
         # Apply canonical space transformation if enabled
         if self.config.get('use_canonical_space', False):
-            CANONICAL_FX = self.config.get('canonical_focal_length', 1000.0)
+            CANONICAL_FX = self._get_canonical_focal_length()
 
             # Transform inverse depth directly to canonical space
-            # inverse_canonical = inverse_actual * (CANONICAL_FX / fx_actual)
-            # Math: depth_canonical = depth_actual * (fx_actual / CANONICAL_FX)
-            #       1/depth_canonical = (CANONICAL_FX / fx_actual) * (1/depth_actual)
+            # inverse_canonical = inverse_actual * (fx_actual / CANONICAL_FX)
+            # Math: depth_canonical = depth_actual * (CANONICAL_FX / fx_actual)
+            #       1/depth_canonical = (fx_actual / CANONICAL_FX) * (1/depth_actual)
             fx_actual = focal_lengths.view(B, T, 1, 1, 1)
-            gt_depth_inverse_100 = gt_depth_inverse_100 * (CANONICAL_FX / fx_actual)
+            gt_depth_inverse_100 = gt_depth_inverse_100 * (fx_actual / CANONICAL_FX)
 
             if self.global_step < 5:
                 self.logger.info(f"DEBUG - Canonical space enabled (CANONICAL_FX={CANONICAL_FX})")
@@ -897,16 +928,24 @@ class Gear2Trainer:
         # Clamp prediction to reasonable range to prevent NaN
         pred_depth_inverse_flat = torch.clamp(pred_depth_inverse_flat, min=1e-3, max=1e4)
 
-        # Compute valid mask: GT and Pred must both be valid
-        # Warmup threshold for initial steps (prevent empty batches during initialization)
+        # Compute valid mask: GT valid + Pred outlier filtering
+        # GT valid: Only compute loss where GT is valid (70m threshold)
+        # Pred outlier: Filter out extreme predictions (>200m outliers)
         if self.global_step < 100:
             MIN_INVERSE_DEPTH = 100.0 / 200.0  # Relaxed: 200m threshold for first 100 steps
         else:
             MIN_INVERSE_DEPTH = 100.0 / 70.0   # Normal: 70m threshold after warmup
 
+        # GT valid mask: where GT depth is within valid range
         gt_valid_mask = (gt_depth_inverse_flat > MIN_INVERSE_DEPTH)
-        pred_valid_mask = (pred_depth_inverse_flat > MIN_INVERSE_DEPTH)
-        valid_mask = gt_valid_mask & pred_valid_mask
+
+        # Pred outlier mask: filter extreme predictions (>200m is outlier)
+        MAX_DEPTH_OUTLIER = 200.0
+        MIN_INVERSE_OUTLIER = 100.0 / MAX_DEPTH_OUTLIER
+        pred_outlier_mask = (pred_depth_inverse_flat > MIN_INVERSE_OUTLIER)
+
+        # Final mask: GT valid AND pred not outlier
+        valid_mask = gt_valid_mask & pred_outlier_mask
 
         if valid_mask.sum() == 0:
             self.logger.error("No valid GT & Pred pixels in batch!")
@@ -1003,11 +1042,12 @@ class Gear2Trainer:
 
                 # Apply canonical space transformation if enabled
                 if self.config.get('use_canonical_space', False):
-                    CANONICAL_FX = self.config.get('canonical_focal_length', 1000.0)
+                    CANONICAL_FX = self._get_canonical_focal_length()
 
                     # Transform inverse depth directly to canonical space
+                    # inverse_canonical = inverse_actual * (fx_actual / CANONICAL_FX)
                     fx_actual = focal_lengths.view(B, T, 1, 1, 1)
-                    gt_depth_inverse_100 = gt_depth_inverse_100 * (CANONICAL_FX / fx_actual)
+                    gt_depth_inverse_100 = gt_depth_inverse_100 * (fx_actual / CANONICAL_FX)
 
                 # Process all frames in sequence (like original FlashDepth)
                 frame_losses = []
@@ -1067,13 +1107,21 @@ class Gear2Trainer:
                         )
 
                     # Compute loss in inverse depth space (100/m)
-                    # Apply same 70m threshold as training for consistency
-                    MIN_INVERSE_DEPTH = 100.0 / 70.0  # Filter out >70m depths (same as training)
+                    # Validation: Use same threshold (70m) for both GT and Pred for fair evaluation
+                    MIN_INVERSE_DEPTH = 100.0 / 70.0  # 70m threshold (consistent with test)
 
-                    # GT and Pred must both be valid (same as metrics calculation)
-                    gt_valid_mask = (gt_t_inverse_100 >= MIN_INVERSE_DEPTH)  # GT within 70m and valid
-                    pred_valid_mask = (pred_depth_inverse >= MIN_INVERSE_DEPTH)  # Pred within reasonable range
+                    # GT valid mask: where GT depth is within valid range
+                    gt_valid_mask = (gt_t_inverse_100 >= MIN_INVERSE_DEPTH)
+
+                    # Pred valid mask: same threshold as GT for fair evaluation
+                    pred_valid_mask = (pred_depth_inverse >= MIN_INVERSE_DEPTH)
+
+                    # Final mask: GT valid AND pred valid (both use 70m threshold)
                     valid_mask = (gt_valid_mask & pred_valid_mask).float()
+
+                    # Save canonical masks for visualization
+                    canonical_gt_valid = gt_valid_mask.cpu()  # [B, 1, H, W]
+                    canonical_pred_valid = pred_valid_mask.cpu()  # [B, 1, H, W]
 
                     # Ensure shapes match: pred [B, 1, H, W], gt [B, 1, H, W], mask [B, 1, H, W]
                     if gt_t_inverse_100.dim() == 3:  # [B, H, W]
@@ -1128,7 +1176,9 @@ class Gear2Trainer:
 
                                     model_outputs = {
                                         'pred_depth': pred_depth_metric,  # [B, 1, gt_h, gt_w] at GT resolution
-                                        'importance_map': importance_map_cpu  # [B, 1, gt_h, gt_w] or None
+                                        'importance_map': importance_map_cpu,  # [B, 1, gt_h, gt_w] or None
+                                        'canonical_gt_valid': canonical_gt_valid,  # [B, 1, H, W] - canonical space mask
+                                        'canonical_pred_valid': canonical_pred_valid  # [B, 1, H, W] - canonical space mask
                                     }
 
                                     # For visualization, we need [B, T, ...] format like training
@@ -1136,7 +1186,8 @@ class Gear2Trainer:
                                     sample_batch = (
                                         img_t_resized.unsqueeze(1).float().cpu(),  # [B, 1, C, gt_h, gt_w] at GT resolution
                                         gt_depth_metric.unsqueeze(1).float().cpu(),  # [B, 1, gt_h, gt_w]
-                                        dataset_idx
+                                        dataset_idx,
+                                        focal_lengths[:, 0:1].float().cpu()  # [B, 1] - resized focal length for first frame
                                     )
 
                                     # FPS removed from training (only measured in test_gear2.py)
@@ -1151,7 +1202,7 @@ class Gear2Trainer:
                                     save_name = f"validation_{current_dataset}_seq{seq_num:03d}_step_{self.global_step:06d}"
                                     self.val_visualizer.create_validation_summary(
                                         sample_batch, model_outputs, self.global_step,
-                                        save_name=save_name, fps=current_fps, loss_dict=val_loss_dict, dataset_name=current_dataset
+                                        save_name=save_name, fps=current_fps, loss_dict=val_loss_dict, dataset_name=current_dataset, config=self.config
                                     )
                                     config['saved'].append(seq_num)
                                     self.logger.info(f"Saved validation visualization: {current_dataset} sequence {seq_num} ({len(config['saved'])}/{len(config['sequences'])})")

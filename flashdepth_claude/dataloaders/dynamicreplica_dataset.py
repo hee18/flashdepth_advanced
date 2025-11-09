@@ -101,8 +101,11 @@ class DynamicReplicaDepth(BaseDatasetPairs):
         We convert NDC focal length to pixel coordinates:
         fx_pixel = fx_ndc × width / 2
 
+        Note: These fx values are for ORIGINAL resolution (1280×720).
+        They will be scaled in get_focal_length() when images are resized.
+
         Returns:
-            dict: Mapping from image path to focal length in pixels
+            dict: Mapping from image path to focal length in pixels (for original resolution)
         """
         annotation_path = os.path.join(root_dir, 'dynamicreplica', 'frame_annotations_train.jgz')
         focal_length_cache = {}
@@ -117,21 +120,25 @@ class DynamicReplicaDepth(BaseDatasetPairs):
                 for line in f:
                     if not line.strip():
                         continue
-                    frame_data = json.loads(line)
+                    
+                    # Each line is a JSON array of frame data
+                    frames_array = json.loads(line)
+                    
+                    # Process each frame in the array
+                    for frame_data in frames_array:
+                        # Get image path and size
+                        image_path = frame_data['image']['path']
+                        width = frame_data['image']['size'][1]  # [height, width]
 
-                    # Get image path and size
-                    image_path = frame_data['image']['path']
-                    width = frame_data['image']['size'][1]  # [height, width]
+                        # Get NDC focal length
+                        viewpoint = frame_data.get('viewpoint', {})
+                        focal_length_ndc = viewpoint.get('focal_length', [None, None])
+                        fx_ndc = focal_length_ndc[0]
 
-                    # Get NDC focal length
-                    viewpoint = frame_data.get('viewpoint', {})
-                    focal_length_ndc = viewpoint.get('focal_length', [None, None])
-                    fx_ndc = focal_length_ndc[0]
-
-                    if fx_ndc is not None:
-                        # Convert NDC to pixel coordinates
-                        fx_pixel = fx_ndc * width / 2.0
-                        focal_length_cache[image_path] = fx_pixel
+                        if fx_ndc is not None:
+                            # Convert NDC to pixel coordinates (for original resolution)
+                            fx_pixel = fx_ndc * width / 2.0
+                            focal_length_cache[image_path] = fx_pixel
 
             logging.info(f"Loaded {len(focal_length_cache)} focal lengths from DynamicReplica annotations")
 
@@ -146,16 +153,16 @@ class DynamicReplicaDepth(BaseDatasetPairs):
 
         Reads from annotation file (frame_annotations_train.jgz) which contains
         per-frame intrinsics in NDC format. Converts to pixel coordinates:
-        fx_pixel = fx_ndc × width / 2
+        fx_pixel = fx_ndc × width / 2 (for original 1280×720 resolution)
 
-        Fallback: fx = width / 2.0 if annotation not found
+        Then scales to current image shape.
 
         Args:
             pair (dict): Data pair with 'image' key containing image path
-            image_shape (tuple): (H, W) image shape
+            image_shape (tuple): (H, W) image shape AFTER resizing
 
         Returns:
-            float: Focal length in pixels
+            float: Focal length in pixels for current image shape
         """
         # Try to get from cache first
         img_path = pair.get('image', '')
@@ -168,7 +175,12 @@ class DynamicReplicaDepth(BaseDatasetPairs):
             if len(parts) > 1:
                 relative_path = parts[1]
                 if relative_path in self.focal_length_cache:
-                    return self.focal_length_cache[relative_path]
+                    # Cached fx is for original 1280 width, scale to current width
+                    fx_original = self.focal_length_cache[relative_path]
+                    original_width = 1280
+                    current_width = image_shape[1]
+                    fx_scaled = fx_original * (current_width / original_width)
+                    return fx_scaled
 
         # Fallback: use default pinhole model
         height, width = image_shape

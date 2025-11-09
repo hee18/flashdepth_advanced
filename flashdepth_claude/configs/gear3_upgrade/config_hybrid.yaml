@@ -10,22 +10,25 @@ gear_checkpoint: train_results/results_XX/gear3_upgrade_s/best.pth  # Gear3 Upgr
 phase: 2  # Stage 2: Hybrid training (2K resolution)
 
 # Canonical space settings
-canonical_focal_length: 1000.0
-use_canonical_space: false  # DISABLED - using raw inverse depth without canonicalization
+canonical_focal_length:
+  base: 1000.0   # For 518×518 resolution
+  2k: 1000.0     # For 2K resolution
+use_canonical_space: true  # ENABLED - all training data normalized to canonical focal length
 
 # Dataset configuration
 dataset:
   data_root: null # change data path
   resolution: '2k'  # 2K resolution for Stage 2
-  video_length: 5
+  video_length: 1  # Minimal setting for 2K + multi-layer attention (4 blocks) + gradient_checkpointing
   train_datasets: [mvs-synth, spring]  # Only high-res datasets
   val_datasets: [sintel, waymo_seg]
 
 # Training configuration
 training:
-  batch_size: 1   # Smaller batch size for 2K resolution (full sequence: 1*5=5 frames/GPU)
-  workers: 8      # Optimized for 96 CPU cores
+  batch_size: 1   # Smaller batch size for 2K resolution (full sequence: 1*2=2 frames/GPU)
+  workers: 2      # Optimized for 96 CPU cores
   iterations: 40001  # Same as Stage 1
+  gradient_checkpointing: true  # CRITICAL for 2K resolution - saves ~50% memory
   save_freq: 5000
   val_freq: 1000  # Validation every 1k steps
   log_freq: 100
@@ -97,4 +100,4 @@ object_wise:
   dataset: waymo_seg  # Dataset type for object-wise eval: waymo_seg, sintel
 
 # Gear3 Upgrade specific settings
-separation_method: cls_seg  # FG/BG separation method: cls_seg (CLS token), kmeans, multi_layer
+separation_method: multi_layer  # FG/BG separation method: cls_seg (CLS token), kmeans, multi_layer

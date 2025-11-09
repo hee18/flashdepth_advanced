@@ -69,7 +69,8 @@ show_usage() {
     echo "  --config VARIANT     Set FlashDepth config: flashdepth, flashdepth-l, flashdepth-s (default: flashdepth-l)"
     echo "  --inverse BOOL       Inverse colormap for depth (original FlashDepth only, default: false)"
     echo "  --no-video           Skip video (GIF/MP4) generation for faster testing"
-    echo "  --whole-test BOOL    Use all test datasets (true) or validation datasets only (false, default: false)"
+    echo "  --whole-seq-test BOOL    Use all sequences in dataset (true) or first 8 sequences only (false, default: false)"
+    echo "  --canon BOOL         Use canonical focal length normalization (default: true)"
     echo ""
     echo "Note: Regularization losses are deprecated. Importance map now uses raw DINOv2 attention (frozen)."
     echo ""
@@ -110,9 +111,9 @@ show_usage() {
 
 # Parse command line arguments - optimized for RTX A6000 (2x 48GB)
 COMMAND=""
-BATCH_SIZE=2  # Per GPU for full sequence processing (2*5=10 frames/GPU, effective 20 frames with DDP)
+BATCH_SIZE=3
 WORKERS=8      # Optimized for 96 CPU cores, prevents I/O bottleneck
-TOTAL_ITERS=30001
+TOTAL_ITERS=40001
 GPU_ID=0
 RESULTS_DIR="train_results/results_1"
 FLASHDEPTH_CHECKPOINT="configs/flashdepth-l/iter_10001.pth"
@@ -129,7 +130,8 @@ INVERSE="false"  # Inverse colormap for depth visualization (original FlashDepth
 OBJWISE_DATASET=""  # Dataset for evaluation (waymo) - empty means use config default
 RESOLUTION="base"  # Resolution mode for testing (base, 2k) - default to base (518x518)
 NO_VIDEO="false"  # Skip video (GIF/MP4) generation for faster testing
-WHOLE_TEST="false"  # Use all test datasets (true) or validation datasets only (false, default)
+WHOLE_SEQ_TEST="false"  # Use all sequences in dataset (true) or first 8 sequences only (false, default)
+USE_CANONICAL="true"  # Use canonical focal length normalization (default: true)
 
 # Parse arguments
 USER_BATCH_SIZE=""  # Track if user explicitly set batch size
@@ -216,8 +218,12 @@ while [[ $# -gt 0 ]]; do
             NO_VIDEO="true"
             shift
             ;;
-        --whole-test)
-            WHOLE_TEST="$2"
+        --whole-seq-test)
+            WHOLE_SEQ_TEST="$2"
+            shift 2
+            ;;
+        --canon)
+            USE_CANONICAL="$2"
             shift 2
             ;;
         -h|--help)
@@ -301,6 +307,15 @@ case $COMMAND in
         ;;
 
     train_gear2)
+        # Determine canonical focal length based on config variant
+        if [ "$CONFIG_VARIANT" = "hybrid" ]; then
+            CANONICAL_FX="1000.0"
+            RES_NAME="2k"
+        else
+            CANONICAL_FX="1000.0"
+            RES_NAME="base"
+        fi
+
         echo "Starting Gear2 training (Single GPU) - Ablation Study..."
         echo "Configuration:"
         echo "  - Config variant: $CONFIG_VARIANT"
@@ -310,6 +325,7 @@ case $COMMAND in
         echo "  - Total iterations: $TOTAL_ITERS"
         echo "  - GPU: $GPU_ID"
         echo "  - Results directory: $RESULTS_DIR"
+        echo "  - Canonical focal length: $CANONICAL_FX ($RES_NAME resolution)"
         echo ""
 
         # Build train_gear2 command with config variant
@@ -320,6 +336,7 @@ case $COMMAND in
             training.batch_size=$BATCH_SIZE \
             training.workers=$WORKERS \
             training.iterations=$TOTAL_ITERS \
+            use_canonical_space=$USE_CANONICAL \
             +results_dir=$RESULTS_DIR"
 
         # Add nuScenes flag if enabled
@@ -340,6 +357,8 @@ case $COMMAND in
         if [ "$CONFIG_VARIANT" = "hybrid" ]; then
             # Hybrid: 2K resolution - reduce both batch size and workers
             ACTUAL_WORKERS=2  # 2 workers per GPU (total 4 across 2 GPUs)
+            CANONICAL_FX="1000.0"
+            RES_NAME="2k"
 
             # Auto-adjust batch size for 2K resolution if user didn't specify
             if [ -z "$USER_BATCH_SIZE" ]; then
@@ -355,6 +374,8 @@ case $COMMAND in
         else
             # Stage 1 (L/S): 518x518 resolution - can use more workers and larger batch
             ACTUAL_WORKERS=$WORKERS
+            CANONICAL_FX="1000.0"
+            RES_NAME="base"
         fi
 
         echo "Starting Gear2 training (Multi-GPU: 0,1) - Ablation Study..."
@@ -368,6 +389,7 @@ case $COMMAND in
         echo "  - GPUs: 0,1"
         echo "  - Results directory: $RESULTS_DIR"
         echo "  - FPS measurement: $MEASURE_FPS"
+        echo "  - Canonical focal length: $CANONICAL_FX ($RES_NAME resolution)"
         echo ""
 
         DOCKER_CMD="CUDA_VISIBLE_DEVICES=0,1 docker compose run --rm \
@@ -385,6 +407,7 @@ case $COMMAND in
             training.workers=$ACTUAL_WORKERS \
             training.iterations=$TOTAL_ITERS \
             training.measure_fps=$MEASURE_FPS \
+            use_canonical_space=$USE_CANONICAL \
             +results_dir=$RESULTS_DIR"
 
         # Add nuScenes flag if enabled
@@ -406,6 +429,15 @@ case $COMMAND in
         ;;
 
     train_gear3)
+        # Determine canonical focal length based on config variant
+        if [ "$CONFIG_VARIANT" = "hybrid" ]; then
+            CANONICAL_FX="1000.0"
+            RES_NAME="2k"
+        else
+            CANONICAL_FX="1000.0"
+            RES_NAME="base"
+        fi
+
         echo "Starting Gear3 training (Single GPU)..."
         echo "Configuration:"
         echo "  - Config variant: $CONFIG_VARIANT"
@@ -415,6 +447,7 @@ case $COMMAND in
         echo "  - Total iterations: $TOTAL_ITERS"
         echo "  - GPU: $GPU_ID"
         echo "  - Results directory: $RESULTS_DIR"
+        echo "  - Canonical focal length: $CANONICAL_FX ($RES_NAME resolution)"
         echo ""
 
         # Build train_gear3 command with config variant
@@ -425,6 +458,7 @@ case $COMMAND in
             training.batch_size=$BATCH_SIZE \
             training.workers=$WORKERS \
             training.iterations=$TOTAL_ITERS \
+            use_canonical_space=$USE_CANONICAL \
             +results_dir=$RESULTS_DIR"
 
         # Add nuScenes flag if enabled
@@ -445,6 +479,8 @@ case $COMMAND in
         if [ "$CONFIG_VARIANT" = "hybrid" ]; then
             # Hybrid: 2K resolution - reduce both batch size and workers
             ACTUAL_WORKERS=2  # 2 workers per GPU (total 4 across 2 GPUs)
+            CANONICAL_FX="1000.0"
+            RES_NAME="2k"
 
             # Auto-adjust batch size for 2K resolution if user didn't specify
             if [ -z "$USER_BATCH_SIZE" ]; then
@@ -460,6 +496,8 @@ case $COMMAND in
         else
             # Stage 1 (L/S): 518x518 resolution - can use more workers and larger batch
             ACTUAL_WORKERS=$WORKERS
+            CANONICAL_FX="1000.0"
+            RES_NAME="base"
         fi
 
         echo "Starting Gear3 training (Multi-GPU: 0,1)..."
@@ -473,6 +511,7 @@ case $COMMAND in
         echo "  - GPUs: 0,1"
         echo "  - Results directory: $RESULTS_DIR"
         echo "  - FPS measurement: $MEASURE_FPS"
+        echo "  - Canonical focal length: $CANONICAL_FX ($RES_NAME resolution)"
         echo ""
 
         DOCKER_CMD="CUDA_VISIBLE_DEVICES=0,1 docker compose run --rm \
@@ -490,6 +529,7 @@ case $COMMAND in
             training.workers=$ACTUAL_WORKERS \
             training.iterations=$TOTAL_ITERS \
             training.measure_fps=$MEASURE_FPS \
+            use_canonical_space=$USE_CANONICAL \
             +results_dir=$RESULTS_DIR"
 
         # Add nuScenes flag if enabled
@@ -532,6 +572,15 @@ case $COMMAND in
             esac
         fi
 
+        # Determine canonical focal length based on config variant
+        if [ "$CONFIG_VARIANT" = "hybrid" ]; then
+            CANONICAL_FX="1000.0"
+            RES_NAME="2k"
+        else
+            CANONICAL_FX="1000.0"
+            RES_NAME="base"
+        fi
+
         echo "Starting Gear3 Upgrade training (Single GPU) - Enhanced FG/BG Separation..."
         echo "Configuration:"
         echo "  - Config variant: $CONFIG_VARIANT"
@@ -543,6 +592,7 @@ case $COMMAND in
         echo "  - GPU: $GPU_ID"
         echo "  - Results directory: $RESULTS_DIR"
         echo "  - Checkpoint: $FLASHDEPTH_CHECKPOINT"
+        echo "  - Canonical focal length: $CANONICAL_FX ($RES_NAME resolution)"
         echo ""
 
         # Build train_gear3_upgrade command with config variant
@@ -554,6 +604,7 @@ case $COMMAND in
             training.workers=$WORKERS \
             training.iterations=$TOTAL_ITERS \
             separation_method=$SEPARATION_METHOD \
+            use_canonical_space=$USE_CANONICAL \
             +results_dir=$RESULTS_DIR"
 
         # Add nuScenes flag if enabled
@@ -595,6 +646,8 @@ case $COMMAND in
         if [ "$CONFIG_VARIANT" = "hybrid" ]; then
             # Hybrid: 2K resolution - reduce both batch size and workers
             ACTUAL_WORKERS=2  # 2 workers per GPU (total 4 across 2 GPUs)
+            CANONICAL_FX="1000.0"
+            RES_NAME="2k"
 
             # Auto-adjust batch size for 2K resolution if user didn't specify
             if [ -z "$USER_BATCH_SIZE" ]; then
@@ -610,6 +663,8 @@ case $COMMAND in
         else
             # Stage 1 (L/S): 518x518 resolution - can use more workers and larger batch
             ACTUAL_WORKERS=$WORKERS
+            CANONICAL_FX="1000.0"
+            RES_NAME="base"
         fi
 
         echo "Starting Gear3 Upgrade training (Multi-GPU: 0,1) - Enhanced FG/BG Separation..."
@@ -625,6 +680,7 @@ case $COMMAND in
         echo "  - Results directory: $RESULTS_DIR"
         echo "  - FPS measurement: $MEASURE_FPS"
         echo "  - Checkpoint: $FLASHDEPTH_CHECKPOINT"
+        echo "  - Canonical focal length: $CANONICAL_FX ($RES_NAME resolution)"
         echo ""
 
         DOCKER_CMD="CUDA_VISIBLE_DEVICES=0,1 docker compose run --rm \
@@ -643,6 +699,7 @@ case $COMMAND in
             training.iterations=$TOTAL_ITERS \
             training.measure_fps=$MEASURE_FPS \
             separation_method=$SEPARATION_METHOD \
+            use_canonical_space=$USE_CANONICAL \
             +results_dir=$RESULTS_DIR"
 
         # Add nuScenes flag if enabled
@@ -702,7 +759,7 @@ case $COMMAND in
         fi
 
         # Add frame interval and video length options
-        TEST_CMD="$TEST_CMD +frame_interval=$FRAME_INTERVAL +vid_len=$VID_LEN +whole_test=$WHOLE_TEST"
+        TEST_CMD="$TEST_CMD +frame_interval=$FRAME_INTERVAL +vid_len=$VID_LEN +whole_seq_test=$WHOLE_SEQ_TEST"
 
         # Add single sequence path if specified
         if [ -n "$SINGLE_SEQUENCE" ]; then
@@ -752,7 +809,7 @@ case $COMMAND in
         fi
 
         # Add frame interval and video length options
-        TEST_CMD="$TEST_CMD +frame_interval=$FRAME_INTERVAL +vid_len=$VID_LEN +whole_test=$WHOLE_TEST"
+        TEST_CMD="$TEST_CMD +frame_interval=$FRAME_INTERVAL +vid_len=$VID_LEN +whole_seq_test=$WHOLE_SEQ_TEST"
 
         # Add single sequence path if specified
         if [ -n "$SINGLE_SEQUENCE" ]; then
@@ -803,7 +860,7 @@ case $COMMAND in
         fi
 
         # Add frame interval and video length options
-        TEST_CMD="$TEST_CMD +frame_interval=$FRAME_INTERVAL +vid_len=$VID_LEN +whole_test=$WHOLE_TEST"
+        TEST_CMD="$TEST_CMD +frame_interval=$FRAME_INTERVAL +vid_len=$VID_LEN +whole_seq_test=$WHOLE_SEQ_TEST"
 
         # Add video generation control
         if [ "$NO_VIDEO" == "true" ]; then

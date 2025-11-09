@@ -10,8 +10,10 @@ gear_checkpoint: train_results/results_XX/gear2_s/best.pth  # Gear2-S Stage 1 ch
 phase: 2  # Stage 2: Hybrid training (2K resolution)
 
 # Canonical space settings
-canonical_focal_length: 1000.0
-use_canonical_space: false  # DISABLED - using raw inverse depth without canonicalization
+canonical_focal_length:
+  base: 1000.0   # For 518×518 resolution
+  2k: 1000.0     # For 2K resolution
+use_canonical_space: true  # ENABLED - all training data normalized to canonical focal length
 
 # Dataset configuration
 dataset:

@@ -67,28 +67,36 @@ class MvsSynthDepth(BaseDatasetPairs):
         Get focal length for MVS-Synth dataset.
 
         MVS-Synth provides per-frame intrinsics in poses/*.json files.
-        Each JSON contains: f_x, f_y, c_x, c_y
+        Each JSON contains: f_x, f_y, c_x, c_y (for original 1920×1080 resolution)
 
         Args:
             pair (dict): Data pair with 'image' and 'depth' paths
-            image_shape (tuple): (H, W) image shape
+            image_shape (tuple): (H, W) image shape AFTER resizing
 
         Returns:
-            float: Focal length in pixels
+            float: Focal length in pixels for current image shape
         """
         # Extract frame number from image path (e.g., /path/to/scene/images/0001.png)
         img_path = pair['image']
         frame_number = os.path.basename(img_path).split('.png')[0]
 
-        # Read pose file
+        # Read pose file (values are for original 1920×1080 resolution)
         scene_dir = os.path.dirname(os.path.dirname(img_path))  # Go up from images/ to scene/
         pose_path = os.path.join(scene_dir, 'poses', f'{frame_number}.json')
 
         try:
             with open(pose_path, 'r') as f:
                 pose_data = json.load(f)
-            fx = float(pose_data['f_x'])
-            return fx
+            fx_original = float(pose_data['f_x'])
+
+            # Scale focal length to current image width
+            original_width = 1920
+            current_width = image_shape[1]
+            fx_scaled = fx_original * (current_width / original_width)
+
+            return fx_scaled
         except Exception as e:
-            logging.warning(f"Error reading pose from {pose_path}: {e}, using typical fx=1156.0")
-            return 1156.0
+            logging.warning(f"Error reading pose from {pose_path}: {e}, using typical fx=1156.0 for 1920 width")
+            # Fallback: scale typical value to current width
+            fx_fallback = 1156.0 * (image_shape[1] / 1920)
+            return fx_fallback

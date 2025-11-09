@@ -14,7 +14,7 @@ phase: 1  # Training phase (1, 2, or 3)
 
 # Canonical space settings
 canonical_focal_length: 1000.0
-use_canonical_space: false  # DISABLED - using raw inverse depth without canonicalization
+use_canonical_space: true  # ENABLED - all training data normalized to canonical focal length
 
 # ========== Ablation Study: Multi-layer CLS without FG/BG Separation ==========
 # This ablation uses 'multi_layer_no_sep':

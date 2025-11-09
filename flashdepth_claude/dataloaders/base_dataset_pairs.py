@@ -80,6 +80,11 @@ class BaseDatasetPairs(Dataset):
         all_scenes = self.get_all_scenes(scenes_path)
         filter_scenes = self.get_filter_scenes(self.split)
 
+        logging.info(f"[DEBUG base_dataset_pairs] Building pairs for {self.dataset_name}, split={self.split}")
+        logging.info(f"[DEBUG base_dataset_pairs] Total scenes available: {len(all_scenes)}")
+        logging.info(f"[DEBUG base_dataset_pairs] Scenes to filter out: {len(filter_scenes)}")
+        logging.info(f"[DEBUG base_dataset_pairs] Will process {len(all_scenes) - len(filter_scenes)} scenes")
+
         for item in all_scenes:
             if self.split != 'train':
                 scene_pairs = []

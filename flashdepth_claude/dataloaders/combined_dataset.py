@@ -8,7 +8,7 @@ import math
 
 from .depthanything_preprocess import _load_and_process_image, _load_and_process_depth
 from .base_dataset_pairs import BaseDatasetPairs
-from utils.dataset_intrinsics import get_intrinsics_info, validate_focal_length, get_fallback_fx
+from utils.dataset_intrinsics import get_intrinsics_info, get_fallback_fx
 
 
 class CombinedDataset(Dataset):
@@ -69,10 +69,12 @@ class CombinedDataset(Dataset):
 
 
         for dataset_name in enable_dataset_flags:
+            logging.info(f"[DEBUG combined_dataset] Loading dataset: {dataset_name}, split={split}")
             dataset = BaseDatasetPairs.create(dataset_name, root_dir, split, load_cache=cache_dir)
             self.pairslist[dataset_name] = dataset.pairs
             self.depth_read_list[dataset_name] = dataset.depth_read
             self.reshape_list[dataset_name] = dataset.reshape_list
+            logging.info(f"[DEBUG combined_dataset] Dataset {dataset_name} loaded: {len(dataset.pairs)} pairs/sequences")
 
             # Store focal length getter method if dataset has it, otherwise None
             if hasattr(dataset, 'get_focal_length'):
@@ -166,10 +168,7 @@ class CombinedDataset(Dataset):
         if self.focal_length_getter_list[dataset_idx] is not None:
             try:
                 fx = self.focal_length_getter_list[dataset_idx](pair, image_shape)
-                validated_fx = validate_focal_length(fx, image_shape[1], dataset_idx)
-                if validated_fx != fx:
-                    logging.warning(f"[{dataset_idx}] Focal length {fx:.1f} failed validation, using {validated_fx:.1f}")
-                return validated_fx
+                return fx
             except Exception as e:
                 error_info = f"Dataset-specific getter failed: {e}"
                 logging.warning(f"[{dataset_idx}] {error_info}")
@@ -205,7 +204,7 @@ class CombinedDataset(Dataset):
 
         if intrinsic_type == 'fixed':
             fx = intrinsics_info['fx']
-            return validate_focal_length(fx, image_shape[1], dataset_idx)
+            return fx
 
         elif intrinsic_type == 'computed':
             # Compute from formula (e.g., DynamicReplica: fx = width / 2)
@@ -216,7 +215,7 @@ class CombinedDataset(Dataset):
                 else:
                     # Generic fallback
                     fx = get_fallback_fx(width)
-                return validate_focal_length(fx, width, dataset_idx)
+                return fx
 
         # For per_frame, per_sequence, per_image types:
         # Dataset should implement get_focal_length()

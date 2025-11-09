@@ -84,14 +84,14 @@ class Eth3dDepth(BaseDatasetPairs):
         Get focal length for ETH3D dataset.
 
         ETH3D provides per-image intrinsics in cameras.txt (COLMAP format).
-        Format: CAMERA_ID MODEL WIDTH HEIGHT fx fy cx cy
+        Format: CAMERA_ID MODEL WIDTH HEIGHT fx fy cx cy (for original 6048×4032 resolution)
 
         Args:
             pair (dict): Data pair with 'image' and 'depth' paths
-            image_shape (tuple): (H, W) image shape
+            image_shape (tuple): (H, W) image shape AFTER resizing
 
         Returns:
-            float: Focal length in pixels
+            float: Focal length in pixels for current image shape
         """
         # Extract scene directory and image name
         img_path = pair['image']
@@ -114,8 +114,8 @@ class Eth3dDepth(BaseDatasetPairs):
                     camera_id = int(parts[0])
                     model = parts[1]
                     if model == 'PINHOLE':
-                        fx = float(parts[4])
-                        cameras[camera_id] = fx
+                        fx_original = float(parts[4])
+                        cameras[camera_id] = fx_original
 
             # Parse images.txt to find camera_id for current image
             with open(images_path, 'r') as f:
@@ -132,17 +132,25 @@ class Eth3dDepth(BaseDatasetPairs):
                         # Check if basename matches (handle both with and without path)
                         if name == img_name or os.path.basename(name) == img_name:
                             camera_id = int(parts[8])
-                            fx = cameras[camera_id]
-                            return fx
+                            fx_original = cameras[camera_id]
+                            
+                            # Scale focal length to current image width (from original 6048)
+                            original_width = 6048
+                            current_width = image_shape[1]
+                            fx_scaled = fx_original * (current_width / original_width)
+                            return fx_scaled
 
             # If not found, use first camera as fallback
             if cameras:
-                fx = list(cameras.values())[0]
-                logging.warning(f"Camera for {img_name} not found in images.txt, using first camera fx={fx:.1f}")
-                return fx
+                fx_original = list(cameras.values())[0]
+                logging.warning(f"Camera for {img_name} not found in images.txt, using first camera fx={fx_original:.1f}")
+                # Scale to current width
+                fx_scaled = fx_original * (image_shape[1] / 6048)
+                return fx_scaled
 
             raise ValueError(f"No cameras found in {cameras_path}")
         except Exception as e:
             logging.warning(f"Error reading camera from {cameras_path}: {e}, using fallback")
-            # Fallback: typical value for 6048×4032 with ~50° FOV
-            return image_shape[1] * 0.8
+            # Fallback: typical value scaled to current width
+            fx_fallback = image_shape[1] * 0.8
+            return fx_fallback

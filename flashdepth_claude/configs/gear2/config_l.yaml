@@ -9,8 +9,10 @@ load: configs/flashdepth-l/iter_10001.pth  # FlashDepth-L pretrained weights
 phase: 1  # Stage 1: Base training (518×518)
 
 # Canonical space settings
-canonical_focal_length: 1000.0
-use_canonical_space: false  # DISABLED - using raw inverse depth without canonicalization
+canonical_focal_length:
+  base: 1000.0   # For 518×518 resolution
+  2k: 1000.0     # For 2K resolution
+use_canonical_space: true  # ENABLED - all training data normalized to canonical focal length
 
 # Dataset configuration
 dataset:
@@ -22,7 +24,7 @@ dataset:
 
 # Training configuration
 training:
-  batch_size: 20  # Per GPU (effective 40 with 2 GPUs in DDP) - optimized based on GPU memory
+  batch_size: 4  # Per GPU (effective 8 with 2 GPUs in DDP) - optimized based on GPU memory
   workers: 8      # Optimized for 96 CPU cores
   iterations: 40001  # Reduced from 60001 (best model at step 2k, overfitting after)
   save_freq: 5000

@@ -27,6 +27,10 @@ class WaymoDepth(BaseDatasetPairs):
             use_segmentation and return_dict are accepted for API compatibility but not used.
             For object-wise evaluation with segmentation, use WaymoSegmentationDataset directly.
         """
+        # Store data_root and dataset_name for calibration file access
+        self.data_root = root_dir
+        self.dataset_name = dataset_name
+        
         # Set root directory based on dataset name
         if dataset_name == 'waymo_seg':
             self.root_dir = os.path.join(root_dir, 'waymo_seg/val')
@@ -70,14 +74,17 @@ class WaymoDepth(BaseDatasetPairs):
         Get focal length for Waymo dataset.
 
         Waymo provides per-sequence intrinsics in camera_calibration/*.parquet files.
+        For waymo_seg: Files are in waymo_seg/waymo_seg/camera_calibration/ directory.
+        For waymo: Files are in each sequence's camera_calibration/ directory.
         Fields: f_u (fx), f_v (fy), c_u (cx), c_v (cy), and distortion coefficients.
+        Values are for original 1920×1280 resolution.
 
         Args:
             pair (dict): Data pair with 'image' and 'depth' paths
-            image_shape (tuple): (H, W) image shape
+            image_shape (tuple): (H, W) image shape AFTER resizing
 
         Returns:
-            float: Focal length in pixels
+            float: Focal length in pixels for current image shape
         """
         # Extract sequence name from path (e.g., segment-XXXXX)
         img_path = pair['image']
@@ -85,31 +92,47 @@ class WaymoDepth(BaseDatasetPairs):
         parts = img_path.split('/')
         sequence_idx = [i for i, p in enumerate(parts) if p.startswith('segment-')]
         if not sequence_idx:
-            # Fallback to typical value
-            logging.warning(f"Could not extract sequence name from {img_path}, using typical fx=2059.0")
-            return 2059.0
+            # Fallback to typical value scaled to current width
+            logging.warning(f"Could not extract sequence name from {img_path}, using typical fx=2059.0 for 1920 width")
+            fx_fallback = 2059.0 * (image_shape[1] / 1920)
+            return fx_fallback
 
         sequence_name = parts[sequence_idx[0]]
-
-        # Read camera calibration file
-        calib_path = os.path.join('/'.join(parts[:sequence_idx[0]+1]), 'camera_calibration', f'{sequence_name}_FRONT.parquet')
+        
+        # Determine calibration path based on dataset type
+        if self.dataset_name == 'waymo_seg':
+            # waymo_seg: Central calibration directory at waymo_seg/waymo_seg/camera_calibration/
+            # Directory structure: {data_root}/waymo_seg/waymo_seg/camera_calibration/
+            seq_id = sequence_name.replace('segment-', '')
+            calib_path = os.path.join(self.data_root, 'waymo_seg', 'waymo_seg', 'camera_calibration', f'{seq_id}.parquet')
+        else:
+            # waymo: Per-sequence calibration directory
+            calib_path = os.path.join('/'.join(parts[:sequence_idx[0]+1]), 'camera_calibration', f'{sequence_name}_FRONT.parquet')
 
         try:
             calib_df = pd.read_parquet(calib_path)
             # Waymo uses full field names with component prefix
-            fx = float(calib_df['[CameraCalibrationComponent].intrinsic.f_u'].iloc[0])  # All frames in sequence share same intrinsics
-            return fx
+            fx_original = float(calib_df['[CameraCalibrationComponent].intrinsic.f_u'].iloc[0])  # All frames in sequence share same intrinsics
+            
+            # Scale focal length to current image width (from original 1920)
+            original_width = 1920
+            current_width = image_shape[1]
+            fx_scaled = fx_original * (current_width / original_width)
+            return fx_scaled
         except KeyError:
             # Try alternative field name (older format)
             try:
-                fx = float(calib_df['f_u'].iloc[0])
-                return fx
+                fx_original = float(calib_df['f_u'].iloc[0])
+                fx_scaled = fx_original * (image_shape[1] / 1920)
+                return fx_scaled
             except Exception as e:
-                logging.warning(f"Error reading calibration from {calib_path}: {e}, using typical fx=2059.0")
-                return 2059.0
+                logging.warning(f"Error reading calibration from {calib_path}: {e}, using typical fx=2059.0 for 1920 width")
+                fx_fallback = 2059.0 * (image_shape[1] / 1920)
+                return fx_fallback
         except Exception as e:
-            logging.warning(f"Error reading calibration from {calib_path}: {e}, using typical fx=2059.0")
-            return 2059.0
+            logging.warning(f"Error reading calibration from {calib_path}: {e}, using typical fx=2059.0 for 1920 width")
+            fx_fallback = 2059.0 * (image_shape[1] / 1920)
+            return fx_fallback
 
     def get_cache_path(self, cache_dir):
         # Use different cache files for waymo and waymo_seg
@@ -119,8 +142,30 @@ class WaymoDepth(BaseDatasetPairs):
     def get_filter_scenes(self, split):
         all_scenes = self.get_all_scenes(self.get_scenes_path())
 
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"[DEBUG waymo_dataset] get_filter_scenes called: split={split}, total_scenes={len(all_scenes)}")
+        logger.info(f"[DEBUG waymo_dataset] All scenes: {all_scenes}")
+
         if split == 'val':
-            return sorted(all_scenes)[:8]  # only use first 8 scenes
+            # These are the 8 sequences we WANT to use for validation
+            val_scenes_to_use = [
+                'segment-10017090168044687777_6380_000_6400_000',
+                'segment-10023947602400723454_1120_000_1140_000',
+                'segment-1005081002024129653_5313_150_5333_150',
+                'segment-10061305430875486848_1080_000_1100_000',
+                'segment-10072140764565668044_4060_000_4080_000',
+                'segment-10072231702153043603_5725_000_5745_000',
+                'segment-10075870402459732738_1060_000_1080_000',
+                'segment-10094743350625019937_3420_000_3440_000',
+            ]
+            # IMPORTANT: get_filter_scenes() returns scenes to EXCLUDE (filter out)
+            # So we return all scenes EXCEPT the 8 we want to use
+            scenes_to_exclude = [s for s in all_scenes if s not in val_scenes_to_use]
+            logger.info(f"[DEBUG waymo_dataset] Validation: want to use {len(val_scenes_to_use)} scenes")
+            logger.info(f"[DEBUG waymo_dataset] Validation: excluding {len(scenes_to_exclude)} scenes")
+            logger.info(f"[DEBUG waymo_dataset] Validation: will use these {len(all_scenes) - len(scenes_to_exclude)} scenes: {[s for s in all_scenes if s not in scenes_to_exclude]}")
+            return scenes_to_exclude
         elif split == 'test':
             return [s for s in all_scenes if s not in testing_scenes]  # only use the 30 testing scenes
         return []  

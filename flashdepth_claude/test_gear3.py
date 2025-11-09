@@ -35,12 +35,39 @@ from flashdepth.model import FlashDepth
 from flashdepth.gear3_modules import Gear3MetricHead
 from dataloaders.combined_dataset import CombinedDataset
 from dataloaders.waymo_segmentation_dataset import WaymoSegmentationDataset, collate_fn as waymo_collate_fn
+from dataloaders.urbansyn_dataset import UrbanSynDepth
+from dataloaders.urbansyn_segmentation_dataset import UrbanSynSegmentationDataset, urbansyn_collate_fn
 from utils.metric_depth_metrics import MetricDepthMetrics, format_metrics
 from utils.object_wise_evaluation import ObjectWiseMetrics
 from utils.object_wise_visualization import create_object_wise_grid
 from utils.helpers import save_gifs_as_grid, save_grid_to_mp4, depth_to_np_arr, torch_batch_to_np_arr
 from utils.gear_common_helpers import depth_to_colored_frame
 from utils.gear_video_utils import save_video as save_video_util
+
+
+
+def get_canonical_focal_length(config):
+    """
+    Get canonical focal length based on current resolution.
+
+    Args:
+        config: Configuration dict
+
+    Returns:
+        float: Canonical focal length
+    """
+    canonical_fx_config = config.get('canonical_focal_length', 1000.0)
+
+    # If config is a dict (resolution-dependent), select based on current resolution
+    # Check for dict-like object (handles both dict and OmegaConf DictConfig)
+    if hasattr(canonical_fx_config, 'get'):
+        resolution = config['dataset']['resolution']
+        canonical_fx = canonical_fx_config.get(resolution, canonical_fx_config.get('base', 500.0))
+        logging.info(f"Using resolution-dependent canonical focal length: {canonical_fx} for resolution '{resolution}'")
+        return float(canonical_fx)
+    else:
+        # Legacy: single value for all resolutions
+        return float(canonical_fx_config)
 
 # Setup logging
 logging.basicConfig(
@@ -172,6 +199,15 @@ class Gear3Tester:
                     objwise_mode=True  # Only use frames 0-19 with segmentation annotation
                 )
                 collate_fn = waymo_collate_fn
+            elif self.object_wise_dataset == 'urbansyn':
+                test_dataset = UrbanSynSegmentationDataset(
+                    data_root=data_root,
+                    split='test',
+                    video_length=video_length,
+                    resolution=resolution,
+                    max_frames=1000
+                )
+                collate_fn = urbansyn_collate_fn
             else:
                 raise ValueError(f"Unknown object-wise dataset: {self.object_wise_dataset}")
 
@@ -184,18 +220,28 @@ class Gear3Tester:
             collate_fn = self._collate_fn
         else:
             # Normal mode: use CombinedDataset
-            # Check if whole-test mode (default: False)
-            whole_test = self.config.get('whole_test', False)
+            # Priority: 1) eval.test_datasets (CLI override), 2) whole_seq_test flag
+            whole_seq_test = self.config.get('whole_seq_test', False)
 
-            if whole_test:
+            # Check if eval.test_datasets is explicitly provided (CLI override)
+            has_test_datasets_override = hasattr(self.config.eval, 'test_datasets') and len(self.config.eval.test_datasets) > 0
+
+            if has_test_datasets_override:
+                # CLI override: use provided test_datasets regardless of whole_seq_test
                 test_datasets = self.config.eval.test_datasets
-                logger.info("Using ALL test datasets (whole_test=True)")
+                logger.info(f"Using CLI-specified datasets: {test_datasets}")
+            elif whole_seq_test:
+                # Use all test datasets from config
+                test_datasets = self.config.eval.test_datasets
+                logger.info("Using ALL test datasets (whole_seq_test=True)")
             else:
                 # Use validation datasets with waymo_seg (first 8 sequences)
-                test_datasets = self.config.dataset.get('val_datasets', ['sintel', 'waymo_seg'])
+                # Default to all available datasets if val_datasets not specified
+                default_val_datasets = ['sintel', 'waymo_seg', 'eth3d', 'urbansyn', 'unreal4k', 'tartanair']
+                test_datasets = self.config.dataset.get('val_datasets', default_val_datasets)
                 # Replace 'waymo' with 'waymo_seg' if present
                 test_datasets = ['waymo_seg' if d == 'waymo' else d for d in test_datasets]
-                logger.info(f"Using VALIDATION datasets only (whole_test=False): {test_datasets}")
+                logger.info(f"Using VALIDATION datasets (whole_seq_test=False): {test_datasets}")
 
             video_length = int(self.config.get('vid_len', 50))  # Ensure integer (Hydra may pass string)  # Get from config override
             resolution = self.config.get('resolution', self.config.eval.test_dataset_resolution)  # Allow resolution override
@@ -510,19 +556,28 @@ class Gear3Tester:
         # Dataloader gives inverse depth (1/m), scale to 100/m for training
         gt_depth_inverse_100 = gt_depth * 100.0  # [1, T, 1, H, W] in 100/m
 
-        # Apply canonical space transformation to GT if enabled (for fair comparison)
-        CANONICAL_FX = self.config.get('canonical_focal_length', 1000.0)
+        # Save original actual space GT for visualization and metrics (before canonicalization)
+        gt_depth_inverse_100_actual = gt_depth_inverse_100.clone()  # [1, T, 1, H, W] in actual space
+
+        # Apply canonical space transformation to GT if enabled (for mask calculation only)
+        CANONICAL_FX = get_canonical_focal_length(self.config)
         use_canonical = self.config.get('use_canonical_space', False)
         if use_canonical:
-            # Transform GT to canonical space for comparison
+            # Transform GT to canonical space for mask calculation
+            # inverse_canonical = inverse_actual * (fx_actual / CANONICAL_FX)
             fx_actual = focal_lengths.view(1, T, 1, 1, 1)  # [1, T, 1, 1, 1]
-            gt_depth_inverse_100 = gt_depth_inverse_100 * (CANONICAL_FX / fx_actual)
+            gt_depth_inverse_100 = gt_depth_inverse_100 * (fx_actual / CANONICAL_FX)
+
+        # Create canonical valid masks (70m threshold in canonical space)
+        MIN_INVERSE_CANONICAL = 100.0 / 70.0
+        canonical_gt_valid = (gt_depth_inverse_100 > MIN_INVERSE_CANONICAL)  # [1, T, 1, H, W]
 
         # Storage for predictions
         pred_depths = []
         importance_maps = []
         fg_features_list = []
         bg_features_list = []
+        canonical_pred_valid_all = []  # Store canonical pred masks
 
         # Best frame tracking
         best_frame_idx = 0
@@ -634,11 +689,15 @@ class Gear3Tester:
                 # Prediction is already positive (Softplus activation in output_conv2)
                 pred_depth_inverse_100 = out  # [1, 1, H, W] in 100/m_canonical
 
+                # Save canonical pred mask (before de-canonicalization!)
+                canonical_pred_valid_t = (pred_depth_inverse_100 > MIN_INVERSE_CANONICAL)  # [1, 1, H, W]
+                canonical_pred_valid_all.append(canonical_pred_valid_t.cpu())
+
                 # De-canonicalization: convert from canonical space to actual metric space
                 if use_canonical:
-                    # pred_inverse_actual = pred_inverse_canonical * (fx_actual / CANONICAL_FX)
+                    # pred_inverse_actual = pred_inverse_canonical * (CANONICAL_FX / fx_actual)
                     fx_t = focal_lengths[0, t]  # Focal length for this frame
-                    pred_depth_inverse_100 = pred_depth_inverse_100 * (fx_t / CANONICAL_FX)
+                    pred_depth_inverse_100 = pred_depth_inverse_100 * (CANONICAL_FX / fx_t)
 
                 # Interpolate prediction to GT resolution (like train_gear3.py validation)
                 gt_t_shape = gt_t_inverse.shape[-2:]  # GT original resolution
@@ -686,8 +745,12 @@ class Gear3Tester:
         fg_features_all = torch.stack(fg_features_list, dim=0)  # [T, C, patch_h, patch_w]
         bg_features_all = torch.stack(bg_features_list, dim=0)  # [T, C, patch_h, patch_w]
 
-        # Convert GT to metric depth for evaluation: 100/m -> m
-        gt_depth_metric = 100.0 / (gt_depth_inverse_100[0] + 1e-8)  # [T, 1, H, W] in meters
+        # Stack canonical pred masks
+        canonical_pred_valid = torch.cat(canonical_pred_valid_all, dim=1)  # [1, T, 1, H, W]
+
+        # Convert GT to metric depth for evaluation: use actual space GT (not canonical)
+        # This ensures visualization and metrics are in real-world metric depth
+        gt_depth_metric = 100.0 / (gt_depth_inverse_100_actual[0] + 1e-8)  # [T, 1, H, W] in actual meters
 
         # Compute metrics (both pred and GT are now in meters)
         # Move to CPU and compute per-frame metrics (like test_metric_head.py)
@@ -700,12 +763,10 @@ class Gear3Tester:
             pred_frame = pred_depths_cpu[t, 0]  # [H, W]
             gt_frame = gt_depth_metric_cpu[t, 0]  # [H, W]
 
-            # Create valid mask for this frame (like train_gear3 validation)
-            # Use same MAX_DEPTH as Gear3Visualizer (70m)
-            MAX_DEPTH = 70.0
-            gt_valid_mask = (gt_frame > 0) & (gt_frame < MAX_DEPTH)  # GT valid pixels
-            pred_valid_mask = (pred_frame > 0) & (pred_frame < MAX_DEPTH)  # Filter extreme values
-            valid_mask = gt_valid_mask & pred_valid_mask  # [H, W] bool tensor
+            # Use canonical space masks (70m threshold in canonical space)
+            canonical_gt_valid_t = canonical_gt_valid[0, t, 0].cpu()  # [H, W]
+            canonical_pred_valid_t = canonical_pred_valid[0, t, 0].cpu()  # [H, W]
+            valid_mask = canonical_gt_valid_t & canonical_pred_valid_t  # [H, W] bool tensor
 
             # Debug logging for first frame of first sequence
             if t == 0 and sequence_id == 0:
@@ -846,8 +907,9 @@ class Gear3Tester:
                 traceback.print_exc()
                 metrics['object_wise'] = {}
 
-        # Recreate valid_mask on GPU for visualization
-        valid_mask = (gt_depth_metric > 0)  # [T, 1, H, W] on GPU
+        # Use canonical valid masks for visualization (combine GT and pred)
+        # canonical_gt_valid: [1, T, 1, H, W], canonical_pred_valid: [1, T, 1, H, W]
+        valid_mask = (canonical_gt_valid[0] & canonical_pred_valid[0])  # [T, 1, H, W]
 
         # Visualize
         if self.config.eval.get('save_grid', True):
@@ -855,7 +917,7 @@ class Gear3Tester:
             frame_numbers = batch.get('frame_indices', [None])[0] if 'frame_indices' in batch else None
             self._visualize_sequence(
                 images[0], pred_depths, gt_depth_metric, importance_maps,
-                valid_mask, sequence_id, metrics, fps, frame_numbers=frame_numbers
+                valid_mask, sequence_id, metrics, fps, frame_numbers=frame_numbers, focal_lengths=focal_lengths[0]
             )
 
         # Save video (GIF or MP4)
@@ -910,7 +972,7 @@ class Gear3Tester:
         return metrics
 
     def _visualize_sequence(self, images, pred_depths, gt_depths, importance_maps,
-                           valid_mask, sequence_id, metrics, fps=None, frame_numbers=None):
+                           valid_mask, sequence_id, metrics, fps=None, frame_numbers=None, focal_lengths=None):
         """
         Create visualization grid for a sequence.
 
@@ -918,6 +980,7 @@ class Gear3Tester:
 
         Args:
             frame_numbers: Optional list of actual frame numbers (from batch['frame_indices'])
+            focal_lengths: Optional tensor of focal lengths [T]
         """
         T = images.shape[0]
         # For waymo_seg objwise: interval=2, max 10 frames (regardless of actual frame numbers)
@@ -951,9 +1014,46 @@ class Gear3Tester:
             # Row 1: Predicted metric depth (invalid pixels = black)
             MAX_DEPTH = 70.0
             pred = pred_depths[t, 0].cpu().numpy()
-            pred_valid = (pred > 0) & (pred < MAX_DEPTH)  # Only <70m
-            pred_display = np.where(pred_valid, pred, np.nan)  # Invalid = NaN
-            if pred_valid.sum() > 0:
+            gt = gt_depths[t, 0].cpu().numpy()
+
+            # Check if dataset is sparse (< 50% valid GT pixels)
+            gt_exists = (gt > 0)
+            gt_density = gt_exists.sum() / gt_exists.size
+            is_sparse = gt_density < 0.5
+
+            # GT valid mask (canonical 70m)
+            gt_valid = (gt > 0) & (gt < MAX_DEPTH)
+
+            if is_sparse:
+                # Sparse dataset (waymo_seg): Apply height mask + fill sparse gaps
+                # 1. Find valid scan height range from GT
+                valid_pixels_per_row = gt_exists.sum(axis=1)  # [H]
+                min_valid_pixels_threshold = 10  # At least 10 GT pixels per row
+                valid_rows = valid_pixels_per_row >= min_valid_pixels_threshold
+                valid_row_indices = np.where(valid_rows)[0]
+
+                if len(valid_row_indices) > 0:
+                    min_valid_row = valid_row_indices.min()
+                    max_valid_row = valid_row_indices.max()
+                    height_mask = np.zeros_like(gt, dtype=bool)
+                    height_mask[min_valid_row:max_valid_row+1, :] = True
+                else:
+                    height_mask = np.ones_like(gt, dtype=bool)
+
+                # 2. GT missing mask (sparse LiDAR gaps)
+                gt_missing = ~gt_exists
+
+                # 3. Pred valid mask (canonical 70m)
+                pred_valid_depth = (pred > 0) & (pred < MAX_DEPTH)
+
+                # 4. Final: Within height AND (GT valid OR (GT missing AND Pred valid))
+                pred_show_mask = height_mask & (gt_valid | (gt_missing & pred_valid_depth))
+            else:
+                # Dense dataset (sintel): Just use GT valid mask
+                pred_show_mask = gt_valid
+
+            pred_display = np.where(pred_show_mask, pred, np.nan)  # Invalid = NaN (will be black)
+            if pred_show_mask.sum() > 0:
                 pred_vmin = np.nanpercentile(pred_display, 2)
                 pred_vmax = np.nanpercentile(pred_display, 98)
             else:
@@ -995,6 +1095,32 @@ class Gear3Tester:
         )
         if fps is not None:
             title_str += f" | FPS: {fps:.1f}"
+
+        # Add focal length and max depth info
+        if focal_lengths is not None:
+            # Use first frame's focal length (resized)
+            fx_value = focal_lengths[0].item()
+            # Calculate max GT depth from valid region
+            gt_max = 0.0
+            if valid_mask.sum() > 0:
+                # gt_depths: [T, 1, H, W], valid_mask: [T, 1, H, W]
+                # Remove channel dimension from both and apply mask
+                valid_mask_no_channel = valid_mask[:, 0] if valid_mask.ndim == 4 else valid_mask
+                gt_depths_no_channel = gt_depths[:, 0] if gt_depths.ndim == 4 else gt_depths
+                gt_valid_depths = gt_depths_no_channel[valid_mask_no_channel]  # Extract valid depths
+                if len(gt_valid_depths) > 0:
+                    gt_max = gt_valid_depths.max().item()
+
+            # Show valid GT range (canonical 70m in actual space)
+            use_canonical = self.config.get('use_canonical_space', False)
+            if use_canonical:
+                CANONICAL_FX = get_canonical_focal_length(self.config)
+                # depth_canonical = depth_actual * (CANONICAL_FX / fx_actual) = 70
+                # Therefore: depth_actual = 70 * (fx_actual / CANONICAL_FX)
+                valid_gt_max = 70.0 * (fx_value / CANONICAL_FX)
+                title_str += f"\nresized_fx: {fx_value:.1f}, valid_gt_max: {valid_gt_max:.3f}m"
+            else:
+                title_str += f"\nresized_fx: {fx_value:.1f}, valid_gt_max: {gt_max:.3f}m"
 
         fig.suptitle(title_str, fontsize=14)
 
@@ -1054,9 +1180,47 @@ class Gear3Tester:
 
         # Create separate valid masks for GT and Pred
         MAX_DEPTH = 70.0  # Same as training (100/70 = 1.43 inverse depth threshold)
+
+        # Check if dataset is sparse (< 50% valid GT pixels)
+        gt_exists = (gt_depth > 0)
+        gt_density = gt_exists.sum() / gt_exists.size
+        is_sparse = gt_density < 0.5
+
+        # GT valid mask (canonical 70m)
         gt_valid_mask = (gt_depth > 0) & (gt_depth < MAX_DEPTH)  # GT valid pixels
-        pred_valid_mask = (pred_depth > 0) & (pred_depth < MAX_DEPTH)  # Pred valid pixels (<70m for visualization)
-        error_valid_mask = gt_valid_mask & pred_valid_mask  # Both valid for error computation
+
+        if is_sparse:
+            # Sparse dataset (waymo_seg): Apply height mask + fill sparse gaps
+            # 1. Find valid scan height range from GT (to exclude sky/non-scanned regions)
+            valid_pixels_per_row = gt_exists.sum(axis=1)  # [H]
+            min_valid_pixels_threshold = 10  # At least 10 GT pixels per row
+            valid_rows = valid_pixels_per_row >= min_valid_pixels_threshold
+            valid_row_indices = np.where(valid_rows)[0]
+
+            if len(valid_row_indices) > 0:
+                min_valid_row = valid_row_indices.min()
+                max_valid_row = valid_row_indices.max()
+                height_mask = np.zeros_like(gt_depth, dtype=bool)
+                height_mask[min_valid_row:max_valid_row+1, :] = True
+            else:
+                height_mask = np.ones_like(gt_depth, dtype=bool)
+
+            # 2. GT missing mask (sparse LiDAR gaps)
+            gt_missing = ~gt_exists
+
+            # 3. Pred valid mask (canonical 70m)
+            pred_valid_depth = (pred_depth > 0) & (pred_depth < MAX_DEPTH)
+
+            # 4. Final: Within height AND (GT valid OR (GT missing AND Pred valid))
+            pred_show_mask = height_mask & (gt_valid_mask | (gt_missing & pred_valid_depth))
+
+            # 5. Error mask (both GT and Pred valid)
+            error_valid_mask = gt_valid_mask & pred_valid_depth
+        else:
+            # Dense dataset (sintel): Just use GT valid mask
+            pred_show_mask = gt_valid_mask
+            pred_valid_depth = (pred_depth > 0) & (pred_depth < MAX_DEPTH)
+            error_valid_mask = gt_valid_mask & pred_valid_depth
 
         # Calculate error (only where both GT and Pred are valid)
         abs_error = np.abs(pred_depth - gt_depth)
@@ -1115,7 +1279,7 @@ class Gear3Tester:
 
         # 3. Predicted Metric Depth (invalid pixels = black)
         ax3 = fig.add_subplot(gs[0, 2])
-        pred_display = np.where(pred_valid_mask, pred_depth, np.nan)  # Invalid = NaN
+        pred_display = np.where(pred_show_mask, pred_depth, np.nan)  # Invalid = NaN (will be black)
         cmap_pred = plt.cm.plasma_r.copy()
         cmap_pred.set_bad(color='black')  # NaN pixels = black
         im3 = ax3.imshow(pred_display, cmap=cmap_pred, vmin=vmin, vmax=vmax)  # plasma_r: near=bright, far=dark

@@ -25,6 +25,11 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+    CheckpointImpl,
+    apply_activation_checkpointing,
+    checkpoint_wrapper,
+)
 import logging
 import hydra
 from omegaconf import DictConfig, OmegaConf
@@ -189,6 +194,25 @@ class Gear3UpgradeTrainer:
                 'sintel': {'sequences': [0, 4, 7], 'saved': []},  # seq 0, 4, 7 (3 samples)
                 'waymo_seg': {'sequences': [0, 1, 2, 3, 4, 5, 6, 7], 'saved': []}  # all 8 sequences
             }
+
+    def _get_canonical_focal_length(self):
+        """
+        Get canonical focal length based on current resolution.
+
+        Returns:
+            float: Canonical focal length
+        """
+        canonical_fx_config = self.config.get('canonical_focal_length', 1000.0)
+
+        # If config is a dict (resolution-dependent), select based on current resolution
+        # Check for dict-like object (handles both dict and OmegaConf DictConfig)
+        if hasattr(canonical_fx_config, 'get'):
+            resolution = self.config['dataset']['resolution']
+            canonical_fx = canonical_fx_config.get(resolution, canonical_fx_config.get('base', 500.0))
+            return float(canonical_fx)
+        else:
+            # Legacy: single value for all resolutions
+            return float(canonical_fx_config)
 
     def _setup_model(self):
         """Initialize FlashDepth with Gear3 metric head"""
@@ -359,6 +383,22 @@ class Gear3UpgradeTrainer:
         # Freeze and configure parameters
         self._configure_parameters(model)
 
+        # Apply gradient checkpointing before DDP wrapping (critical for 2K resolution)
+        if self.config.training.get('gradient_checkpointing', False):
+            if self.rank == 0:
+                self.logger.info("Applying gradient checkpointing to ViT and DPT (saves ~50% memory)")
+            apply_activation_checkpointing(
+                getattr(model, 'pretrained'),  # DINOv2 ViT
+                checkpoint_wrapper_fn=checkpoint_wrapper,
+                check_fn=lambda _: True
+            )
+            apply_activation_checkpointing(
+                getattr(model, 'depth_head'),  # DPT
+                checkpoint_wrapper_fn=checkpoint_wrapper,
+                check_fn=lambda _: True
+            )
+            # Note: Mamba is not compatible with gradient checkpointing (recurrent architecture)
+
         # Wrap with DDP if multi-GPU
         if self.world_size > 1:
             model = DDP(
@@ -447,8 +487,8 @@ class Gear3UpgradeTrainer:
             resolution = 'base'  # 518×518 (same as Phase 1)
         elif self.phase == 2:
             # Phase 2: mvs-synth, spring only, 2K resolution (Hybrid)
-            train_datasets = ['mvs-synth', 'spring']
-            val_datasets = ['sintel', 'waymo']
+            train_datasets = self.config.dataset.get('train_datasets', ['mvs-synth', 'spring'])
+            val_datasets = self.config.dataset.get('val_datasets', ['sintel', 'waymo_seg'])
             resolution = '2k'
         else:
             raise ValueError(f"Invalid phase: {self.phase}. Must be 1, 1.5, or 2.")
@@ -677,6 +717,15 @@ class Gear3UpgradeTrainer:
                     # Get batch size for Mamba initialization
                     B_orig, T_orig, C, H, W = images.shape
 
+                    # Apply canonical space transformation if enabled (for visualization consistency)
+                    if self.config.get('use_canonical_space', False):
+                        CANONICAL_FX = self._get_canonical_focal_length()
+
+                        # Transform inverse depth directly to canonical space
+                        # inverse_canonical = inverse_actual * (fx_actual / CANONICAL_FX)
+                        fx_actual = focal_lengths.view(B_orig, T_orig, 1, 1, 1)
+                        gt_depth_inverse_100 = gt_depth_inverse_100 * (fx_actual / CANONICAL_FX)
+
                     # Initialize Mamba sequence for temporal processing
                     if hasattr(model, 'mamba'):
                         model.mamba.start_new_sequence()
@@ -766,7 +815,8 @@ class Gear3UpgradeTrainer:
                         sample_batch = (
                             images[:1, :1].float().cpu(),  # [1, 1, 3, H, W] - convert BFloat16 to Float32 first
                             gt_depth_metric[:1].float().cpu(),  # [1, 1, H, W]
-                            dataset_idx
+                            dataset_idx,
+                            focal_lengths[:1, :1].float().cpu()  # [1, 1] - resized focal length
                         )
                         model_outputs_cpu = {
                             'pred_depth': pred_depth_metric_vis[:1].cpu(),  # [1, 1, H, W]
@@ -792,7 +842,7 @@ class Gear3UpgradeTrainer:
 
                         # Pass loss_dict and layer_weights for visualization
                         self.train_visualizer.create_validation_summary(
-                            sample_batch, model_outputs_cpu, step, prefix="training", fps=current_fps, loss_dict=loss_dict, layer_weights=layer_weights
+                            sample_batch, model_outputs_cpu, step, prefix="training", fps=current_fps, loss_dict=loss_dict, layer_weights=layer_weights, config=self.config
                         )
 
                     self._set_train_mode()
@@ -866,12 +916,12 @@ class Gear3UpgradeTrainer:
 
         # Apply canonical space transformation if enabled
         if self.config.get('use_canonical_space', False):
-            CANONICAL_FX = self.config.get('canonical_focal_length', 1000.0)
+            CANONICAL_FX = self._get_canonical_focal_length()
 
             # Transform inverse depth directly to canonical space
-            # inverse_canonical = inverse_actual * (CANONICAL_FX / fx_actual)
+            # inverse_canonical = inverse_actual * (fx_actual / CANONICAL_FX)
             fx_actual = focal_lengths.view(B, T, 1, 1, 1)
-            gt_depth_inverse_100 = gt_depth_inverse_100 * (CANONICAL_FX / fx_actual)
+            gt_depth_inverse_100 = gt_depth_inverse_100 * (fx_actual / CANONICAL_FX)
 
             if self.global_step < 5:
                 self.logger.info(f"DEBUG - Canonical space enabled (CANONICAL_FX={CANONICAL_FX})")
@@ -935,6 +985,9 @@ class Gear3UpgradeTrainer:
                 cls_token=cls_token
             )
 
+            # Note: attention_weights_multi_layer will be garbage collected automatically
+            # No need to manually set to None (validation also needs attention weights)
+
             # Apply Mamba temporal modeling to modulated (metric-aware) feature
             # Mamba is trainable in Phase 1+, so gradients flow through it
             path_1_temporal = model.dpt_features_to_mamba(
@@ -966,16 +1019,24 @@ class Gear3UpgradeTrainer:
         # Clamp prediction to reasonable range to prevent NaN
         pred_depth_inverse_flat = torch.clamp(pred_depth_inverse_flat, min=1e-3, max=1e4)
 
-        # Compute valid mask: GT and Pred must both be valid
-        # Warmup threshold for initial steps (prevent empty batches during initialization)
+        # Compute valid mask: GT valid + Pred outlier filtering
+        # GT valid: Only compute loss where GT is valid (70m threshold)
+        # Pred outlier: Filter out extreme predictions (>200m outliers)
         if self.global_step < 100:
             MIN_INVERSE_DEPTH = 100.0 / 200.0  # Relaxed: 200m threshold for first 100 steps
         else:
             MIN_INVERSE_DEPTH = 100.0 / 70.0   # Normal: 70m threshold after warmup
 
+        # GT valid mask: where GT depth is within valid range
         gt_valid_mask = (gt_depth_inverse_flat > MIN_INVERSE_DEPTH)
-        pred_valid_mask = (pred_depth_inverse_flat > MIN_INVERSE_DEPTH)
-        valid_mask = gt_valid_mask & pred_valid_mask
+
+        # Pred outlier mask: filter extreme predictions (>200m is outlier)
+        MAX_DEPTH_OUTLIER = 200.0
+        MIN_INVERSE_OUTLIER = 100.0 / MAX_DEPTH_OUTLIER
+        pred_outlier_mask = (pred_depth_inverse_flat > MIN_INVERSE_OUTLIER)
+
+        # Final mask: GT valid AND pred not outlier
+        valid_mask = gt_valid_mask & pred_outlier_mask
 
         if valid_mask.sum() == 0:
             self.logger.error("No valid GT & Pred pixels in batch!")
@@ -1027,14 +1088,17 @@ class Gear3UpgradeTrainer:
         dataset_sequence_counters = {'sintel': 0, 'waymo_seg': 0}
 
         # Phase 2/3: Limit validation batches to save memory (2K resolution)
-        # 8 batches to ensure both sintel and waymo_seg are included (DDP splits across ranks)
-        max_val_batches = 8 if self.phase >= 2 else None
+        # Dataset-specific limits: sintel 4개, waymo_seg 2개 (총 6 batches)
+        if self.phase >= 2:
+            max_val_batches = 6  # Total max batches
+            dataset_max_sequences = {'sintel': 4, 'waymo_seg': 2}
+        else:
+            max_val_batches = None
+            dataset_max_sequences = {}
+
+        total_processed = 0  # Track total processed sequences across all datasets
 
         for batch_idx, batch in enumerate(tqdm(self.val_loader, desc="Validation", disable=(self.rank != 0))):
-            # Limit validation batches for Phase 2/3 to prevent OOM
-            if max_val_batches is not None and batch_idx >= max_val_batches:
-                break
-
             # Skip None batches (all items were invalid)
             if batch is None:
                 continue
@@ -1051,6 +1115,17 @@ class Gear3UpgradeTrainer:
                 current_dataset = str(dataset_idx[0].item() if dataset_idx.dim() > 0 else dataset_idx.item())
             else:
                 current_dataset = str(dataset_idx)
+
+            # Check dataset-specific limit (Phase 2/3 only)
+            if dataset_max_sequences and current_dataset in dataset_max_sequences:
+                if dataset_sequence_counters.get(current_dataset, 0) >= dataset_max_sequences[current_dataset]:
+                    if self.rank == 0 and dataset_sequence_counters.get(current_dataset, 0) == dataset_max_sequences[current_dataset]:
+                        self.logger.info(f"  [{current_dataset}] Reached max {dataset_max_sequences[current_dataset]} sequences, skipping further...")
+                    continue
+
+            # Check total batch limit
+            if max_val_batches is not None and total_processed >= max_val_batches:
+                break
 
             # Use BFloat16 autocast like original FlashDepth
             with torch.amp.autocast('cuda', dtype=torch.bfloat16):
@@ -1071,11 +1146,12 @@ class Gear3UpgradeTrainer:
 
                 # Apply canonical space transformation if enabled
                 if self.config.get('use_canonical_space', False):
-                    CANONICAL_FX = self.config.get('canonical_focal_length', 1000.0)
+                    CANONICAL_FX = self._get_canonical_focal_length()
 
                     # Transform inverse depth directly to canonical space
+                    # inverse_canonical = inverse_actual * (fx_actual / CANONICAL_FX)
                     fx_actual = focal_lengths.view(B, T, 1, 1, 1)
-                    gt_depth_inverse_100 = gt_depth_inverse_100 * (CANONICAL_FX / fx_actual)
+                    gt_depth_inverse_100 = gt_depth_inverse_100 * (fx_actual / CANONICAL_FX)
 
                 # Initialize Mamba sequence for temporal processing
                 if hasattr(model, 'mamba'):
@@ -1123,6 +1199,9 @@ class Gear3UpgradeTrainer:
                     cls_token=cls_token
                 )
 
+                # Note: attention_weights_multi_layer will be garbage collected automatically
+                # No need to manually set to None (validation also needs attention weights)
+
                 # Apply Mamba temporal modeling to modulated feature
                 path_1_temporal = model.dpt_features_to_mamba(
                     input_shape=(B_orig, T_orig, None, H, W),
@@ -1140,6 +1219,11 @@ class Gear3UpgradeTrainer:
                 # Reshape GT from (B, T, 1, H, W) to (B*T, 1, H, W)
                 gt_depth_inverse_flat = rearrange(gt_depth_inverse_100, 'b t 1 h w -> (b t) 1 h w')
 
+                # DEBUG: Check prediction range at step 0
+                if self.global_step == 0 and batch_idx == 0 and self.rank == 0:
+                    self.logger.info(f"DEBUG VALIDATION - Pred before interpolate: min={pred_depth_inverse.min():.4f}, max={pred_depth_inverse.max():.4f}, mean={pred_depth_inverse.mean():.4f}")
+                    self.logger.info(f"DEBUG VALIDATION - GT inverse_100: min={gt_depth_inverse_flat.min():.4f}, max={gt_depth_inverse_flat.max():.4f}")
+
                 # Interpolate prediction to GT resolution (like original FlashDepth validation)
                 gt_shape = gt_depth_inverse_flat.shape[-2:]
                 if pred_depth_inverse.shape[-2:] != gt_shape:
@@ -1147,14 +1231,26 @@ class Gear3UpgradeTrainer:
                         pred_depth_inverse, size=gt_shape, mode="bilinear", align_corners=True
                     )
 
-                # Compute loss for entire sequence
-                # Apply same 70m threshold as training for consistency
-                MIN_INVERSE_DEPTH = 100.0 / 70.0  # Filter out >70m depths (same as training)
+                # DEBUG: Check after interpolate
+                if self.global_step == 0 and batch_idx == 0 and self.rank == 0:
+                    self.logger.info(f"DEBUG VALIDATION - Pred after interpolate: min={pred_depth_inverse.min():.4f}, max={pred_depth_inverse.max():.4f}")
 
-                # GT and Pred must both be valid (same as metrics calculation)
-                gt_valid_mask = (gt_depth_inverse_flat >= MIN_INVERSE_DEPTH)  # GT within 70m and valid
-                pred_valid_mask = (pred_depth_inverse >= MIN_INVERSE_DEPTH)  # Pred within reasonable range
+                # Compute loss for entire sequence
+                # Validation: Use same threshold (70m) for both GT and Pred for fair evaluation
+                MIN_INVERSE_DEPTH = 100.0 / 70.0  # 70m threshold (consistent with test)
+
+                # GT valid mask: where GT depth is within valid range
+                gt_valid_mask = (gt_depth_inverse_flat >= MIN_INVERSE_DEPTH)
+
+                # Pred valid mask: same threshold as GT for fair evaluation
+                pred_valid_mask = (pred_depth_inverse >= MIN_INVERSE_DEPTH)
+
+                # Final mask: GT valid AND pred valid (both use 70m threshold)
                 valid_mask = (gt_valid_mask & pred_valid_mask).float()
+
+                # Save canonical masks for visualization (before any reshaping)
+                canonical_gt_valid = gt_valid_mask.cpu()  # [B*T, 1, H, W]
+                canonical_pred_valid = pred_valid_mask.cpu()  # [B*T, 1, H, W]
 
                 if valid_mask.sum() > 0:
                     loss_batch = self.loss_fn(pred_depth_inverse, gt_depth_inverse_flat, valid_mask)
@@ -1221,11 +1317,19 @@ class Gear3UpgradeTrainer:
                                     img_vis, size=(gt_h, gt_w), mode='bilinear', align_corners=True
                                 )
 
+                                # Reshape canonical masks to (B, T, 1, H, W) and select first frame
+                                canonical_gt_valid_seq = rearrange(canonical_gt_valid, '(b t) 1 h w -> b t 1 h w', b=B_orig, t=T_orig)
+                                canonical_pred_valid_seq = rearrange(canonical_pred_valid, '(b t) 1 h w -> b t 1 h w', b=B_orig, t=T_orig)
+                                canonical_gt_valid_vis = canonical_gt_valid_seq[:, 0]  # [B, 1, H, W]
+                                canonical_pred_valid_vis = canonical_pred_valid_seq[:, 0]
+
                                 model_outputs = {
                                     'pred_depth': pred_depth_metric,  # [B, 1, gt_h, gt_w] at GT resolution
                                     'importance_map': importance_map_resized.float().cpu(),  # [B, 1, gt_h, gt_w]
                                     'fg_mask': fg_mask_resized.float().cpu(),  # [B, 1, gt_h, gt_w]
-                                    'bg_mask': bg_mask_resized.float().cpu()   # [B, 1, gt_h, gt_w]
+                                    'bg_mask': bg_mask_resized.float().cpu(),   # [B, 1, gt_h, gt_w]
+                                    'canonical_gt_valid': canonical_gt_valid_vis,  # [B, 1, H, W] - canonical space mask
+                                    'canonical_pred_valid': canonical_pred_valid_vis  # [B, 1, H, W] - canonical space mask
                                 }
 
                                 # For visualization, we need [B, T, ...] format like training
@@ -1233,7 +1337,8 @@ class Gear3UpgradeTrainer:
                                 sample_batch = (
                                     img_t_resized.unsqueeze(1).float().cpu(),  # [B, 1, C, gt_h, gt_w] at GT resolution
                                     gt_depth_metric.unsqueeze(1),  # [B, 1, gt_h, gt_w]
-                                    dataset_idx
+                                    dataset_idx,
+                                    focal_lengths[:, 0:1].float().cpu()  # [B, 1] - resized focal length for first frame
                                 )
 
                                 # FPS removed from training (only measured in test_gear3.py)
@@ -1260,7 +1365,7 @@ class Gear3UpgradeTrainer:
                                 save_name = f"validation_{current_dataset}_seq{seq_num:03d}_step_{self.global_step:06d}"
                                 self.val_visualizer.create_validation_summary(
                                     sample_batch, model_outputs, self.global_step,
-                                    save_name=save_name, fps=current_fps, loss_dict=val_loss_dict, dataset_name=current_dataset, layer_weights=layer_weights
+                                    save_name=save_name, fps=current_fps, loss_dict=val_loss_dict, dataset_name=current_dataset, layer_weights=layer_weights, config=self.config
                                 )
                                 config['saved'].append(seq_num)
                                 self.logger.info(f"Saved validation visualization: {current_dataset} sequence {seq_num} ({len(config['saved'])}/{len(config['sequences'])})")
@@ -1291,6 +1396,9 @@ class Gear3UpgradeTrainer:
             # Increment sequence counter for this dataset
             if current_dataset in dataset_sequence_counters:
                 dataset_sequence_counters[current_dataset] += 1
+
+            # Increment total processed count (for batch limit)
+            total_processed += 1
 
             # Clear batch memory and GPU cache to prevent OOM
             del images, gt_depth, gt_depth_inverse_100

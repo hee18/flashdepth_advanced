@@ -98,15 +98,15 @@ class SintelDepth(BaseDatasetPairs):
         Sintel provides per-frame intrinsics in cam_data/training/camdata_left/*.cam files.
         Binary format:
           - TAG_FLOAT (float32): validation value (202021.25)
-          - Intrinsic matrix M: 9 float64 values (3×3)
+          - Intrinsic matrix M: 9 float64 values (3×3) for original 1024×436 resolution
           - Extrinsic matrix N: 12 float64 values (3×4) [not used]
 
         Args:
             pair (dict): Data pair with 'image' and 'depth' paths
-            image_shape (tuple): (H, W) image shape
+            image_shape (tuple): (H, W) image shape AFTER resizing
 
         Returns:
-            float: Focal length in pixels
+            float: Focal length in pixels for current image shape
         """
         # Extract frame info from image path (e.g., .../clean/scene_name/frame_0001.png)
         img_path = pair['image']
@@ -123,12 +123,18 @@ class SintelDepth(BaseDatasetPairs):
 
                 # Read intrinsic matrix M (9 float64 values, reshape to 3×3)
                 M = np.fromfile(f, dtype=np.float64, count=9).reshape(3, 3)
-                fx = float(M[0, 0])
+                fx_original = float(M[0, 0])
+
+                # Scale focal length to current image width (from original 1024)
+                original_width = 1024
+                current_width = image_shape[1]
+                fx_scaled = fx_original * (current_width / original_width)
 
                 # Note: Extrinsic matrix N (12 float64) follows but we don't need it
-                return fx
+                return fx_scaled
         except Exception as e:
             logging.warning(f"Error reading camera from {cam_path}: {e}, using fallback")
-            # Fallback: typical value for 1024×436 with ~50° FOV
-            return image_shape[1] * 0.9
+            # Fallback: typical value scaled to current width
+            fx_fallback = image_shape[1] * 0.9
+            return fx_fallback
 

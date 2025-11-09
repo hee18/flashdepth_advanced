@@ -208,11 +208,22 @@ class WaymoSegmentationDataset(Dataset):
         all_seq_dirs = sorted([d for d in self.waymo_root.iterdir()
                               if d.is_dir() and d.name.startswith('segment-')])
 
-        # Apply same filtering as WaymoDepth for validation split
-        # WaymoDepth uses sorted(all_scenes)[:8] for val split (use first 8 scenes only)
+        # For validation split: use exactly these 8 sequences (not alphabetically sorted)
         if self.split == 'val':
-            seq_dirs = all_seq_dirs[:8]  # Use first 8 scenes for validation
-            logger.info(f"Found {len(all_seq_dirs)} total sequences, using {len(seq_dirs)} for validation (first 8 scenes)")
+            val_sequence_names = [
+                'segment-10017090168044687777_6380_000_6400_000',
+                'segment-10023947602400723454_1120_000_1140_000',
+                'segment-1005081002024129653_5313_150_5333_150',
+                'segment-10061305430875486848_1080_000_1100_000',
+                'segment-10072140764565668044_4060_000_4080_000',
+                'segment-10072231702153043603_5725_000_5745_000',
+                'segment-10075870402459732738_1060_000_1080_000',
+                'segment-10094743350625019937_3420_000_3440_000',
+            ]
+            # Filter to only these sequences, preserving specified order
+            seq_name_to_dir = {d.name: d for d in all_seq_dirs}
+            seq_dirs = [seq_name_to_dir[name] for name in val_sequence_names if name in seq_name_to_dir]
+            logger.info(f"Found {len(all_seq_dirs)} total sequences, using {len(seq_dirs)} specified sequences for validation")
         else:
             seq_dirs = all_seq_dirs
             logger.info(f"Found {len(seq_dirs)} sequences in {self.waymo_root}")
@@ -292,36 +303,49 @@ class WaymoSegmentationDataset(Dataset):
         Get focal length for Waymo Segmentation dataset.
 
         Waymo provides per-sequence intrinsics in camera_calibration/*.parquet files.
+        Files are in central waymo_seg/waymo_seg/camera_calibration/ directory (not per-sequence).
         Fields: f_u (fx), f_v (fy), c_u (cx), c_v (cy), and distortion coefficients.
+        Values are for original 1920×1280 resolution.
 
         Args:
             sequence_name (str): Sequence name (e.g., 'segment-XXXXX')
 
         Returns:
-            float: Focal length in pixels
+            float: Focal length in pixels for current image resolution
         """
-        # Find sequence directory
-        seq_dir = self.waymo_root / sequence_name
-
-        # Read camera calibration file
-        calib_path = seq_dir / 'camera_calibration' / f'{sequence_name}_{self.camera_name}.parquet'
+        # Remove 'segment-' prefix from sequence name for filename
+        seq_id = sequence_name.replace('segment-', '')
+        
+        # Calibration files are in central waymo_seg/waymo_seg/camera_calibration/ directory
+        # Directory structure: {data_root}/waymo_seg/waymo_seg/camera_calibration/
+        calib_dir = self.data_root / 'waymo_seg' / 'waymo_seg' / 'camera_calibration'
+        calib_path = calib_dir / f'{seq_id}.parquet'
 
         try:
             calib_df = pd.read_parquet(calib_path)
             # Waymo uses full field names with component prefix
-            fx = float(calib_df['[CameraCalibrationComponent].intrinsic.f_u'].iloc[0])  # All frames in sequence share same intrinsics
-            return fx
+            fx_original = float(calib_df['[CameraCalibrationComponent].intrinsic.f_u'].iloc[0])  # All frames in sequence share same intrinsics
+            
+            # Scale focal length to current image width (from original 1920)
+            original_width = 1920
+            current_width = self.width
+            fx_scaled = fx_original * (current_width / original_width)
+            
+            return fx_scaled
         except KeyError:
             # Try alternative field name (older format)
             try:
-                fx = float(calib_df['f_u'].iloc[0])
-                return fx
+                fx_original = float(calib_df['f_u'].iloc[0])
+                fx_scaled = fx_original * (self.width / 1920)
+                return fx_scaled
             except Exception as e:
-                logger.warning(f"Error reading calibration from {calib_path}: {e}, using typical fx=2059.0")
-                return 2059.0
+                logger.warning(f"Error reading calibration from {calib_path}: {e}, using typical fx=2059.0 for 1920 width")
+                fx_fallback = 2059.0 * (self.width / 1920)
+                return fx_fallback
         except Exception as e:
-            logger.warning(f"Error reading calibration from {calib_path}: {e}, using typical fx=2059.0")
-            return 2059.0
+            logger.warning(f"Error reading calibration from {calib_path}: {e}, using typical fx=2059.0 for 1920 width")
+            fx_fallback = 2059.0 * (self.width / 1920)
+            return fx_fallback
 
     def __getitem__(self, idx):
         """
