@@ -48,26 +48,15 @@ from utils.gear_video_utils import save_video as save_video_util
 
 def get_canonical_focal_length(config):
     """
-    Get canonical focal length based on current resolution.
+    Get canonical focal length (fixed at 1000.0 for all resolutions).
 
     Args:
         config: Configuration dict
 
     Returns:
-        float: Canonical focal length
+        float: Canonical focal length (always 1000.0)
     """
-    canonical_fx_config = config.get('canonical_focal_length', 1000.0)
-
-    # If config is a dict (resolution-dependent), select based on current resolution
-    # Check for dict-like object (handles both dict and OmegaConf DictConfig)
-    if hasattr(canonical_fx_config, 'get'):
-        resolution = config['dataset']['resolution']
-        canonical_fx = canonical_fx_config.get(resolution, canonical_fx_config.get('base', 500.0))
-        logging.info(f"Using resolution-dependent canonical focal length: {canonical_fx} for resolution '{resolution}'")
-        return float(canonical_fx)
-    else:
-        # Legacy: single value for all resolutions
-        return float(canonical_fx_config)
+    return 1000.0
 
 # Setup logging
 logging.basicConfig(

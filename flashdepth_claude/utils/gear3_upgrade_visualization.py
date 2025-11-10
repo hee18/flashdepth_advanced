@@ -66,7 +66,7 @@ class Gear3UpgradeVisualizer:
         try:
             images, gt_depth, dataset_idx, focal_lengths = sample_batch
             pred_depth = model_outputs['pred_depth']
-            importance_map = model_outputs['importance_map']
+            importance_map = model_outputs.get('importance_map', None)  # Optional (None in Step 1)
             fg_mask = model_outputs.get('fg_mask', None)
             bg_mask = model_outputs.get('bg_mask', None)
 
@@ -77,7 +77,7 @@ class Gear3UpgradeVisualizer:
                 gt_depth = torch.from_numpy(gt_depth) if isinstance(gt_depth, np.ndarray) else gt_depth
             if not hasattr(pred_depth, 'cpu'):
                 pred_depth = torch.from_numpy(pred_depth) if isinstance(pred_depth, np.ndarray) else pred_depth
-            if not hasattr(importance_map, 'cpu'):
+            if importance_map is not None and not hasattr(importance_map, 'cpu'):
                 importance_map = torch.from_numpy(importance_map) if isinstance(importance_map, np.ndarray) else importance_map
 
             # Use first batch and first frame for visualization
@@ -102,10 +102,14 @@ class Gear3UpgradeVisualizer:
             else:  # [B, H, W]
                 pred_depth_frame = pred_depth[0].cpu().numpy()  # [H, W]
 
-            if importance_map.ndim == 4:  # [B, T, H, W] or [B, 1, H, W]
-                importance_frame = importance_map[0, 0].cpu().numpy()  # [H, W]
-            else:  # [B, H, W]
-                importance_frame = importance_map[0].cpu().numpy()  # [H, W]
+            # Importance map is optional (None in Step 1)
+            if importance_map is not None:
+                if importance_map.ndim == 4:  # [B, T, H, W] or [B, 1, H, W]
+                    importance_frame = importance_map[0, 0].cpu().numpy()  # [H, W]
+                else:  # [B, H, W]
+                    importance_frame = importance_map[0].cpu().numpy()  # [H, W]
+            else:
+                importance_frame = None
 
             # FG/BG masks (Gear3 Upgrade specific)
             if fg_mask is not None:
@@ -135,8 +139,9 @@ class Gear3UpgradeVisualizer:
                 gt_depth_frame = gt_depth_frame[0]
             while pred_depth_frame.ndim > 2:
                 pred_depth_frame = pred_depth_frame[0]
-            while importance_frame.ndim > 2:
-                importance_frame = importance_frame[0]
+            if importance_frame is not None:
+                while importance_frame.ndim > 2:
+                    importance_frame = importance_frame[0]
             if fg_mask_frame is not None:
                 while fg_mask_frame.ndim > 2:
                     fg_mask_frame = fg_mask_frame[0]
@@ -236,9 +241,20 @@ class Gear3UpgradeVisualizer:
                 valid_mask_vis = gt_valid
 
             # Create figure with subplots
-            # NEW LAYOUT: 4 rows × 3 columns
-            fig = plt.figure(figsize=(15, 16))
-            gs = GridSpec(4, 3, figure=fig, hspace=0.3, wspace=0.3)
+            # Step 1: 3 rows (no importance map/masks row)
+            # Step 2: 4 rows (with importance map/masks row)
+            if importance_frame is not None:
+                # Step 2: 4 rows × 3 columns
+                fig = plt.figure(figsize=(15, 16))
+                gs = GridSpec(4, 3, figure=fig, hspace=0.3, wspace=0.3)
+                row_valid_mask = 2  # Row 3
+                row_bottom = 3      # Row 4
+            else:
+                # Step 1: 3 rows × 3 columns (skip Row 2)
+                fig = plt.figure(figsize=(15, 12))
+                gs = GridSpec(3, 3, figure=fig, hspace=0.3, wspace=0.3)
+                row_valid_mask = 1  # Row 2 (no gap)
+                row_bottom = 2      # Row 3
 
             # Calculate valid ratio and error BEFORE visualization (IDENTICAL to Gear3)
             num_valid_metrics = valid_mask_metrics.sum()
@@ -250,9 +266,13 @@ class Gear3UpgradeVisualizer:
             # Check if we have valid pixels for metrics calculation
             has_valid_pixels = num_valid_metrics > 0
 
-            # Calculate importance statistics
-            imp_mean = importance_frame.mean()
-            imp_std = importance_frame.std()
+            # Calculate importance statistics (only if available)
+            if importance_frame is not None:
+                imp_mean = importance_frame.mean()
+                imp_std = importance_frame.std()
+            else:
+                imp_mean = None
+                imp_std = None
 
             # ==================== Row 1: Input, GT, Pred ====================
 
@@ -273,11 +293,24 @@ class Gear3UpgradeVisualizer:
                 _, gt_dense_vis, gt_info = create_sparse_depth_vis_no_inpaint(
                     gt_depth_frame, valid_mask_gt_vis, colormap='plasma_r', percentile_range=(2, 98)
                 )
-                im2 = ax2.imshow(gt_dense_vis)
+
+                # Limit colorbar to canonical 70m if canonical space is enabled
+                vmin, vmax = gt_info['vmin'], gt_info['vmax']
+                use_canonical = config.get('use_canonical_space', False) if config is not None else False
+                if use_canonical:
+                    vmax = min(vmax, 70.0)  # Cap at canonical 70m
+
+                # Create custom colormap with NaN handling
+                cmap_gt = plt.cm.plasma_r.copy()
+                cmap_gt.set_bad(color='black')  # NaN pixels = black
+
+                # Re-normalize GT display with capped vmax
+                gt_display_capped = np.where(valid_mask_gt_vis, gt_depth_frame, np.nan)
+                im2 = ax2.imshow(gt_display_capped, cmap=cmap_gt, vmin=vmin, vmax=vmax)
+
                 valid_ratio_gt_vis = valid_mask_gt_vis.sum() / valid_mask_gt_vis.size
                 ax2.set_title(f'GT Depth (Sparse)\n{valid_ratio_gt_vis*100:.1f}% valid',
                              fontsize=14, fontweight='bold')
-                vmin, vmax = gt_info['vmin'], gt_info['vmax']
             else:
                 # Dense depth: use standard visualization (invalid pixels = black)
                 gt_display = np.where(valid_mask_gt_vis, gt_depth_frame, np.nan)  # Invalid = NaN (will be black)
@@ -313,84 +346,86 @@ class Gear3UpgradeVisualizer:
             ax3.axis('off')
             plt.colorbar(im3, ax=ax3, fraction=0.046, pad=0.04)
 
-            # ==================== Row 2: Importance, FG, BG ====================
+            # ==================== Row 2: Importance, FG, BG (only in Step 2) ====================
 
-            # 4. Importance Map (upsampled with bilinear for smooth visualization)
-            ax4 = fig.add_subplot(gs[1, 0])
-            # Upsample importance map to image resolution
-            img_h, img_w = input_img.shape[:2]
-            importance_upsampled = F.interpolate(
-                torch.from_numpy(importance_frame).unsqueeze(0).unsqueeze(0),
-                size=(img_h, img_w),
-                mode='bilinear',
-                align_corners=True
-            ).squeeze().numpy()
-            im4 = ax4.imshow(importance_upsampled, cmap='jet', vmin=0, vmax=1)
-            ax4.set_title(f'Importance Map\nmean={imp_mean:.3f}, std={imp_std:.3f}',
-                         fontsize=14, fontweight='bold')
-            ax4.axis('off')
-            plt.colorbar(im4, ax=ax4, fraction=0.046, pad=0.04)
+            # Only visualize Row 2 if importance_map is available (Step 2)
+            if importance_frame is not None:
+                # 4. Importance Map (upsampled with bilinear for smooth visualization)
+                ax4 = fig.add_subplot(gs[1, 0])
+                # Upsample importance map to image resolution
+                img_h, img_w = input_img.shape[:2]
+                importance_upsampled = F.interpolate(
+                    torch.from_numpy(importance_frame).unsqueeze(0).unsqueeze(0),
+                    size=(img_h, img_w),
+                    mode='bilinear',
+                    align_corners=True
+                ).squeeze().numpy()
+                im4 = ax4.imshow(importance_upsampled, cmap='jet', vmin=0, vmax=1)
+                ax4.set_title(f'Importance Map\nmean={imp_mean:.3f}, std={imp_std:.3f}',
+                             fontsize=14, fontweight='bold')
+                ax4.axis('off')
+                plt.colorbar(im4, ax=ax4, fraction=0.046, pad=0.04)
 
-            # Calculate FG/BG from importance map (fallback if masks not provided)
-            if fg_mask_frame is None or bg_mask_frame is None:
-                fg_mask_frame = (importance_frame >= imp_mean).astype(np.float32)
-                bg_mask_frame = (importance_frame < imp_mean).astype(np.float32)
-            else:
-                # IMPORTANT: Convert soft masks to binary (like visualize_attention_weights.py)
-                # cls_seg and kmeans return soft probabilities, but we want binary visualization
-                # Use mean threshold on the mask itself (or 0.5 for probabilistic masks)
-                fg_mask_frame = (fg_mask_frame > 0.5).astype(np.float32)
-                bg_mask_frame = (bg_mask_frame > 0.5).astype(np.float32)
+                # Calculate FG/BG from importance map (fallback if masks not provided)
+                if fg_mask_frame is None or bg_mask_frame is None:
+                    fg_mask_frame = (importance_frame >= imp_mean).astype(np.float32)
+                    bg_mask_frame = (importance_frame < imp_mean).astype(np.float32)
+                else:
+                    # IMPORTANT: Convert soft masks to binary (like visualize_attention_weights.py)
+                    # cls_seg and kmeans return soft probabilities, but we want binary visualization
+                    # Use mean threshold on the mask itself (or 0.5 for probabilistic masks)
+                    fg_mask_frame = (fg_mask_frame > 0.5).astype(np.float32)
+                    bg_mask_frame = (bg_mask_frame > 0.5).astype(np.float32)
 
-            # Upsample FG/BG masks to match input image resolution (bilinear for smoother visualization)
-            img_h, img_w = input_img.shape[:2]
-            fg_mask_upsampled = F.interpolate(
-                torch.from_numpy(fg_mask_frame).unsqueeze(0).unsqueeze(0),
-                size=(img_h, img_w),
-                mode='bilinear',
-                align_corners=True
-            ).squeeze().numpy()
+                # Upsample FG/BG masks to match input image resolution (bilinear for smoother visualization)
+                img_h, img_w = input_img.shape[:2]
+                fg_mask_upsampled = F.interpolate(
+                    torch.from_numpy(fg_mask_frame).unsqueeze(0).unsqueeze(0),
+                    size=(img_h, img_w),
+                    mode='bilinear',
+                    align_corners=True
+                ).squeeze().numpy()
 
-            bg_mask_upsampled = F.interpolate(
-                torch.from_numpy(bg_mask_frame).unsqueeze(0).unsqueeze(0),
-                size=(img_h, img_w),
-                mode='bilinear',
-                align_corners=True
-            ).squeeze().numpy()
+                bg_mask_upsampled = F.interpolate(
+                    torch.from_numpy(bg_mask_frame).unsqueeze(0).unsqueeze(0),
+                    size=(img_h, img_w),
+                    mode='bilinear',
+                    align_corners=True
+                ).squeeze().numpy()
 
-            # 5. FG Mask (visualize_attention_weights.py style)
-            ax5 = fig.add_subplot(gs[1, 1])
-            ax5.imshow(input_img)
-            # Create FG overlay (Red channel only, as in visualize_attention_weights.py)
-            fg_overlay = np.zeros((*fg_mask_upsampled.shape, 3))
-            fg_overlay[..., 0] = fg_mask_upsampled  # Red channel
-            ax5.imshow(fg_overlay, alpha=0.5)  # Use imshow alpha parameter
-            fg_ratio = fg_mask_frame.mean() * 100  # Use original for ratio (not upsampled)
-            ax5.set_title(f'FG Mask (Red)\n{fg_ratio:.1f}%', fontsize=14, fontweight='bold')
-            ax5.axis('off')
+                # 5. FG Mask (visualize_attention_weights.py style)
+                ax5 = fig.add_subplot(gs[1, 1])
+                ax5.imshow(input_img)
+                # Create FG overlay (Red channel only, as in visualize_attention_weights.py)
+                fg_overlay = np.zeros((*fg_mask_upsampled.shape, 3))
+                fg_overlay[..., 0] = fg_mask_upsampled  # Red channel
+                ax5.imshow(fg_overlay, alpha=0.5)  # Use imshow alpha parameter
+                fg_ratio = fg_mask_frame.mean() * 100  # Use original for ratio (not upsampled)
+                ax5.set_title(f'FG Mask (Red)\n{fg_ratio:.1f}%', fontsize=14, fontweight='bold')
+                ax5.axis('off')
 
-            # 6. BG Mask (visualize_attention_weights.py style)
-            ax6 = fig.add_subplot(gs[1, 2])
-            ax6.imshow(input_img)
-            # Create BG overlay (Blue channel only, as in visualize_attention_weights.py)
-            bg_overlay = np.zeros((*bg_mask_upsampled.shape, 3))
-            bg_overlay[..., 2] = bg_mask_upsampled  # Blue channel
-            ax6.imshow(bg_overlay, alpha=0.5)  # Use imshow alpha parameter
-            bg_ratio = bg_mask_frame.mean() * 100  # Use original for ratio (not upsampled)
-            ax6.set_title(f'BG Mask (Blue)\n{bg_ratio:.1f}%', fontsize=14, fontweight='bold')
-            ax6.axis('off')
+                # 6. BG Mask (visualize_attention_weights.py style)
+                ax6 = fig.add_subplot(gs[1, 2])
+                ax6.imshow(input_img)
+                # Create BG overlay (Blue channel only, as in visualize_attention_weights.py)
+                bg_overlay = np.zeros((*bg_mask_upsampled.shape, 3))
+                bg_overlay[..., 2] = bg_mask_upsampled  # Blue channel
+                ax6.imshow(bg_overlay, alpha=0.5)  # Use imshow alpha parameter
+                bg_ratio = bg_mask_frame.mean() * 100  # Use original for ratio (not upsampled)
+                ax6.set_title(f'BG Mask (Blue)\n{bg_ratio:.1f}%', fontsize=14, fontweight='bold')
+                ax6.axis('off')
 
             # ==================== Row 3: Valid Mask, Error, Metrics & Training Info ====================
 
             # 7. Valid Mask (metrics threshold: <70m, valid=white, invalid=black)
-            ax7 = fig.add_subplot(gs[2, 0])
+            ax7 = fig.add_subplot(gs[row_valid_mask, 0])
             ax7.imshow(valid_mask_metrics.astype(np.uint8), cmap='gray', vmin=0, vmax=1)
             valid_ratio_pct = (valid_mask_metrics.sum() / valid_mask_metrics.size) * 100
             ax7.set_title(f'Valid Mask ({valid_ratio_pct:.1f}%)\ninvalid: black', fontsize=14, fontweight='bold')
             ax7.axis('off')
 
             # 8. Absolute Error Map
-            ax8 = fig.add_subplot(gs[2, 1])
+            ax8 = fig.add_subplot(gs[row_valid_mask, 1])
             if has_valid_pixels:
                 error_vmax = np.nanpercentile(abs_error_masked, 95)
                 im8 = ax8.imshow(abs_error_masked, cmap='hot', vmin=0, vmax=error_vmax)
@@ -406,7 +441,7 @@ class Gear3UpgradeVisualizer:
             ax8.axis('off')
 
             # 9. Depth Metrics & Training Info (COMBINED)
-            ax9 = fig.add_subplot(gs[2, 2])
+            ax9 = fig.add_subplot(gs[row_valid_mask, 2])
 
             y_pos = 0.95
             # Step info
@@ -432,31 +467,27 @@ class Gear3UpgradeVisualizer:
                 # Extract first batch, first/middle frame
                 fx_value = focal_lengths[0, 0].item() if focal_lengths.ndim >= 2 else focal_lengths[0].item()
 
-                # Show valid GT range (canonical 70m in actual space)
+                # Show valid GT range (canonical 70m, and actual space equivalent for reference)
                 use_canonical = config.get('use_canonical_space', False) if config is not None else False
                 if use_canonical:
                     # Get canonical focal length from config
-                    canonical_fx_config = config.get('canonical_focal_length', 1000.0)
-                    if hasattr(canonical_fx_config, 'get'):
-                        resolution = config['dataset']['resolution']
-                        CANONICAL_FX = float(canonical_fx_config.get(resolution, canonical_fx_config.get('base', 500.0)))
-                    else:
-                        CANONICAL_FX = float(canonical_fx_config)
-                    # depth_canonical = depth_actual * (CANONICAL_FX / fx_actual) = 70
-                    # Therefore: depth_actual = 70 * (fx_actual / CANONICAL_FX)
-                    valid_gt_max = 70.0 * (fx_value / CANONICAL_FX)
-                    ax9.text(0.05, y_pos, f'resized_fx: {fx_value:.1f}, valid_gt_max: {valid_gt_max:.3f}m', fontsize=10,
+                    CANONICAL_FX = 1000.0  # Fixed canonical focal length for all resolutions
+
+                    # Actual space equivalent: depth_actual = 70 × (fx_actual / CANONICAL_FX)
+                    valid_gt_max_actual = 70.0 * (fx_value / CANONICAL_FX)
+                    ax9.text(0.05, y_pos, f'resized_fx: {fx_value:.1f}, valid: 70.0m (canon={valid_gt_max_actual:.1f}m actual)', fontsize=10,
                             transform=ax9.transAxes, bbox=dict(boxstyle="round", facecolor='lightyellow'))
                 else:
-                    # No canonical space
-                    ax9.text(0.05, y_pos, f'resized_fx: {fx_value:.1f}, valid_gt_max: 70.000m', fontsize=10,
+                    # No canonical space - GT is in actual space
+                    ax9.text(0.05, y_pos, f'resized_fx: {fx_value:.1f}, valid_gt_max: 70.000m (actual)', fontsize=10,
                             transform=ax9.transAxes, bbox=dict(boxstyle="round", facecolor='lightyellow'))
                 y_pos -= 0.10
 
-            # FG:BG ratio
-            ax9.text(0.05, y_pos, f'FG:BG = {fg_ratio:.1f}:{bg_ratio:.1f}', fontsize=10,
-                    transform=ax9.transAxes, bbox=dict(boxstyle="round", facecolor='lightcyan'))
-            y_pos -= 0.10
+            # FG:BG ratio (only available in Step 2)
+            if importance_frame is not None:
+                ax9.text(0.05, y_pos, f'FG:BG = {fg_ratio:.1f}:{bg_ratio:.1f}', fontsize=10,
+                        transform=ax9.transAxes, bbox=dict(boxstyle="round", facecolor='lightcyan'))
+                y_pos -= 0.10
 
             # FPS if available
             if fps is not None:
@@ -533,7 +564,7 @@ class Gear3UpgradeVisualizer:
             # ==================== Row 4: Depth Distribution, Importance Distribution ====================
 
             # 10. Depth Distribution Histogram
-            ax10 = fig.add_subplot(gs[3, :2])
+            ax10 = fig.add_subplot(gs[row_bottom, :2])
             if valid_mask_metrics.sum() > 0:
                 gt_valid = gt_depth_frame[valid_mask_metrics]
                 pred_valid = pred_depth_frame[valid_mask_metrics]
@@ -551,30 +582,38 @@ class Gear3UpgradeVisualizer:
                 ax10.legend(fontsize=12)
                 ax10.grid(True, alpha=0.3)
 
-            # 11. Importance Distribution
-            ax11 = fig.add_subplot(gs[3, 2])
-            importance_flat = importance_frame.flatten()
+            # 11. Importance Distribution (only in Step 2)
+            ax11 = fig.add_subplot(gs[row_bottom, 2])
+            if importance_frame is not None:
+                importance_flat = importance_frame.flatten()
 
-            # Handle case where all values are identical (std=0)
-            if imp_std < 1e-6:
-                # Just show a vertical line at the constant value
-                ax11.axvline(imp_mean, color='purple', linestyle='-', linewidth=3,
-                            label=f'Constant: {imp_mean:.3f}')
-                ax11.set_xlim(max(0, imp_mean - 0.1), min(1, imp_mean + 0.1))
-                ax11.text(0.5, 0.5, f'All pixels = {imp_mean:.3f}\n(std = {imp_std:.6f})',
-                         ha='center', va='center', transform=ax11.transAxes,
-                         fontsize=14, bbox=dict(boxstyle='round', facecolor='yellow', alpha=0.5))
+                # Handle case where all values are identical (std=0)
+                if imp_std < 1e-6:
+                    # Just show a vertical line at the constant value
+                    ax11.axvline(imp_mean, color='purple', linestyle='-', linewidth=3,
+                                label=f'Constant: {imp_mean:.3f}')
+                    ax11.set_xlim(max(0, imp_mean - 0.1), min(1, imp_mean + 0.1))
+                    ax11.text(0.5, 0.5, f'All pixels = {imp_mean:.3f}\n(std = {imp_std:.6f})',
+                             ha='center', va='center', transform=ax11.transAxes,
+                             fontsize=14, bbox=dict(boxstyle='round', facecolor='yellow', alpha=0.5))
+                else:
+                    # Normal histogram
+                    ax11.hist(importance_flat, bins=50, alpha=0.7, color='purple', density=True)
+                    ax11.axvline(imp_mean, color='red', linestyle='--', linewidth=2,
+                                label=f'Mean: {imp_mean:.3f}')
+
+                ax11.set_xlabel('Importance Value', fontsize=12)
+                ax11.set_ylabel('Density', fontsize=12)
+                ax11.set_title('Importance Map Distribution', fontsize=14, fontweight='bold')
+                ax11.legend(fontsize=12)
+                ax11.grid(True, alpha=0.3)
             else:
-                # Normal histogram
-                ax11.hist(importance_flat, bins=50, alpha=0.7, color='purple', density=True)
-                ax11.axvline(imp_mean, color='red', linestyle='--', linewidth=2,
-                            label=f'Mean: {imp_mean:.3f}')
-
-            ax11.set_xlabel('Importance Value', fontsize=12)
-            ax11.set_ylabel('Density', fontsize=12)
-            ax11.set_title('Importance Map Distribution', fontsize=14, fontweight='bold')
-            ax11.legend(fontsize=12)
-            ax11.grid(True, alpha=0.3)
+                # Step 1: Show placeholder
+                ax11.text(0.5, 0.5, 'Importance Map\nNot Available\n(Step 1)',
+                         ha='center', va='center', transform=ax11.transAxes,
+                         fontsize=14, bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.5))
+                ax11.set_title('Importance Map Distribution', fontsize=14, fontweight='bold')
+                ax11.axis('off')
 
             # Save figure
             if save_name:

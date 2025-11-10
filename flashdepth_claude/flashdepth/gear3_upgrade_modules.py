@@ -216,11 +216,19 @@ class MultiLayerAttentionFusion(nn.Module):
 
     Overhead: ~3ms (4× attention processing)
     """
-    def __init__(self, num_layers=4):
+    def __init__(self, num_layers=4, uniform_weights=False):
         super().__init__()
-        # Learnable fusion weights (favor later layers)
-        init_weights = torch.tensor([0.1, 0.2, 0.3, 0.4])
-        self.fusion_weights = nn.Parameter(init_weights)
+        self.num_layers = num_layers
+        self.uniform_weights = uniform_weights
+
+        if uniform_weights:
+            # Fixed uniform weights (equal ratio for all layers)
+            uniform = torch.ones(num_layers) / num_layers
+            self.register_buffer('fusion_weights', uniform)
+        else:
+            # Learnable fusion weights (favor later layers)
+            init_weights = torch.tensor([0.1, 0.2, 0.3, 0.4])
+            self.fusion_weights = nn.Parameter(init_weights)
 
     def forward(self, attention_weights_list, patch_h, patch_w):
         """
@@ -241,8 +249,11 @@ class MultiLayerAttentionFusion(nn.Module):
         # Stack: [B, num_layers, patch_h, patch_w]
         importance_stack = torch.stack(importance_maps, dim=1)
 
-        # Normalize fusion weights
-        weights_norm = torch.softmax(self.fusion_weights, dim=0)
+        # Normalize fusion weights (uniform weights are already normalized)
+        if self.uniform_weights:
+            weights_norm = self.fusion_weights
+        else:
+            weights_norm = torch.softmax(self.fusion_weights, dim=0)
 
         # Weighted fusion: [B, num_layers, patch_h, patch_w] → [B, patch_h, patch_w] → [B, 1, patch_h, patch_w]
         importance_fused = (importance_stack * weights_norm.view(1, -1, 1, 1)).sum(dim=1).unsqueeze(1)
@@ -477,7 +488,7 @@ class Gear3UpgradeMetricHead(nn.Module):
         2. 'kmeans': Differentiable K-means clustering
         3. 'multi_layer': Multi-layer attention fusion
     """
-    def __init__(self, embed_dim=1024, dpt_dim=256, separation_method='cls_seg', num_heads=16):
+    def __init__(self, embed_dim=1024, dpt_dim=256, separation_method='cls_seg', num_heads=16, uniform_fusion_weights=False):
         super().__init__()
 
         self.separation_method = separation_method
@@ -490,7 +501,7 @@ class Gear3UpgradeMetricHead(nn.Module):
         elif separation_method == 'kmeans':
             self.kmeans = DifferentiableKMeans(n_clusters=2, n_iters=10)
         elif separation_method == 'multi_layer':
-            self.multi_layer_fusion = MultiLayerAttentionFusion(num_layers=4)
+            self.multi_layer_fusion = MultiLayerAttentionFusion(num_layers=4, uniform_weights=uniform_fusion_weights)
         else:
             raise ValueError(f"Unknown separation_method: {separation_method}")
 

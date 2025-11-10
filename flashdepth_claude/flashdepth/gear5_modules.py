@@ -272,8 +272,8 @@ class ForegroundOnlyModulationHead(nn.Module):
 
         self.embed_dim = embed_dim
 
-        # Multi-layer attention fusion (reuse from Gear3)
-        self.multi_layer_fusion = MultiLayerAttentionFusion(num_layers=4)
+        # Multi-layer attention fusion (uniform weights for Gear5)
+        self.multi_layer_fusion = MultiLayerAttentionFusion(num_layers=4, uniform_weights=True)
 
         # FG feature extraction
         self.fg_feature_network = ForegroundFeatureNetwork(

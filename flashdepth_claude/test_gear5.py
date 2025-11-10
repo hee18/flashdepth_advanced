@@ -52,26 +52,15 @@ from utils.gear_video_utils import save_video as save_video_util
 
 def get_canonical_focal_length(config):
     """
-    Get canonical focal length based on current resolution.
+    Get canonical focal length (fixed at 1000.0 for all resolutions).
 
     Args:
         config: Configuration dict
 
     Returns:
-        float: Canonical focal length
+        float: Canonical focal length (always 1000.0)
     """
-    canonical_fx_config = config.get('canonical_focal_length', 1000.0)
-
-    # If config is a dict (resolution-dependent), select based on current resolution
-    # Check for dict-like object (handles both dict and OmegaConf DictConfig)
-    if hasattr(canonical_fx_config, 'get'):
-        resolution = config['dataset']['resolution']
-        canonical_fx = canonical_fx_config.get(resolution, canonical_fx_config.get('base', 500.0))
-        logging.info(f"Using resolution-dependent canonical focal length: {canonical_fx} for resolution '{resolution}'")
-        return float(canonical_fx)
-    else:
-        # Legacy: single value for all resolutions
-        return float(canonical_fx_config)
+    return 1000.0
 
 # Setup logging
 logging.basicConfig(
@@ -101,6 +90,18 @@ class Gear5Tester:
         self.save_dir.mkdir(parents=True, exist_ok=True)
         logger.info(f"Save directory: {self.save_dir}")
 
+        # Detect phase and step from config
+        # Phase: Determined by config directory name (gear5 = Phase1, gear5/hybrid = Phase2)
+        # Step: From config.step
+        config_dir = config.get('config_dir', '')
+        if 'hybrid' in str(config_dir).lower():
+            self.phase = 2
+        else:
+            self.phase = 1
+
+        self.step = int(config.get('step', 1))
+        logger.info(f"Testing Phase {self.phase}, Step {self.step}")
+
         # Object-wise evaluation configuration
         self.object_wise_enabled = config.get('object_wise', {}).get('enabled', False)
         self.object_wise_dataset = config.get('object_wise', {}).get('dataset', 'waymo')
@@ -124,59 +125,65 @@ class Gear5Tester:
         self.metrics = MetricDepthMetrics()
 
     def _setup_model(self):
-        """Load trained Gear3 Upgrade model"""
-        # Create base FlashDepth model
+        """Load trained Gear5 model with phase/step-specific configuration"""
+        # Determine ViT size based on phase
+        # Phase 1: Uses config's vit_size (typically 'vitl')
+        # Phase 2: Uses 'vits' (hybrid with ViT-S+ViT-L)
         model_config = dict(self.config.model)
+        if self.phase == 2:
+            # Phase 2 (hybrid): Always use ViT-S as student model
+            model_config['vit_size'] = 'vits'
+            logger.info("Phase 2 (Hybrid): Using ViT-S for student model")
+        else:
+            # Phase 1: Use config's vit_size
+            logger.info(f"Phase 1: Using ViT size from config: {model_config.get('vit_size', 'vitl')}")
+
         model_config['batch_size'] = 1
         model_config['use_metric_head'] = False
 
         model = FlashDepth(**model_config)
 
-        # Add Gear3 Upgrade metric head
+        # Add Gear5 metric head
         embed_dim = 1024 if model.encoder == 'vitl' else 384
         dpt_dim = 256 if model.encoder == 'vitl' else 64
-        num_heads = 16 if model.encoder == 'vitl' else 6
-        separation_method = self.config.get('separation_method', 'cls_seg')
 
         model.gear5_metric_head = Gear5MetricHead(
             embed_dim=embed_dim,
-            dpt_dim=dpt_dim,
-            num_heads=num_heads,
-            separation_method=separation_method
+            dpt_dim=dpt_dim
         )
 
-        # Enable attention weights storage
-        # - 'multi_layer': Enable for multiple blocks (encoder-specific)
-        #   - ViT-L (24 blocks): [3, 10, 16, 22]
-        #   - ViT-S (12 blocks): [2, 5, 8, 11]
-        # - Other methods: Enable only last block
-        if separation_method == 'multi_layer':
-            # Multi-layer: enable attention storage for specified blocks
+        # Enable attention weights storage based on ViT size and step
+        # ViT-L: [4, 11, 17, 23] (Step 1), [11, 17] (Step 2)
+        # ViT-S: [2, 5, 8, 11] (Step 1), [5, 8] (Step 2)
+        if self.step == 1:
+            # Step 1: GSP module uses all 4 DPT layers
             if model.encoder == 'vitl':
-                target_blocks = [3, 10, 16, 22]  # ViT-L
+                target_blocks = [4, 11, 17, 23]
+            else:  # vits
+                target_blocks = [2, 5, 8, 11]
+        else:  # Step 2
+            # Step 2: FG feature module uses mid 2 DPT layers only
+            if model.encoder == 'vitl':
+                target_blocks = [11, 17]
+            else:  # vits
+                target_blocks = [5, 8]
+
+        for i, block in enumerate(model.pretrained.blocks):
+            if i in target_blocks:
+                block.attn.store_attn_weights = True
+                logger.info(f"Enabled attention weights storage for block {i}")
             else:
-                target_blocks = [2, 5, 8, 11]  # ViT-S
+                block.attn.store_attn_weights = False
 
-            for i, block in enumerate(model.pretrained.blocks):
-                if i in target_blocks:
-                    block.attn.store_attn_weights = True
-                    logger.info(f"Enabled attention weights storage for block {i}")
-                else:
-                    block.attn.store_attn_weights = False
-        else:
-            # Other methods: enable only last block
-            for i, block in enumerate(model.pretrained.blocks):
-                if i == len(model.pretrained.blocks) - 1:
-                    block.attn.store_attn_weights = True
-                    logger.info(f"Enabled attention weights storage for block {i} (last block)")
-                else:
-                    block.attn.store_attn_weights = False
+        logger.info(f"Target blocks for Step {self.step} ({model.encoder}): {target_blocks}")
 
-        # Load checkpoint
+        # Load checkpoint based on phase and step
         checkpoint_path = self.config.get('load')
         if checkpoint_path and checkpoint_path != 'true':
             if os.path.exists(checkpoint_path):
                 logger.info(f"Loading checkpoint from {checkpoint_path}")
+                logger.info(f"Testing configuration: Phase {self.phase}, Step {self.step}")
+
                 checkpoint = torch.load(checkpoint_path, map_location='cpu')
 
                 # Extract state dict
@@ -187,25 +194,24 @@ class Gear5Tester:
                 else:
                     state_dict = checkpoint
 
-                # Convert gear3_head keys to gear5_metric_head for backward compatibility
-                converted_state_dict = {}
-                for key, value in state_dict.items():
-                    if key.startswith('gear3_head.'):
-                        new_key = key.replace('gear3_head.', 'gear5_metric_head.', 1)
-                        converted_state_dict[new_key] = value
-                        logger.debug(f"Converted key: {key} -> {new_key}")
-                    else:
-                        converted_state_dict[key] = value
+                # Remove module. prefix if present
+                state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
 
-                # Load state dict
-                model.load_state_dict(converted_state_dict, strict=True)
-                logger.info(f"Loaded checkpoint successfully")
+                # Load state dict (strict=False to allow for missing/extra keys in hybrid models)
+                missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+
+                if missing_keys:
+                    logger.warning(f"Missing keys: {missing_keys[:10]}...")  # Show first 10
+                if unexpected_keys:
+                    logger.warning(f"Unexpected keys: {unexpected_keys[:10]}...")  # Show first 10
+
+                logger.info(f"Loaded checkpoint successfully for Phase {self.phase} Step {self.step}")
 
                 # Log training info if available
                 if 'global_step' in checkpoint:
                     logger.info(f"Checkpoint step: {checkpoint['global_step']}")
                 if 'phase' in checkpoint:
-                    logger.info(f"Training phase: {checkpoint['phase']}")
+                    logger.info(f"Checkpoint phase: {checkpoint['phase']}")
             else:
                 logger.warning(f"Checkpoint {checkpoint_path} not found")
                 raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
@@ -672,11 +678,19 @@ class Gear5Tester:
 
             # Collect attention weights (multi_layer or last block only)
             if self.config.get('separation_method', 'cls_seg') == 'multi_layer':
-                # Multi-layer: collect from specified blocks
-                if self.model.encoder == 'vitl':
-                    target_blocks = [3, 10, 16, 22]
-                else:
-                    target_blocks = [2, 5, 8, 11]
+                # Multi-layer: collect from step-specific blocks
+                if self.step == 1:
+                    # Step 1: GSP uses all 4 DPT layers
+                    if self.model.encoder == 'vitl':
+                        target_blocks = [4, 11, 17, 23]
+                    else:
+                        target_blocks = [2, 5, 8, 11]
+                else:  # Step 2
+                    # Step 2: FG uses mid 2 DPT layers
+                    if self.model.encoder == 'vitl':
+                        target_blocks = [11, 17]
+                    else:
+                        target_blocks = [5, 8]
                 attention_weights_multi_layer_warmup = [
                     self.model.pretrained.blocks[i].attn.attn_weights for i in target_blocks
                 ]
@@ -747,11 +761,19 @@ class Gear5Tester:
 
                 # Collect attention weights (multi_layer or last block only)
                 if self.config.get('separation_method', 'cls_seg') == 'multi_layer':
-                    # Multi-layer: collect from specified blocks
-                    if self.model.encoder == 'vitl':
-                        target_blocks = [3, 10, 16, 22]
-                    else:
-                        target_blocks = [2, 5, 8, 11]
+                    # Multi-layer: collect from specified blocks (step-based)
+                    if self.step == 1:
+                        # Step 1: GSP module uses all 4 DPT layers
+                        if self.model.encoder == 'vitl':
+                            target_blocks = [4, 11, 17, 23]
+                        else:
+                            target_blocks = [2, 5, 8, 11]
+                    else:  # Step 2
+                        # Step 2: FG feature module uses mid 2 DPT layers only
+                        if self.model.encoder == 'vitl':
+                            target_blocks = [11, 17]
+                        else:
+                            target_blocks = [5, 8]
                     attention_weights_multi_layer = [
                         self.model.pretrained.blocks[i].attn.attn_weights for i in target_blocks
                     ]
@@ -1166,27 +1188,28 @@ class Gear5Tester:
                 # Dense dataset (sintel): Just use GT valid mask
                 pred_show_mask = gt_valid
 
-            pred_display = np.where(pred_show_mask, pred, np.nan)  # Invalid = NaN (will be black)
-            if pred_show_mask.sum() > 0:
-                pred_vmin = np.nanpercentile(pred_display, 2)
-                pred_vmax = np.nanpercentile(pred_display, 98)
-            else:
-                pred_vmin, pred_vmax = 0, 1
-            cmap_pred = plt.cm.plasma_r.copy()
-            cmap_pred.set_bad(color='black')  # NaN pixels = black
-            axes[1, col].imshow(pred_display, cmap=cmap_pred, vmin=pred_vmin, vmax=pred_vmax)  # plasma_r: near=bright, far=dark
-            axes[1, col].set_title(f'Pred (m)')
-            axes[1, col].axis('off')
-
             # Row 2: GT metric depth (invalid pixels = black)
+            # IMPORTANT: Compute GT's vmin/vmax FIRST, then use for both Pred and GT
             gt = gt_depths[t, 0].cpu().numpy()
             gt_valid = (gt > 0) & (gt < MAX_DEPTH)  # Only <70m
             gt_display = np.where(gt_valid, gt, np.nan)  # Invalid = NaN
+
+            # Compute GT's percentile range (will be used for both Pred and GT)
             if gt_valid.sum() > 0:
                 gt_vmin = np.nanpercentile(gt_display, 2)
                 gt_vmax = np.nanpercentile(gt_display, 98)
             else:
                 gt_vmin, gt_vmax = 0, 1
+
+            # Row 1: Predicted metric depth (use GT's vmin/vmax for consistent normalization)
+            pred_display = np.where(pred_show_mask, pred, np.nan)  # Invalid = NaN (will be black)
+            cmap_pred = plt.cm.plasma_r.copy()
+            cmap_pred.set_bad(color='black')  # NaN pixels = black
+            axes[1, col].imshow(pred_display, cmap=cmap_pred, vmin=gt_vmin, vmax=gt_vmax)  # Use GT's range!
+            axes[1, col].set_title(f'Pred (m)')
+            axes[1, col].axis('off')
+
+            # Display GT with its own range
             cmap_gt = plt.cm.plasma_r.copy()
             cmap_gt.set_bad(color='black')  # NaN pixels = black
             axes[2, col].imshow(gt_display, cmap=cmap_gt, vmin=gt_vmin, vmax=gt_vmax)  # plasma_r: near=bright, far=dark

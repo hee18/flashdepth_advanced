@@ -111,16 +111,28 @@ class Gear5Trainer:
         self.world_size = world_size
         self.local_rank = local_rank
 
+        # Detect phase based on config_variant (similar to Gear3 Upgrade)
+        # Phase 1: 518×518, config_l or config_s (Step 1 or 2)
+        # Phase 2: 2K, config_hybrid (Step 2 only)
+        config_variant = config.get('config_variant', 'l')
+        self.phase = 2 if config_variant == 'hybrid' else 1
+
+        if self.phase == 2 and self.step != 2:
+            raise ValueError("Phase 2 (Hybrid) requires step=2!")
+
         # Setup device
         self.device = f"cuda:{local_rank}"
         torch.cuda.set_device(local_rank)
 
         if rank == 0:
-            logging.info(f"Training Step {self.step} on {world_size} GPU(s)")
+            logging.info(f"Training Step {self.step}, Phase {self.phase} on {world_size} GPU(s)")
+            if self.phase == 2:
+                logging.info(f"  Phase 2 (Hybrid): 2K resolution, Gear5-S weights + FlashDepth-hybrid")
 
         # Setup results directory (only rank 0)
+        phase_suffix = f"_phase{self.phase}" if self.phase > 1 else ""
         step_suffix = f"_step{self.step}"
-        self.results_dir = Path(config.get('results_dir', f'./train_results/gear5{step_suffix}'))
+        self.results_dir = Path(config.get('results_dir', f'./train_results/gear5{step_suffix}{phase_suffix}'))
         if rank == 0:
             self.results_dir.mkdir(parents=True, exist_ok=True)
 
@@ -196,9 +208,9 @@ class Gear5Trainer:
         self.num_sequences = None  # Track number of sequences per dataset
 
         # Validation visualization config: track which sequences to visualize
-        # Phase 2/3: Save 1 sample per dataset at every validation step (for step-by-step comparison)
+        # Phase 2: Save 1 sample per dataset at every validation step (for step-by-step comparison)
         # Sintel is smaller (1022×434), Waymo_seg is 2K (1918×1274)
-        if self.step >= 2:
+        if self.phase >= 2:
             self.val_vis_config = {
                 'sintel': {'sequences': [0], 'saved': []},  # seq 0 only
                 'waymo_seg': {'sequences': [0], 'saved': []}    # seq 0 only
@@ -212,25 +224,18 @@ class Gear5Trainer:
 
     def _get_canonical_focal_length(self):
         """
-        Get canonical focal length based on current resolution.
+        Get canonical focal length (fixed at 1000.0 for all resolutions).
 
         Returns:
-            float: Canonical focal length
+            float: Canonical focal length (always 1000.0)
         """
-        canonical_fx_config = self.config.get('canonical_focal_length', 1000.0)
-
-        # If config is a dict (resolution-dependent), select based on current resolution
-        # Check for dict-like object (handles both dict and OmegaConf DictConfig)
-        if hasattr(canonical_fx_config, 'get'):
-            resolution = self.config['dataset']['resolution']
-            canonical_fx = canonical_fx_config.get(resolution, canonical_fx_config.get('base', 500.0))
-            return float(canonical_fx)
-        else:
-            # Legacy: single value for all resolutions
-            return float(canonical_fx_config)
+        return 1000.0
 
     def _setup_model(self):
         """Initialize FlashDepth with Gear5 modules (GSP + FG modulation)"""
+        # Gear5 ALWAYS uses multi_layer separation method
+        self.separation_method = 'multi_layer'
+
         # Create base FlashDepth model
         model_config = dict(self.config.model)
         model_config['batch_size'] = self.config.training.batch_size
@@ -243,20 +248,31 @@ class Gear5Trainer:
         dpt_dim = 256 if model.encoder == 'vitl' else 64
 
         # Load pre-trained checkpoint
-        # Step 1: Load FlashDepth weights (ViT + DPT only)
-        # Step 2: Load Step 1 checkpoint (ViT + DPT + GSP + Mamba + Final)
+        # Phase 1, Step 1: Load FlashDepth weights (DINOv2 + DPT + Mamba + Final head)
+        # Phase 1, Step 2: Load Step 1 checkpoint (all modules including Gear5)
+        # Phase 2, Step 2: Load Gear5-S checkpoint (will load later after creating gear5_metric_head)
         if self.step == 1:
             checkpoint_path = self.config.get('load')
-        else:
-            # Phase 2: Load Gear-S Phase 1 checkpoint (always S for hybrid)
+        elif self.phase == 2:
+            # Phase 2 (Hybrid): Load Gear5-S checkpoint after creating gear5_metric_head
             checkpoint_path = self.config.get('gear_checkpoint')
             if not checkpoint_path:
                 raise ValueError(
-                    "Phase 2 (hybrid) requires 'gear_checkpoint' in config! "
-                    "Set gear_checkpoint to your Gear-S Phase 1 checkpoint path."
+                    "Phase 2 (Hybrid) requires 'gear_checkpoint' in config! "
+                    "Set gear_checkpoint to your Gear5-S Phase 1 checkpoint path."
                 )
             if self.rank == 0:
-                self.logger.info(f"Step {self.step}: Loading Gear-S checkpoint for Gear modules from {checkpoint_path}")
+                self.logger.info(f"Phase {self.phase}: Will load Gear5-S checkpoint from {checkpoint_path}")
+        else:
+            # Phase 1, Step 2: Load Step 1 checkpoint
+            checkpoint_path = self.config.get('gear_checkpoint')
+            if not checkpoint_path:
+                raise ValueError(
+                    "Step 2 requires 'gear_checkpoint' in config! "
+                    "Set gear_checkpoint to your Step 1 checkpoint path."
+                )
+            if self.rank == 0:
+                self.logger.info(f"Step {self.step}: Loading Step 1 checkpoint from {checkpoint_path}")
 
         if checkpoint_path and checkpoint_path != 'true':
             if os.path.exists(checkpoint_path):
@@ -275,29 +291,33 @@ class Gear5Trainer:
                 state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
 
                 if self.step == 1:
-                    # Phase 1: Load only DINOv2 and DPT refinement layers
-                    # Exclude: Mamba (modulated input), output_conv1/2 (modulated features), gear3_head
+                    # Phase 1, Step 1: Load ALL parameters from FlashDepth (DINOv2, DPT, Mamba, output_conv)
+                    # Only exclude gear5_metric_head (will be created and trained from scratch)
                     loaded_dict = {}
                     excluded_keys = []
                     for k, v in state_dict.items():
-                        # Exclude modules that receive modulated features
-                        if any(x in k for x in ['mamba', 'hybrid_fusion', 'teacher_model',
-                                                'output_conv1', 'output_conv2', 'gear3_upgrade_head']):
+                        # Exclude only gear5_metric_head (doesn't exist in FlashDepth checkpoint)
+                        if 'gear5_metric_head' in k:
                             excluded_keys.append(k)
                         else:
                             loaded_dict[k] = v
 
-                    # Load state dict (strict=False to allow missing modules)
+                    # Load state dict (strict=False to allow missing gear5_metric_head)
                     model.load_state_dict(loaded_dict, strict=False)
-                    self.logger.info(f"Phase 1: Loaded {len(loaded_dict)} parameters from checkpoint")
-                    self.logger.info(f"  - DINOv2 encoder: ✓")
-                    self.logger.info(f"  - DPT projects/resize/refinenet: ✓")
-                    self.logger.info(f"Excluded {len(excluded_keys)} parameters (will train from scratch):")
-                    self.logger.info(f"  - Mamba, output_conv1/2, gear3_head")
+                    self.logger.info(f"Phase 1, Step 1: Loaded {len(loaded_dict)} parameters from FlashDepth checkpoint")
+                    self.logger.info(f"  - DINOv2 encoder: ✓ (will be frozen)")
+                    self.logger.info(f"  - DPT projects/resize/refinenet: ✓ (will be frozen)")
+                    self.logger.info(f"  - Mamba: ✓ (will be trained)")
+                    self.logger.info(f"  - output_conv1/2: ✓ (will be trained)")
+                    if excluded_keys:
+                        self.logger.info(f"Excluded {len(excluded_keys)} parameters (gear5_metric_head will be created)")
+                elif self.phase == 2:
+                    # Phase 2: Skip loading here, will load after creating gear5_metric_head
+                    pass
                 else:
-                    # Phase 2, 3: Load ALL parameters including gear3_head
-                    # But need to add gear3_head first before loading
-                    pass  # Will load after gear3_head is created
+                    # Phase 1, Step 2: Load ALL parameters including gear5_metric_head
+                    # But need to add gear5_metric_head first before loading
+                    pass  # Will load after gear5_metric_head is created
             else:
                 self.logger.warning(f"Checkpoint {checkpoint_path} not found")
 
@@ -306,20 +326,15 @@ class Gear5Trainer:
         dpt_dim = 256 if model.encoder == 'vitl' else 64
         num_heads = 16 if model.encoder == 'vitl' else 6
 
-        # Get separation method from config (default: 'cls_seg')
-        separation_method = self.config.get('separation_method', 'cls_seg')
-        self.separation_method = separation_method
-        self.logger.info(f"Using FG/BG separation method: {separation_method}")
-
-        model.gear3_upgrade_head = Gear3UpgradeMetricHead(
+        # Gear5 uses its own metric head (global GSP + FG modulation)
+        # Multi-layer fusion uses uniform weights (fixed equal ratio)
+        model.gear5_metric_head = Gear5MetricHead(
             embed_dim=embed_dim,
-            dpt_dim=dpt_dim,
-            separation_method=separation_method,
-            num_heads=num_heads
+            dpt_dim=dpt_dim
         )
 
-        # Phase 2, 3: Load ALL parameters after gear3_head is created
-        if self.step > 1 and checkpoint_path and checkpoint_path != 'true' and os.path.exists(checkpoint_path):
+        # Phase 1, Step 2: Load ALL parameters after gear5_metric_head is created
+        if self.step == 2 and self.phase == 1 and checkpoint_path and checkpoint_path != 'true' and os.path.exists(checkpoint_path):
             checkpoint = torch.load(checkpoint_path, map_location='cpu')
             if isinstance(checkpoint, dict) and 'model' in checkpoint:
                 state_dict = checkpoint['model']
@@ -330,59 +345,150 @@ class Gear5Trainer:
 
             state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
 
-            # Load all parameters including gear3_head
+            # Load all parameters including gear5_metric_head from Step 1
             model.load_state_dict(state_dict, strict=False)
-            self.logger.info(f"Step {self.step}: Loaded ALL parameters from Phase 1 checkpoint")
-            self.logger.info(f"  - DINOv2, DPT, Mamba, output_conv, Gear3: ✓")
+            self.logger.info(f"Phase 1, Step 2: Loaded ALL parameters from Step 1 checkpoint")
+            self.logger.info(f"  - DINOv2, DPT, Mamba, output_conv, Gear5 (GSP + FFM): ✓")
+            self.logger.info(f"  - DINOv2 and DPT are already frozen from Step 1 (same as FlashDepth checkpoint)")
 
-            # Phase 2 ONLY: Overwrite ViT-DPT with FlashDepth-hybrid weights
-            if self.step == 2:
-                # Use 'load' config for hybrid weights (ViT-DPT overwrite)
-                hybrid_path = self.config.get('load', 'configs/flashdepth/iter_43002.pth')
-                if os.path.exists(hybrid_path):
-                    self.logger.info(f"Phase 2: Overwriting ViT-DPT with Hybrid weights from {hybrid_path}")
-                    hybrid_checkpoint = torch.load(hybrid_path, map_location='cpu')
+        # Phase 2, Step 1 (Hybrid): Load GSP+Mamba+output from Phase1 Step2, overwrite DINOv2+DPT from FlashDepth-hybrid (NO FFM)
+        elif self.step == 1 and self.phase == 2 and checkpoint_path and checkpoint_path != 'true' and os.path.exists(checkpoint_path):
+            # Step 1: Load Phase1 Step2 checkpoint (GSP, Mamba, output_conv) - EXCLUDE FFM
+            self.logger.info(f"Phase 2, Step 1: Loading from Phase1 Step2 checkpoint (excluding FFM): {checkpoint_path}")
+            checkpoint = torch.load(checkpoint_path, map_location='cpu')
+            if isinstance(checkpoint, dict) and 'model' in checkpoint:
+                state_dict = checkpoint['model']
+            elif isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
+                state_dict = checkpoint['state_dict']
+            else:
+                state_dict = checkpoint
 
-                    # Extract state dict
-                    if isinstance(hybrid_checkpoint, dict) and 'model' in hybrid_checkpoint:
-                        hybrid_state_dict = hybrid_checkpoint['model']
-                    elif isinstance(hybrid_checkpoint, dict) and 'state_dict' in hybrid_checkpoint:
-                        hybrid_state_dict = hybrid_checkpoint['state_dict']
-                    else:
-                        hybrid_state_dict = hybrid_checkpoint
+            state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
 
-                    # Remove module. prefix if present
-                    hybrid_state_dict = {k.replace('module.', ''): v for k, v in hybrid_state_dict.items()}
-
-                    # Load ONLY DINOv2 and DPT parameters (overwrite Phase 1 weights)
-                    loaded_hybrid = {}
-                    for k, v in hybrid_state_dict.items():
-                        # Include only encoder and DPT refinement (same as Phase 1 loading)
-                        if not any(x in k for x in ['mamba', 'hybrid_fusion', 'teacher_model',
-                                                     'output_conv1', 'output_conv2', 'gear3_upgrade_head']):
-                            loaded_hybrid[k] = v
-
-                    # Overwrite ViT-DPT parameters
-                    model.load_state_dict(loaded_hybrid, strict=False)
-                    self.logger.info(f"Phase 2: Overwritten {len(loaded_hybrid)} ViT-DPT parameters with Hybrid weights")
-                    self.logger.info(f"  - Kept from Phase 1: Gear3, Mamba, output_conv (continue training)")
+            # Filter out FFM keys (gear5_metric_head.fg_modulation_head.*)
+            filtered_state_dict = {}
+            excluded_ffm_keys = []
+            for k, v in state_dict.items():
+                if k.startswith('gear5_metric_head.fg_modulation_head.'):
+                    excluded_ffm_keys.append(k)
                 else:
-                    self.logger.warning(f"Hybrid checkpoint {hybrid_path} not found! Using Phase 1 ViT-DPT weights.")
+                    filtered_state_dict[k] = v
+
+            # Load filtered state dict (GSP, Mamba, output_conv, but NO FFM)
+            model.load_state_dict(filtered_state_dict, strict=False)
+            self.logger.info(f"Phase 2, Step 1: Loaded {len(filtered_state_dict)} parameters from Phase1 Step2")
+            self.logger.info(f"  - GSP (gear5_metric_head.gsp): ✓")
+            self.logger.info(f"  - Mamba: ✓")
+            self.logger.info(f"  - output_conv1/2: ✓")
+            self.logger.info(f"  - FFM: ✗ (excluded {len(excluded_ffm_keys)} keys, will NOT be used in Step 1)")
+
+            # Step 2: Overwrite DINOv2 + DPT with FlashDepth-hybrid weights
+            hybrid_path = self.config.get('load', 'configs/flashdepth/iter_43002.pth')
+            if os.path.exists(hybrid_path):
+                self.logger.info(f"Phase 2, Step 1: Loading FlashDepth-hybrid weights from {hybrid_path}")
+                hybrid_checkpoint = torch.load(hybrid_path, map_location='cpu')
+
+                # Extract state dict
+                if isinstance(hybrid_checkpoint, dict) and 'model' in hybrid_checkpoint:
+                    hybrid_state_dict = hybrid_checkpoint['model']
+                elif isinstance(hybrid_checkpoint, dict) and 'state_dict' in hybrid_checkpoint:
+                    hybrid_state_dict = hybrid_checkpoint['state_dict']
+                else:
+                    hybrid_state_dict = hybrid_checkpoint
+
+                # Remove module. prefix if present
+                hybrid_state_dict = {k.replace('module.', ''): v for k, v in hybrid_state_dict.items()}
+
+                # Load ONLY DINOv2 and DPT parameters (overwrite Phase1 weights with Hybrid)
+                loaded_hybrid = {}
+                for k, v in hybrid_state_dict.items():
+                    # Include only encoder and DPT refinement (exclude Mamba, output_conv, gear5_metric_head)
+                    if not any(x in k for x in ['mamba', 'hybrid_fusion', 'teacher_model',
+                                                 'output_conv1', 'output_conv2', 'gear5_metric_head']):
+                        loaded_hybrid[k] = v
+
+                # Overwrite DINOv2 + DPT parameters
+                model.load_state_dict(loaded_hybrid, strict=False)
+                self.logger.info(f"Phase 2, Step 1: Overwritten {len(loaded_hybrid)} DINOv2 + DPT parameters with Hybrid weights")
+                self.logger.info(f"  - DINOv2 (ViT-L + ViT-S + Cross Attn): ✓")
+                self.logger.info(f"  - DPT: ✓")
+                self.logger.info(f"  - Kept from Phase1 Step2: GSP, Mamba, output_conv")
+                self.logger.info(f"  - FFM: Will NOT be loaded (Step 1 trains without FFM)")
+            else:
+                self.logger.warning(f"FlashDepth-hybrid checkpoint {hybrid_path} not found! Using Phase1 DINOv2 + DPT.")
+
+        # Phase 2, Step 2 (Hybrid): Load from Phase2 Step1, add FFM from Phase1 Step2
+        elif self.step == 2 and self.phase == 2 and checkpoint_path and checkpoint_path != 'true' and os.path.exists(checkpoint_path):
+            # Step 1: Load Phase2 Step1 checkpoint (GSP, Mamba, output_conv, DINOv2, DPT - but NO FFM yet)
+            self.logger.info(f"Phase 2, Step 2: Loading from Phase2 Step1 checkpoint: {checkpoint_path}")
+            checkpoint = torch.load(checkpoint_path, map_location='cpu')
+            if isinstance(checkpoint, dict) and 'model' in checkpoint:
+                state_dict = checkpoint['model']
+            elif isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
+                state_dict = checkpoint['state_dict']
+            else:
+                state_dict = checkpoint
+
+            state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+
+            # Load all parameters from Phase2 Step1 (should NOT have FFM yet)
+            model.load_state_dict(state_dict, strict=False)
+            self.logger.info(f"Phase 2, Step 2: Loaded base model from Phase2 Step1")
+            self.logger.info(f"  - DINOv2 + DPT (from FlashDepth-hybrid): ✓")
+            self.logger.info(f"  - GSP + Mamba + output_conv (from Phase1 Step2): ✓")
+            self.logger.info(f"  - FFM: Not yet loaded (will load from Phase1 Step2 next)")
+
+            # Step 2: Load FFM from Phase1 Step2 checkpoint
+            phase1_step2_path = self.config.get('phase1_step2_checkpoint')
+            if phase1_step2_path and phase1_step2_path != 'true' and os.path.exists(phase1_step2_path):
+                self.logger.info(f"Phase 2, Step 2: Loading FFM from Phase1 Step2 checkpoint: {phase1_step2_path}")
+                phase1_checkpoint = torch.load(phase1_step2_path, map_location='cpu')
+
+                # Extract state dict
+                if isinstance(phase1_checkpoint, dict) and 'model' in phase1_checkpoint:
+                    phase1_state_dict = phase1_checkpoint['model']
+                elif isinstance(phase1_checkpoint, dict) and 'state_dict' in phase1_checkpoint:
+                    phase1_state_dict = phase1_checkpoint['state_dict']
+                else:
+                    phase1_state_dict = phase1_checkpoint
+
+                # Remove module. prefix if present
+                phase1_state_dict = {k.replace('module.', ''): v for k, v in phase1_state_dict.items()}
+
+                # Extract ONLY FFM parameters
+                ffm_state_dict = {}
+                for k, v in phase1_state_dict.items():
+                    if k.startswith('gear5_metric_head.fg_modulation_head.'):
+                        ffm_state_dict[k] = v
+
+                # Load FFM parameters
+                if ffm_state_dict:
+                    model.load_state_dict(ffm_state_dict, strict=False)
+                    self.logger.info(f"Phase 2, Step 2: Loaded {len(ffm_state_dict)} FFM parameters from Phase1 Step2")
+                    self.logger.info(f"  - FFM (fg_modulation_head): ✓")
+                    self.logger.info(f"  - Now ready to train full model with FFM!")
+                else:
+                    self.logger.warning(f"No FFM parameters found in Phase1 Step2 checkpoint!")
+            else:
+                self.logger.warning(f"Phase1 Step2 checkpoint not provided or not found. FFM will be randomly initialized!")
 
         # Enable attention weights storage
-        # - 'multi_layer': Enable for multiple blocks (encoder-specific)
-        #   - ViT-L (24 blocks): [3, 10, 16, 22]
-        #   - ViT-S (12 blocks): [2, 5, 8, 11]
-        # - Others: Enable ONLY for last block (saves memory)
-        if separation_method == 'multi_layer':
-            # Use encoder-specific block indices for proportional coverage
+        # Gear5 ALWAYS uses multi_layer separation method
+        # - Step 1 (GSP): [4, 11, 17, 23] - all 4 DPT layers
+        # - Step 2 (FG): [11, 17] - mid 2 DPT layers only
+        if self.step == 1:
+            # Step 1: GSP module uses all 4 DPT layers
             multi_layer_blocks = {
-                'vitl': [3, 10, 16, 22],
+                'vitl': [4, 11, 17, 23],
                 'vits': [2, 5, 8, 11]
             }
-            target_blocks = multi_layer_blocks[model.encoder]
-        else:
-            target_blocks = [len(model.pretrained.blocks) - 1]
+        else:  # Step 2
+            # Step 2: FG feature module uses mid 2 DPT layers only
+            multi_layer_blocks = {
+                'vitl': [11, 17],
+                'vits': [5, 8]
+            }
+        target_blocks = multi_layer_blocks[model.encoder]
 
         for i, block in enumerate(model.pretrained.blocks):
             if i in target_blocks:
@@ -391,8 +497,22 @@ class Gear5Trainer:
             else:
                 block.attn.store_attn_weights = False
 
-        if separation_method == 'multi_layer':
-            self.logger.info(f"Multi-layer attention fusion: storing attention from blocks {target_blocks}")
+        self.logger.info(f"Multi-layer attention fusion (Step {self.step}): storing attention from blocks {target_blocks}")
+
+        # Store target blocks and compute encoder_features indices
+        # encoder_features from get_intermediate_layers returns features at intermediate_layer_idx
+        # For vitl: intermediate_layer_idx = [4, 11, 17, 23], encoder_features has indices [0, 1, 2, 3]
+        # For vits: intermediate_layer_idx = [2, 5, 8, 11], encoder_features has indices [0, 1, 2, 3]
+        intermediate_idx = model.intermediate_layer_idx[model.encoder]
+
+        # Map target_blocks to encoder_features indices
+        # e.g., target_blocks = [4, 11, 17, 23], intermediate_idx = [4, 11, 17, 23]
+        #       encoder_indices = [0, 1, 2, 3] (all 4 for Step 1)
+        # e.g., target_blocks = [11, 17], intermediate_idx = [4, 11, 17, 23]
+        #       encoder_indices = [1, 2] (middle 2 for Step 2)
+        encoder_indices = [intermediate_idx.index(block) for block in target_blocks]
+        self.encoder_indices = encoder_indices
+        self.logger.info(f"Encoder features indices for Step {self.step}: {encoder_indices}")
 
         # Store target blocks for use in training/validation steps
         self.target_blocks = target_blocks
@@ -432,28 +552,45 @@ class Gear5Trainer:
 
     def _configure_parameters(self, model):
         """
-        Freeze: DINOv2, DPT refinement layers
-        Train from scratch: Mamba, output_conv1/2, Gear3 modules
+        Freeze configuration based on step and phase:
+
+        Step 1:
+            Frozen: DINOv2, DPT
+            Trainable: GSP, Mamba, output_conv
+
+        Step 2 (Phase 1 or 2):
+            Frozen: DINOv2, DPT, GSP
+            Trainable: FFM, Mamba, output_conv
         """
         frozen_params = 0
         mamba_params = 0
         output_conv_params = 0
-        gear3_params = 0
+        gsp_params = 0
+        ffm_params = 0
 
         for name, param in model.named_parameters():
-            if 'gear3_upgrade_head' in name:
-                # Gear3 modules: trainable
-                param.requires_grad = True
-                gear3_params += param.numel()
-                self.logger.info(f"Trainable (Gear3): {name} - {param.shape}")
+            # Gear5 metric head - step-specific freezing
+            if 'gear5_metric_head.global_gsp' in name:
+                # GSP: trainable only in Step 1
+                param.requires_grad = (self.step == 1)
+                gsp_params += param.numel()
+                if param.requires_grad:
+                    self.logger.info(f"Trainable (GSP): {name} - {param.shape}")
+
+            elif 'gear5_metric_head.fg_modulation_head' in name:
+                # FFM: trainable only in Step 2
+                param.requires_grad = (self.step == 2)
+                ffm_params += param.numel()
+                if param.requires_grad:
+                    self.logger.info(f"Trainable (FFM): {name} - {param.shape}")
 
             elif 'mamba' in name:
-                # Mamba: train from scratch (receives modulated input)
+                # Mamba: always trainable
                 param.requires_grad = True
                 mamba_params += param.numel()
 
             elif 'output_conv' in name:
-                # DPT output head: train from scratch (receives modulated features)
+                # DPT output head: always trainable
                 param.requires_grad = True
                 output_conv_params += param.numel()
                 self.logger.info(f"Trainable (output_conv): {name} - {param.shape}")
@@ -463,12 +600,24 @@ class Gear5Trainer:
                 param.requires_grad = False
                 frozen_params += param.numel()
 
-        self.logger.info(f"Frozen (DINOv2 + DPT refinement): {frozen_params:,}")
-        self.logger.info(f"Trainable (Mamba, from scratch): {mamba_params:,}")
-        self.logger.info(f"Trainable (output_conv, from scratch): {output_conv_params:,}")
-        self.logger.info(f"Trainable (Gear3 modules): {gear3_params:,}")
+        # Log summary
+        self.logger.info(f"=== Parameter Configuration (Step {self.step}, Phase {self.phase}) ===")
+        self.logger.info(f"Frozen:")
+        self.logger.info(f"  - DINOv2 + DPT: {frozen_params:,}")
+        if self.step == 2:
+            self.logger.info(f"  - GSP: {gsp_params:,}")
 
-        total_trainable = mamba_params + output_conv_params + gear3_params
+        self.logger.info(f"Trainable:")
+        if self.step == 1:
+            self.logger.info(f"  - GSP: {gsp_params:,}")
+        else:
+            self.logger.info(f"  - FFM: {ffm_params:,}")
+        self.logger.info(f"  - Mamba: {mamba_params:,}")
+        self.logger.info(f"  - output_conv: {output_conv_params:,}")
+
+        total_frozen = frozen_params + (gsp_params if self.step == 2 else 0)
+        total_trainable = mamba_params + output_conv_params + (gsp_params if self.step == 1 else ffm_params)
+        self.logger.info(f"Total frozen: {total_frozen:,}")
         self.logger.info(f"Total trainable: {total_trainable:,}")
 
     def _set_train_mode(self):
@@ -485,7 +634,7 @@ class Gear5Trainer:
                 continue
 
             # Keep trainable parts in train mode
-            if any(keyword in name for keyword in ['gear3_upgrade_head', 'mamba', 'output_conv']):
+            if any(keyword in name for keyword in ['gear5_metric_head', 'mamba', 'output_conv']):
                 continue
 
             # Set frozen parts to eval mode
@@ -609,7 +758,7 @@ class Gear5Trainer:
 
         for name, param in self.model.named_parameters():
             if param.requires_grad:
-                if 'gear3_upgrade_head' in name:
+                if 'gear5_metric_head' in name:
                     gear3_params.append(param)
                 elif 'mamba' in name:
                     mamba_params.append(param)
@@ -772,21 +921,47 @@ class Gear5Trainer:
                         attention_weights_multi_layer = None
                         cls_token = None
 
-                        if self.separation_method == 'multi_layer':
-                            # Collect attention weights from multiple layers (encoder-specific)
-                            attention_weights_multi_layer = [
-                                model.pretrained.blocks[i].attn.attn_weights
-                                for i in self.target_blocks
-                            ]
-                        elif self.separation_method == 'cls_seg':
-                            cls_token = encoder_features[-1][:, 0]  # [B*T, embed_dim]
+                        # Gear5: Collect CLS tokens and attention weights from multiple layers
+                        # Use encoder_indices to index into encoder_features
+                        # Step 1: encoder_indices = [0, 1, 2, 3] (all 4 layers)
+                        # Step 2: encoder_indices = [1, 2] (middle 2 layers)
+                        cls_tokens_list = [
+                            encoder_features[i][:, 0]  # CLS token from each layer
+                            for i in self.encoder_indices
+                        ]
+                        attention_weights_multi_layer = [
+                            model.pretrained.blocks[block_idx].attn.attn_weights
+                            for block_idx in self.target_blocks
+                        ]
 
-                        # Apply Gear modulation BEFORE Mamba
-                        path_1_modulated, importance_map, fg_features, bg_features, fg_mask, bg_mask = model.gear3_upgrade_head(
-                            patch_tokens, attention_weights, [path_1], patch_h, patch_w,
+                        # Apply Gear5 modulation BEFORE Mamba
+                        # Returns: dict with keys based on step
+                        gear5_outputs = model.gear5_metric_head(
+                            cls_tokens_list=cls_tokens_list,
+                            patch_tokens=patch_tokens,
                             attention_weights_multi_layer=attention_weights_multi_layer,
-                            cls_token=cls_token
+                            dpt_features=path_1,
+                            patch_h=patch_h,
+                            patch_w=patch_w,
+                            step=self.step
                         )
+
+                        path_1_modulated = gear5_outputs['modulated_features']
+                        scale = gear5_outputs['scale']
+                        shift = gear5_outputs['shift']
+
+                        # Step 2: Extract additional outputs
+                        if self.step == 2:
+                            importance_map = gear5_outputs['importance_map']
+                            fg_features = gear5_outputs['fg_features']
+                            fg_mask = gear5_outputs['fg_mask']
+                            bg_mask = 1.0 - fg_mask  # Derive BG mask from FG mask
+                        else:
+                            # Step 1: Set to None
+                            importance_map = None
+                            fg_features = None
+                            fg_mask = None
+                            bg_mask = None
 
                         # Apply Mamba temporal modeling to modulated feature
                         path_1_temporal = model.dpt_features_to_mamba(
@@ -799,36 +974,32 @@ class Gear5Trainer:
                         out = F.interpolate(out, (H, W), mode="bilinear", align_corners=True)
                         out = model.depth_head.scratch.output_conv2(out)
 
+                        # Save prediction inverse depth for mask calculation
+                        pred_depth_inverse = out  # [B*T, 1, H, W]
+
                         # Convert prediction to metric depth: 100/m -> m
                         # Output shape: (B*T, 1, H, W)
                         pred_depth_metric = 100.0 / (out + 1e-8)
 
-                        # Reshape outputs from (B*T, ...) to (B, T, ...)
+                        # Reshape prediction to (B, T, ...) and select first frame
+                        pred_depth_inverse_seq = rearrange(pred_depth_inverse, '(b t) 1 h w -> b t 1 h w', b=B_orig, t=T_orig)
                         pred_depth_metric_seq = rearrange(pred_depth_metric, '(b t) 1 h w -> b t 1 h w', b=B_orig, t=T_orig)
-                        importance_map_seq = rearrange(importance_map, '(b t) c h w -> b t c h w', b=B_orig, t=T_orig)
-                        fg_mask_seq = rearrange(fg_mask, '(b t) c h w -> b t c h w', b=B_orig, t=T_orig)
-                        bg_mask_seq = rearrange(bg_mask, '(b t) c h w -> b t c h w', b=B_orig, t=T_orig)
-
-                        # Select first frame for visualization
+                        pred_depth_inverse_vis = pred_depth_inverse_seq[:, 0]  # [B, 1, H, W]
                         pred_depth_metric_vis = pred_depth_metric_seq[:, 0]  # [B, 1, H, W]
-                        importance_map_vis = importance_map_seq[:, 0]  # [B, C, H, W]
-                        fg_mask_vis = fg_mask_seq[:, 0]  # [B, 1, H, W]
-                        bg_mask_vis = bg_mask_seq[:, 0]  # [B, 1, H, W]
 
                         # GT depth for first frame
                         gt_depth_inverse_vis = gt_depth_inverse_100[:, 0]  # [B, 1, H, W]
                         gt_depth_metric = 100.0 / (gt_depth_inverse_vis + 1e-8)
 
-                        # Resize masks to match image resolution (no need to resize pred_depth_metric_vis as it's already at H, W)
-                        importance_map_resized = F.interpolate(
-                            importance_map_vis, size=(H, W), mode='bilinear', align_corners=True
-                        )
-                        fg_mask_resized = F.interpolate(
-                            fg_mask_vis, size=(H, W), mode='bilinear', align_corners=True
-                        )
-                        bg_mask_resized = F.interpolate(
-                            bg_mask_vis, size=(H, W), mode='bilinear', align_corners=True
-                        )
+                        # Compute canonical masks for visualization (70m threshold in canonical space)
+                        # Use same logic as training loss calculation (but no warmup)
+                        MIN_INVERSE_DEPTH_VIS = 100.0 / 70.0  # Canonical space 70m
+                        canonical_gt_valid_vis = (gt_depth_inverse_vis > MIN_INVERSE_DEPTH_VIS)  # [B, 1, H, W]
+
+                        # Training: Pred outlier filtering (200m, like training loss)
+                        MAX_DEPTH_OUTLIER_VIS = 200.0
+                        MIN_INVERSE_OUTLIER_VIS = 100.0 / MAX_DEPTH_OUTLIER_VIS
+                        canonical_pred_valid_vis = (pred_depth_inverse_vis > MIN_INVERSE_OUTLIER_VIS)  # [B, 1, H, W]
 
                         # Move tensors to CPU for visualization (only first batch, first frame)
                         sample_batch = (
@@ -837,24 +1008,58 @@ class Gear5Trainer:
                             dataset_idx,
                             focal_lengths[:1, :1].float().cpu()  # [1, 1] - resized focal length
                         )
-                        model_outputs_cpu = {
-                            'pred_depth': pred_depth_metric_vis[:1].cpu(),  # [1, 1, H, W]
-                            'importance_map': importance_map_resized[:1].cpu(),  # [1, 1, H, W]
-                            'fg_mask': fg_mask_resized[:1].cpu(),  # [1, 1, H, W]
-                            'bg_mask': bg_mask_resized[:1].cpu()   # [1, 1, H, W]
-                        }
+
+                        # Step 2: Include importance map and masks
+                        if self.step == 2:
+                            # Reshape outputs from (B*T, ...) to (B, T, ...)
+                            importance_map_seq = rearrange(importance_map, '(b t) c h w -> b t c h w', b=B_orig, t=T_orig)
+                            fg_mask_seq = rearrange(fg_mask, '(b t) c h w -> b t c h w', b=B_orig, t=T_orig)
+                            bg_mask_seq = rearrange(bg_mask, '(b t) c h w -> b t c h w', b=B_orig, t=T_orig)
+
+                            # Select first frame for visualization
+                            importance_map_vis = importance_map_seq[:, 0]  # [B, C, H, W]
+                            fg_mask_vis = fg_mask_seq[:, 0]  # [B, 1, H, W]
+                            bg_mask_vis = bg_mask_seq[:, 0]  # [B, 1, H, W]
+
+                            # Resize masks to match image resolution
+                            importance_map_resized = F.interpolate(
+                                importance_map_vis, size=(H, W), mode='bilinear', align_corners=True
+                            )
+                            fg_mask_resized = F.interpolate(
+                                fg_mask_vis, size=(H, W), mode='bilinear', align_corners=True
+                            )
+                            bg_mask_resized = F.interpolate(
+                                bg_mask_vis, size=(H, W), mode='bilinear', align_corners=True
+                            )
+
+                            # Step 2: Include all outputs + canonical masks
+                            model_outputs_cpu = {
+                                'pred_depth': pred_depth_metric_vis[:1].cpu(),  # [1, 1, H, W]
+                                'importance_map': importance_map_resized[:1].cpu(),  # [1, 1, H, W]
+                                'fg_mask': fg_mask_resized[:1].cpu(),  # [1, 1, H, W]
+                                'bg_mask': bg_mask_resized[:1].cpu(),   # [1, 1, H, W]
+                                'canonical_gt_valid': canonical_gt_valid_vis[:1].cpu(),  # [1, 1, H, W] - canonical space mask
+                                'canonical_pred_valid': canonical_pred_valid_vis[:1].cpu()  # [1, 1, H, W] - canonical space mask
+                            }
+                        else:
+                            # Step 1: Only pred_depth + canonical masks (no FG/BG masks)
+                            model_outputs_cpu = {
+                                'pred_depth': pred_depth_metric_vis[:1].cpu(),  # [1, 1, H, W]
+                                'canonical_gt_valid': canonical_gt_valid_vis[:1].cpu(),  # [1, 1, H, W] - canonical space mask
+                                'canonical_pred_valid': canonical_pred_valid_vis[:1].cpu()  # [1, 1, H, W] - canonical space mask
+                            }
 
                         # FPS removed from training (only measured in test_gear3.py)
                         current_fps = None
 
-                        # Extract layer_weights for visualization (multi_layer separation only)
+                        # Extract layer_weights for visualization (multi_layer separation only, Step 2 only)
                         layer_weights = None
-                        if self.separation_method == 'multi_layer':
+                        if self.separation_method == 'multi_layer' and self.step == 2:
                             try:
                                 # Handle DDP wrapping
                                 model = self.model.module if hasattr(self.model, 'module') else self.model
-                                # Get softmax-normalized weights
-                                fusion_weights = model.gear3_upgrade_head.multi_layer_fusion.fusion_weights
+                                # Gear5: multi_layer_fusion is in fg_modulation_head (Step 2 only)
+                                fusion_weights = model.gear5_metric_head.fg_modulation_head.multi_layer_fusion.fusion_weights
                                 layer_weights = torch.softmax(fusion_weights, dim=0).detach().cpu().numpy()
                             except Exception as e:
                                 self.logger.warning(f"Failed to extract layer_weights: {e}")
@@ -980,29 +1185,42 @@ class Gear5Trainer:
                 )  # Returns [path_4, path_3, path_2, path_1], each (B*T, dpt_dim, h, w)
                 path_1 = dpt_features[-1]  # Extract path_1: (B*T, dpt_dim, h, w)
 
-            # Prepare inputs based on separation_method
-            attention_weights_multi_layer = None
-            cls_token = None
-
-            if self.separation_method == 'multi_layer':
-                # Collect attention weights from multiple layers (encoder-specific)
-                # Each has shape (B*T, num_heads, N, N)
-                attention_weights_multi_layer = [
-                    model.pretrained.blocks[i].attn.attn_weights.detach()
-                    for i in self.target_blocks
+            # Gear5: Collect CLS tokens and attention weights from multiple layers
+            # Use encoder_indices to index into encoder_features
+            # Step 1: encoder_indices = [0, 1, 2, 3] (all 4 layers)
+            # Step 2: encoder_indices = [1, 2] (middle 2 layers)
+            with torch.no_grad():
+                cls_tokens_list = [
+                    encoder_features[i][:, 0]  # CLS token from each layer
+                    for i in self.encoder_indices
                 ]
-            elif self.separation_method == 'cls_seg':
-                with torch.no_grad():
-                    cls_token = patch_tokens[:, 0]  # (B*T, embed_dim)
+                attention_weights_multi_layer = [
+                    model.pretrained.blocks[block_idx].attn.attn_weights.detach()
+                    for block_idx in self.target_blocks
+                ]
 
-            # Apply Gear3 Upgrade modulation to path_1 (BEFORE Mamba)
+            # Apply Gear5 modulation to path_1 (BEFORE Mamba)
             # This makes the feature metric-aware before temporal modeling
             # Inputs: (B*T, ...), Output: (B*T, ...)
-            path_1_modulated, importance_map, fg_features, bg_features, fg_mask, bg_mask = model.gear3_upgrade_head(
-                patch_tokens, attention_weights, [path_1], patch_h, patch_w,
+            gear5_outputs = model.gear5_metric_head(
+                cls_tokens_list=cls_tokens_list,
+                patch_tokens=patch_tokens,
                 attention_weights_multi_layer=attention_weights_multi_layer,
-                cls_token=cls_token
+                dpt_features=path_1,
+                patch_h=patch_h,
+                patch_w=patch_w,
+                step=self.step
             )
+
+            path_1_modulated = gear5_outputs['modulated_features']
+            scale = gear5_outputs['scale']
+            shift = gear5_outputs['shift']
+
+            # Step 2: Extract additional outputs
+            if self.step == 2:
+                importance_map = gear5_outputs['importance_map']
+                fg_features = gear5_outputs['fg_features']
+                fg_mask = gear5_outputs['fg_mask']
 
             # Note: attention_weights_multi_layer will be garbage collected automatically
             # No need to manually set to None (validation also needs attention weights)
@@ -1106,9 +1324,9 @@ class Gear5Trainer:
         # Track dataset-specific sequence counters for visualization
         dataset_sequence_counters = {'sintel': 0, 'waymo_seg': 0}
 
-        # Phase 2/3: Limit validation batches to save memory (2K resolution)
+        # Phase 2: Limit validation batches to save memory (2K resolution)
         # Dataset-specific limits: sintel 4개, waymo_seg 2개 (총 6 batches)
-        if self.step >= 2:
+        if self.phase >= 2:
             max_val_batches = 6  # Total max batches
             dataset_max_sequences = {'sintel': 4, 'waymo_seg': 2}
         else:
@@ -1197,26 +1415,47 @@ class Gear5Trainer:
                 )  # Returns [path_4, path_3, path_2, path_1]
                 path_1 = dpt_features[-1]  # Extract path_1: (B*T, dpt_dim, h, w)
 
-                # Prepare inputs based on separation_method
-                attention_weights_multi_layer = None
-                cls_token = None
+                # Gear5: Collect CLS tokens and attention weights from multiple layers
+                # Use encoder_indices to index into encoder_features
+                # Step 1: encoder_indices = [0, 1, 2, 3] (all 4 layers)
+                # Step 2: encoder_indices = [1, 2] (middle 2 layers)
+                cls_tokens_list = [
+                    encoder_features[i][:, 0]  # CLS token from each layer
+                    for i in self.encoder_indices
+                ]
+                attention_weights_multi_layer = [
+                    model.pretrained.blocks[block_idx].attn.attn_weights.detach()
+                    for block_idx in self.target_blocks
+                ]
 
-                if self.separation_method == 'multi_layer':
-                    # Collect attention weights from multiple layers (encoder-specific)
-                    attention_weights_multi_layer = [
-                        model.pretrained.blocks[i].attn.attn_weights.detach()
-                        for i in self.target_blocks
-                    ]
-                elif self.separation_method == 'cls_seg':
-                    cls_token = patch_tokens[:, 0]  # (B*T, embed_dim)
-
-                # Apply Gear modulation BEFORE Mamba (metric-aware feature)
+                # Apply Gear5 modulation BEFORE Mamba (metric-aware feature)
                 # Inputs/outputs: (B*T, ...)
-                path_1_modulated, importance_map, fg_features, bg_features, fg_mask, bg_mask = model.gear3_upgrade_head(
-                    patch_tokens, attention_weights, [path_1], patch_h, patch_w,
+                gear5_outputs = model.gear5_metric_head(
+                    cls_tokens_list=cls_tokens_list,
+                    patch_tokens=patch_tokens,
                     attention_weights_multi_layer=attention_weights_multi_layer,
-                    cls_token=cls_token
+                    dpt_features=path_1,
+                    patch_h=patch_h,
+                    patch_w=patch_w,
+                    step=self.step
                 )
+
+                path_1_modulated = gear5_outputs['modulated_features']
+                scale = gear5_outputs['scale']
+                shift = gear5_outputs['shift']
+
+                # Step 2: Extract additional outputs
+                if self.step == 2:
+                    importance_map = gear5_outputs['importance_map']
+                    fg_features = gear5_outputs['fg_features']
+                    fg_mask = gear5_outputs['fg_mask']
+                    bg_mask = 1.0 - fg_mask  # Derive BG mask from FG mask
+                else:
+                    # Step 1: Set to None
+                    importance_map = None
+                    fg_features = None
+                    fg_mask = None
+                    bg_mask = None
 
                 # Note: attention_weights_multi_layer will be garbage collected automatically
                 # No need to manually set to None (validation also needs attention weights)
@@ -1308,28 +1547,6 @@ class Gear5Trainer:
                                 # Get GT resolution for visualization
                                 gt_h, gt_w = gt_depth_inverse_vis.shape[-2:]
 
-                                # Reshape importance/mask maps to (B, T, ...) and select first frame
-                                importance_map_seq = rearrange(importance_map, '(b t) c h w -> b t c h w', b=B_orig, t=T_orig)
-                                fg_mask_seq = rearrange(fg_mask, '(b t) c h w -> b t c h w', b=B_orig, t=T_orig)
-                                bg_mask_seq = rearrange(bg_mask, '(b t) c h w -> b t c h w', b=B_orig, t=T_orig)
-
-                                importance_map_vis = importance_map_seq[:, 0]  # [B, C, h, w]
-                                fg_mask_vis = fg_mask_seq[:, 0]
-                                bg_mask_vis = bg_mask_seq[:, 0]
-
-                                # Resize importance map to GT resolution
-                                importance_map_resized = F.interpolate(
-                                    importance_map_vis, size=(gt_h, gt_w), mode='bilinear', align_corners=True
-                                )
-
-                                # Resize FG/BG masks to GT resolution
-                                fg_mask_resized = F.interpolate(
-                                    fg_mask_vis, size=(gt_h, gt_w), mode='bilinear', align_corners=True
-                                )
-                                bg_mask_resized = F.interpolate(
-                                    bg_mask_vis, size=(gt_h, gt_w), mode='bilinear', align_corners=True
-                                )
-
                                 # Resize images to GT resolution (for visualization consistency)
                                 img_vis = images[:, 0]  # [B, C, H, W] - first frame
                                 img_t_resized = F.interpolate(
@@ -1342,14 +1559,46 @@ class Gear5Trainer:
                                 canonical_gt_valid_vis = canonical_gt_valid_seq[:, 0]  # [B, 1, H, W]
                                 canonical_pred_valid_vis = canonical_pred_valid_seq[:, 0]
 
-                                model_outputs = {
-                                    'pred_depth': pred_depth_metric,  # [B, 1, gt_h, gt_w] at GT resolution
-                                    'importance_map': importance_map_resized.float().cpu(),  # [B, 1, gt_h, gt_w]
-                                    'fg_mask': fg_mask_resized.float().cpu(),  # [B, 1, gt_h, gt_w]
-                                    'bg_mask': bg_mask_resized.float().cpu(),   # [B, 1, gt_h, gt_w]
-                                    'canonical_gt_valid': canonical_gt_valid_vis,  # [B, 1, H, W] - canonical space mask
-                                    'canonical_pred_valid': canonical_pred_valid_vis  # [B, 1, H, W] - canonical space mask
-                                }
+                                # Step 2: Include importance map and masks
+                                if self.step == 2:
+                                    # Reshape importance/mask maps to (B, T, ...) and select first frame
+                                    importance_map_seq = rearrange(importance_map, '(b t) c h w -> b t c h w', b=B_orig, t=T_orig)
+                                    fg_mask_seq = rearrange(fg_mask, '(b t) c h w -> b t c h w', b=B_orig, t=T_orig)
+                                    bg_mask_seq = rearrange(bg_mask, '(b t) c h w -> b t c h w', b=B_orig, t=T_orig)
+
+                                    importance_map_vis = importance_map_seq[:, 0]  # [B, C, h, w]
+                                    fg_mask_vis = fg_mask_seq[:, 0]
+                                    bg_mask_vis = bg_mask_seq[:, 0]
+
+                                    # Resize importance map to GT resolution
+                                    importance_map_resized = F.interpolate(
+                                        importance_map_vis, size=(gt_h, gt_w), mode='bilinear', align_corners=True
+                                    )
+
+                                    # Resize FG/BG masks to GT resolution
+                                    fg_mask_resized = F.interpolate(
+                                        fg_mask_vis, size=(gt_h, gt_w), mode='bilinear', align_corners=True
+                                    )
+                                    bg_mask_resized = F.interpolate(
+                                        bg_mask_vis, size=(gt_h, gt_w), mode='bilinear', align_corners=True
+                                    )
+
+                                    # Step 2: Include all outputs
+                                    model_outputs = {
+                                        'pred_depth': pred_depth_metric,  # [B, 1, gt_h, gt_w] at GT resolution
+                                        'importance_map': importance_map_resized.float().cpu(),  # [B, 1, gt_h, gt_w]
+                                        'fg_mask': fg_mask_resized.float().cpu(),  # [B, 1, gt_h, gt_w]
+                                        'bg_mask': bg_mask_resized.float().cpu(),   # [B, 1, gt_h, gt_w]
+                                        'canonical_gt_valid': canonical_gt_valid_vis,  # [B, 1, H, W] - canonical space mask
+                                        'canonical_pred_valid': canonical_pred_valid_vis  # [B, 1, H, W] - canonical space mask
+                                    }
+                                else:
+                                    # Step 1: Only pred_depth and canonical masks (no importance map/fg/bg masks)
+                                    model_outputs = {
+                                        'pred_depth': pred_depth_metric,  # [B, 1, gt_h, gt_w] at GT resolution
+                                        'canonical_gt_valid': canonical_gt_valid_vis,  # [B, 1, H, W] - canonical space mask
+                                        'canonical_pred_valid': canonical_pred_valid_vis  # [B, 1, H, W] - canonical space mask
+                                    }
 
                                 # For visualization, we need [B, T, ...] format like training
                                 # But we only have one frame (t=0), so unsqueeze T dimension
@@ -1368,14 +1617,14 @@ class Gear5Trainer:
                                     'val_loss': loss_batch.item() if len(frame_losses) > 0 else 0.0
                                 }
 
-                                # Extract layer_weights for visualization (multi_layer separation only)
+                                # Extract layer_weights for visualization (multi_layer separation only, Step 2 only)
                                 layer_weights = None
-                                if self.separation_method == 'multi_layer':
+                                if self.separation_method == 'multi_layer' and self.step == 2:
                                     try:
                                         # Handle DDP wrapping
                                         model = self.model.module if hasattr(self.model, 'module') else self.model
-                                        # Get softmax-normalized weights
-                                        fusion_weights = model.gear3_upgrade_head.multi_layer_fusion.fusion_weights
+                                        # Gear5: multi_layer_fusion is in fg_modulation_head (Step 2 only)
+                                        fusion_weights = model.gear5_metric_head.fg_modulation_head.multi_layer_fusion.fusion_weights
                                         layer_weights = torch.softmax(fusion_weights, dim=0).detach().cpu().numpy()
                                     except Exception as e:
                                         self.logger.warning(f"Failed to extract layer_weights: {e}")
@@ -1394,7 +1643,10 @@ class Gear5Trainer:
 
                     # Clear intermediate tensors to free memory after each sequence
                     del encoder_features, attention_weights, patch_tokens, dpt_features, path_1, path_1_temporal
-                    del path_1_modulated, importance_map, fg_features, bg_features, fg_mask, bg_mask, pred_depth_inverse
+                    del path_1_modulated, pred_depth_inverse
+                    # Clear step-2-only tensors (importance_map, fg_features, fg_mask, bg_mask)
+                    if self.step == 2:
+                        del importance_map, fg_features, fg_mask, bg_mask
                     # Always clear cache after each sequence to prevent OOM during validation
                     torch.cuda.empty_cache()                # Track sequence count (regardless of valid pixels)
                 if current_dataset not in dataset_sequence_counts:
@@ -1501,14 +1753,14 @@ class Gear5Trainer:
         self.logger.info(f"Saved checkpoint: {checkpoint_path}")
 
 
-@hydra.main(version_base=None, config_path="configs/gear3", config_name="config")
+@hydra.main(version_base=None, config_path="configs/gear5", config_name="config")
 def main(config: DictConfig):
     """Main entry point"""
     # Initialize distributed training
     rank, world_size, local_rank = init_distributed()
 
     # Create trainer
-    trainer = Gear3UpgradeTrainer(config, rank, world_size, local_rank)
+    trainer = Gear5Trainer(config, rank, world_size, local_rank)
     trainer.train()
 
     # Cleanup

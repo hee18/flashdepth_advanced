@@ -219,10 +219,23 @@ class Gear2Visualizer:
                 _, gt_dense_vis, gt_info = create_sparse_depth_vis_no_inpaint(
                     gt_depth_frame, valid_mask_gt_vis, colormap='plasma_r', percentile_range=(2, 98)
                 )
-                im2 = ax2.imshow(gt_dense_vis)
+
+                # Limit colorbar to canonical 70m if canonical space is enabled
+                vmin, vmax = gt_info['vmin'], gt_info['vmax']
+                use_canonical = config.get('use_canonical_space', False) if config is not None else False
+                if use_canonical:
+                    vmax = min(vmax, 70.0)  # Cap at canonical 70m
+
+                # Create custom colormap with NaN handling
+                cmap_gt = plt.cm.plasma_r.copy()
+                cmap_gt.set_bad(color='black')  # NaN pixels = black
+
+                # Re-normalize GT display with capped vmax
+                gt_display_capped = np.where(valid_mask_gt_vis, gt_depth_frame, np.nan)
+                im2 = ax2.imshow(gt_display_capped, cmap=cmap_gt, vmin=vmin, vmax=vmax)
+
                 ax2.set_title(f'GT Depth (Sparse)\n{valid_ratio_gt_vis*100:.1f}% valid\n(Metrics: {valid_ratio_metrics*100:.1f}%)',
                              fontsize=12, fontweight='bold')
-                vmin, vmax = gt_info['vmin'], gt_info['vmax']
             else:
                 # Dense depth: use standard visualization (invalid pixels = black)
                 gt_display = np.where(valid_mask_gt_vis, gt_depth_frame, np.nan)  # Invalid = NaN (will be black)
@@ -343,24 +356,19 @@ class Gear2Visualizer:
                 # Extract first batch, first/middle frame
                 fx_value = focal_lengths[0, 0].item() if focal_lengths.ndim >= 2 else focal_lengths[0].item()
 
-                # Show valid GT range (canonical 70m in actual space)
+                # Show valid GT range (canonical 70m, and actual space equivalent for reference)
                 use_canonical = config.get('use_canonical_space', False) if config is not None else False
                 if use_canonical:
                     # Get canonical focal length from config
-                    canonical_fx_config = config.get('canonical_focal_length', 1000.0)
-                    if hasattr(canonical_fx_config, 'get'):
-                        resolution = config['dataset']['resolution']
-                        CANONICAL_FX = float(canonical_fx_config.get(resolution, canonical_fx_config.get('base', 500.0)))
-                    else:
-                        CANONICAL_FX = float(canonical_fx_config)
-                    # depth_canonical = depth_actual * (CANONICAL_FX / fx_actual) = 70
-                    # Therefore: depth_actual = 70 * (fx_actual / CANONICAL_FX)
-                    valid_gt_max = 70.0 * (fx_value / CANONICAL_FX)
-                    ax9.text(0.05, y_pos, f'resized_fx: {fx_value:.1f}, valid_gt_max: {valid_gt_max:.3f}m', fontsize=10,
+                    CANONICAL_FX = 1000.0  # Fixed canonical focal length for all resolutions
+
+                    # Actual space equivalent: depth_actual = 70 × (fx_actual / CANONICAL_FX)
+                    valid_gt_max_actual = 70.0 * (fx_value / CANONICAL_FX)
+                    ax9.text(0.05, y_pos, f'resized_fx: {fx_value:.1f}, valid: 70.0m (canon={valid_gt_max_actual:.1f}m actual)', fontsize=10,
                             transform=ax9.transAxes, bbox=dict(boxstyle="round", facecolor='lightyellow'))
                 else:
-                    # No canonical space
-                    ax9.text(0.05, y_pos, f'resized_fx: {fx_value:.1f}, valid_gt_max: 70.000m', fontsize=10,
+                    # No canonical space - GT is in actual space
+                    ax9.text(0.05, y_pos, f'resized_fx: {fx_value:.1f}, valid_gt_max: 70.000m (actual)', fontsize=10,
                             transform=ax9.transAxes, bbox=dict(boxstyle="round", facecolor='lightyellow'))
                 y_pos -= 0.10
 

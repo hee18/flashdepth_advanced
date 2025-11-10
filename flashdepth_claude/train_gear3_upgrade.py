@@ -197,22 +197,12 @@ class Gear3UpgradeTrainer:
 
     def _get_canonical_focal_length(self):
         """
-        Get canonical focal length based on current resolution.
+        Get canonical focal length (fixed at 1000.0 for all resolutions).
 
         Returns:
-            float: Canonical focal length
+            float: Canonical focal length (always 1000.0)
         """
-        canonical_fx_config = self.config.get('canonical_focal_length', 1000.0)
-
-        # If config is a dict (resolution-dependent), select based on current resolution
-        # Check for dict-like object (handles both dict and OmegaConf DictConfig)
-        if hasattr(canonical_fx_config, 'get'):
-            resolution = self.config['dataset']['resolution']
-            canonical_fx = canonical_fx_config.get(resolution, canonical_fx_config.get('base', 500.0))
-            return float(canonical_fx)
-        else:
-            # Legacy: single value for all resolutions
-            return float(canonical_fx_config)
+        return 1000.0
 
     def _setup_model(self):
         """Initialize FlashDepth with Gear3 metric head"""
@@ -352,13 +342,13 @@ class Gear3UpgradeTrainer:
 
         # Enable attention weights storage
         # - 'multi_layer': Enable for multiple blocks (encoder-specific)
-        #   - ViT-L (24 blocks): [3, 10, 16, 22]
+        #   - ViT-L (24 blocks): [4, 11, 17, 23] (aligned with DPT layers)
         #   - ViT-S (12 blocks): [2, 5, 8, 11]
         # - Others: Enable ONLY for last block (saves memory)
         if separation_method == 'multi_layer':
             # Use encoder-specific block indices for proportional coverage
             multi_layer_blocks = {
-                'vitl': [3, 10, 16, 22],
+                'vitl': [4, 11, 17, 23],
                 'vits': [2, 5, 8, 11]
             }
             target_blocks = multi_layer_blocks[model.encoder]
@@ -780,17 +770,22 @@ class Gear3UpgradeTrainer:
                         out = F.interpolate(out, (H, W), mode="bilinear", align_corners=True)
                         out = model.depth_head.scratch.output_conv2(out)
 
+                        # Save prediction inverse depth for mask calculation
+                        pred_depth_inverse = out  # [B*T, 1, H, W]
+
                         # Convert prediction to metric depth: 100/m -> m
                         # Output shape: (B*T, 1, H, W)
                         pred_depth_metric = 100.0 / (out + 1e-8)
 
                         # Reshape outputs from (B*T, ...) to (B, T, ...)
+                        pred_depth_inverse_seq = rearrange(pred_depth_inverse, '(b t) 1 h w -> b t 1 h w', b=B_orig, t=T_orig)
                         pred_depth_metric_seq = rearrange(pred_depth_metric, '(b t) 1 h w -> b t 1 h w', b=B_orig, t=T_orig)
                         importance_map_seq = rearrange(importance_map, '(b t) c h w -> b t c h w', b=B_orig, t=T_orig)
                         fg_mask_seq = rearrange(fg_mask, '(b t) c h w -> b t c h w', b=B_orig, t=T_orig)
                         bg_mask_seq = rearrange(bg_mask, '(b t) c h w -> b t c h w', b=B_orig, t=T_orig)
 
                         # Select first frame for visualization
+                        pred_depth_inverse_vis = pred_depth_inverse_seq[:, 0]  # [B, 1, H, W]
                         pred_depth_metric_vis = pred_depth_metric_seq[:, 0]  # [B, 1, H, W]
                         importance_map_vis = importance_map_seq[:, 0]  # [B, C, H, W]
                         fg_mask_vis = fg_mask_seq[:, 0]  # [B, 1, H, W]
@@ -799,6 +794,16 @@ class Gear3UpgradeTrainer:
                         # GT depth for first frame
                         gt_depth_inverse_vis = gt_depth_inverse_100[:, 0]  # [B, 1, H, W]
                         gt_depth_metric = 100.0 / (gt_depth_inverse_vis + 1e-8)
+
+                        # Compute canonical masks for visualization (70m threshold in canonical space)
+                        # Use same logic as training loss calculation (but no warmup)
+                        MIN_INVERSE_DEPTH_VIS = 100.0 / 70.0  # Canonical space 70m
+                        canonical_gt_valid_vis = (gt_depth_inverse_vis > MIN_INVERSE_DEPTH_VIS)  # [B, 1, H, W]
+
+                        # Training: Pred outlier filtering (200m, like training loss)
+                        MAX_DEPTH_OUTLIER_VIS = 200.0
+                        MIN_INVERSE_OUTLIER_VIS = 100.0 / MAX_DEPTH_OUTLIER_VIS
+                        canonical_pred_valid_vis = (pred_depth_inverse_vis > MIN_INVERSE_OUTLIER_VIS)  # [B, 1, H, W]
 
                         # Resize masks to match image resolution (no need to resize pred_depth_metric_vis as it's already at H, W)
                         importance_map_resized = F.interpolate(
@@ -822,7 +827,9 @@ class Gear3UpgradeTrainer:
                             'pred_depth': pred_depth_metric_vis[:1].cpu(),  # [1, 1, H, W]
                             'importance_map': importance_map_resized[:1].cpu(),  # [1, 1, H, W]
                             'fg_mask': fg_mask_resized[:1].cpu(),  # [1, 1, H, W]
-                            'bg_mask': bg_mask_resized[:1].cpu()   # [1, 1, H, W]
+                            'bg_mask': bg_mask_resized[:1].cpu(),   # [1, 1, H, W]
+                            'canonical_gt_valid': canonical_gt_valid_vis[:1].cpu(),  # [1, 1, H, W] - canonical space mask
+                            'canonical_pred_valid': canonical_pred_valid_vis[:1].cpu()  # [1, 1, H, W] - canonical space mask
                         }
 
                         # FPS removed from training (only measured in test_gear3.py)

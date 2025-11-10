@@ -107,22 +107,12 @@ class Gear2Trainer:
         
     def _get_canonical_focal_length(self):
         """
-        Get canonical focal length based on current resolution.
+        Get canonical focal length (fixed at 1000.0 for all resolutions).
 
         Returns:
-            float: Canonical focal length
+            float: Canonical focal length (always 1000.0)
         """
-        canonical_fx_config = self.config.get('canonical_focal_length', 1000.0)
-
-        # If config is a dict (resolution-dependent), select based on current resolution
-        # Check for dict-like object (handles both dict and OmegaConf DictConfig)
-        if hasattr(canonical_fx_config, 'get'):
-            resolution = self.config['dataset']['resolution']
-            canonical_fx = canonical_fx_config.get(resolution, canonical_fx_config.get('base', 500.0))
-            return float(canonical_fx)
-        else:
-            # Legacy: single value for all resolutions
-            return float(canonical_fx_config)
+        return 1000.0
 
 
     def emit(self, record):
@@ -349,9 +339,9 @@ class Gear2Trainer:
                 else:
                     self.logger.warning(f"Hybrid checkpoint {hybrid_path} not found! Using Phase 1 ViT-DPT weights.")
 
-        # Enable attention weights storage for multi-layer extraction (blocks 3, 10, 16, 22)
-        # Need to store attention from layers 4, 11, 17, 23 for multi-layer CLS extraction
-        target_blocks = [3, 10, 16, 22]  # Blocks 3, 10, 16, 22 (layers 4, 11, 17, 23)
+        # Enable attention weights storage for multi-layer extraction (blocks 4, 11, 17, 23)
+        # Aligned with DPT layers for consistent feature extraction
+        target_blocks = [4, 11, 17, 23]  # Blocks 4, 11, 17, 23 (aligned with DPT layers)
         for i, block in enumerate(model.pretrained.blocks):
             if i in target_blocks:
                 block.attn.store_attn_weights = True
@@ -735,10 +725,23 @@ class Gear2Trainer:
                         out = F.interpolate(out, (h, w), mode="bilinear", align_corners=True)
                         out = model.depth_head.scratch.output_conv2(out)
 
+                        # Save prediction inverse depth for mask calculation
+                        pred_depth_inverse = out  # [B, 1, H, W]
+
                         # Convert to metric depth for visualization: 100/m -> m
                         # Already positive (Softplus activation in output_conv2)
                         pred_depth_metric = 100.0 / (out + 1e-8)  # 100 / (100/m) = m
                         gt_depth_metric = 100.0 / (gt_t_inverse_100 + 1e-8)  # 100 / (100/m) = m
+
+                        # Compute canonical masks for visualization (70m threshold in canonical space)
+                        # Use same logic as training loss calculation (but no warmup)
+                        MIN_INVERSE_DEPTH_VIS = 100.0 / 70.0  # Canonical space 70m
+                        canonical_gt_valid_vis = (gt_t_inverse_100 > MIN_INVERSE_DEPTH_VIS)  # [B, 1, H, W]
+
+                        # Training: Pred outlier filtering (200m, like training loss)
+                        MAX_DEPTH_OUTLIER_VIS = 200.0
+                        MIN_INVERSE_OUTLIER_VIS = 100.0 / MAX_DEPTH_OUTLIER_VIS
+                        canonical_pred_valid_vis = (pred_depth_inverse > MIN_INVERSE_OUTLIER_VIS)  # [B, 1, H, W]
 
                         # Handle importance_map (None for Gear2)
                         if importance_map is not None:
@@ -758,7 +761,9 @@ class Gear2Trainer:
                         )
                         model_outputs_cpu = {
                             'pred_depth': pred_depth_metric[:1].cpu(),  # [1, 1, H, W]
-                            'importance_map': importance_map_cpu  # [1, 1, H, W] or None
+                            'importance_map': importance_map_cpu,  # [1, 1, H, W] or None
+                            'canonical_gt_valid': canonical_gt_valid_vis[:1].cpu(),  # [1, 1, H, W] - canonical space mask
+                            'canonical_pred_valid': canonical_pred_valid_vis[:1].cpu()  # [1, 1, H, W] - canonical space mask
                         }
 
                         # FPS removed from training (only measured in test_gear2.py)
