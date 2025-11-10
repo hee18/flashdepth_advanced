@@ -3,6 +3,9 @@ import numpy as np
 from typing import Dict, Tuple, Optional
 import logging
 
+# Import boundary metrics for F1 score computation
+from utils.eval_metrics.boundary_metrics import SI_boundary_F1
+
 
 class MetricDepthMetrics:
     """
@@ -129,6 +132,19 @@ class MetricDepthMetrics:
         mre = torch.mean((pred_valid - gt_valid) / gt_valid)  # Mean Relative Error (signed)
         log_mae = torch.mean(torch.abs(pred_log - gt_log))
 
+        # Boundary F1 score (edge accuracy / depth discontinuity detection)
+        # Convert to numpy for boundary_metrics computation
+        pred_np = pred.cpu().numpy() if isinstance(pred, torch.Tensor) else pred
+        gt_np = gt.cpu().numpy() if isinstance(gt, torch.Tensor) else gt
+
+        # Compute scale-invariant boundary F1 score
+        # (weighted average across thresholds from 5% to 25% depth changes)
+        try:
+            boundary_f1 = SI_boundary_F1(pred_np, gt_np, t_min=1.05, t_max=1.25, N=10)
+        except Exception as e:
+            # Fallback if computation fails
+            boundary_f1 = 0.0
+
         return {
             "mae": mae.item(),
             "rmse": rmse.item(),
@@ -140,6 +156,7 @@ class MetricDepthMetrics:
             "a1": a1.item(),
             "a2": a2.item(),
             "a3": a3.item(),
+            "boundary_f1": float(boundary_f1),  # Edge accuracy (depth discontinuity F1 score)
         }
 
     @staticmethod

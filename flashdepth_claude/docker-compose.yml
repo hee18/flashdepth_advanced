@@ -45,3 +45,38 @@ services:
       training.batch_size=4
       training.workers=10
       results_dir=train_results/results_2
+
+  # Comparison methods service (unified environment with multiple conda envs)
+  comparison:
+    build:
+      context: .
+      dockerfile: Dockerfile.comparison
+    image: flashdepth_comparison:latest
+    container_name: flashdepth_comparison
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+      - CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+      - PYTHONPATH=/workspace
+    volumes:
+      # Mount datasets
+      - /home/cvlab/hsy/Datasets:/data/datasets:ro
+      # Mount project directory
+      - .:/workspace
+      # Mount refer_test methods
+      - ./refer_test:/workspace/refer_test
+      # Mount test results
+      - ./refer_test/test_results:/workspace/refer_test/test_results
+    working_dir: /workspace
+    stdin_open: true
+    tty: true
+    shm_size: '16gb'
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    # Interactive mode by default
+    command: /bin/bash

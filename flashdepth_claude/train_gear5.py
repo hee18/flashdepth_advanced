@@ -327,7 +327,7 @@ class Gear5Trainer:
         num_heads = 16 if model.encoder == 'vitl' else 6
 
         # Gear5 uses its own metric head (global GSP + FG modulation)
-        # Multi-layer fusion uses uniform weights (fixed equal ratio)
+        # GSP fusion: uniform mix (25:25:25:25), consistent with FFM
         model.gear5_metric_head = Gear5MetricHead(
             embed_dim=embed_dim,
             dpt_dim=dpt_dim
@@ -1076,24 +1076,26 @@ class Gear5Trainer:
                     self._set_train_mode()
 
             # Validation (run at step 0 and every val_freq steps)
+            # Only validate on main process (rank 0) to avoid duplicate validation
             if step % self.config.training.get('val_freq', 1000) == 0:
-                val_metrics = self.validate()
-                self.logger.info(f"Validation at step {step}: {val_metrics}")
+                if self.rank == 0:
+                    val_metrics = self.validate()
+                    self.logger.info(f"Validation at step {step}: {val_metrics}")
 
-                # Update current validation loss for checkpoint
-                self.current_val_loss = val_metrics['loss']
-                self.dataset_losses = val_metrics.get('dataset_losses', None)
-                self.num_sequences = val_metrics.get('num_sequences', None)
+                    # Update current validation loss for checkpoint
+                    self.current_val_loss = val_metrics['loss']
+                    self.dataset_losses = val_metrics.get('dataset_losses', None)
+                    self.num_sequences = val_metrics.get('num_sequences', None)
 
-                if self.config.training.get('wandb', False):
-                    wandb.log({f'val/{k}': v for k, v in val_metrics.items()}, step=step)
+                    if self.config.training.get('wandb', False):
+                        wandb.log({f'val/{k}': v for k, v in val_metrics.items()}, step=step)
 
-                # Save best model
-                if val_metrics['loss'] < self.best_val_loss:
-                    self.best_val_loss = val_metrics['loss']
-                    self.best_step = step  # Track best step
-                    self.save_checkpoint(f'best.pth')
-                    self.logger.info(f"New best model at step {step}: val_loss={val_metrics['loss']:.4f}")
+                    # Save best model
+                    if val_metrics['loss'] < self.best_val_loss:
+                        self.best_val_loss = val_metrics['loss']
+                        self.best_step = step  # Track best step
+                        self.save_checkpoint(f'best.pth')
+                        self.logger.info(f"New best model at step {step}: val_loss={val_metrics['loss']:.4f}")
 
                 self._set_train_mode()
 

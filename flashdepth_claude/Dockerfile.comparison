@@ -1,0 +1,133 @@
+# Dockerfile for Comparison Methods Evaluation
+#
+# This Dockerfile creates a unified environment for testing multiple depth estimation methods
+# with separate conda environments to avoid dependency conflicts.
+#
+# Build: docker build -f Dockerfile.comparison -t flashdepth_comparison:latest .
+# Run: docker compose run --rm comparison bash
+
+FROM ubuntu:22.04
+
+# Avoid interactive prompts
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install basic dependencies
+RUN apt-get update && apt-get install -y \
+    wget \
+    curl \
+    git \
+    build-essential \
+    libgl1-mesa-glx \
+    libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Miniconda
+RUN wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O /tmp/miniconda.sh && \
+    bash /tmp/miniconda.sh -b -p /opt/conda && \
+    rm /tmp/miniconda.sh
+
+ENV PATH="/opt/conda/bin:$PATH"
+
+# Initialize conda
+RUN conda init bash && \
+    echo "source /opt/conda/etc/profile.d/conda.sh" >> ~/.bashrc
+
+# Create conda environments for each method
+# Note: Actual package installations should be done based on each method's requirements.txt
+
+# Video-Depth-Anything environment (torch 2.1.1)
+RUN conda create -n vda python=3.10 -y && \
+    /opt/conda/envs/vda/bin/pip install --no-cache-dir \
+        torch==2.1.1 \
+        torchvision==0.16.1 \
+        numpy \
+        opencv-python \
+        matplotlib \
+        tqdm
+
+# DepthCrafter environment (torch 2.0.1, diffusers)
+RUN conda create -n depthcrafter python=3.9 -y && \
+    /opt/conda/envs/depthcrafter/bin/pip install --no-cache-dir \
+        torch==2.0.1 \
+        torchvision==0.15.1 \
+        diffusers==0.29.1 \
+        transformers \
+        numpy \
+        opencv-python \
+        matplotlib
+
+# Metric3D environment (torch 2.0.1, xformers)
+RUN conda create -n metric3d python=3.10 -y && \
+    /opt/conda/envs/metric3d/bin/pip install --no-cache-dir \
+        torch==2.0.1 \
+        torchvision==0.15.1 \
+        xformers==0.0.21 \
+        numpy \
+        opencv-python \
+        matplotlib \
+        timm
+
+# UniDepth environment (torch 2.4.0, triton)
+RUN conda create -n unidepth python=3.11 -y && \
+    /opt/conda/envs/unidepth/bin/pip install --no-cache-dir \
+        torch==2.4.0 \
+        torchvision==0.19.0 \
+        triton \
+        numpy \
+        opencv-python \
+        matplotlib \
+        einops
+
+# ZoeDepth environment (torch 2.0.1)
+RUN conda create -n zoedepth python=3.10 -y && \
+    /opt/conda/envs/zoedepth/bin/pip install --no-cache-dir \
+        torch==2.0.1 \
+        torchvision==0.15.1 \
+        numpy \
+        opencv-python \
+        matplotlib \
+        timm
+
+# DepthPro environment (torch 2.4.0)
+RUN conda create -n depthpro python=3.11 -y && \
+    /opt/conda/envs/depthpro/bin/pip install --no-cache-dir \
+        torch==2.4.0 \
+        torchvision==0.19.0 \
+        numpy \
+        opencv-python \
+        matplotlib \
+        pillow
+
+# CUT3R environment (torch 2.1.1)
+RUN conda create -n cut3r python=3.10 -y && \
+    /opt/conda/envs/cut3r/bin/pip install --no-cache-dir \
+        torch==2.1.1 \
+        torchvision==0.16.1 \
+        numpy \
+        opencv-python \
+        matplotlib \
+        roma
+
+# Set working directory
+WORKDIR /workspace
+
+# Copy project files
+COPY . /workspace/
+
+# Install common dependencies in each environment
+RUN for env in vda depthcrafter metric3d unidepth zoedepth depthpro cut3r; do \
+        /opt/conda/envs/$env/bin/pip install --no-cache-dir \
+            hydra-core \
+            omegaconf \
+            Pillow \
+            scipy; \
+    done
+
+# Default command
+CMD ["/bin/bash"]
+
+# Notes:
+# - For GPU support, use nvidia/cuda:11.8-devel-ubuntu22.04 as base image
+# - Install method-specific dependencies from requirements.txt files:
+#   /opt/conda/envs/<env>/bin/pip install -r refer_test/<method>/requirements.txt
+# - Download checkpoints using: ./refer_test/download_checkpoints.sh

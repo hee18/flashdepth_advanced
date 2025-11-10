@@ -545,14 +545,12 @@ class Gear3Tester:
         # Dataloader gives inverse depth (1/m), scale to 100/m for training
         gt_depth_inverse_100 = gt_depth * 100.0  # [1, T, 1, H, W] in 100/m
 
-        # Save original actual space GT for visualization and metrics (before canonicalization)
-        gt_depth_inverse_100_actual = gt_depth_inverse_100.clone()  # [1, T, 1, H, W] in actual space
-
-        # Apply canonical space transformation to GT if enabled (for mask calculation only)
+        # Apply canonical space transformation to GT if enabled (for BOTH masks AND metrics calculation)
+        # This ensures consistency with training/validation which use canonical space
         CANONICAL_FX = get_canonical_focal_length(self.config)
         use_canonical = self.config.get('use_canonical_space', False)
         if use_canonical:
-            # Transform GT to canonical space for mask calculation
+            # Transform GT to canonical space for masks and metrics
             # inverse_canonical = inverse_actual * (fx_actual / CANONICAL_FX)
             fx_actual = focal_lengths.view(1, T, 1, 1, 1)  # [1, T, 1, 1, 1]
             gt_depth_inverse_100 = gt_depth_inverse_100 * (fx_actual / CANONICAL_FX)
@@ -737,9 +735,9 @@ class Gear3Tester:
         # Stack canonical pred masks
         canonical_pred_valid = torch.cat(canonical_pred_valid_all, dim=1)  # [1, T, 1, H, W]
 
-        # Convert GT to metric depth for evaluation: use actual space GT (not canonical)
-        # This ensures visualization and metrics are in real-world metric depth
-        gt_depth_metric = 100.0 / (gt_depth_inverse_100_actual[0] + 1e-8)  # [T, 1, H, W] in actual meters
+        # Convert GT to metric depth for evaluation: use canonical GT (consistent with training)
+        # This ensures metrics are computed in canonical space, same as training/validation
+        gt_depth_metric = 100.0 / (gt_depth_inverse_100[0] + 1e-8)  # [T, 1, H, W] in canonical meters
 
         # Compute metrics (both pred and GT are now in meters)
         # Move to CPU and compute per-frame metrics (like test_metric_head.py)
@@ -955,7 +953,8 @@ class Gear3Tester:
                 best_frame_abs_rel,
                 fps,  # Add FPS
                 seg_mask_for_viz,  # Add segmentation mask
-                class_metrics_for_viz  # Add class metrics
+                class_metrics_for_viz,  # Add class metrics
+                frame_metrics[best_frame_idx] if best_frame_idx < len(frame_metrics) else None  # Add frame metrics (includes boundary_f1)
             )
 
         return metrics
@@ -1080,7 +1079,8 @@ class Gear3Tester:
             f"Sequence {sequence_id} | "
             f"TAE: {metrics.get('tae', 0):.4f} | "
             f"AbsRel: {metrics.get('abs_rel', 0):.4f} | "
-            f"δ1: {metrics.get('a1', 0):.4f}"
+            f"δ1: {metrics.get('a1', 0):.4f} | "
+            f"F1: {metrics.get('boundary_f1', 0):.3f}"
         )
         if fps is not None:
             title_str += f" | FPS: {fps:.1f}"
@@ -1122,7 +1122,7 @@ class Gear3Tester:
 
     def _save_best_frame_visualizations(self, image, pred_depth, gt_depth, importance_map,
                                         fg_features, bg_features, sequence_id, frame_idx, abs_rel, fps=None,
-                                        seg_mask=None, class_metrics=None):
+                                        seg_mask=None, class_metrics=None, frame_metrics=None):
         """
         Save best frame visualization matching train_gear3_upgrade layout
 
@@ -1404,6 +1404,13 @@ class Gear3Tester:
             ax9.text(0.05, y_pos, f'MAE: {mae:.3f}m', fontsize=9,
                     transform=ax9.transAxes, bbox=dict(boxstyle="round", facecolor='lightblue'))
             y_pos -= 0.08
+
+            # Add boundary F1 score if available
+            if frame_metrics is not None and 'boundary_f1' in frame_metrics:
+                boundary_f1 = frame_metrics['boundary_f1']
+                ax9.text(0.05, y_pos, f'F1: {boundary_f1:.3f}', fontsize=9,
+                        transform=ax9.transAxes, bbox=dict(boxstyle="round", facecolor='lavender'))
+                y_pos -= 0.08
 
         # Per-class pixel counts (if available)
         if class_metrics is not None and len(class_metrics) > 0:

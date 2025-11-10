@@ -33,7 +33,6 @@ sys.path.insert(0, str(project_root))
 
 from flashdepth.model import FlashDepth
 from flashdepth.gear5_modules import (
-    GlobalScalePredictorMultiLayer,
     ForegroundOnlyModulationHead,
     Gear5MetricHead
 )
@@ -637,10 +636,8 @@ class Gear5Tester:
         # Dataloader gives inverse depth (1/m), scale to 100/m for training
         gt_depth_inverse_100 = gt_depth * 100.0  # [1, T, 1, H, W] in 100/m
 
-        # Save original actual space GT for visualization and metrics (before canonicalization)
-        gt_depth_inverse_100_actual = gt_depth_inverse_100.clone()  # [1, T, 1, H, W] in actual space
-
-        # Apply canonical transformation to GT (for mask calculation only)
+        # Apply canonical transformation to GT (for BOTH masks AND metrics calculation)
+        # This ensures consistency with training/validation which use canonical space
         CANONICAL_FX = get_canonical_focal_length(self.config)
         use_canonical = self.config.get('use_canonical_space', False)
         if use_canonical:
@@ -874,9 +871,9 @@ class Gear5Tester:
         fg_mask_all = torch.stack(fg_mask_list, dim=0)  # [T, 1, patch_h, patch_w]
         bg_mask_all = torch.stack(bg_mask_list, dim=0)  # [T, 1, patch_h, patch_w]
 
-        # Convert GT to metric depth for evaluation: use actual space GT (not canonical)
-        # This ensures visualization and metrics are in real-world metric depth
-        gt_depth_metric = 100.0 / (gt_depth_inverse_100_actual[0] + 1e-8)  # [T, 1, H, W] in actual meters
+        # Convert GT to metric depth for evaluation: use canonical GT (consistent with training)
+        # This ensures metrics are computed in canonical space, same as training/validation
+        gt_depth_metric = 100.0 / (gt_depth_inverse_100[0] + 1e-8)  # [T, 1, H, W] in canonical meters
 
         # Compute metrics (both pred and GT are now in meters)
         # Move to CPU and compute per-frame metrics (like test_metric_head.py)
@@ -1106,7 +1103,8 @@ class Gear5Tester:
                 fps,  # Add FPS
                 seg_mask_for_viz,  # Add segmentation mask (only if matches best_frame)
                 class_metrics_for_viz,  # Add class metrics
-                layer_weights  # Add layer weights
+                layer_weights,  # Add layer weights
+                frame_metrics[best_frame_idx] if best_frame_idx < len(frame_metrics) else None  # Add frame metrics (includes boundary_f1)
             )
 
         return metrics
@@ -1228,7 +1226,8 @@ class Gear5Tester:
             f"Sequence {sequence_id} | "
             f"TAE: {metrics.get('tae', 0):.4f} | "
             f"AbsRel: {metrics.get('abs_rel', 0):.4f} | "
-            f"δ1: {metrics.get('a1', 0):.4f}"
+            f"δ1: {metrics.get('a1', 0):.4f} | "
+            f"F1: {metrics.get('boundary_f1', 0):.3f}"
         )
         if fps is not None:
             title_str += f" | FPS: {fps:.1f}"
@@ -1270,7 +1269,7 @@ class Gear5Tester:
 
     def _save_best_frame_visualizations(self, image, pred_depth, gt_depth, importance_map,
                                         fg_mask, bg_mask, sequence_id, frame_idx, abs_rel, fps=None,
-                                        seg_mask=None, class_metrics=None, layer_weights=None):
+                                        seg_mask=None, class_metrics=None, layer_weights=None, frame_metrics=None):
         """
         Save best frame visualization matching train_gear3_upgrade layout
 
@@ -1294,6 +1293,7 @@ class Gear5Tester:
             frame_idx: int - Frame index within sequence
             abs_rel: float - AbsRel metric for this frame
             fps: float - Optional FPS measurement
+            frame_metrics: dict - Optional pre-computed metrics (includes boundary_f1)
         """
         # Convert tensors to numpy and move to CPU
         if isinstance(image, torch.Tensor):
@@ -1577,6 +1577,13 @@ class Gear5Tester:
             ax9.text(0.05, y_pos, f'MAE: {mae:.3f}m', fontsize=9,
                     transform=ax9.transAxes, bbox=dict(boxstyle="round", facecolor='lightblue'))
             y_pos -= 0.08
+
+            # Add boundary F1 score if available
+            if frame_metrics is not None and 'boundary_f1' in frame_metrics:
+                boundary_f1 = frame_metrics['boundary_f1']
+                ax9.text(0.05, y_pos, f'F1: {boundary_f1:.3f}', fontsize=9,
+                        transform=ax9.transAxes, bbox=dict(boxstyle="round", facecolor='lavender'))
+                y_pos -= 0.08
 
         ax9.set_title('Depth Metrics', fontsize=14, fontweight='bold')
         ax9.axis('off')

@@ -34,45 +34,49 @@ from flashdepth.gear3_upgrade_modules import (
 
 # ==================== Step 1: Global Scale Predictor ====================
 
-class GlobalScalePredictorMultiLayer(nn.Module):
+class GlobalScalePredictor(nn.Module):
     """
-    Predict global scale and shift from multi-layer CLS tokens.
+    Predict global scale and shift using uniform mix of multi-layer CLS tokens.
 
-    This module extracts CLS tokens from multiple ViT layers and fuses them
-    to predict scene-level scale and shift parameters for metric depth conversion.
+    Consistent with FFM's MultiLayerAttentionFusion approach (uniform averaging).
 
     Input: CLS tokens from layers [4, 11, 17, 23] (encoder output layers)
     Output: scale (positive), shift (any value)
 
     Architecture:
-        Concat [CLS_4, CLS_11, CLS_17, CLS_23] → 4*embed_dim
+        Stack [CLS_4, CLS_11, CLS_17, CLS_23] → [B, 4, 1024]
         ↓
-        MLP: 4*embed_dim → 1024 → 256 → 2
+        Uniform Average (25:25:25:25) → [B, 1024]
+        ↓
+        MLP: 1024 → 512 → 256 → 2
         ↓
         [scale (Softplus), shift]
+
+    Parameters: ~656K (85.3% reduction vs concatenation approach)
     """
     def __init__(self, embed_dim=1024, num_layers=4):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_layers = num_layers
 
-        # Concatenate all CLS tokens: 4 × embed_dim → 4096 (for ViT-L)
-        input_dim = embed_dim * num_layers
+        # Uniform fusion weights (non-trainable)
+        uniform_weights = torch.ones(num_layers) / num_layers
+        self.register_buffer('fusion_weights', uniform_weights)
 
-        # MLP to predict scale and shift
+        # Lightweight MLP
         self.predictor = nn.Sequential(
-            nn.Linear(input_dim, 1024),
+            nn.Linear(embed_dim, 512),
             nn.ReLU(inplace=True),
-            nn.Linear(1024, 256),
+            nn.Linear(512, 256),
             nn.ReLU(inplace=True),
             nn.Linear(256, 2)  # Output: [scale, shift]
         )
 
         # Count parameters
         total_params = sum(p.numel() for p in self.parameters())
-        logging.info(f"GlobalScalePredictorMultiLayer: {total_params:,} parameters")
-        logging.info(f"  Input: {num_layers} CLS tokens × {embed_dim} = {input_dim}")
-        logging.info(f"  Output: scale (positive), shift (any)")
+        logging.info(f"GlobalScalePredictor: {total_params:,} parameters")
+        logging.info(f"  Fusion: uniform average of {num_layers} layers (25:25:25:25)")
+        logging.info(f"  Consistent with FFM's fusion strategy")
 
     def forward(self, cls_tokens_list):
         """
@@ -84,11 +88,14 @@ class GlobalScalePredictorMultiLayer(nn.Module):
             scale: [B] - positive scale factor
             shift: [B] - shift value (any)
         """
-        # Concatenate all CLS tokens: [B, 4*embed_dim]
-        cls_concat = torch.cat(cls_tokens_list, dim=-1)
+        # Stack CLS tokens: [B, num_layers, embed_dim]
+        cls_stack = torch.stack(cls_tokens_list, dim=1)  # [B, 4, 1024]
+
+        # Uniform weighted average: [B, 4, 1024] → [B, 1024]
+        cls_fused = (cls_stack * self.fusion_weights.view(1, -1, 1)).sum(dim=1)
 
         # Predict scale and shift
-        params = self.predictor(cls_concat)  # [B, 2]
+        params = self.predictor(cls_fused)  # [B, 2]
 
         # Ensure positive scale with Softplus
         scale = F.softplus(params[:, 0])  # [B]
@@ -356,7 +363,7 @@ class Gear5MetricHead(nn.Module):
         super().__init__()
 
         # Global scale predictor (will be frozen in Step 2)
-        self.global_gsp = GlobalScalePredictorMultiLayer(
+        self.global_gsp = GlobalScalePredictor(
             embed_dim=embed_dim, num_layers=4
         )
 
