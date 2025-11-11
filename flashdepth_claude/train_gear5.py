@@ -52,7 +52,7 @@ from datetime import timedelta
 from flashdepth.model import FlashDepth
 from utils.gear3_upgrade_visualization import Gear3UpgradeVisualizer  # Can reuse for now
 from flashdepth.gear5_modules import (
-    GlobalScalePredictorMultiLayer,
+    GlobalScalePredictor,
     ForegroundOnlyModulationHead,
     Gear5MetricHead
 )
@@ -224,12 +224,12 @@ class Gear5Trainer:
 
     def _get_canonical_focal_length(self):
         """
-        Get canonical focal length (fixed at 1000.0 for all resolutions).
+        Get canonical focal length (fixed at 500.0 for 518×518 resolution).
 
         Returns:
-            float: Canonical focal length (always 1000.0)
+            float: Canonical focal length (always 500.0)
         """
-        return 1000.0
+        return 500.0
 
     def _setup_model(self):
         """Initialize FlashDepth with Gear5 modules (GSP + FG modulation)"""
@@ -869,10 +869,12 @@ class Gear5Trainer:
                     model = self.model.module if isinstance(self.model, DDP) else self.model
 
                     # Unpack and move to device (batch is still on CPU from dataloader)
-                    images, gt_depth, focal_lengths, dataset_idx = batch
+                    images, gt_depth, focal_lengths_canonical, focal_lengths_actual, actual_valid_masks, dataset_idx = batch
                     images = images.to(self.device)
                     gt_depth = gt_depth.to(self.device)
-                    focal_lengths = focal_lengths.to(self.device)
+                    focal_lengths_canonical = focal_lengths_canonical.to(self.device)
+                    focal_lengths_actual = focal_lengths_actual.to(self.device)
+                    actual_valid_masks = actual_valid_masks.to(self.device)
 
                     if gt_depth.ndim == 3:
                         gt_depth = gt_depth.unsqueeze(1)
@@ -885,14 +887,8 @@ class Gear5Trainer:
                     # Get batch size for Mamba initialization
                     B_orig, T_orig, C, H, W = images.shape
 
-                    # Apply canonical space transformation if enabled (for visualization consistency)
-                    if self.config.get('use_canonical_space', False):
-                        CANONICAL_FX = self._get_canonical_focal_length()
-
-                        # Transform inverse depth directly to canonical space
-                        # inverse_canonical = inverse_actual * (fx_actual / CANONICAL_FX)
-                        fx_actual = focal_lengths.view(B_orig, T_orig, 1, 1, 1)
-                        gt_depth_inverse_100 = gt_depth_inverse_100 * (fx_actual / CANONICAL_FX)
+                    # NOTE: GT depth is already in canonical space (fx=500 at 518×518)
+                    # Canonical transformation is now handled in the dataloader
 
                     # Initialize Mamba sequence for temporal processing
                     if hasattr(model, 'mamba'):
@@ -1109,11 +1105,13 @@ class Gear5Trainer:
 
     def train_step(self, batch):
         """Single training step with BFloat16 autocast"""
-        # Unpack batch (updated to include focal_lengths)
-        images, gt_depth, focal_lengths, dataset_idx = batch
+        # Unpack batch (now includes fx_canonical, fx_actual, and actual_valid_mask)
+        images, gt_depth, focal_lengths_canonical, focal_lengths_actual, actual_valid_mask, dataset_idx = batch
         images = images.to(self.device)
         gt_depth = gt_depth.to(self.device)
-        focal_lengths = focal_lengths.to(self.device)  # Shape: (B, T)
+        focal_lengths_canonical = focal_lengths_canonical.to(self.device)  # Shape: (B, T), all 500.0 (canonical)
+        focal_lengths_actual = focal_lengths_actual.to(self.device)  # Shape: (B, T), original focal lengths
+        actual_valid_mask = actual_valid_mask.to(self.device)  # Shape: (B, T, H, W), actual space <70m
 
         # Add channel dimension if needed
         if gt_depth.ndim == 3:
@@ -1140,19 +1138,16 @@ class Gear5Trainer:
             self.logger.info(f"DEBUG - After scaling to 100/m: min={gt_depth_inverse_100.min():.4f}, max={gt_depth_inverse_100.max():.4f}")
             self.logger.info(f"DEBUG - Has {(gt_depth_inverse_100 > 0).sum()} valid pixels")
 
-        # Apply canonical space transformation if enabled
-        if self.config.get('use_canonical_space', False):
-            CANONICAL_FX = self._get_canonical_focal_length()
+        # NOTE: GT depth is already in canonical space (fx=500 at 518×518)
+        # Canonical transformation is now handled in the dataloader
+        # focal_lengths_canonical tensor contains all 500.0 values (canonical focal length)
+        # focal_lengths_actual contains original focal lengths from datasets
+        CANONICAL_FX = self._get_canonical_focal_length()  # 500.0
 
-            # Transform inverse depth directly to canonical space
-            # inverse_canonical = inverse_actual * (fx_actual / CANONICAL_FX)
-            fx_actual = focal_lengths.view(B, T, 1, 1, 1)
-            gt_depth_inverse_100 = gt_depth_inverse_100 * (fx_actual / CANONICAL_FX)
-
-            if self.global_step < 5:
-                self.logger.info(f"DEBUG - Canonical space enabled (CANONICAL_FX={CANONICAL_FX})")
-                self.logger.info(f"DEBUG - fx_actual range: {fx_actual.min():.1f} - {fx_actual.max():.1f}")
-                self.logger.info(f"DEBUG - After canonical transform: min={gt_depth_inverse_100.min():.4f}, max={gt_depth_inverse_100.max():.4f}")
+        if self.global_step < 5:
+            self.logger.info(f"DEBUG - Canonical space: CANONICAL_FX={CANONICAL_FX}, fx_canonical from dataloader: {focal_lengths_canonical[0,0]:.1f}")
+            self.logger.info(f"DEBUG - Original fx_actual from dataloader: {focal_lengths_actual[0,0]:.1f}")
+            self.logger.info(f"DEBUG - GT depth already in canonical space (transformed in dataloader)")
 
         # Forward pass following original FlashDepth pattern (whole sequence at once)
         # Initialize Mamba sequence (critical for temporal processing!)
@@ -1258,27 +1253,14 @@ class Gear5Trainer:
         # Clamp prediction to reasonable range to prevent NaN
         pred_depth_inverse_flat = torch.clamp(pred_depth_inverse_flat, min=1e-3, max=1e4)
 
-        # Compute valid mask: GT valid + Pred outlier filtering
-        # GT valid: Only compute loss where GT is valid (70m threshold)
-        # Pred outlier: Filter out extreme predictions (>200m outliers)
-        if self.global_step < 100:
-            MIN_INVERSE_DEPTH = 100.0 / 200.0  # Relaxed: 200m threshold for first 100 steps
-        else:
-            MIN_INVERSE_DEPTH = 100.0 / 70.0   # Normal: 70m threshold after warmup
-
-        # GT valid mask: where GT depth is within valid range
-        gt_valid_mask = (gt_depth_inverse_flat > MIN_INVERSE_DEPTH)
-
-        # Pred outlier mask: filter extreme predictions (>200m is outlier)
-        MAX_DEPTH_OUTLIER = 200.0
-        MIN_INVERSE_OUTLIER = 100.0 / MAX_DEPTH_OUTLIER
-        pred_outlier_mask = (pred_depth_inverse_flat > MIN_INVERSE_OUTLIER)
-
-        # Final mask: GT valid AND pred not outlier
-        valid_mask = gt_valid_mask & pred_outlier_mask
+        # Follow original FlashDepth: use ONLY GT valid mask (no 70m threshold, no pred check)
+        # GT depth is already scaled to 100/m (inverse depth: 100/m)
+        # Invalid pixels are marked as -1, which becomes -100 after scaling
+        # So we just need to check for >= 0 to exclude invalid pixels (originally -1)
+        valid_mask = (gt_depth_inverse_flat >= 0)  # Exclude only invalid pixels (originally -1)
 
         if valid_mask.sum() == 0:
-            self.logger.error("No valid GT & Pred pixels in batch!")
+            self.logger.error("No valid GT pixels in batch!")
             return {'loss': 0.0}
 
         # Compute loss (like original FlashDepth)
@@ -1342,8 +1324,8 @@ class Gear5Trainer:
             if batch is None:
                 continue
 
-            # Unpack batch (updated to include focal_lengths)
-            images, gt_depth, focal_lengths, dataset_idx = batch
+            # Unpack batch (now includes fx_canonical, fx_actual, and actual_valid_mask)
+            images, gt_depth, focal_lengths_canonical, focal_lengths_actual, actual_valid_mask, dataset_idx = batch
 
             # Get dataset name for this batch (before frame loop)
             if isinstance(dataset_idx, str):
@@ -1370,7 +1352,9 @@ class Gear5Trainer:
             with torch.amp.autocast('cuda', dtype=torch.bfloat16):
                 images = images.to(self.device)
                 gt_depth = gt_depth.to(self.device)
-                focal_lengths = focal_lengths.to(self.device)  # Shape: (B, T)
+                focal_lengths_canonical = focal_lengths_canonical.to(self.device)  # Shape: (B, T), all 500.0
+                focal_lengths_actual = focal_lengths_actual.to(self.device)  # Shape: (B, T), original focal lengths
+                actual_valid_mask = actual_valid_mask.to(self.device)  # Shape: (B, T, H, W)
 
                 # Add channel dimension if needed
                 if gt_depth.ndim == 3:
@@ -1380,17 +1364,11 @@ class Gear5Trainer:
 
                 B, T = images.shape[:2]
 
-                # GT depth from dataloader is inverse depth (1/m), scale to 100/m for training
+                # GT depth from dataloader is inverse depth (1/m), scale to 100/m for validation
                 gt_depth_inverse_100 = gt_depth * 100.0  # (1/m) * 100 = 100/m
 
-                # Apply canonical space transformation if enabled
-                if self.config.get('use_canonical_space', False):
-                    CANONICAL_FX = self._get_canonical_focal_length()
-
-                    # Transform inverse depth directly to canonical space
-                    # inverse_canonical = inverse_actual * (fx_actual / CANONICAL_FX)
-                    fx_actual = focal_lengths.view(B, T, 1, 1, 1)
-                    gt_depth_inverse_100 = gt_depth_inverse_100 * (fx_actual / CANONICAL_FX)
+                # NOTE: GT depth is already in canonical space (transformed in dataloader)
+                # No need to apply canonical transformation here
 
                 # Initialize Mamba sequence for temporal processing
                 if hasattr(model, 'mamba'):
@@ -1496,21 +1474,17 @@ class Gear5Trainer:
                     self.logger.info(f"DEBUG VALIDATION - Pred after interpolate: min={pred_depth_inverse.min():.4f}, max={pred_depth_inverse.max():.4f}")
 
                 # Compute loss for entire sequence
-                # Validation: Use same threshold (70m) for both GT and Pred for fair evaluation
-                MIN_INVERSE_DEPTH = 100.0 / 70.0  # 70m threshold (consistent with test)
+                # Follow original FlashDepth: use ONLY GT valid mask
+                # GT depth is already scaled to 100/m
+                # Reshape GT from (B, T, 1, H, W) to (B*T, 1, H, W) for mask computation
+                valid_mask = (gt_depth_inverse_flat >= 0).float()  # Exclude only invalid pixels (originally -1)
 
-                # GT valid mask: where GT depth is within valid range
-                gt_valid_mask = (gt_depth_inverse_flat >= MIN_INVERSE_DEPTH)
-
-                # Pred valid mask: same threshold as GT for fair evaluation
-                pred_valid_mask = (pred_depth_inverse >= MIN_INVERSE_DEPTH)
-
-                # Final mask: GT valid AND pred valid (both use 70m threshold)
-                valid_mask = (gt_valid_mask & pred_valid_mask).float()
-
-                # Save canonical masks for visualization (before any reshaping)
-                canonical_gt_valid = gt_valid_mask.cpu()  # [B*T, 1, H, W]
-                canonical_pred_valid = pred_valid_mask.cpu()  # [B*T, 1, H, W]
+                # Save masks for visualization (use actual_valid_mask for visualization)
+                # For visualization: we'll compute separate masks at 70m threshold for display purposes only
+                H_gt, W_gt = gt_depth_inverse_flat.shape[-2:]
+                gt_valid_mask_vis = actual_valid_mask.view(B_orig * T_orig, 1, H_gt, W_gt).bool()  # Actual space <70m (for visualization)
+                canonical_gt_valid = gt_valid_mask_vis.cpu()  # [B*T, 1, H_gt, W_gt] - at GT resolution
+                canonical_pred_valid = (pred_depth_inverse > 0).cpu()  # Basic validity for visualization
 
                 if valid_mask.sum() > 0:
                     loss_batch = self.loss_fn(pred_depth_inverse, gt_depth_inverse_flat, valid_mask)

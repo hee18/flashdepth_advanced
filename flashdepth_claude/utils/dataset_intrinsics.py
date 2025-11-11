@@ -248,6 +248,25 @@ DEFAULT_FOV_DEG = 65.0
 DEFAULT_WIDTH_RATIO = 0.7  # fx = width * 0.7 → FOV ~ 65°
 
 
+# ============================================================================
+# Canonical Space Definition
+# ============================================================================
+# FlashDepth uses a canonical space to normalize depth predictions across
+# different cameras and datasets. This ensures consistent metric depth learning.
+#
+# Canonical Transform:
+#   depth_canonical = depth_actual × (CANONICAL_FOCAL_LENGTH / fx_actual)
+#
+# For inverse depth (1/m), the ratio is REVERSED:
+#   inverse_canonical = inverse_actual × (fx_actual / CANONICAL_FOCAL_LENGTH)
+#
+# ============================================================================
+
+CANONICAL_FOCAL_LENGTH = 500.0  # pixels at canonical resolution
+CANONICAL_RESOLUTION = (518, 518)  # height, width
+ACTUAL_MAX_DEPTH = 70.0  # meters in actual space (for valid mask)
+
+
 def get_fallback_fx(width):
     """
     Get fallback focal length for unknown datasets.

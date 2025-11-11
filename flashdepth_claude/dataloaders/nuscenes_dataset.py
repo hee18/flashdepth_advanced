@@ -32,13 +32,18 @@ class NuScenesDepth(BaseDatasetPairs):
         """
         Read depth from NuScenes depth file.
         Assumes depth is stored as metric depth in meters.
+        Invalid pixels are marked as -1 (matching other datasets).
         """
         # Load metric depth (should be in meters)
         depth_map = np.load(path).astype(np.float32)
 
+        # Mark invalid pixels as -1 (matching other datasets' convention)
+        invalid_mask = (depth_map <= 0) | np.isnan(depth_map) | np.isinf(depth_map)
+        depth_map[invalid_mask] = -1
+
         # Convert to inverse depth for consistency with other datasets
-        # Invalid pixels should be marked with 0 or negative values
-        inverse_depth = np.where(depth_map > 0, 1.0 / depth_map, 0.0)
+        inverse_depth = 1.0 / depth_map
+        inverse_depth[invalid_mask] = -1  # Re-mark invalid pixels
 
         return inverse_depth
 

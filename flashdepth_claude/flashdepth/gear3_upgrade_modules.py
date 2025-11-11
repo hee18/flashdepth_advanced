@@ -613,11 +613,12 @@ class MultiLayerCLSNetwork(nn.Module):
     def __init__(self, embed_dim=1024, feature_dim=256, num_layers=4):
         super().__init__()
         self.num_layers = num_layers
-        
-        # Learnable fusion weights (favor later layers initially)
-        init_weights = torch.tensor([0.1, 0.2, 0.3, 0.4])
-        self.fusion_weights = nn.Parameter(init_weights)
-        
+
+        # Uniform fusion weights (non-trainable, consistent with Gear5)
+        # Equal weight for all layers: 25:25:25:25
+        uniform_weights = torch.ones(num_layers) / num_layers
+        self.register_buffer('fusion_weights', uniform_weights)
+
         # Project fused CLS to feature space
         self.projection = nn.Sequential(
             nn.Linear(embed_dim, feature_dim * 2),
@@ -625,30 +626,28 @@ class MultiLayerCLSNetwork(nn.Module):
             nn.Linear(feature_dim * 2, feature_dim),
             nn.ReLU(inplace=True)
         )
-        
-        logging.info(f"Multi-layer CLS Network: {num_layers} layers -> {feature_dim} features")
+
+        logging.info(f"Multi-layer CLS Network: {num_layers} layers -> {feature_dim} features (uniform fusion: 25:25:25:25)")
     
     def forward(self, cls_tokens_list):
         """
         Args:
             cls_tokens_list: List of [B, embed_dim] CLS tokens from different layers
                             [Layer 4, Layer 11, Layer 17, Layer 23]
-        
+
         Returns:
             global_feature: [B, feature_dim] - fused multi-layer feature
         """
         # Stack CLS tokens: [B, num_layers, embed_dim]
         cls_stack = torch.stack(cls_tokens_list, dim=1)
-        
-        # Normalize fusion weights
-        weights_norm = torch.softmax(self.fusion_weights, dim=0)
-        
-        # Weighted fusion: [B, num_layers, embed_dim] -> [B, embed_dim]
-        cls_fused = (cls_stack * weights_norm.view(1, -1, 1)).sum(dim=1)
-        
+
+        # Uniform weighted average (25:25:25:25)
+        # No normalization needed - weights already sum to 1.0
+        cls_fused = (cls_stack * self.fusion_weights.view(1, -1, 1)).sum(dim=1)
+
         # Project to feature space
         global_feature = self.projection(cls_fused)
-        
+
         return global_feature
 
 

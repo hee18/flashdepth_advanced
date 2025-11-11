@@ -1,6 +1,7 @@
 import torch
 from torch.utils.data import Dataset, DataLoader, Subset, ConcatDataset
 import numpy as np
+import cv2
 import logging
 import os
 from os.path import join
@@ -8,7 +9,12 @@ import math
 
 from .depthanything_preprocess import _load_and_process_image, _load_and_process_depth
 from .base_dataset_pairs import BaseDatasetPairs
-from utils.dataset_intrinsics import get_intrinsics_info, get_fallback_fx
+from utils.dataset_intrinsics import (
+    get_intrinsics_info,
+    get_fallback_fx,
+    CANONICAL_FOCAL_LENGTH,
+    ACTUAL_MAX_DEPTH
+)
 
 
 class CombinedDataset(Dataset):
@@ -246,6 +252,52 @@ class CombinedDataset(Dataset):
         )
         return fx
 
+    def _apply_canonical_transform(self, inverse_depth_actual, fx_actual):
+        """
+        Apply canonical transformation to inverse depth and compute actual space valid mask.
+
+        Canonical space: fx=500 at 518×518 resolution
+
+        Args:
+            inverse_depth_actual (np.ndarray or torch.Tensor): Inverse depth in actual space (1/m)
+            fx_actual (float): Actual focal length in pixels
+
+        Returns:
+            tuple: (inverse_depth_canonical, fx_canonical, fx_actual, actual_valid_mask)
+                - inverse_depth_canonical: Inverse depth in canonical space (1/m)
+                - fx_canonical: Canonical focal length (500.0)
+                - fx_actual: Original actual focal length (for visualization)
+                - actual_valid_mask: Valid mask in actual space (<70m)
+        """
+        # Convert to numpy for computation
+        is_torch = isinstance(inverse_depth_actual, torch.Tensor)
+        if is_torch:
+            inverse_np = inverse_depth_actual.cpu().numpy()
+        else:
+            inverse_np = inverse_depth_actual
+
+        # Convert to normal depth (m) to compute actual space valid mask
+        # Avoid division by zero
+        depth_actual = np.where(inverse_np > 1e-8, 1.0 / inverse_np, 0.0)
+
+        # Compute actual space valid mask: depth > 0 AND depth < 70m
+        actual_valid_mask = (depth_actual > 0) & (depth_actual < ACTUAL_MAX_DEPTH)
+
+        # Apply canonical transformation to inverse depth
+        # For inverse depth: inverse_canonical = inverse_actual × (fx_actual / fx_canonical)
+        canonical_ratio = fx_actual / CANONICAL_FOCAL_LENGTH
+        inverse_canonical_np = inverse_np * canonical_ratio
+
+        # Convert back to torch if input was torch
+        if is_torch:
+            inverse_canonical = torch.from_numpy(inverse_canonical_np).float()
+            actual_valid_mask = torch.from_numpy(actual_valid_mask).bool()
+        else:
+            inverse_canonical = inverse_canonical_np
+
+        # Return fx_actual for visualization (shows original dataset focal length)
+        return inverse_canonical, CANONICAL_FOCAL_LENGTH, fx_actual, actual_valid_mask
+
     def __len__(self):
         return len(self.pairs)
 
@@ -260,8 +312,11 @@ class CombinedDataset(Dataset):
                 scene = scene[:self.video_length]
 
             images = []
-            depths = []
-            focal_lengths = []
+            depths_canonical = []
+            focal_lengths_canonical = []
+            focal_lengths_actual = []
+            actual_valid_masks = []
+
             for pair in scene:
                 # Debug: check if pair is string or dict
                 if isinstance(pair, str):
@@ -271,17 +326,29 @@ class CombinedDataset(Dataset):
 
                 try:
                     image, _current_crop = _load_and_process_image(pair['image'], **self.reshape_list[dataset_idx])
-                    depth = self.depth_read_list[dataset_idx](pair['depth'], is_inverse=True) # Load inverse depth (1/m) for training
+                    depth_inverse_actual = self.depth_read_list[dataset_idx](pair['depth'], is_inverse=True) # Load inverse depth (1/m)
                     # Keep GT at ORIGINAL resolution (like original FlashDepth)
                     # Prediction will be interpolated to GT resolution during validation
 
                     # Get focal length for this frame
                     image_shape = image.shape[1:]  # (H, W) from (C, H, W)
-                    fx = self._get_focal_length(dataset_idx, pair, image_shape)
+                    fx_actual = self._get_focal_length(dataset_idx, pair, image_shape)
+
+                    # Apply canonical transformation (now returns 4 values)
+                    depth_inverse_canonical, fx_canonical, fx_actual_returned, actual_valid_mask = self._apply_canonical_transform(
+                        depth_inverse_actual, fx_actual
+                    )
 
                     images.append(image)
-                    depths.append(torch.from_numpy(depth).float()) # Keep original resolution
-                    focal_lengths.append(fx)
+                    # Convert to torch.Tensor if numpy array (for validation consistency)
+                    if isinstance(depth_inverse_canonical, np.ndarray):
+                        depth_inverse_canonical = torch.from_numpy(depth_inverse_canonical).float()
+                    if isinstance(actual_valid_mask, np.ndarray):
+                        actual_valid_mask = torch.from_numpy(actual_valid_mask).bool()
+                    depths_canonical.append(depth_inverse_canonical) # Canonical inverse depth
+                    focal_lengths_canonical.append(fx_canonical) # 500.0
+                    focal_lengths_actual.append(fx_actual_returned) # Original fx for visualization
+                    actual_valid_masks.append(actual_valid_mask) # Actual space mask (<70m)
                 except Exception as e:
                     print(f"Error loading validation pair: {e}")
                     continue
@@ -292,8 +359,14 @@ class CombinedDataset(Dataset):
                 return None
 
             return_name = dataset_idx
-            focal_lengths_tensor = torch.tensor(focal_lengths, dtype=torch.float32)
-            return torch.stack(images).float(), torch.stack(depths).float(), focal_lengths_tensor, return_name
+            focal_lengths_canonical_tensor = torch.tensor(focal_lengths_canonical, dtype=torch.float32)
+            focal_lengths_actual_tensor = torch.tensor(focal_lengths_actual, dtype=torch.float32)
+            return (torch.stack(images).float(),
+                    torch.stack(depths_canonical).float(),
+                    focal_lengths_canonical_tensor,
+                    focal_lengths_actual_tensor,
+                    torch.stack(actual_valid_masks).bool(),
+                    return_name)
 
 
         elif self.split == 'test':
@@ -306,23 +379,44 @@ class CombinedDataset(Dataset):
                 scene = scene[:self.video_length]
 
             images = []
-            depths = []
-            focal_lengths = []
+            depths_canonical = []
+            focal_lengths_canonical = []
+            focal_lengths_actual = []
+            actual_valid_masks = []
+
             for pair in scene:
                 image, _current_crop = _load_and_process_image(pair['image'], **self.reshape_list[dataset_idx])
-                depth = self.depth_read_list[dataset_idx](pair['depth'], is_inverse=True) # Load inverse depth (1/m) for testing
+                depth_inverse_actual = self.depth_read_list[dataset_idx](pair['depth'], is_inverse=True) # Load inverse depth (1/m)
 
                 # Get focal length for this frame
                 image_shape = image.shape[1:]  # (H, W) from (C, H, W)
-                fx = self._get_focal_length(dataset_idx, pair, image_shape)
+                fx_actual = self._get_focal_length(dataset_idx, pair, image_shape)
+
+                # Apply canonical transformation (now returns 4 values)
+                depth_inverse_canonical, fx_canonical, fx_actual_returned, actual_valid_mask = self._apply_canonical_transform(
+                    depth_inverse_actual, fx_actual
+                )
 
                 images.append(image)
-                depths.append(torch.from_numpy(depth).float()) # not resizing depth, using original resolution like train
-                focal_lengths.append(fx)
+                # Convert to torch.Tensor if numpy array (for validation/test consistency)
+                if isinstance(depth_inverse_canonical, np.ndarray):
+                    depth_inverse_canonical = torch.from_numpy(depth_inverse_canonical).float()
+                if isinstance(actual_valid_mask, np.ndarray):
+                    actual_valid_mask = torch.from_numpy(actual_valid_mask).bool()
+                depths_canonical.append(depth_inverse_canonical) # Canonical inverse depth
+                focal_lengths_canonical.append(fx_canonical) # 500.0
+                focal_lengths_actual.append(fx_actual_returned) # Original fx for visualization
+                actual_valid_masks.append(actual_valid_mask) # Actual space mask (<70m)
 
             return_name = os.path.join(dataset_idx, pair['scene_name'])
-            focal_lengths_tensor = torch.tensor(focal_lengths, dtype=torch.float32)
-            return torch.stack(images).float(), torch.stack(depths).float(), focal_lengths_tensor, return_name
+            focal_lengths_canonical_tensor = torch.tensor(focal_lengths_canonical, dtype=torch.float32)
+            focal_lengths_actual_tensor = torch.tensor(focal_lengths_actual, dtype=torch.float32)
+            return (torch.stack(images).float(),
+                    torch.stack(depths_canonical).float(),
+                    focal_lengths_canonical_tensor,
+                    focal_lengths_actual_tensor,
+                    torch.stack(actual_valid_masks).bool(),
+                    return_name)
 
 
         # dataset_idx: i-th dataset; e.g. pointodyssey is 0, spring is 1...etc
@@ -384,8 +478,11 @@ class CombinedDataset(Dataset):
         
         # Load all frames in sequence
         images = []
-        depths = []
-        focal_lengths = []
+        depths_canonical = []
+        focal_lengths_canonical = []
+        focal_lengths_actual = []
+        actual_valid_masks = []
+
         # Transform scene-relative indices to dataset-relative indices
         sequence_indices = [scene_start_idx + s for s in sequence_indices]
         for seq_i, seq_idx in enumerate(sequence_indices):
@@ -397,32 +494,66 @@ class CombinedDataset(Dataset):
                 print(f"seq indices: {sequence_indices}")
                 print("pairslist len: ", len(self.pairslist[dataset_idx]))
                 raise e
+
             image, _current_crop = _load_and_process_image(pair['image'], **self.reshape_list[dataset_idx])
             print_depth_minmax = False #seq_i == 0
-            depth = self.depth_read_list[dataset_idx](pair['depth'], is_inverse=True, print_minmax=print_depth_minmax) # Load inverse depth (1/m) for training
-            depth = _load_and_process_depth(depth, image.shape, _current_crop, **self.reshape_list[dataset_idx])
+            depth_inverse_actual = self.depth_read_list[dataset_idx](pair['depth'], is_inverse=True, print_minmax=print_depth_minmax) # Load inverse depth (1/m)
 
-            # Get focal length for this frame
-            image_shape = image.shape[1:]  # (H, W) from (C, H, W)
-            fx = self._get_focal_length(dataset_idx, pair, image_shape)
+            # Get focal length for this frame (at original resolution before any processing)
+            original_h, original_w = depth_inverse_actual.shape
+            fx_actual = self._get_focal_length(dataset_idx, pair, (original_h, original_w))
+
+            # Apply canonical transformation BEFORE resizing (now returns 4 values)
+            # This computes actual space mask at original resolution
+            depth_inverse_canonical, fx_canonical, fx_actual_returned, actual_valid_mask = self._apply_canonical_transform(
+                depth_inverse_actual, fx_actual
+            )
+
+            # Convert back to numpy for resizing
+            if isinstance(depth_inverse_canonical, torch.Tensor):
+                depth_inverse_canonical_np = depth_inverse_canonical.cpu().numpy()
+                actual_valid_mask_np = actual_valid_mask.cpu().numpy().astype(np.uint8)
+            else:
+                depth_inverse_canonical_np = depth_inverse_canonical
+                actual_valid_mask_np = actual_valid_mask.astype(np.uint8)
+
+            # Resize depth using same logic as before
+            depth_resized = _load_and_process_depth(
+                depth_inverse_canonical_np, image.shape, _current_crop, **self.reshape_list[dataset_idx]
+            )
+
+            # Resize mask using same logic (nearest neighbor for binary mask)
+            mask_resized = cv2.resize(actual_valid_mask_np,
+                                     (image.shape[2], image.shape[1]),
+                                     interpolation=cv2.INTER_NEAREST)
+            mask_resized = torch.from_numpy(mask_resized).bool()
 
             images.append(image)
-            depths.append(depth)
-            focal_lengths.append(fx)
+            depths_canonical.append(depth_resized)
+            focal_lengths_canonical.append(fx_canonical)
+            focal_lengths_actual.append(fx_actual_returned)
+            actual_valid_masks.append(mask_resized)
 
         try:
             images = torch.stack(images, dim=0)  # [T, C, H, W]
-            depths = torch.stack(depths, dim=0) if self.split != 'test' else None  # [T, H, W]
-            focal_lengths_tensor = torch.tensor(focal_lengths, dtype=torch.float32)  # [T]
+            depths_canonical_stacked = torch.stack(depths_canonical, dim=0)  # [T, H, W]
+            focal_lengths_canonical_tensor = torch.tensor(focal_lengths_canonical, dtype=torch.float32)  # [T]
+            focal_lengths_actual_tensor = torch.tensor(focal_lengths_actual, dtype=torch.float32)  # [T]
+            actual_valid_masks_stacked = torch.stack(actual_valid_masks, dim=0)  # [T, H, W]
         except Exception as e:
             print(f"Error stacking tensors in dataset {dataset_idx}: {e}")
             print(f"Images length: {len(images)}")
-            if self.split != 'test':
-                print(f"Depths length: {len(depths)}")
+            print(f"Depths canonical length: {len(depths_canonical)}")
+            print(f"Masks length: {len(actual_valid_masks)}")
             print(f"Image shapes: {[img.shape if hasattr(img, 'shape') else type(img) for img in images]}")
-            if self.split != 'test' and len(depths) > 0:
-                print(f"Depth shapes: {[d.shape if hasattr(d, 'shape') else type(d) for d in depths]}")
+            print(f"Depth shapes: {[d.shape if hasattr(d, 'shape') else type(d) for d in depths_canonical]}")
+            print(f"Mask shapes: {[m.shape if hasattr(m, 'shape') else type(m) for m in actual_valid_masks]}")
             raise e
 
-        return images.float(), depths, focal_lengths_tensor, dataset_idx #, pair['scene_name'] #, pair['scene_name'] #, pair['scene_name']
+        return (images.float(),
+                depths_canonical_stacked,
+                focal_lengths_canonical_tensor,
+                focal_lengths_actual_tensor,
+                actual_valid_masks_stacked,
+                dataset_idx)
        

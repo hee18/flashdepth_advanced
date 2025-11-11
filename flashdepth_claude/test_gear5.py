@@ -222,6 +222,56 @@ class Gear5Tester:
 
         return model
 
+    def _get_actual_focal_length(self, dataset_name, image_shape):
+        """
+        Get actual focal length for a dataset based on intrinsics registry.
+
+        Args:
+            dataset_name (str): Dataset name
+            image_shape (tuple): Image shape (B, T, C, H, W)
+
+        Returns:
+            float: Actual focal length in pixels
+        """
+        from utils.dataset_intrinsics import get_intrinsics_info, get_fallback_fx
+
+        # Clean dataset name
+        if isinstance(dataset_name, str):
+            dataset_name = dataset_name.lower().replace('-', '_')
+
+        # Get intrinsics from registry
+        intrinsics_info = get_intrinsics_info(dataset_name)
+
+        if intrinsics_info is None:
+            # Fallback: Use width * 0.7
+            width = image_shape[-1]
+            fx = get_fallback_fx(width)
+            logger.warning(f"No intrinsics for {dataset_name}, using fallback fx={fx:.1f}")
+            return fx
+
+        # Handle fixed focal length
+        if intrinsics_info['type'] == 'fixed':
+            return intrinsics_info['fx']
+
+        # Handle computed focal length (e.g., dynamicreplica)
+        if intrinsics_info['type'] == 'computed':
+            if dataset_name in ['dynamicreplica', 'replica']:
+                width = image_shape[-1]
+                return width / 2.0
+            else:
+                width = image_shape[-1]
+                return get_fallback_fx(width)
+
+        # For per_frame/per_sequence types, use typical_fx if available
+        if 'typical_fx' in intrinsics_info:
+            return intrinsics_info['typical_fx']
+
+        # Final fallback
+        width = image_shape[-1]
+        fx = get_fallback_fx(width)
+        logger.warning(f"Could not determine fx for {dataset_name}, using fallback fx={fx:.1f}")
+        return fx
+
     def _setup_test_loader(self):
         """Setup test data loader"""
         # Check if single sequence mode
@@ -499,16 +549,26 @@ class Gear5Tester:
         if len(batch) == 0:
             return None
 
-        # CombinedDataset returns (images, depths, focal_lengths, dataset_name) tuple for val/test splits
+        # CombinedDataset returns (images, depths, focal_lengths, actual_valid_mask, dataset_name) tuple for val/test splits
         # Convert to dict format for easier access
         if len(batch) > 0 and isinstance(batch[0], tuple):
-            images, depths, focal_lengths, names = zip(*batch)
-            return {
-                'image': torch.stack(images, dim=0),
-                'depth': torch.stack(depths, dim=0),
-                'focal_lengths': torch.stack(focal_lengths, dim=0),
-                'dataset_name': names
-            }
+            if len(batch[0]) == 5:  # New format with actual_valid_mask
+                images, depths, focal_lengths, actual_valid_masks, names = zip(*batch)
+                return {
+                    'image': torch.stack(images, dim=0),
+                    'depth': torch.stack(depths, dim=0),
+                    'focal_lengths': torch.stack(focal_lengths, dim=0),
+                    'actual_valid_mask': torch.stack(actual_valid_masks, dim=0),
+                    'dataset_name': names
+                }
+            else:  # Old format without actual_valid_mask (for backwards compatibility)
+                images, depths, focal_lengths, names = zip(*batch)
+                return {
+                    'image': torch.stack(images, dim=0),
+                    'depth': torch.stack(depths, dim=0),
+                    'focal_lengths': torch.stack(focal_lengths, dim=0),
+                    'dataset_name': names
+                }
 
         # Segmentation datasets return dict with 'images' key, rename to 'image' for compatibility
         if len(batch) > 0 and isinstance(batch[0], dict) and 'images' in batch[0]:
@@ -620,7 +680,14 @@ class Gear5Tester:
         else:
             images = batch['image'].to(self.device)  # [1, T, 3, H, W]
         gt_depth = batch['depth'].to(self.device)  # [1, T, H, W] or [T, H, W] - val split has no channel dim
-        focal_lengths = batch['focal_lengths'].to(self.device)  # [1, T]
+        focal_lengths = batch['focal_lengths'].to(self.device)  # [1, T], all 500.0 (canonical)
+
+        # Get actual space valid mask if available (from updated CombinedDataset)
+        if 'actual_valid_mask' in batch:
+            actual_valid_mask = batch['actual_valid_mask'].to(self.device)  # [1, T, H, W]
+        else:
+            # Fallback for datasets without actual_valid_mask (e.g., WaymoSegmentationDataset)
+            actual_valid_mask = None
 
         # Add batch dimension if missing (WaymoSegmentationDataset returns [T, H, W])
         if gt_depth.ndim == 3:
@@ -633,21 +700,29 @@ class Gear5Tester:
         B, T = images.shape[:2]
         assert B == 1, "Batch size must be 1 for testing"
 
-        # Dataloader gives inverse depth (1/m), scale to 100/m for training
-        gt_depth_inverse_100 = gt_depth * 100.0  # [1, T, 1, H, W] in 100/m
+        # Dataloader gives inverse depth (1/m) already in canonical space (fx=500), scale to 100/m
+        gt_depth_inverse_100 = gt_depth * 100.0  # [1, T, 1, H, W] in canonical 100/m
 
-        # Apply canonical transformation to GT (for BOTH masks AND metrics calculation)
-        # This ensures consistency with training/validation which use canonical space
-        CANONICAL_FX = get_canonical_focal_length(self.config)
-        use_canonical = self.config.get('use_canonical_space', False)
-        if use_canonical:
-            # inverse_canonical = inverse_actual * (fx_actual / CANONICAL_FX)
-            fx_actual = focal_lengths.view(1, T, 1, 1, 1)
-            gt_depth_inverse_100 = gt_depth_inverse_100 * (fx_actual / CANONICAL_FX)
+        # NOTE: GT depth is already in canonical space (fx=500 at 518×518)
+        # Canonical transformation is now handled in the dataloader
+        CANONICAL_FX = get_canonical_focal_length(self.config)  # 500.0
 
-        # Create canonical valid masks (70m threshold in canonical space)
-        MIN_INVERSE_CANONICAL = 100.0 / 70.0
-        canonical_gt_valid = (gt_depth_inverse_100 > MIN_INVERSE_CANONICAL)  # [1, T, 1, H, W]
+        # Get fx_actual for de-canonical visualization (retrieve from dataset intrinsics)
+        # focal_lengths tensor now contains canonical fx (500.0), so we need to get actual fx
+        dataset_name = batch.get('dataset_name', ['unknown'])[0]
+        if isinstance(dataset_name, (list, tuple)):
+            dataset_name = dataset_name[0]
+        fx_actual = self._get_actual_focal_length(dataset_name, images.shape)  # Will implement this helper
+
+        # Use actual space valid mask from dataloader if available
+        # Otherwise fallback to computing from canonical depth
+        if actual_valid_mask is not None:
+            # Use actual space mask (<70m in actual space, computed before canonical transform)
+            canonical_gt_valid = actual_valid_mask.unsqueeze(2)  # [1, T, 1, H, W]
+        else:
+            # Fallback: compute from canonical depth (70m threshold in canonical space)
+            MIN_INVERSE_CANONICAL = 100.0 / 70.0
+            canonical_gt_valid = (gt_depth_inverse_100 > MIN_INVERSE_CANONICAL)  # [1, T, 1, H, W]
 
         # Storage for predictions
         pred_depths = []
@@ -832,8 +907,10 @@ class Gear5Tester:
                         pred_depth_inverse_100, size=gt_t_shape, mode="bilinear", align_corners=True
                     )
 
-                # Convert to metric depth: 100/m -> m
-                pred_depth_metric = 100.0 / (pred_depth_inverse_100[0] + 1e-8)  # [1, H, W]
+                # Convert to metric depth and de-canonicalize for visualization
+                # Prediction is in canonical space (fx=500), convert to actual space
+                pred_depth_canonical = 100.0 / (pred_depth_inverse_100[0] + 1e-8)  # [1, H, W] canonical meters
+                pred_depth_metric = pred_depth_canonical * de_canonical_ratio  # [1, H, W] actual meters
 
                 # Upsample importance_map to image resolution for smooth visualization
                 # (like train_gear3_upgrade.py does before passing to visualizer)
@@ -871,9 +948,14 @@ class Gear5Tester:
         fg_mask_all = torch.stack(fg_mask_list, dim=0)  # [T, 1, patch_h, patch_w]
         bg_mask_all = torch.stack(bg_mask_list, dim=0)  # [T, 1, patch_h, patch_w]
 
-        # Convert GT to metric depth for evaluation: use canonical GT (consistent with training)
-        # This ensures metrics are computed in canonical space, same as training/validation
-        gt_depth_metric = 100.0 / (gt_depth_inverse_100[0] + 1e-8)  # [T, 1, H, W] in canonical meters
+        # Convert GT to metric depth for visualization
+        # GT is in canonical space (fx=500), de-canonicalize to actual space for visualization
+        gt_depth_canonical = 100.0 / (gt_depth_inverse_100[0] + 1e-8)  # [T, 1, H, W] in canonical meters
+
+        # De-canonicalize: depth_actual = depth_canonical × (fx_actual / fx_canonical)
+        # This converts from canonical space (fx=500) back to actual space for visualization
+        de_canonical_ratio = fx_actual / CANONICAL_FX
+        gt_depth_metric = gt_depth_canonical * de_canonical_ratio  # [T, 1, H, W] in actual meters
 
         # Compute metrics (both pred and GT are now in meters)
         # Move to CPU and compute per-frame metrics (like test_metric_head.py)

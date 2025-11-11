@@ -107,12 +107,15 @@ class Gear2Trainer:
         
     def _get_canonical_focal_length(self):
         """
-        Get canonical focal length (fixed at 1000.0 for all resolutions).
+        Get canonical focal length (fixed at 500.0 for 518×518 resolution).
+
+        This matches the canonical space definition in utils/dataset_intrinsics.py
+        and the dataloader's canonical transformation (CombinedDataset).
 
         Returns:
-            float: Canonical focal length (always 1000.0)
+            float: Canonical focal length (always 500.0)
         """
-        return 1000.0
+        return 500.0
 
 
     def emit(self, record):
@@ -845,21 +848,15 @@ class Gear2Trainer:
             self.logger.info(f"DEBUG - After scaling to 100/m: min={gt_depth_inverse_100.min():.4f}, max={gt_depth_inverse_100.max():.4f}")
             self.logger.info(f"DEBUG - Valid pixels: {(gt_depth_inverse_100 > 0).sum()}")
 
-        # Apply canonical space transformation if enabled
-        if self.config.get('use_canonical_space', False):
-            CANONICAL_FX = self._get_canonical_focal_length()
+        # Canonical space is already applied in the dataloader
+        CANONICAL_FX = self._get_canonical_focal_length()  # 500.0
+        # NOTE: GT depth is already in canonical space (fx=500 at 518×518)
+        # Canonical transformation is handled in dataloaders/combined_dataset.py
+        # All focal_lengths in the batch are CANONICAL_FX (500.0)
 
-            # Transform inverse depth directly to canonical space
-            # inverse_canonical = inverse_actual * (fx_actual / CANONICAL_FX)
-            # Math: depth_canonical = depth_actual * (CANONICAL_FX / fx_actual)
-            #       1/depth_canonical = (fx_actual / CANONICAL_FX) * (1/depth_actual)
-            fx_actual = focal_lengths.view(B, T, 1, 1, 1)
-            gt_depth_inverse_100 = gt_depth_inverse_100 * (fx_actual / CANONICAL_FX)
-
-            if self.global_step < 5:
-                self.logger.info(f"DEBUG - Canonical space enabled (CANONICAL_FX={CANONICAL_FX})")
-                self.logger.info(f"DEBUG - fx_actual range: {fx_actual.min():.1f} - {fx_actual.max():.1f}")
-                self.logger.info(f"DEBUG - After canonical transform: min={gt_depth_inverse_100.min():.4f}, max={gt_depth_inverse_100.max():.4f}")
+        if self.global_step < 5:
+            self.logger.info(f"Using canonical focal length: {CANONICAL_FX} (from dataloader)")
+            self.logger.info(f"Focal lengths in batch: {focal_lengths[:5].tolist()}")  # Should all be 500.0
 
         # Forward pass following original FlashDepth pattern (whole sequence at once)
         # Initialize Mamba sequence (critical for temporal processing!)
