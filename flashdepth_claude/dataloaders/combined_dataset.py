@@ -277,8 +277,9 @@ class CombinedDataset(Dataset):
             inverse_np = inverse_depth_actual
 
         # Convert to normal depth (m) to compute actual space valid mask
-        # Avoid division by zero
-        depth_actual = np.where(inverse_np > 1e-8, 1.0 / inverse_np, 0.0)
+        # Avoid division by zero (suppress warning)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            depth_actual = np.where(inverse_np > 1e-8, 1.0 / inverse_np, 0.0)
 
         # Compute actual space valid mask: depth > 0 AND depth < 70m
         actual_valid_mask = (depth_actual > 0) & (depth_actual < ACTUAL_MAX_DEPTH)

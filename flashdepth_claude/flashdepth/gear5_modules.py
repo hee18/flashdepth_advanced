@@ -1,23 +1,25 @@
 """
-Gear5 Modules: Global Scale Prediction + FG-only Modulation
+Gear5 Modules: GRU-based Temporal Scale Prediction with Importance-weighted Loss
 
-This module implements a two-stage metric depth training approach:
+This module implements a unified single-stage metric depth training approach:
 
-Stage 1: Global Scale & Shift Prediction
-- Input: Multi-layer CLS tokens [Layers 4, 11, 17, 23]
-- Output: Global scale and shift parameters
-- Applied to: DPT output features (before Mamba)
-- Formula: DPT_global = DPT × scale + shift
+Single Stage: Temporal Scale & Shift Prediction
+- Input: 2-layer CLS tokens [Layers 11, 23 for ViT-L / 5, 11 for ViT-S]
+- Processing: GRU for temporal consistency
+- Output: Frame-wise scale and shift parameters
+- Applied to: Final relative depth output (after output_conv2)
+- Formula: D_metric = Scale × D_relative + Shift
 
-Stage 2: Foreground-only Modulation
-- Input: Globally-modulated DPT features + Multi-layer attention
-- Output: FG-only modulated features
-- Applied to: Foreground pixels only (Background keeps global modulation)
-- Formula: DPT_fg = gamma × DPT_global_fg + beta
+Key Features:
+1. GRU provides temporal consistency across frames
+2. Importance map for loss weighting (attention-based)
+3. Frozen FlashDepth components (ViT, DPT, Mamba, output_conv)
+4. Only ~132K trainable parameters
 
 Architecture:
-    ViT → DPT → Global GSP → Mamba → Final Head (Step 1)
-    ViT → DPT → Global GSP → FG Modulation → Mamba → Final Head (Step 2)
+    ViT (frozen) → DPT (frozen) → Mamba (frozen) → output_conv (frozen) → Relative Depth
+                                                                              ↓
+    CLS tokens → TemporalScalePredictor → Scale/Shift → Metric Depth
 """
 
 import torch
@@ -25,413 +27,256 @@ import torch.nn as nn
 import torch.nn.functional as F
 import logging
 
-# Import from gear3_upgrade_modules
-from flashdepth.gear3_upgrade_modules import (
-    MultiLayerAttentionFusion,
-    process_attention_to_importance
-)
 
+# ==================== Importance Map Generator ====================
 
-# ==================== Step 1: Global Scale Predictor ====================
-
-class GlobalScalePredictor(nn.Module):
+class ImportanceMapGenerator(nn.Module):
     """
-    Predict global scale and shift using uniform mix of multi-layer CLS tokens.
+    Generate importance map from multi-layer CLS attention weights.
 
-    Consistent with FFM's MultiLayerAttentionFusion approach (uniform averaging).
+    Pipeline:
+        1. Extract CLS-to-patch attention from multiple layers
+        2. Average across layers
+        3. Resize to spatial dimensions
+        4. Normalize to [0, 1]
 
-    Input: CLS tokens from layers [4, 11, 17, 23] (encoder output layers)
-    Output: scale (positive), shift (any value)
-
-    Architecture:
-        Stack [CLS_4, CLS_11, CLS_17, CLS_23] → [B, 4, 1024]
-        ↓
-        Uniform Average (25:25:25:25) → [B, 1024]
-        ↓
-        MLP: 1024 → 512 → 256 → 2
-        ↓
-        [scale (Softplus), shift]
-
-    Parameters: ~656K (85.3% reduction vs concatenation approach)
+    Input: List of attention weights from [Layer 11, 23] (or [5, 11] for ViT-S)
+    Output: Importance map [B, T, H, W]
     """
-    def __init__(self, embed_dim=1024, num_layers=4):
+    def __init__(self, num_layers=2):
         super().__init__()
-        self.embed_dim = embed_dim
         self.num_layers = num_layers
 
-        # Uniform fusion weights (non-trainable)
-        uniform_weights = torch.ones(num_layers) / num_layers
-        self.register_buffer('fusion_weights', uniform_weights)
+        logging.info(f"ImportanceMapGenerator: Averaging {num_layers} attention layers")
 
-        # Lightweight MLP
-        self.predictor = nn.Sequential(
-            nn.Linear(embed_dim, 512),
-            nn.ReLU(inplace=True),
-            nn.Linear(512, 256),
-            nn.ReLU(inplace=True),
-            nn.Linear(256, 2)  # Output: [scale, shift]
-        )
-
-        # Count parameters
-        total_params = sum(p.numel() for p in self.parameters())
-        logging.info(f"GlobalScalePredictor: {total_params:,} parameters")
-        logging.info(f"  Fusion: uniform average of {num_layers} layers (25:25:25:25)")
-        logging.info(f"  Consistent with FFM's fusion strategy")
-
-    def forward(self, cls_tokens_list):
+    def forward(self, attention_weights_list, patch_h, patch_w):
         """
         Args:
-            cls_tokens_list: List of [B, embed_dim] CLS tokens
-                            [CLS_4, CLS_11, CLS_17, CLS_23]
+            attention_weights_list: List of [B, num_heads, N+1, N+1] attention weights
+                                   Length = num_layers (e.g., 2 for layers [11, 23])
+            patch_h, patch_w: Spatial patch dimensions (e.g., 37×37 for 518×518)
 
         Returns:
-            scale: [B] - positive scale factor
-            shift: [B] - shift value (any)
+            importance_map: [B, 1, patch_h, patch_w] normalized importance scores
         """
-        # Stack CLS tokens: [B, num_layers, embed_dim]
-        cls_stack = torch.stack(cls_tokens_list, dim=1)  # [B, 4, 1024]
+        # Extract CLS-to-patch attention from each layer
+        cls_to_patch_list = []
+        for attn in attention_weights_list:
+            # attn: [B, num_heads, N+1, N+1]
+            # CLS row: attn[:, :, 0, 1:]  -> [B, num_heads, N]
+            cls_to_patch = attn[:, :, 0, 1:]  # [B, num_heads, num_patches]
+            cls_to_patch = cls_to_patch.mean(dim=1)  # Average over heads: [B, num_patches]
+            cls_to_patch_list.append(cls_to_patch)
 
-        # Uniform weighted average: [B, 4, 1024] → [B, 1024]
-        cls_fused = (cls_stack * self.fusion_weights.view(1, -1, 1)).sum(dim=1)
+        # Average across layers
+        cls_attention = torch.stack(cls_to_patch_list, dim=0).mean(dim=0)  # [B, num_patches]
 
-        # Predict scale and shift
-        params = self.predictor(cls_fused)  # [B, 2]
+        # Reshape to spatial dimensions
+        num_patches = cls_attention.shape[1]
+        expected_patches = patch_h * patch_w
 
-        # Ensure positive scale with Softplus
-        scale = F.softplus(params[:, 0])  # [B]
-        shift = params[:, 1]  # [B]
+        if num_patches != expected_patches:
+            logging.warning(
+                f"Patch mismatch: got {num_patches}, expected {expected_patches}. "
+                f"Interpolating to {patch_h}×{patch_w}."
+            )
+            # Linear interpolation
+            cls_attention = F.interpolate(
+                cls_attention.unsqueeze(1), size=expected_patches,
+                mode='linear', align_corners=True
+            ).squeeze(1)
+
+        # Reshape to 2D: [B, patch_h, patch_w]
+        importance_map = cls_attention.view(-1, patch_h, patch_w).unsqueeze(1)  # [B, 1, patch_h, patch_w]
+
+        # Remove register token (highest attention patch) with 3×3 inpainting
+        B = importance_map.shape[0]
+        for b in range(B):
+            attn_2d = importance_map[b, 0]  # [patch_h, patch_w]
+
+            # Find the patch with maximum attention (register token)
+            max_val = attn_2d.max()
+            outlier_mask = (attn_2d == max_val)  # Only the single highest patch
+
+            # Inpaint with local average (3×3 box filter at patch level)
+            kernel = torch.ones(1, 1, 3, 3, device=importance_map.device) / 9
+            attn_smoothed = F.conv2d(
+                importance_map[b:b+1], kernel, padding=1
+            )
+            importance_map[b, 0] = torch.where(
+                outlier_mask,
+                attn_smoothed[0, 0],
+                importance_map[b, 0]
+            )
+
+        # Percentile normalization (1-99 percentile) to [0, 1]
+        # More robust than min-max: reduces sensitivity to remaining outliers
+        for b in range(B):
+            attn_flat = importance_map[b].flatten()
+            attn_p1 = torch.quantile(attn_flat, 0.01)   # 1st percentile
+            attn_p99 = torch.quantile(attn_flat, 0.99)  # 99th percentile
+
+            # Normalize to [0, 1] and clip
+            importance_map[b] = (importance_map[b] - attn_p1) / (attn_p99 - attn_p1 + 1e-8)
+            importance_map[b] = torch.clamp(importance_map[b], 0.0, 1.0)
+
+        return importance_map
+
+
+# ==================== Temporal Scale Predictor (GRU-based) ====================
+
+class TemporalScalePredictor(nn.Module):
+    """
+    GRU-based temporal scale and shift predictor for metric depth conversion.
+
+    Architecture:
+        CLS tokens [B, T, 1024]
+            ↓ Feature Extractor
+        Features [B, T, 256]
+            ↓ GRU (temporal modeling)
+        Hidden states [B, T, 128]
+            ↓ Scale/Shift Heads
+        Scale [B, T], Shift [B, T]
+
+    Key Benefits:
+        1. GRU provides temporal consistency (smooth predictions across frames)
+        2. Hidden state carries context from previous frames
+        3. Lightweight (~132K parameters)
+        4. No manual temporal aggregation needed
+
+    Parameters:
+        - Feature Net: (1024 × 256) + 256 = 262,400
+        - GRU: ~100K (input=256, hidden=128, layers=1)
+        - Scale Head: (128 × 1) + 1 = 129
+        - Shift Head: (128 × 1) + 1 = 129
+        - Total: ~362K parameters
+    """
+    def __init__(self, embed_dim=1024, feature_dim=256, hidden_dim=128, num_layers=1):
+        super().__init__()
+
+        self.embed_dim = embed_dim
+        self.feature_dim = feature_dim
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+
+        # 1. Feature Extractor: Reduce CLS token dimensionality
+        self.feature_net = nn.Sequential(
+            nn.Linear(embed_dim, feature_dim),
+            nn.ReLU(inplace=True)
+        )
+
+        # 2. GRU: Temporal modeling
+        self.temporal_gru = nn.GRU(
+            input_size=feature_dim,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            batch_first=True  # Input: [B, T, feature_dim]
+        )
+
+        # 3. Scale/Shift Heads
+        self.scale_head = nn.Linear(hidden_dim, 1)
+        self.shift_head = nn.Linear(hidden_dim, 1)
+
+        # Parameter count
+        total_params = sum(p.numel() for p in self.parameters())
+        logging.info(f"TemporalScalePredictor: {total_params:,} parameters")
+        logging.info(f"  Feature Net: {embed_dim} → {feature_dim}")
+        logging.info(f"  GRU: input={feature_dim}, hidden={hidden_dim}, layers={num_layers}")
+        logging.info(f"  Heads: hidden={hidden_dim} → 1 (scale), 1 (shift)")
+
+    def forward(self, cls_tokens):
+        """
+        Args:
+            cls_tokens: [B, T, embed_dim] - 2-layer averaged CLS tokens
+
+        Returns:
+            scale: [B, T] - positive scale factors
+            shift: [B, T] - shift values
+        """
+        B, T, embed_dim = cls_tokens.shape
+
+        # 1. Feature extraction
+        features = self.feature_net(cls_tokens)  # [B, T, feature_dim]
+
+        # 2. GRU temporal modeling
+        # Output: [B, T, hidden_dim], hidden: [num_layers, B, hidden_dim]
+        gru_output, _ = self.temporal_gru(features)  # [B, T, hidden_dim]
+
+        # 3. Predict scale and shift from hidden states
+        scale_logits = self.scale_head(gru_output).squeeze(-1)  # [B, T]
+        shift_logits = self.shift_head(gru_output).squeeze(-1)  # [B, T]
+
+        # 4. Ensure positive scale with Softplus
+        scale = F.softplus(scale_logits)  # [B, T]
+        shift = shift_logits  # [B, T] - any value
 
         return scale, shift
 
 
-# ==================== Step 2: Foreground-only Modulation ====================
-
-class ForegroundFeatureNetwork(nn.Module):
-    """
-    Extract foreground-only features from patch tokens using FG mask.
-
-    Unlike Gear3 which extracts both FG and BG features, this only extracts FG.
-    Uses weighted pooling with importance map for soft attention weighting.
-    """
-    def __init__(self, embed_dim=1024, feature_dim=256):
-        super().__init__()
-
-        # FG feature network (same as Gear3)
-        self.fg_net = nn.Sequential(
-            nn.Linear(embed_dim, feature_dim * 2),
-            nn.ReLU(inplace=True),
-            nn.Linear(feature_dim * 2, feature_dim),
-            nn.ReLU(inplace=True)
-        )
-
-        logging.info(f"ForegroundFeatureNetwork: {embed_dim} -> {feature_dim}")
-
-    def forward(self, patch_tokens, fg_mask, importance_map):
-        """
-        Args:
-            patch_tokens: [B, num_patches, embed_dim]
-            fg_mask: [B, 1, patch_h, patch_w] - binary FG mask
-            importance_map: [B, 1, patch_h, patch_w] - soft importance scores
-
-        Returns:
-            fg_features: [B, feature_dim]
-        """
-        B, num_patches, embed_dim = patch_tokens.shape
-
-        # Flatten masks
-        fg_mask_flat = fg_mask.flatten(2).squeeze(1)  # [B, mask_patches]
-        importance_flat = importance_map.flatten(2).squeeze(1)  # [B, map_patches]
-
-        # Handle dimension mismatch (resize to num_patches)
-        if fg_mask_flat.shape[1] != num_patches:
-            fg_mask_flat = F.interpolate(
-                fg_mask_flat.unsqueeze(1), size=num_patches,
-                mode='linear', align_corners=True
-            ).squeeze(1)
-
-        if importance_flat.shape[1] != num_patches:
-            importance_flat = F.interpolate(
-                importance_flat.unsqueeze(1), size=num_patches,
-                mode='linear', align_corners=True
-            ).squeeze(1)
-
-        # Soft weighting: importance × FG mask
-        fg_weights = importance_flat * fg_mask_flat  # [B, num_patches]
-
-        # Normalize weights
-        fg_weights = fg_weights / (fg_weights.sum(dim=1, keepdim=True) + 1e-8)
-
-        # Weighted pooling
-        fg_pooled = (patch_tokens * fg_weights.unsqueeze(-1)).sum(dim=1)  # [B, embed_dim]
-
-        # Pass through network
-        fg_features = self.fg_net(fg_pooled)  # [B, feature_dim]
-
-        return fg_features
-
-
-class ForegroundModulationNetwork(nn.Module):
-    """
-    Generate FiLM parameters (gamma, beta) for FG-only modulation.
-
-    Input: FG features [B, feature_dim]
-    Output: gamma [B, dpt_dim], beta [B, dpt_dim]
-    """
-    def __init__(self, feature_dim=256, dpt_dim=256):
-        super().__init__()
-        self.dpt_dim = dpt_dim
-
-        # FG modulation network
-        self.fg_modulation = nn.Sequential(
-            nn.Linear(feature_dim, dpt_dim * 2),
-            nn.ReLU(inplace=True),
-            nn.Linear(dpt_dim * 2, dpt_dim * 2)  # [gamma, beta]
-        )
-
-        logging.info(f"ForegroundModulationNetwork: {feature_dim} -> gamma/beta ({dpt_dim})")
-
-    def forward(self, fg_features):
-        """
-        Args:
-            fg_features: [B, feature_dim]
-
-        Returns:
-            fg_gamma: [B, dpt_dim]
-            fg_beta: [B, dpt_dim]
-        """
-        # Generate modulation parameters
-        fg_params = self.fg_modulation(fg_features)  # [B, dpt_dim * 2]
-
-        # Split into gamma and beta
-        fg_gamma = fg_params[:, :self.dpt_dim]
-        fg_beta = fg_params[:, self.dpt_dim:]
-
-        return fg_gamma, fg_beta
-
-
-class ForegroundOnlyModulator(nn.Module):
-    """
-    Apply FiLM modulation to foreground pixels only.
-
-    Modulation formula:
-        For FG pixels: modulated = gamma × feature + beta
-        For BG pixels: modulated = feature (no change)
-
-    This is different from Gear3 which blends FG/BG modulation.
-    """
-    def __init__(self):
-        super().__init__()
-
-    def forward(self, features, fg_mask, fg_gamma, fg_beta):
-        """
-        Args:
-            features: [B, C, H, W] - DPT features (already globally-modulated)
-            fg_mask: [B, 1, patch_h, patch_w] - binary FG mask
-            fg_gamma: [B, C] - FG modulation scale
-            fg_beta: [B, C] - FG modulation shift
-
-        Returns:
-            modulated_features: [B, C, H, W]
-        """
-        B, C, H, W = features.shape
-
-        # Resize FG mask to match feature spatial dimensions
-        if fg_mask.shape[2:] != (H, W):
-            fg_mask = F.interpolate(
-                fg_mask, size=(H, W), mode='bilinear', align_corners=True
-            )  # [B, 1, H, W]
-
-        # Expand gamma and beta to spatial dimensions
-        fg_gamma = fg_gamma.view(B, C, 1, 1)  # [B, C, 1, 1]
-        fg_beta = fg_beta.view(B, C, 1, 1)
-
-        # Apply FiLM to FG pixels only
-        # Ensure fg_mask matches dtype for BFloat16 compatibility
-        fg_mask = fg_mask.to(features.dtype)
-
-        # FG modulation: gamma × feature + beta
-        fg_modulated = fg_gamma * features + fg_beta
-
-        # Blend: FG modulation for FG pixels, original for BG pixels
-        # modulated = fg_mask × (gamma × feature + beta) + (1 - fg_mask) × feature
-        modulated_features = fg_mask * fg_modulated + (1.0 - fg_mask) * features
-
-        return modulated_features
-
-
-class ForegroundOnlyModulationHead(nn.Module):
-    """
-    Foreground-only modulation head for Step 2.
-
-    Pipeline:
-        1. Multi-layer attention fusion → importance map
-        2. FG mask generation (mean threshold)
-        3. FG feature extraction (weighted pooling)
-        4. FG modulation parameters (gamma, beta)
-        5. Apply FiLM to FG pixels only
-
-    Key difference from Gear3:
-        - Only FG modulation (no BG modulation)
-        - BG pixels keep globally-modulated values
-    """
-    def __init__(self, embed_dim=1024, dpt_dim=256):
-        super().__init__()
-
-        self.embed_dim = embed_dim
-
-        # Multi-layer attention fusion (uniform weights for Gear5)
-        self.multi_layer_fusion = MultiLayerAttentionFusion(num_layers=4, uniform_weights=True)
-
-        # FG feature extraction
-        self.fg_feature_network = ForegroundFeatureNetwork(
-            embed_dim=embed_dim, feature_dim=256
-        )
-
-        # FG modulation network
-        self.fg_modulation_network = ForegroundModulationNetwork(
-            feature_dim=256, dpt_dim=dpt_dim
-        )
-
-        # FG-only modulator
-        self.fg_modulator = ForegroundOnlyModulator()
-
-        # Count parameters
-        total_params = sum(p.numel() for p in self.parameters())
-        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        logging.info(f"ForegroundOnlyModulationHead: {trainable_params:,} / {total_params:,} trainable parameters")
-
-    def forward(self, patch_tokens, attention_weights_multi_layer,
-                dpt_features_global, patch_h, patch_w):
-        """
-        Args:
-            patch_tokens: [B, num_patches+1, embed_dim] from Layer 23 (includes CLS)
-            attention_weights_multi_layer: List of [B, num_heads, N+1, N+1]
-                                          from layers [4, 11, 17, 23] (same as CLS layers)
-            dpt_features_global: [B, dpt_dim, H, W] - globally-modulated DPT features
-            patch_h, patch_w: Spatial dimensions (e.g., 37×37 for 518×518)
-
-        Returns:
-            path_1_fg_modulated: [B, dpt_dim, H, W]
-            importance_map: [B, 1, patch_h, patch_w]
-            fg_features: [B, 256]
-            fg_mask: [B, 1, patch_h, patch_w]
-        """
-        # Remove CLS token
-        patch_tokens_only = patch_tokens[:, 1:, :]  # [B, num_patches, embed_dim]
-
-        # Step 1: Multi-layer attention fusion → importance map
-        importance_map = self.multi_layer_fusion(
-            attention_weights_multi_layer, patch_h, patch_w
-        )  # [B, 1, patch_h, patch_w]
-
-        # Step 2: Generate FG mask (mean threshold)
-        importance_flat = importance_map.flatten(2).squeeze(1)  # [B, num_patches]
-        threshold = importance_flat.mean(dim=1, keepdim=True)  # Per-sample adaptive
-        fg_mask = (importance_flat > threshold).float().reshape(importance_map.shape)
-
-        # Step 3: Extract FG features
-        fg_features = self.fg_feature_network(
-            patch_tokens_only, fg_mask, importance_map
-        )  # [B, 256]
-
-        # Step 4: Generate FG modulation parameters
-        fg_gamma, fg_beta = self.fg_modulation_network(fg_features)  # [B, dpt_dim]
-
-        # Step 5: Apply FG-only modulation
-        path_1_fg_modulated = self.fg_modulator(
-            dpt_features_global, fg_mask, fg_gamma, fg_beta
-        )  # [B, dpt_dim, H, W]
-
-        return path_1_fg_modulated, importance_map, fg_features, fg_mask
-
-
-# ==================== Combined Head for Step 2 ====================
+# ==================== Gear5 Metric Head ====================
 
 class Gear5MetricHead(nn.Module):
     """
-    Combined Gear5 head with both Global GSP and FG modulation.
-
-    Used in Step 2 training where:
-        - Global GSP is frozen (from Step 1)
-        - FG modulation is trainable
-        - Mamba + Final head are trainable (from Step 1)
+    Unified Gear5 metric head with temporal scale prediction and importance mapping.
 
     Pipeline:
-        ViT → DPT → Global GSP (frozen) → FG Modulation (trainable) → Mamba → Final
+        1. Extract 2-layer CLS tokens
+        2. Generate importance map from attention weights
+        3. Predict scale/shift with GRU
+        4. Return for application to final depth
+
+    Note: This head does NOT modify DPT features. Scale/shift are applied
+          AFTER output_conv2 in the training/inference loop.
     """
-    def __init__(self, embed_dim=1024, dpt_dim=256):
+    def __init__(self, embed_dim=1024, feature_dim=256, hidden_dim=128):
         super().__init__()
 
-        # Global scale predictor (will be frozen in Step 2)
-        self.global_gsp = GlobalScalePredictor(
-            embed_dim=embed_dim, num_layers=4
+        # Temporal scale predictor (GRU-based)
+        self.temporal_scale_predictor = TemporalScalePredictor(
+            embed_dim=embed_dim,
+            feature_dim=feature_dim,
+            hidden_dim=hidden_dim,
+            num_layers=1
         )
 
-        # FG-only modulation (trainable in Step 2)
-        self.fg_modulation_head = ForegroundOnlyModulationHead(
-            embed_dim=embed_dim, dpt_dim=dpt_dim
-        )
+        # Importance map generator
+        self.importance_map_generator = ImportanceMapGenerator(num_layers=2)
 
-        # Count parameters
-        gsp_params = sum(p.numel() for p in self.global_gsp.parameters())
-        fg_params = sum(p.numel() for p in self.fg_modulation_head.parameters())
-        total_params = gsp_params + fg_params
+        # Total parameters
+        total_params = sum(p.numel() for p in self.parameters())
+        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        logging.info(f"Gear5MetricHead: {trainable_params:,} / {total_params:,} trainable parameters")
 
-        logging.info(f"Gear5MetricHead: {total_params:,} total parameters")
-        logging.info(f"  Global GSP: {gsp_params:,} (frozen in Step 2)")
-        logging.info(f"  FG Modulation: {fg_params:,} (trainable in Step 2)")
-
-    def forward(self, cls_tokens_list, patch_tokens, attention_weights_multi_layer,
-                dpt_features, patch_h, patch_w, step=2):
+    def forward(self, cls_tokens, attention_weights_list, patch_h, patch_w):
         """
         Args:
-            cls_tokens_list: List of [B, embed_dim] CLS tokens [Layer 4, 11, 17, 23]
-            patch_tokens: [B, num_patches+1, embed_dim] from Layer 23
-            attention_weights_multi_layer: List from layers [4, 11, 17, 23] (same as CLS)
-            dpt_features: [B, dpt_dim, H, W] - original DPT path_1 features
-            patch_h, patch_w: Spatial dimensions
-            step: 1 (global only) or 2 (global + FG)
+            cls_tokens: [B, T, embed_dim] - 2-layer averaged CLS tokens
+            attention_weights_list: List of [B*T, num_heads, N+1, N+1] from 2 layers
+            patch_h, patch_w: Spatial patch dimensions
 
         Returns:
-            modulated_features: [B, dpt_dim, H, W]
-            scale: [B] (for monitoring)
-            shift: [B] (for monitoring)
-            importance_map: [B, 1, patch_h, patch_w] (if step==2)
-            fg_features: [B, 256] (if step==2)
-            fg_mask: [B, 1, patch_h, patch_w] (if step==2)
+            dict with:
+                - scale: [B, T]
+                - shift: [B, T]
+                - importance_map: [B, T, patch_h, patch_w]
         """
-        B = dpt_features.shape[0]
+        # 1. Predict scale and shift
+        scale, shift = self.temporal_scale_predictor(cls_tokens)  # [B, T], [B, T]
 
-        # Step 1: Global scale prediction
-        scale, shift = self.global_gsp(cls_tokens_list)  # [B], [B]
+        # 2. Generate importance map
+        # Note: attention_weights_list is [B*T, ...], need to handle temporal dimension
+        importance_map = self.importance_map_generator(
+            attention_weights_list, patch_h, patch_w
+        )  # [B*T, 1, patch_h, patch_w]
 
-        # Apply global modulation to DPT features
-        dpt_features_global = dpt_features * scale.view(B, 1, 1, 1) + shift.view(B, 1, 1, 1)
+        # Reshape importance map to [B, T, patch_h, patch_w]
+        BT = importance_map.shape[0]
+        T = cls_tokens.shape[1]
+        B = BT // T
+        importance_map = importance_map.view(B, T, patch_h, patch_w)  # [B, T, patch_h, patch_w]
 
-        if step == 1:
-            # Step 1 training: only global modulation
-            return {
-                'modulated_features': dpt_features_global,
-                'scale': scale,
-                'shift': shift
-            }
-
-        elif step == 2:
-            # Step 2 training: global + FG modulation
-            path_1_fg_modulated, importance_map, fg_features, fg_mask = \
-                self.fg_modulation_head(
-                    patch_tokens, attention_weights_multi_layer,
-                    dpt_features_global, patch_h, patch_w
-                )
-
-            return {
-                'modulated_features': path_1_fg_modulated,
-                'scale': scale,
-                'shift': shift,
-                'importance_map': importance_map,
-                'fg_features': fg_features,
-                'fg_mask': fg_mask
-            }
-
-        else:
-            raise ValueError(f"Invalid step: {step}. Must be 1 or 2.")
+        return {
+            'scale': scale,
+            'shift': shift,
+            'importance_map': importance_map
+        }

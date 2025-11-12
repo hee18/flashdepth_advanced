@@ -1,22 +1,25 @@
-# Gear5 Configuration - Two-Stage Global + Foreground Modulation
-# Step 1: Global Scale & Shift Prediction from multi-layer CLS tokens (518×518)
-# Step 2: Foreground-only modulation on globally-modulated features (518×518)
+# Gear5 Configuration - Unified GRU-based Temporal Scale Prediction
+# Single-Stage: GRU predicts frame-wise scale & shift from 2-layer CLS tokens
+# Architecture: Frozen FlashDepth pipeline + Trainable Gear5MetricHead (~132K params)
+# Formula: D_metric = Scale × D_relative + Shift
 
 # General settings
 config_dir: null # overwrite by --config-path
 inference: false
-load: configs/flashdepth-l/iter_10001.pth  # FlashDepth-L pretrained weights (ViT + DPT)
-step: 1  # Training step (1 or 2)
-step1_checkpoint: null  # For Step 2: path to trained Step 1 checkpoint
+load: configs/flashdepth-l/iter_10001.pth  # FlashDepth-L pretrained weights (ViT + DPT + Mamba + output_conv)
 
 # Canonical space settings
 canonical_focal_length: 1000.0  # Fixed canonical focal length for all resolutions
 use_canonical_space: true  # ENABLED - all training data normalized to canonical focal length
 
 # ========== Gear5 Specific Settings ==========
-# Step 1: Uses multi-layer CLS tokens [4, 11, 17, 23] for global GSP (uniform mix 25:25:25:25)
-# Step 2: Uses multi-layer attention [11, 17] for FG mask generation (uniform mix 50:50)
-# GSP fusion strategy: uniform averaging (consistent with FFM, 85% params reduction vs concat)
+# Unified Architecture:
+#   - 2-layer CLS tokens [11, 23] for ViT-L or [5, 11] for ViT-S (averaged)
+#   - 2-layer attention weights for importance map generation
+#   - GRU temporal modeling for smooth scale/shift predictions
+#   - Importance-weighted Log L1 loss: L = |log(pred_inv) - log(gt_inv)| × (1 + α × importance)
+# Frozen: ViT encoder, DPT decoder, Mamba, output_conv (~340M params)
+# Trainable: TemporalScalePredictor (~132K params, 0.04% of total)
 
 # Dataset configuration
 dataset:
@@ -35,15 +38,11 @@ training:
   val_freq: 1000  # Validation every 1k steps
   log_freq: 100
   wandb: false
-  wandb_name: "gear5_step1"  # Update to gear5_step2 for Step 2
+  wandb_name: "gear5_phase1"  # Update to gear5_phase2 for Phase 2
 
-  # Learning rates (step-specific)
-  # Step 1: GSP (1e-4) + Mamba (1e-4) + Final (1e-4)
-  # Step 2: FG modulation (1e-4) + Mamba (5e-5, lower) + Final (5e-5)
-  gsp_lr: 1.0e-4      # Step 1: Global GSP learning rate
-  fg_mod_lr: 1.0e-4   # Step 2: FG modulation learning rate
-  mamba_lr: 1.0e-4    # Step 1: Mamba LR; Step 2: 5e-5 (lower for fine-tuning)
-  output_lr: 1.0e-4   # Step 1: Output head LR; Step 2: 5e-5
+  # Learning rates (unified single-stage training)
+  # Only Gear5MetricHead is trainable, all other components frozen
+  gear5_lr: 1.0e-4    # Temporal scale predictor learning rate
   weight_decay: 1.0e-6
 
   # FPS measurement
@@ -57,7 +56,11 @@ model:
   patch_size: 14
   attn_class: "MemEffAttention"
 
-  # Mamba configuration
+  # Gear5 attention layer selection (2-layer CLS tokens)
+  target_blocks: [11, 23]  # ViT-L: layers 11, 23 (for Phase 1)
+  target_blocks_s: [5, 11]  # ViT-S: layers 5, 11 (for Phase 2 hybrid)
+
+  # Mamba configuration (frozen during Gear5 training)
   use_mamba: true
   mamba_type: "add"
   num_mamba_layers: 4

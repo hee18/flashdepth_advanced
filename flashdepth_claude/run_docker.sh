@@ -41,13 +41,13 @@ show_usage() {
     echo "  train_gear3_upgrade Start Gear3 Upgrade training (single GPU) - Enhanced FG/BG separation"
     echo "  train_gear3_upgrade_ddp Start Gear3 Upgrade training with 2 GPUs (GPU 0,1)"
     echo "  test_gear3_upgrade  Start Gear3 Upgrade testing (supports --separation option)"
-    echo "  train_gear5     Start Gear5 training - Two-stage Global + FG modulation (supports --step 1,2)"
+    echo "  train_gear5     Start Gear5 training - Two-stage Global + FG modulation"
     echo "  train_gear5_ddp Start Gear5 training with 2 GPUs (GPU 0,1) - Two-stage Global + FG modulation"
-    echo "  test_gear5      Start Gear5 testing (supports --step 1 or 2)"
+    echo "  test_gear5      Start Gear5 testing"
     echo "  test_gear2_objwise  Start Gear2 object-wise evaluation (Waymo segmentation)"
     echo "  test_gear3_objwise  Start Gear3 object-wise evaluation (Waymo segmentation)"
     echo "  test_gear3_upgrade_objwise  Start Gear3 Upgrade object-wise evaluation"
-    echo "  test_gear5_objwise  Start Gear5 object-wise evaluation (supports --step 1 or 2)"
+    echo "  test_gear5_objwise  Start Gear5 object-wise evaluation"
     echo "  test_original_flashdepth  Test original FlashDepth (without Gear modules) for comparison"
     echo "  shell       Start interactive shell in container"
     echo "  clean       Remove containers and images"
@@ -68,8 +68,6 @@ show_usage() {
     echo "  --config-variant VARIANT  Set Gear config variant: l, s, hybrid (default: l for Stage 1)"
     echo "  --nuscenes            Enable nuScenes fine-tuning mode (Stage 3)"
     echo "  --separation METHOD  Set FG/BG separation method: cls_seg, kmeans, multi_layer (default: cls_seg)"
-    echo "  --step STEPS         Set Gear5 training/testing step: 1, 2, or 1,2 (default: 1)"
-    echo "  --step1-checkpoint PATH  Set Step 1 checkpoint path for Gear5 Step 2 training"
     echo "  --dataset DATASET     Set object-wise evaluation dataset: waymo (default: waymo)"
     echo "  --resolution MODE    Set resolution mode for testing: base (518x518), 2k (1918x1078) (default: base)"
     echo "  --config VARIANT     Set FlashDepth config: flashdepth, flashdepth-l, flashdepth-s (default: flashdepth-l)"
@@ -106,13 +104,13 @@ show_usage() {
     echo "  $0 test_gear2_objwise --dataset waymo_seg --config-variant l --gpu 0  # Object-wise evaluation on Waymo"
     echo "  $0 test_gear3_objwise --dataset waymo_seg --config-variant l --gpu 1  # Object-wise evaluation on Waymo"
     echo "  $0 test_gear3_upgrade_objwise --dataset waymo_seg --config-variant l --separation kmeans --gpu 2  # Gear3 Upgrade object-wise"
-    echo "  $0 test_gear5_objwise --dataset waymo_seg --step 2 --gpu 0  # Gear5 object-wise evaluation (Step 2)"
-    echo "  $0 test_gear5_objwise --dataset urbansyn --step 1 --gpu 1  # Gear5 object-wise evaluation on UrbanSyn (Step 1)"
+    echo "  $0 test_gear5_objwise --dataset waymo_seg --gpu 0  # Gear5 object-wise evaluation"
+    echo "  $0 test_gear5_objwise --dataset urbansyn --gpu 1  # Gear5 object-wise evaluation on UrbanSyn"
     echo "  $0 train_gear2_ddp --config-variant hybrid --gear-checkpoint train_results/gear2_s/best.pth  # Hybrid training with Gear-S weights"
     echo "  $0 test_original_flashdepth --gpu 0  # Test original FlashDepth (ViT-L)"
     echo "  DATASET=waymo $0 test_original_flashdepth --gpu 1  # Test on Waymo dataset"
     echo "  $0 test_original_flashdepth --config flashdepth-s --gpu 0  # Use ViT-S variant (smaller/faster)"
-    echo "  CHECKPOINT=/app/configs/flashdepth-s/iter_10001.pth $0 test_original_flashdepth --config flashdepth-s  # ViT-S with matching checkpoint"
+    echo "  CHECKPOINT=/app/configs/flashdepth-s/iter_14001.pth $0 test_original_flashdepth --config flashdepth-s  # ViT-S with matching checkpoint"
     echo "  $0 train --results-dir train_results/results_2  # Custom results directory"
     echo "  $0 shell                              # Interactive development"
 }
@@ -133,8 +131,6 @@ MEASURE_FPS="true"
 CONFIG_VARIANT="l"  # Gear config variant: l (Stage 1 ViT-L), s (Stage 1 ViT-S), hybrid (Stage 2)
 NUSCENES="false"  # nuScenes fine-tuning mode (Stage 3)
 SEPARATION_METHOD="multi_layer"  # FG/BG separation method for Gear3 Upgrade (cls_seg, kmeans, multi_layer)
-GEAR5_STEP="1"  # Gear5 training/testing step: 1, 2, or "1,2" (default: 1)
-STEP1_CHECKPOINT=""  # Step 1 checkpoint path (required for Gear5 Step 2 training)
 CONFIG="flashdepth-l"  # FlashDepth config variant (flashdepth, flashdepth-l, flashdepth-s)
 INVERSE="false"  # Inverse colormap for depth visualization (original FlashDepth only)
 OBJWISE_DATASET=""  # Dataset for evaluation (waymo) - empty means use config default
@@ -206,14 +202,6 @@ while [[ $# -gt 0 ]]; do
             ;;
         --separation)
             SEPARATION_METHOD="$2"
-            shift 2
-            ;;
-        --step)
-            GEAR5_STEP="$2"
-            shift 2
-            ;;
-        --step1-checkpoint)
-            STEP1_CHECKPOINT="$2"
             shift 2
             ;;
         --dataset)
@@ -327,10 +315,10 @@ case $COMMAND in
     train_gear2)
         # Determine canonical focal length based on config variant
         if [ "$CONFIG_VARIANT" = "hybrid" ]; then
-            CANONICAL_FX="1000.0"
+            CANONICAL_FX="500.0"
             RES_NAME="2k"
         else
-            CANONICAL_FX="1000.0"
+            CANONICAL_FX="500.0"
             RES_NAME="base"
         fi
 
@@ -375,7 +363,7 @@ case $COMMAND in
         if [ "$CONFIG_VARIANT" = "hybrid" ]; then
             # Hybrid: 2K resolution - reduce both batch size and workers
             ACTUAL_WORKERS=2  # 2 workers per GPU (total 4 across 2 GPUs)
-            CANONICAL_FX="1000.0"
+            CANONICAL_FX="500.0"
             RES_NAME="2k"
 
             # Auto-adjust batch size for 2K resolution if user didn't specify
@@ -392,7 +380,7 @@ case $COMMAND in
         else
             # Stage 1 (L/S): 518x518 resolution - can use more workers and larger batch
             ACTUAL_WORKERS=$WORKERS
-            CANONICAL_FX="1000.0"
+            CANONICAL_FX="500.0"
             RES_NAME="base"
         fi
 
@@ -449,10 +437,10 @@ case $COMMAND in
     train_gear3)
         # Determine canonical focal length based on config variant
         if [ "$CONFIG_VARIANT" = "hybrid" ]; then
-            CANONICAL_FX="1000.0"
+            CANONICAL_FX="500.0"
             RES_NAME="2k"
         else
-            CANONICAL_FX="1000.0"
+            CANONICAL_FX="500.0"
             RES_NAME="base"
         fi
 
@@ -497,7 +485,7 @@ case $COMMAND in
         if [ "$CONFIG_VARIANT" = "hybrid" ]; then
             # Hybrid: 2K resolution - reduce both batch size and workers
             ACTUAL_WORKERS=2  # 2 workers per GPU (total 4 across 2 GPUs)
-            CANONICAL_FX="1000.0"
+            CANONICAL_FX="500.0"
             RES_NAME="2k"
 
             # Auto-adjust batch size for 2K resolution if user didn't specify
@@ -514,7 +502,7 @@ case $COMMAND in
         else
             # Stage 1 (L/S): 518x518 resolution - can use more workers and larger batch
             ACTUAL_WORKERS=$WORKERS
-            CANONICAL_FX="1000.0"
+            CANONICAL_FX="500.0"
             RES_NAME="base"
         fi
 
@@ -592,10 +580,10 @@ case $COMMAND in
 
         # Determine canonical focal length based on config variant
         if [ "$CONFIG_VARIANT" = "hybrid" ]; then
-            CANONICAL_FX="1000.0"
+            CANONICAL_FX="500.0"
             RES_NAME="2k"
         else
-            CANONICAL_FX="1000.0"
+            CANONICAL_FX="500.0"
             RES_NAME="base"
         fi
 
@@ -664,7 +652,7 @@ case $COMMAND in
         if [ "$CONFIG_VARIANT" = "hybrid" ]; then
             # Hybrid: 2K resolution - reduce both batch size and workers
             ACTUAL_WORKERS=2  # 2 workers per GPU (total 4 across 2 GPUs)
-            CANONICAL_FX="1000.0"
+            CANONICAL_FX="500.0"
             RES_NAME="2k"
 
             # Auto-adjust batch size for 2K resolution if user didn't specify
@@ -681,7 +669,7 @@ case $COMMAND in
         else
             # Stage 1 (L/S): 518x518 resolution - can use more workers and larger batch
             ACTUAL_WORKERS=$WORKERS
-            CANONICAL_FX="1000.0"
+            CANONICAL_FX="500.0"
             RES_NAME="base"
         fi
 
@@ -984,15 +972,11 @@ case $COMMAND in
     train_gear5)
         echo "Starting Gear5 training - Two-Stage Global + FG Modulation..."
         echo "Configuration:"
-        echo "  - Step: $GEAR5_STEP"
         echo "  - Batch size: $BATCH_SIZE"
         echo "  - Workers: $WORKERS"
         echo "  - GPU: $GPU_ID"
         echo "  - Results directory: $RESULTS_DIR"
         echo "  - FlashDepth checkpoint: $FLASHDEPTH_CHECKPOINT"
-        if [ -n "$STEP1_CHECKPOINT" ]; then
-            echo "  - Step 1 checkpoint: $STEP1_CHECKPOINT (for Step 2 training)"
-        fi
         echo ""
 
         # Build train_gear5 command
@@ -1003,7 +987,6 @@ case $COMMAND in
             training.batch_size=$BATCH_SIZE \
             training.workers=$WORKERS \
             training.iterations=$TOTAL_ITERS \
-            step=$GEAR5_STEP \
             +config_variant=$CONFIG_VARIANT \
             use_canonical_space=$USE_CANONICAL \
             +results_dir=$RESULTS_DIR"
@@ -1011,11 +994,6 @@ case $COMMAND in
         # Add FlashDepth checkpoint (ViT + DPT pretrained weights)
         if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
             DOCKER_CMD="$DOCKER_CMD load=$FLASHDEPTH_CHECKPOINT"
-        fi
-
-        # Add Step 1 checkpoint for Step 2 training
-        if [ -n "$STEP1_CHECKPOINT" ]; then
-            DOCKER_CMD="$DOCKER_CMD step1_checkpoint=$STEP1_CHECKPOINT"
         fi
 
         eval $DOCKER_CMD
@@ -1027,7 +1005,7 @@ case $COMMAND in
         if [ "$CONFIG_VARIANT" = "hybrid" ]; then
             # Hybrid: 2K resolution - reduce both batch size and workers
             ACTUAL_WORKERS=2  # 2 workers per GPU (total 4 across 2 GPUs)
-            CANONICAL_FX="1000.0"
+            CANONICAL_FX="500.0"
             RES_NAME="2k"
 
             # Auto-adjust batch size for 2K resolution if user didn't specify
@@ -1038,16 +1016,15 @@ case $COMMAND in
                 echo "  WARNING: Using user-specified batch size $BATCH_SIZE - may cause OOM on 2K resolution!"
             fi
         else
-            # Phase 1 (Step 1 or 2): 518x518 resolution - can use more workers and larger batch
+            # Phase 1: 518x518 resolution - can use more workers and larger batch
             ACTUAL_WORKERS=$WORKERS
-            CANONICAL_FX="1000.0"
+            CANONICAL_FX="500.0"
             RES_NAME="base"
         fi
 
         echo "Starting Gear5 training (Multi-GPU: 0,1) - Two-Stage Global + FG Modulation..."
         echo "Configuration:"
         echo "  - Config variant: $CONFIG_VARIANT"
-        echo "  - Step: $GEAR5_STEP"
         echo "  - Resolution: $RES_NAME"
         echo "  - Batch size per GPU: $BATCH_SIZE"
         echo "  - Effective batch size: $((BATCH_SIZE * 2))"
@@ -1057,9 +1034,6 @@ case $COMMAND in
         echo "  - Results directory: $RESULTS_DIR"
         echo "  - FPS measurement: $MEASURE_FPS"
         echo "  - FlashDepth checkpoint: $FLASHDEPTH_CHECKPOINT"
-        if [ -n "$STEP1_CHECKPOINT" ]; then
-            echo "  - Step 1 checkpoint: $STEP1_CHECKPOINT (for Gear5-S weights)"
-        fi
         echo ""
 
         DOCKER_CMD="CUDA_VISIBLE_DEVICES=0,1 docker compose run --rm \
@@ -1077,7 +1051,6 @@ case $COMMAND in
             training.workers=$ACTUAL_WORKERS \
             training.iterations=$TOTAL_ITERS \
             training.measure_fps=$MEASURE_FPS \
-            step=$GEAR5_STEP \
             +config_variant=$CONFIG_VARIANT \
             use_canonical_space=$USE_CANONICAL \
             +results_dir=$RESULTS_DIR"
@@ -1087,19 +1060,12 @@ case $COMMAND in
             DOCKER_CMD="$DOCKER_CMD load=$FLASHDEPTH_CHECKPOINT"
         fi
 
-        # Add Step 1 checkpoint for Step 2 training
-        # For Hybrid: this should be Gear5-S checkpoint
-        if [ -n "$STEP1_CHECKPOINT" ]; then
-            DOCKER_CMD="$DOCKER_CMD gear_checkpoint=$STEP1_CHECKPOINT"
-        fi
-
         eval $DOCKER_CMD
         ;;
 
     test_gear5)
         echo "Starting Gear5 testing..."
         echo "Configuration:"
-        echo "  - Step: $GEAR5_STEP"
         echo "  - Video length: $VID_LEN"
         echo "  - Frame interval: $FRAME_INTERVAL"
         echo "  - GPU: $GPU_ID"
@@ -1112,7 +1078,6 @@ case $COMMAND in
             --config-path configs/gear5 \
             --config-name config \
             dataset.data_root=/data/datasets \
-            step=$GEAR5_STEP \
             +results_dir=$RESULTS_DIR \
             +gpu=$GPU_ID \
             +vid_len=$VID_LEN \
@@ -1121,11 +1086,6 @@ case $COMMAND in
         # Add checkpoint
         if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
             TEST_CMD="$TEST_CMD load=$FLASHDEPTH_CHECKPOINT"
-        fi
-
-        # Add Step 1 checkpoint for Step 2 testing
-        if [ "$GEAR5_STEP" = "2" ] && [ -n "$STEP1_CHECKPOINT" ]; then
-            TEST_CMD="$TEST_CMD step1_checkpoint=$STEP1_CHECKPOINT"
         fi
 
         CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm flashdepth $TEST_CMD
@@ -1137,7 +1097,6 @@ case $COMMAND in
 
         echo "Starting Gear5 Object-Wise Evaluation..."
         echo "Configuration:"
-        echo "  - Step: $GEAR5_STEP"
         echo "  - Dataset: $OBJWISE_DATASET"
         echo "  - GPU: $GPU_ID"
         echo "  - Results directory: $RESULTS_DIR"
@@ -1151,7 +1110,6 @@ case $COMMAND in
             --config-name config \
             dataset.data_root=/data/datasets \
             eval.test_datasets=[$OBJWISE_DATASET] \
-            step=$GEAR5_STEP \
             +results_dir=$RESULTS_DIR \
             +gpu=$GPU_ID \
             object_wise.enabled=true \
@@ -1161,11 +1119,6 @@ case $COMMAND in
 
         if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
             TEST_CMD="$TEST_CMD load=$FLASHDEPTH_CHECKPOINT"
-        fi
-
-        # Add Step 1 checkpoint for Step 2 testing
-        if [ "$GEAR5_STEP" = "2" ] && [ -n "$STEP1_CHECKPOINT" ]; then
-            TEST_CMD="$TEST_CMD step1_checkpoint=$STEP1_CHECKPOINT"
         fi
 
         CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm flashdepth $TEST_CMD
@@ -1190,13 +1143,13 @@ case $COMMAND in
             # User didn't specify checkpoint, use default for selected config
             case "$CONFIG" in
                 flashdepth-l)
-                    CHECKPOINT="/app/configs/flashdepth-l/iter_10001.pth"
+                    CHECKPOINT="/app/configs/flashdepth-l/iter_14001.pth"
                     ;;
                 flashdepth-s)
                     CHECKPOINT="/app/configs/flashdepth-s/iter_10001.pth"
                     ;;
                 flashdepth)
-                    CHECKPOINT="/app/configs/flashdepth/iter_10001.pth"
+                    CHECKPOINT="/app/configs/flashdepth/iter_43002.pth"
                     ;;
                 *)
                     echo "Unknown config variant: $CONFIG"

@@ -1,27 +1,27 @@
 """
-Gear5 Training Script: Two-Stage Global + Foreground Modulation
+Gear5 Training Script: Unified Single-Stage Temporal Scale Prediction
 
-Two-stage training approach:
-    Step 1: Global Scale & Shift Prediction (GSP)
-        - Input: Multi-layer CLS tokens [4, 11, 17, 23]
-        - Output: Global scale and shift
-        - Trainable: GSP + Mamba + Final head
-        - Frozen: ViT + DPT
-        - Loss: gt valid & pred inlier pixels
+Single-stage training approach:
+    - Input: 2-layer CLS tokens [11, 23] for ViT-L or [5, 11] for ViT-S
+    - Processing: GRU-based temporal modeling for scale/shift
+    - Output: Frame-wise scale and shift parameters
+    - Applied to: Final relative depth output (after output_conv2)
+    - Formula: D_metric = Scale × D_relative + Shift
 
-    Step 2: Foreground-only Modulation
-        - Input: Globally-modulated DPT + Multi-layer attention [4, 11, 17, 23]
-        - Output: FG-modulated features
-        - Trainable: FG modulation + Mamba + Final head
-        - Frozen: ViT + DPT + GSP (from Step 1)
-        - Loss: gt valid & pred inlier & FG pixels
+Freezing Strategy:
+    - Frozen: ViT encoder, DPT decoder, Mamba modules, output_conv
+    - Trainable: Only Gear5MetricHead (~132K parameters)
+
+Loss:
+    - Importance-weighted Log L1 loss
+    - Importance map from 2-layer attention weights
+    - Weighted by foreground ratio (alpha)
 
 Key features:
-    - Two-stage training: --step 1, --step 2, or --step 1,2
-    - Global modulation from multi-layer CLS tokens
-    - FG-only modulation (BG keeps global modulation)
-    - Canonical space normalization (focal_length=1000)
-    - Resolution: 518×518 for both steps
+    - Temporal consistency via GRU
+    - Attention-based importance weighting
+    - Canonical space normalization (focal_length=500)
+    - Resolution: 518×518 (Phase 1) or 2K (Phase 2)
 """
 
 import os
@@ -50,12 +50,8 @@ import time
 from datetime import timedelta
 
 from flashdepth.model import FlashDepth
-from utils.gear3_upgrade_visualization import Gear3UpgradeVisualizer  # Can reuse for now
-from flashdepth.gear5_modules import (
-    GlobalScalePredictor,
-    ForegroundOnlyModulationHead,
-    Gear5MetricHead
-)
+from utils.gear5_visualization import Gear5Visualizer
+from flashdepth.gear5_modules import Gear5MetricHead
 from dataloaders.combined_dataset import CombinedDataset
 from utils.helpers import *
 from utils.metric_depth_metrics import MetricDepthMetrics
@@ -94,45 +90,36 @@ def init_distributed():
 
 class Gear5Trainer:
     """
-    Trainer for Gear5 two-stage metric depth learning.
+    Trainer for Gear5 unified single-stage metric depth learning.
 
-    Step 1:
-        Frozen: ViT + DPT
-        Trainable: Global GSP + Mamba + Final head
-
-    Step 2:
-        Frozen: ViT + DPT + GSP (from Step 1)
-        Trainable: FG modulation + Mamba + Final head
+    Unified Stage:
+        Frozen: ViT + DPT + Mamba + output_conv
+        Trainable: Gear5MetricHead only (~132K parameters)
     """
     def __init__(self, config, rank, world_size, local_rank):
         self.config = config
-        self.step = config.get('step', 1)  # Training step (1 or 2)
         self.rank = rank
         self.world_size = world_size
         self.local_rank = local_rank
 
-        # Detect phase based on config_variant (similar to Gear3 Upgrade)
-        # Phase 1: 518×518, config_l or config_s (Step 1 or 2)
-        # Phase 2: 2K, config_hybrid (Step 2 only)
+        # Detect phase based on config_variant
+        # Phase 1: 518×518, config_l or config_s
+        # Phase 2: 2K, config_hybrid
         config_variant = config.get('config_variant', 'l')
         self.phase = 2 if config_variant == 'hybrid' else 1
-
-        if self.phase == 2 and self.step != 2:
-            raise ValueError("Phase 2 (Hybrid) requires step=2!")
 
         # Setup device
         self.device = f"cuda:{local_rank}"
         torch.cuda.set_device(local_rank)
 
         if rank == 0:
-            logging.info(f"Training Step {self.step}, Phase {self.phase} on {world_size} GPU(s)")
+            logging.info(f"Training Phase {self.phase} on {world_size} GPU(s)")
             if self.phase == 2:
                 logging.info(f"  Phase 2 (Hybrid): 2K resolution, Gear5-S weights + FlashDepth-hybrid")
 
         # Setup results directory (only rank 0)
         phase_suffix = f"_phase{self.phase}" if self.phase > 1 else ""
-        step_suffix = f"_step{self.step}"
-        self.results_dir = Path(config.get('results_dir', f'./train_results/gear5{step_suffix}{phase_suffix}'))
+        self.results_dir = Path(config.get('results_dir', f'./train_results/gear5{phase_suffix}'))
         if rank == 0:
             self.results_dir.mkdir(parents=True, exist_ok=True)
 
@@ -170,7 +157,7 @@ class Gear5Trainer:
 
         if rank == 0:
             self.logger.info(f"Results directory: {self.results_dir}")
-            self.logger.info(f"Training step: {self.step}")
+            self.logger.info(f"Training phase: {self.phase}")
 
         # Initialize model
         self.model = self._setup_model()
@@ -192,13 +179,13 @@ class Gear5Trainer:
         if config.training.get('wandb', False):
             wandb.init(
                 project="flashdepth-gear5",
-                name=f"gear5_step{self.step}_{config.training.get('wandb_name', 'experiment')}",
+                name=f"gear5_phase{self.phase}_{config.training.get('wandb_name', 'experiment')}",
                 config=dict(config)
             )
 
         # Setup visualizer with separate folders
-        self.train_visualizer = Gear3UpgradeVisualizer(save_dir=self.results_dir / "visualizations" / "train")
-        self.val_visualizer = Gear3UpgradeVisualizer(save_dir=self.results_dir / "visualizations" / "valid")
+        self.train_visualizer = Gear5Visualizer(save_dir=self.results_dir / "visualizations" / "train")
+        self.val_visualizer = Gear5Visualizer(save_dir=self.results_dir / "visualizations" / "valid")
 
         self.global_step = 0
         self.best_val_loss = float('inf')
@@ -232,10 +219,7 @@ class Gear5Trainer:
         return 500.0
 
     def _setup_model(self):
-        """Initialize FlashDepth with Gear5 modules (GSP + FG modulation)"""
-        # Gear5 ALWAYS uses multi_layer separation method
-        self.separation_method = 'multi_layer'
-
+        """Initialize FlashDepth with Gear5 metric head"""
         # Create base FlashDepth model
         model_config = dict(self.config.model)
         model_config['batch_size'] = self.config.training.batch_size
@@ -248,35 +232,25 @@ class Gear5Trainer:
         dpt_dim = 256 if model.encoder == 'vitl' else 64
 
         # Load pre-trained checkpoint
-        # Phase 1, Step 1: Load FlashDepth weights (DINOv2 + DPT + Mamba + Final head)
-        # Phase 1, Step 2: Load Step 1 checkpoint (all modules including Gear5)
-        # Phase 2, Step 2: Load Gear5-S checkpoint (will load later after creating gear5_metric_head)
-        if self.step == 1:
+        # Phase 1: Load FlashDepth-L checkpoint (ViT, DPT, Mamba, output_conv)
+        # Phase 2: Load Phase 1 Gear5 checkpoint, then overwrite ViT+DPT with FlashDepth-S hybrid
+        if self.phase == 1:
             checkpoint_path = self.config.get('load')
-        elif self.phase == 2:
-            # Phase 2 (Hybrid): Load Gear5-S checkpoint after creating gear5_metric_head
+        else:
+            # Phase 2: Load Gear5 Phase 1 checkpoint
             checkpoint_path = self.config.get('gear_checkpoint')
             if not checkpoint_path:
                 raise ValueError(
                     "Phase 2 (Hybrid) requires 'gear_checkpoint' in config! "
-                    "Set gear_checkpoint to your Gear5-S Phase 1 checkpoint path."
+                    "Set gear_checkpoint to your Gear5 Phase 1 checkpoint path."
                 )
             if self.rank == 0:
-                self.logger.info(f"Phase {self.phase}: Will load Gear5-S checkpoint from {checkpoint_path}")
-        else:
-            # Phase 1, Step 2: Load Step 1 checkpoint
-            checkpoint_path = self.config.get('gear_checkpoint')
-            if not checkpoint_path:
-                raise ValueError(
-                    "Step 2 requires 'gear_checkpoint' in config! "
-                    "Set gear_checkpoint to your Step 1 checkpoint path."
-                )
-            if self.rank == 0:
-                self.logger.info(f"Step {self.step}: Loading Step 1 checkpoint from {checkpoint_path}")
+                self.logger.info(f"Phase {self.phase}: Will load Gear5 Phase 1 checkpoint from {checkpoint_path}")
 
-        if checkpoint_path and checkpoint_path != 'true':
+        # Phase 1: Load FlashDepth checkpoint (ViT, DPT, Mamba, output_conv)
+        if self.phase == 1 and checkpoint_path and checkpoint_path != 'true':
             if os.path.exists(checkpoint_path):
-                self.logger.info(f"Loading checkpoint from {checkpoint_path}")
+                self.logger.info(f"Phase 1: Loading FlashDepth checkpoint from {checkpoint_path}")
                 checkpoint = torch.load(checkpoint_path, map_location='cpu')
 
                 # Extract state dict
@@ -290,51 +264,39 @@ class Gear5Trainer:
                 # Remove module. prefix if present
                 state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
 
-                if self.step == 1:
-                    # Phase 1, Step 1: Load ALL parameters from FlashDepth (DINOv2, DPT, Mamba, output_conv)
-                    # Only exclude gear5_metric_head (will be created and trained from scratch)
-                    loaded_dict = {}
-                    excluded_keys = []
-                    for k, v in state_dict.items():
-                        # Exclude only gear5_metric_head (doesn't exist in FlashDepth checkpoint)
-                        if 'gear5_metric_head' in k:
-                            excluded_keys.append(k)
-                        else:
-                            loaded_dict[k] = v
+                # Load ALL parameters from FlashDepth (exclude only gear5_metric_head)
+                loaded_dict = {}
+                excluded_keys = []
+                for k, v in state_dict.items():
+                    if 'gear5_metric_head' in k:
+                        excluded_keys.append(k)
+                    else:
+                        loaded_dict[k] = v
 
-                    # Load state dict (strict=False to allow missing gear5_metric_head)
-                    model.load_state_dict(loaded_dict, strict=False)
-                    self.logger.info(f"Phase 1, Step 1: Loaded {len(loaded_dict)} parameters from FlashDepth checkpoint")
-                    self.logger.info(f"  - DINOv2 encoder: ✓ (will be frozen)")
-                    self.logger.info(f"  - DPT projects/resize/refinenet: ✓ (will be frozen)")
-                    self.logger.info(f"  - Mamba: ✓ (will be trained)")
-                    self.logger.info(f"  - output_conv1/2: ✓ (will be trained)")
-                    if excluded_keys:
-                        self.logger.info(f"Excluded {len(excluded_keys)} parameters (gear5_metric_head will be created)")
-                elif self.phase == 2:
-                    # Phase 2: Skip loading here, will load after creating gear5_metric_head
-                    pass
-                else:
-                    # Phase 1, Step 2: Load ALL parameters including gear5_metric_head
-                    # But need to add gear5_metric_head first before loading
-                    pass  # Will load after gear5_metric_head is created
+                # Load state dict (strict=False to allow missing gear5_metric_head)
+                model.load_state_dict(loaded_dict, strict=False)
+                self.logger.info(f"Phase 1: Loaded {len(loaded_dict)} parameters from FlashDepth checkpoint")
+                self.logger.info(f"  - DINOv2 encoder: ✓ (will be frozen)")
+                self.logger.info(f"  - DPT decoder: ✓ (will be frozen)")
+                self.logger.info(f"  - Mamba modules: ✓ (will be frozen)")
+                self.logger.info(f"  - output_conv1/2: ✓ (will be frozen)")
+                if excluded_keys:
+                    self.logger.info(f"Excluded {len(excluded_keys)} parameters (gear5_metric_head will be created)")
             else:
                 self.logger.warning(f"Checkpoint {checkpoint_path} not found")
 
-        # Add Gear3 Upgrade metric head
-        embed_dim = 1024 if model.encoder == 'vitl' else 384
-        dpt_dim = 256 if model.encoder == 'vitl' else 64
-        num_heads = 16 if model.encoder == 'vitl' else 6
-
-        # Gear5 uses its own metric head (global GSP + FG modulation)
-        # GSP fusion: uniform mix (25:25:25:25), consistent with FFM
+        # Add Gear5 metric head (unified single-stage)
+        # Uses 2-layer CLS tokens and GRU for temporal modeling
         model.gear5_metric_head = Gear5MetricHead(
             embed_dim=embed_dim,
-            dpt_dim=dpt_dim
+            feature_dim=256,
+            hidden_dim=128
         )
 
-        # Phase 1, Step 2: Load ALL parameters after gear5_metric_head is created
-        if self.step == 2 and self.phase == 1 and checkpoint_path and checkpoint_path != 'true' and os.path.exists(checkpoint_path):
+        # Phase 2: Load Phase 1 checkpoint, then overwrite ViT+DPT with FlashDepth-S hybrid
+        if self.phase == 2 and checkpoint_path and checkpoint_path != 'true' and os.path.exists(checkpoint_path):
+            # Step 1: Load Phase 1 Gear5 checkpoint (all components including gear5_metric_head)
+            self.logger.info(f"Phase 2: Loading Gear5 Phase 1 checkpoint: {checkpoint_path}")
             checkpoint = torch.load(checkpoint_path, map_location='cpu')
             if isinstance(checkpoint, dict) and 'model' in checkpoint:
                 state_dict = checkpoint['model']
@@ -345,47 +307,19 @@ class Gear5Trainer:
 
             state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
 
-            # Load all parameters including gear5_metric_head from Step 1
+            # Load all parameters from Phase 1
             model.load_state_dict(state_dict, strict=False)
-            self.logger.info(f"Phase 1, Step 2: Loaded ALL parameters from Step 1 checkpoint")
-            self.logger.info(f"  - DINOv2, DPT, Mamba, output_conv, Gear5 (GSP + FFM): ✓")
-            self.logger.info(f"  - DINOv2 and DPT are already frozen from Step 1 (same as FlashDepth checkpoint)")
+            self.logger.info(f"Phase 2: Loaded Gear5 Phase 1 checkpoint")
+            self.logger.info(f"  - ViT (ViT-L): ✓ (will be overwritten with hybrid)")
+            self.logger.info(f"  - DPT: ✓ (will be overwritten with hybrid)")
+            self.logger.info(f"  - Mamba: ✓ (kept from Phase 1, will be frozen)")
+            self.logger.info(f"  - output_conv: ✓ (kept from Phase 1, will be frozen)")
+            self.logger.info(f"  - Gear5MetricHead: ✓ (kept from Phase 1, trainable)")
 
-        # Phase 2, Step 1 (Hybrid): Load GSP+Mamba+output from Phase1 Step2, overwrite DINOv2+DPT from FlashDepth-hybrid (NO FFM)
-        elif self.step == 1 and self.phase == 2 and checkpoint_path and checkpoint_path != 'true' and os.path.exists(checkpoint_path):
-            # Step 1: Load Phase1 Step2 checkpoint (GSP, Mamba, output_conv) - EXCLUDE FFM
-            self.logger.info(f"Phase 2, Step 1: Loading from Phase1 Step2 checkpoint (excluding FFM): {checkpoint_path}")
-            checkpoint = torch.load(checkpoint_path, map_location='cpu')
-            if isinstance(checkpoint, dict) and 'model' in checkpoint:
-                state_dict = checkpoint['model']
-            elif isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
-                state_dict = checkpoint['state_dict']
-            else:
-                state_dict = checkpoint
-
-            state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
-
-            # Filter out FFM keys (gear5_metric_head.fg_modulation_head.*)
-            filtered_state_dict = {}
-            excluded_ffm_keys = []
-            for k, v in state_dict.items():
-                if k.startswith('gear5_metric_head.fg_modulation_head.'):
-                    excluded_ffm_keys.append(k)
-                else:
-                    filtered_state_dict[k] = v
-
-            # Load filtered state dict (GSP, Mamba, output_conv, but NO FFM)
-            model.load_state_dict(filtered_state_dict, strict=False)
-            self.logger.info(f"Phase 2, Step 1: Loaded {len(filtered_state_dict)} parameters from Phase1 Step2")
-            self.logger.info(f"  - GSP (gear5_metric_head.gsp): ✓")
-            self.logger.info(f"  - Mamba: ✓")
-            self.logger.info(f"  - output_conv1/2: ✓")
-            self.logger.info(f"  - FFM: ✗ (excluded {len(excluded_ffm_keys)} keys, will NOT be used in Step 1)")
-
-            # Step 2: Overwrite DINOv2 + DPT with FlashDepth-hybrid weights
+            # Step 2: Overwrite ViT + DPT with FlashDepth-S hybrid weights
             hybrid_path = self.config.get('load', 'configs/flashdepth/iter_43002.pth')
             if os.path.exists(hybrid_path):
-                self.logger.info(f"Phase 2, Step 1: Loading FlashDepth-hybrid weights from {hybrid_path}")
+                self.logger.info(f"Phase 2: Loading FlashDepth-S hybrid weights from {hybrid_path}")
                 hybrid_checkpoint = torch.load(hybrid_path, map_location='cpu')
 
                 # Extract state dict
@@ -399,96 +333,30 @@ class Gear5Trainer:
                 # Remove module. prefix if present
                 hybrid_state_dict = {k.replace('module.', ''): v for k, v in hybrid_state_dict.items()}
 
-                # Load ONLY DINOv2 and DPT parameters (overwrite Phase1 weights with Hybrid)
+                # Load ONLY ViT and DPT parameters (exclude Mamba, output_conv, gear5_metric_head)
                 loaded_hybrid = {}
                 for k, v in hybrid_state_dict.items():
-                    # Include only encoder and DPT refinement (exclude Mamba, output_conv, gear5_metric_head)
+                    # Include only encoder and DPT (exclude Mamba, output_conv, gear5_metric_head)
                     if not any(x in k for x in ['mamba', 'hybrid_fusion', 'teacher_model',
                                                  'output_conv1', 'output_conv2', 'gear5_metric_head']):
                         loaded_hybrid[k] = v
 
-                # Overwrite DINOv2 + DPT parameters
+                # Overwrite ViT + DPT parameters with hybrid weights
                 model.load_state_dict(loaded_hybrid, strict=False)
-                self.logger.info(f"Phase 2, Step 1: Overwritten {len(loaded_hybrid)} DINOv2 + DPT parameters with Hybrid weights")
-                self.logger.info(f"  - DINOv2 (ViT-L + ViT-S + Cross Attn): ✓")
+                self.logger.info(f"Phase 2: Overwritten {len(loaded_hybrid)} ViT + DPT parameters with hybrid weights")
+                self.logger.info(f"  - ViT (ViT-L + ViT-S + Cross Attn): ✓")
                 self.logger.info(f"  - DPT: ✓")
-                self.logger.info(f"  - Kept from Phase1 Step2: GSP, Mamba, output_conv")
-                self.logger.info(f"  - FFM: Will NOT be loaded (Step 1 trains without FFM)")
+                self.logger.info(f"  - Kept from Phase 1: Mamba (frozen), output_conv (frozen), Gear5MetricHead (trainable)")
             else:
-                self.logger.warning(f"FlashDepth-hybrid checkpoint {hybrid_path} not found! Using Phase1 DINOv2 + DPT.")
-
-        # Phase 2, Step 2 (Hybrid): Load from Phase2 Step1, add FFM from Phase1 Step2
-        elif self.step == 2 and self.phase == 2 and checkpoint_path and checkpoint_path != 'true' and os.path.exists(checkpoint_path):
-            # Step 1: Load Phase2 Step1 checkpoint (GSP, Mamba, output_conv, DINOv2, DPT - but NO FFM yet)
-            self.logger.info(f"Phase 2, Step 2: Loading from Phase2 Step1 checkpoint: {checkpoint_path}")
-            checkpoint = torch.load(checkpoint_path, map_location='cpu')
-            if isinstance(checkpoint, dict) and 'model' in checkpoint:
-                state_dict = checkpoint['model']
-            elif isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
-                state_dict = checkpoint['state_dict']
-            else:
-                state_dict = checkpoint
-
-            state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
-
-            # Load all parameters from Phase2 Step1 (should NOT have FFM yet)
-            model.load_state_dict(state_dict, strict=False)
-            self.logger.info(f"Phase 2, Step 2: Loaded base model from Phase2 Step1")
-            self.logger.info(f"  - DINOv2 + DPT (from FlashDepth-hybrid): ✓")
-            self.logger.info(f"  - GSP + Mamba + output_conv (from Phase1 Step2): ✓")
-            self.logger.info(f"  - FFM: Not yet loaded (will load from Phase1 Step2 next)")
-
-            # Step 2: Load FFM from Phase1 Step2 checkpoint
-            phase1_step2_path = self.config.get('phase1_step2_checkpoint')
-            if phase1_step2_path and phase1_step2_path != 'true' and os.path.exists(phase1_step2_path):
-                self.logger.info(f"Phase 2, Step 2: Loading FFM from Phase1 Step2 checkpoint: {phase1_step2_path}")
-                phase1_checkpoint = torch.load(phase1_step2_path, map_location='cpu')
-
-                # Extract state dict
-                if isinstance(phase1_checkpoint, dict) and 'model' in phase1_checkpoint:
-                    phase1_state_dict = phase1_checkpoint['model']
-                elif isinstance(phase1_checkpoint, dict) and 'state_dict' in phase1_checkpoint:
-                    phase1_state_dict = phase1_checkpoint['state_dict']
-                else:
-                    phase1_state_dict = phase1_checkpoint
-
-                # Remove module. prefix if present
-                phase1_state_dict = {k.replace('module.', ''): v for k, v in phase1_state_dict.items()}
-
-                # Extract ONLY FFM parameters
-                ffm_state_dict = {}
-                for k, v in phase1_state_dict.items():
-                    if k.startswith('gear5_metric_head.fg_modulation_head.'):
-                        ffm_state_dict[k] = v
-
-                # Load FFM parameters
-                if ffm_state_dict:
-                    model.load_state_dict(ffm_state_dict, strict=False)
-                    self.logger.info(f"Phase 2, Step 2: Loaded {len(ffm_state_dict)} FFM parameters from Phase1 Step2")
-                    self.logger.info(f"  - FFM (fg_modulation_head): ✓")
-                    self.logger.info(f"  - Now ready to train full model with FFM!")
-                else:
-                    self.logger.warning(f"No FFM parameters found in Phase1 Step2 checkpoint!")
-            else:
-                self.logger.warning(f"Phase1 Step2 checkpoint not provided or not found. FFM will be randomly initialized!")
+                self.logger.warning(f"FlashDepth-S hybrid checkpoint {hybrid_path} not found! Using Phase 1 ViT + DPT.")
 
         # Enable attention weights storage
-        # Gear5 ALWAYS uses multi_layer separation method
-        # - Step 1 (GSP): [4, 11, 17, 23] - all 4 DPT layers
-        # - Step 2 (FG): [11, 17] - mid 2 DPT layers only
-        if self.step == 1:
-            # Step 1: GSP module uses all 4 DPT layers
-            multi_layer_blocks = {
-                'vitl': [4, 11, 17, 23],
-                'vits': [2, 5, 8, 11]
-            }
-        else:  # Step 2
-            # Step 2: FG feature module uses mid 2 DPT layers only
-            multi_layer_blocks = {
-                'vitl': [11, 17],
-                'vits': [5, 8]
-            }
-        target_blocks = multi_layer_blocks[model.encoder]
+        # Unified single-stage: use 2 layers for CLS token extraction and importance mapping
+        # Layers [11, 23] for ViT-L or [5, 11] for ViT-S
+        target_blocks = {
+            'vitl': [11, 23],
+            'vits': [5, 11]
+        }[model.encoder]
 
         for i, block in enumerate(model.pretrained.blocks):
             if i in target_blocks:
@@ -497,22 +365,18 @@ class Gear5Trainer:
             else:
                 block.attn.store_attn_weights = False
 
-        self.logger.info(f"Multi-layer attention fusion (Step {self.step}): storing attention from blocks {target_blocks}")
+        self.logger.info(f"2-layer attention storage: blocks {target_blocks}")
 
         # Store target blocks and compute encoder_features indices
         # encoder_features from get_intermediate_layers returns features at intermediate_layer_idx
-        # For vitl: intermediate_layer_idx = [4, 11, 17, 23], encoder_features has indices [0, 1, 2, 3]
-        # For vits: intermediate_layer_idx = [2, 5, 8, 11], encoder_features has indices [0, 1, 2, 3]
+        # For vitl: intermediate_layer_idx = [4, 11, 17, 23], target_blocks = [11, 23]
+        #           encoder_indices = [1, 3] (indices for layers 11 and 23)
+        # For vits: intermediate_layer_idx = [2, 5, 8, 11], target_blocks = [5, 11]
+        #           encoder_indices = [1, 3] (indices for layers 5 and 11)
         intermediate_idx = model.intermediate_layer_idx[model.encoder]
-
-        # Map target_blocks to encoder_features indices
-        # e.g., target_blocks = [4, 11, 17, 23], intermediate_idx = [4, 11, 17, 23]
-        #       encoder_indices = [0, 1, 2, 3] (all 4 for Step 1)
-        # e.g., target_blocks = [11, 17], intermediate_idx = [4, 11, 17, 23]
-        #       encoder_indices = [1, 2] (middle 2 for Step 2)
         encoder_indices = [intermediate_idx.index(block) for block in target_blocks]
         self.encoder_indices = encoder_indices
-        self.logger.info(f"Encoder features indices for Step {self.step}: {encoder_indices}")
+        self.logger.info(f"Encoder features indices: {encoder_indices} (for CLS token extraction)")
 
         # Store target blocks for use in training/validation steps
         self.target_blocks = target_blocks
@@ -552,73 +416,50 @@ class Gear5Trainer:
 
     def _configure_parameters(self, model):
         """
-        Freeze configuration based on step and phase:
-
-        Step 1:
-            Frozen: DINOv2, DPT
-            Trainable: GSP, Mamba, output_conv
-
-        Step 2 (Phase 1 or 2):
-            Frozen: DINOv2, DPT, GSP
-            Trainable: FFM, Mamba, output_conv
+        Unified single-stage freezing strategy:
+            Frozen: ViT encoder, DPT decoder, Mamba modules, output_conv
+            Trainable: Only Gear5MetricHead (~132K parameters)
         """
-        frozen_params = 0
-        mamba_params = 0
-        output_conv_params = 0
-        gsp_params = 0
-        ffm_params = 0
+        frozen_vit_dpt = 0
+        frozen_mamba = 0
+        frozen_output_conv = 0
+        trainable_gear5 = 0
 
         for name, param in model.named_parameters():
-            # Gear5 metric head - step-specific freezing
-            if 'gear5_metric_head.global_gsp' in name:
-                # GSP: trainable only in Step 1
-                param.requires_grad = (self.step == 1)
-                gsp_params += param.numel()
-                if param.requires_grad:
-                    self.logger.info(f"Trainable (GSP): {name} - {param.shape}")
+            # Gear5 metric head: always trainable
+            if 'gear5_metric_head' in name:
+                param.requires_grad = True
+                trainable_gear5 += param.numel()
+                self.logger.info(f"Trainable (Gear5): {name} - {param.shape}")
 
-            elif 'gear5_metric_head.fg_modulation_head' in name:
-                # FFM: trainable only in Step 2
-                param.requires_grad = (self.step == 2)
-                ffm_params += param.numel()
-                if param.requires_grad:
-                    self.logger.info(f"Trainable (FFM): {name} - {param.shape}")
-
+            # Mamba: frozen
             elif 'mamba' in name:
-                # Mamba: always trainable
-                param.requires_grad = True
-                mamba_params += param.numel()
-
-            elif 'output_conv' in name:
-                # DPT output head: always trainable
-                param.requires_grad = True
-                output_conv_params += param.numel()
-                self.logger.info(f"Trainable (output_conv): {name} - {param.shape}")
-
-            else:
-                # Everything else (DINOv2, DPT refinement): frozen
                 param.requires_grad = False
-                frozen_params += param.numel()
+                frozen_mamba += param.numel()
+
+            # DPT output head: frozen
+            elif 'output_conv' in name:
+                param.requires_grad = False
+                frozen_output_conv += param.numel()
+
+            # Everything else (ViT encoder, DPT decoder): frozen
+            else:
+                param.requires_grad = False
+                frozen_vit_dpt += param.numel()
 
         # Log summary
-        self.logger.info(f"=== Parameter Configuration (Step {self.step}, Phase {self.phase}) ===")
+        self.logger.info(f"=== Parameter Configuration (Phase {self.phase}) ===")
         self.logger.info(f"Frozen:")
-        self.logger.info(f"  - DINOv2 + DPT: {frozen_params:,}")
-        if self.step == 2:
-            self.logger.info(f"  - GSP: {gsp_params:,}")
+        self.logger.info(f"  - ViT + DPT: {frozen_vit_dpt:,}")
+        self.logger.info(f"  - Mamba: {frozen_mamba:,}")
+        self.logger.info(f"  - output_conv: {frozen_output_conv:,}")
 
         self.logger.info(f"Trainable:")
-        if self.step == 1:
-            self.logger.info(f"  - GSP: {gsp_params:,}")
-        else:
-            self.logger.info(f"  - FFM: {ffm_params:,}")
-        self.logger.info(f"  - Mamba: {mamba_params:,}")
-        self.logger.info(f"  - output_conv: {output_conv_params:,}")
+        self.logger.info(f"  - Gear5MetricHead: {trainable_gear5:,}")
 
-        total_frozen = frozen_params + (gsp_params if self.step == 2 else 0)
-        total_trainable = mamba_params + output_conv_params + (gsp_params if self.step == 1 else ffm_params)
+        total_frozen = frozen_vit_dpt + frozen_mamba + frozen_output_conv
         self.logger.info(f"Total frozen: {total_frozen:,}")
-        self.logger.info(f"Total trainable: {total_trainable:,}")
+        self.logger.info(f"Total trainable: {trainable_gear5:,}")
 
     def _set_train_mode(self):
         """
@@ -642,29 +483,22 @@ class Gear5Trainer:
 
     def _setup_data_loaders(self):
         """Setup phase-specific data loaders"""
-        if self.step == 1:
+        if self.phase == 1:
             # Phase 1: 5 datasets, 518×518
             train_datasets = self.config.dataset.get('train_datasets',
                 ['mvs-synth', 'dynamicreplica', 'tartanair', 'pointodyssey', 'spring'])
             val_datasets = self.config.dataset.get('val_datasets', ['sintel', 'waymo'])
             resolution = 'base'  # 518×518
-        elif self.step == 1.5:
-            # Phase 1.5: nuScenes fine-tuning, 518×518 (optional)
-            train_datasets = ['nuscenes']
-            val_datasets = ['nuscenes']
-            resolution = 'base'  # 518×518 (same as Phase 1)
-        elif self.step == 2:
+        else:
             # Phase 2: mvs-synth, spring only, 2K resolution (Hybrid)
             train_datasets = self.config.dataset.get('train_datasets', ['mvs-synth', 'spring'])
             val_datasets = self.config.dataset.get('val_datasets', ['sintel', 'waymo_seg'])
             resolution = '2k'
-        else:
-            raise ValueError(f"Invalid step: {self.step}. Must be 1, 1.5, or 2.")
 
         if self.rank == 0:
-            self.logger.info(f"Step {self.step} - Train datasets: {train_datasets}")
-            self.logger.info(f"Step {self.step} - Val datasets: {val_datasets}")
-            self.logger.info(f"Step {self.step} - Resolution: {resolution}")
+            self.logger.info(f"Phase {self.phase} - Train datasets: {train_datasets}")
+            self.logger.info(f"Phase {self.phase} - Val datasets: {val_datasets}")
+            self.logger.info(f"Phase {self.phase} - Resolution: {resolution}")
 
         # Training dataset
         train_dataset = CombinedDataset(
@@ -676,9 +510,9 @@ class Gear5Trainer:
             color_aug=False  # No augmentation for metric training
         )
 
-        # Validation dataset: use shorter sequence for Phase 2/3 to save memory
-        # Phase 2/3 use 2K resolution which requires much more memory
-        val_video_length = 1 if self.step >= 2 else self.config.dataset.video_length
+        # Validation dataset: use shorter sequence for Phase 2 to save memory
+        # Phase 2 uses 2K resolution which requires much more memory
+        val_video_length = 1 if self.phase >= 2 else self.config.dataset.video_length
         val_dataset = CombinedDataset(
             root_dir=self.config.dataset.data_root,
             enable_dataset_flags=val_datasets,
@@ -731,7 +565,7 @@ class Gear5Trainer:
             self.logger.info(f"Train dataset size: {len(train_dataset)}")
             self.logger.info(f"Val dataset size: {len(val_dataset)}")
             self.logger.info(f"Train batch size: {self.config.training.batch_size}, video_length: {self.config.dataset.video_length}")
-            self.logger.info(f"Val batch size: 1, video_length: {val_video_length} {'(reduced for 2K)' if self.step >= 2 else '(like original FlashDepth)'}")
+            self.logger.info(f"Val batch size: 1, video_length: {val_video_length} {'(reduced for 2K)' if self.phase >= 2 else '(like original FlashDepth)'}")
 
         return train_loader, val_loader
 
@@ -918,64 +752,55 @@ class Gear5Trainer:
                         cls_token = None
 
                         # Gear5: Collect CLS tokens and attention weights from multiple layers
-                        # Use encoder_indices to index into encoder_features
-                        # Step 1: encoder_indices = [0, 1, 2, 3] (all 4 layers)
-                        # Step 2: encoder_indices = [1, 2] (middle 2 layers)
+                        # Collect 2-layer CLS tokens and average them
                         cls_tokens_list = [
-                            encoder_features[i][:, 0]  # CLS token from each layer
+                            encoder_features[i][:, 0]  # CLS token from each layer [B*T, embed_dim]
                             for i in self.encoder_indices
                         ]
-                        attention_weights_multi_layer = [
-                            model.pretrained.blocks[block_idx].attn.attn_weights
+                        # Average across layers and reshape to [B, T, embed_dim]
+                        cls_tokens_avg = torch.stack(cls_tokens_list, dim=0).mean(dim=0)  # [B*T, embed_dim]
+                        cls_tokens = rearrange(cls_tokens_avg, '(b t) d -> b t d', b=B_orig, t=T_orig)  # [B, T, embed_dim]
+
+                        # Collect attention weights from 2 target layers
+                        attention_weights_list = [
+                            model.pretrained.blocks[block_idx].attn.attn_weights  # [B*T, num_heads, N+1, N+1]
                             for block_idx in self.target_blocks
                         ]
 
-                        # Apply Gear5 modulation BEFORE Mamba
-                        # Returns: dict with keys based on step
+                        # Apply Gear5 metric head (no feature modulation, just scale/shift/importance prediction)
                         gear5_outputs = model.gear5_metric_head(
-                            cls_tokens_list=cls_tokens_list,
-                            patch_tokens=patch_tokens,
-                            attention_weights_multi_layer=attention_weights_multi_layer,
-                            dpt_features=path_1,
+                            cls_tokens=cls_tokens,
+                            attention_weights_list=attention_weights_list,
                             patch_h=patch_h,
-                            patch_w=patch_w,
-                            step=self.step
+                            patch_w=patch_w
                         )
 
-                        path_1_modulated = gear5_outputs['modulated_features']
-                        scale = gear5_outputs['scale']
-                        shift = gear5_outputs['shift']
+                        scale = gear5_outputs['scale']  # [B, T]
+                        shift = gear5_outputs['shift']  # [B, T]
+                        importance_map = gear5_outputs['importance_map']  # [B, T, patch_h, patch_w]
 
-                        # Step 2: Extract additional outputs
-                        if self.step == 2:
-                            importance_map = gear5_outputs['importance_map']
-                            fg_features = gear5_outputs['fg_features']
-                            fg_mask = gear5_outputs['fg_mask']
-                            bg_mask = 1.0 - fg_mask  # Derive BG mask from FG mask
-                        else:
-                            # Step 1: Set to None
-                            importance_map = None
-                            fg_features = None
-                            fg_mask = None
-                            bg_mask = None
-
-                        # Apply Mamba temporal modeling to modulated feature
+                        # Apply Mamba temporal modeling to path_1 (no modulation in Gear5)
                         path_1_temporal = model.dpt_features_to_mamba(
                             input_shape=(B_orig, T_orig, None, H, W),
-                            dpt_features=path_1_modulated,
+                            dpt_features=path_1,
                             in_dpt_layer=0
                         )
 
                         out = model.depth_head.scratch.output_conv1(path_1_temporal)
                         out = F.interpolate(out, (H, W), mode="bilinear", align_corners=True)
-                        out = model.depth_head.scratch.output_conv2(out)
+                        relative_depth = model.depth_head.scratch.output_conv2(out)  # [B*T, 1, H, W]
+
+                        # Apply scale/shift to relative depth (inverse depth space: 100/m)
+                        scale_flat = scale.view(B_orig * T_orig, 1, 1, 1)  # [B*T, 1, 1, 1]
+                        shift_flat = shift.view(B_orig * T_orig, 1, 1, 1)  # [B*T, 1, 1, 1]
+                        pred_depth_inverse_100 = scale_flat * relative_depth + shift_flat  # [B*T, 1, H, W] in 100/m
 
                         # Save prediction inverse depth for mask calculation
-                        pred_depth_inverse = out  # [B*T, 1, H, W]
+                        pred_depth_inverse = pred_depth_inverse_100  # [B*T, 1, H, W] inverse depth (100/m)
 
                         # Convert prediction to metric depth: 100/m -> m
                         # Output shape: (B*T, 1, H, W)
-                        pred_depth_metric = 100.0 / (out + 1e-8)
+                        pred_depth_metric = 100.0 / (pred_depth_inverse_100 + 1e-8)
 
                         # Reshape prediction to (B, T, ...) and select first frame
                         pred_depth_inverse_seq = rearrange(pred_depth_inverse, '(b t) 1 h w -> b t 1 h w', b=B_orig, t=T_orig)
@@ -1002,67 +827,36 @@ class Gear5Trainer:
                             images[:1, :1].float().cpu(),  # [1, 1, 3, H, W] - convert BFloat16 to Float32 first
                             gt_depth_metric[:1].float().cpu(),  # [1, 1, H, W]
                             dataset_idx,
-                            focal_lengths[:1, :1].float().cpu()  # [1, 1] - resized focal length
+                            focal_lengths_actual[:1, :1].float().cpu()  # [1, 1] - original focal length
                         )
 
-                        # Step 2: Include importance map and masks
-                        if self.step == 2:
-                            # Reshape outputs from (B*T, ...) to (B, T, ...)
-                            importance_map_seq = rearrange(importance_map, '(b t) c h w -> b t c h w', b=B_orig, t=T_orig)
-                            fg_mask_seq = rearrange(fg_mask, '(b t) c h w -> b t c h w', b=B_orig, t=T_orig)
-                            bg_mask_seq = rearrange(bg_mask, '(b t) c h w -> b t c h w', b=B_orig, t=T_orig)
+                        # importance_map is already [B, T, patch_h, patch_w]
+                        # Select first frame for visualization
+                        importance_map_vis = importance_map[:, 0]  # [B, patch_h, patch_w]
+                        importance_map_vis = importance_map_vis.unsqueeze(1)  # [B, 1, patch_h, patch_w]
 
-                            # Select first frame for visualization
-                            importance_map_vis = importance_map_seq[:, 0]  # [B, C, H, W]
-                            fg_mask_vis = fg_mask_seq[:, 0]  # [B, 1, H, W]
-                            bg_mask_vis = bg_mask_seq[:, 0]  # [B, 1, H, W]
+                        # Resize importance map to match image resolution
+                        importance_map_resized = F.interpolate(
+                            importance_map_vis, size=(H, W), mode='bilinear', align_corners=True
+                        )
 
-                            # Resize masks to match image resolution
-                            importance_map_resized = F.interpolate(
-                                importance_map_vis, size=(H, W), mode='bilinear', align_corners=True
-                            )
-                            fg_mask_resized = F.interpolate(
-                                fg_mask_vis, size=(H, W), mode='bilinear', align_corners=True
-                            )
-                            bg_mask_resized = F.interpolate(
-                                bg_mask_vis, size=(H, W), mode='bilinear', align_corners=True
-                            )
-
-                            # Step 2: Include all outputs + canonical masks
-                            model_outputs_cpu = {
-                                'pred_depth': pred_depth_metric_vis[:1].cpu(),  # [1, 1, H, W]
-                                'importance_map': importance_map_resized[:1].cpu(),  # [1, 1, H, W]
-                                'fg_mask': fg_mask_resized[:1].cpu(),  # [1, 1, H, W]
-                                'bg_mask': bg_mask_resized[:1].cpu(),   # [1, 1, H, W]
-                                'canonical_gt_valid': canonical_gt_valid_vis[:1].cpu(),  # [1, 1, H, W] - canonical space mask
-                                'canonical_pred_valid': canonical_pred_valid_vis[:1].cpu()  # [1, 1, H, W] - canonical space mask
-                            }
-                        else:
-                            # Step 1: Only pred_depth + canonical masks (no FG/BG masks)
-                            model_outputs_cpu = {
-                                'pred_depth': pred_depth_metric_vis[:1].cpu(),  # [1, 1, H, W]
-                                'canonical_gt_valid': canonical_gt_valid_vis[:1].cpu(),  # [1, 1, H, W] - canonical space mask
-                                'canonical_pred_valid': canonical_pred_valid_vis[:1].cpu()  # [1, 1, H, W] - canonical space mask
-                            }
+                        # Include outputs with importance map + canonical masks + scale/shift
+                        model_outputs_cpu = {
+                            'pred_depth': pred_depth_metric_vis[:1].cpu(),  # [1, 1, H, W]
+                            'importance_map': importance_map_resized[:1].cpu(),  # [1, 1, H, W]
+                            'canonical_gt_valid': canonical_gt_valid_vis[:1].cpu(),  # [1, 1, H, W] - canonical space mask
+                            'canonical_pred_valid': canonical_pred_valid_vis[:1].cpu(),  # [1, 1, H, W] - canonical space mask
+                            'scale': scale[:1, :1].cpu(),  # [1, 1] - first batch, first frame
+                            'shift': shift[:1, :1].cpu()   # [1, 1] - first batch, first frame
+                        }
 
                         # FPS removed from training (only measured in test_gear3.py)
                         current_fps = None
 
-                        # Extract layer_weights for visualization (multi_layer separation only, Step 2 only)
-                        layer_weights = None
-                        if self.separation_method == 'multi_layer' and self.step == 2:
-                            try:
-                                # Handle DDP wrapping
-                                model = self.model.module if hasattr(self.model, 'module') else self.model
-                                # Gear5: multi_layer_fusion is in fg_modulation_head (Step 2 only)
-                                fusion_weights = model.gear5_metric_head.fg_modulation_head.multi_layer_fusion.fusion_weights
-                                layer_weights = torch.softmax(fusion_weights, dim=0).detach().cpu().numpy()
-                            except Exception as e:
-                                self.logger.warning(f"Failed to extract layer_weights: {e}")
-
-                        # Pass loss_dict and layer_weights for visualization
+                        # No layer_weights in unified Gear5 (GRU-based, not multi-layer fusion)
+                        # Pass loss_dict for visualization
                         self.train_visualizer.create_validation_summary(
-                            sample_batch, model_outputs_cpu, step, prefix="training", fps=current_fps, loss_dict=loss_dict, layer_weights=layer_weights, config=self.config
+                            sample_batch, model_outputs_cpu, step, prefix="training", fps=current_fps, loss_dict=loss_dict, config=self.config
                         )
 
                     self._set_train_mode()
@@ -1097,7 +891,7 @@ class Gear5Trainer:
 
             # Save checkpoint
             if step % self.config.training.get('save_freq', 5000) == 0 and step > 0:
-                self.save_checkpoint(f'checkpoint_step{step}_step{self.step}.pth')
+                self.save_checkpoint(f'checkpoint_step{step}.pth')
 
         # Final save
         self.save_checkpoint('last.pth')
@@ -1182,104 +976,133 @@ class Gear5Trainer:
                 )  # Returns [path_4, path_3, path_2, path_1], each (B*T, dpt_dim, h, w)
                 path_1 = dpt_features[-1]  # Extract path_1: (B*T, dpt_dim, h, w)
 
-            # Gear5: Collect CLS tokens and attention weights from multiple layers
-            # Use encoder_indices to index into encoder_features
-            # Step 1: encoder_indices = [0, 1, 2, 3] (all 4 layers)
-            # Step 2: encoder_indices = [1, 2] (middle 2 layers)
+            # Gear5: Extract 2-layer CLS tokens and attention weights
+            # For ViT-L: layers [11, 23], encoder_indices = [1, 3]
+            # For ViT-S: layers [5, 11], encoder_indices = [1, 3]
             with torch.no_grad():
                 cls_tokens_list = [
-                    encoder_features[i][:, 0]  # CLS token from each layer
+                    encoder_features[i][:, 0]  # CLS token: [B*T, embed_dim]
                     for i in self.encoder_indices
                 ]
-                attention_weights_multi_layer = [
-                    model.pretrained.blocks[block_idx].attn.attn_weights.detach()
+                attention_weights_list = [
+                    model.pretrained.blocks[block_idx].attn.attn_weights  # [B*T, num_heads, N+1, N+1]
                     for block_idx in self.target_blocks
                 ]
 
-            # Apply Gear5 modulation to path_1 (BEFORE Mamba)
-            # This makes the feature metric-aware before temporal modeling
-            # Inputs: (B*T, ...), Output: (B*T, ...)
+                # Average 2-layer CLS tokens and reshape to [B, T, embed_dim]
+                cls_tokens_avg = torch.stack(cls_tokens_list, dim=0).mean(dim=0)  # [B*T, embed_dim]
+                cls_tokens = rearrange(cls_tokens_avg, '(b t) d -> b t d', b=B_orig, t=T_orig)  # [B, T, embed_dim]
+
+            # Get DPT features (frozen, no grad)
+            with torch.no_grad():
+                dpt_features = model.depth_head.get_forward_features(
+                    encoder_features, patch_h, patch_w
+                )
+                path_1 = dpt_features[-1]  # [B*T, dpt_dim, h, w]
+
+            # Apply Mamba temporal modeling (frozen)
+            with torch.no_grad():
+                path_1_temporal = model.dpt_features_to_mamba(
+                    input_shape=(B_orig, T_orig, None, H, W),
+                    dpt_features=path_1,
+                    in_dpt_layer=0
+                )  # [B*T, dpt_dim, h, w]
+
+            # Get relative depth from frozen output_conv
+            with torch.no_grad():
+                out = model.depth_head.scratch.output_conv1(path_1_temporal)
+                out = F.interpolate(out, (H, W), mode="bilinear", align_corners=True)
+                relative_depth = model.depth_head.scratch.output_conv2(out)  # [B*T, 1, H, W]
+
+            # Get scale/shift/importance_map from Gear5MetricHead (trainable)
             gear5_outputs = model.gear5_metric_head(
-                cls_tokens_list=cls_tokens_list,
-                patch_tokens=patch_tokens,
-                attention_weights_multi_layer=attention_weights_multi_layer,
-                dpt_features=path_1,
+                cls_tokens=cls_tokens,  # [B, T, 1024]
+                attention_weights_list=attention_weights_list,  # List of 2 attention weights
                 patch_h=patch_h,
-                patch_w=patch_w,
-                step=self.step
+                patch_w=patch_w
             )
 
-            path_1_modulated = gear5_outputs['modulated_features']
-            scale = gear5_outputs['scale']
-            shift = gear5_outputs['shift']
+            scale = gear5_outputs['scale']  # [B, T]
+            shift = gear5_outputs['shift']  # [B, T]
+            importance_map = gear5_outputs['importance_map']  # [B, T, patch_h, patch_w]
 
-            # Step 2: Extract additional outputs
-            if self.step == 2:
-                importance_map = gear5_outputs['importance_map']
-                fg_features = gear5_outputs['fg_features']
-                fg_mask = gear5_outputs['fg_mask']
+            # DEBUG: Check scale/shift values at validation steps
+            if self.rank == 0 and (self.global_step % 1000 == 0 or self.global_step < 10):
+                scale_mean = scale.mean().item()
+                scale_min = scale.min().item()
+                scale_max = scale.max().item()
+                shift_mean = shift.mean().item()
+                shift_min = shift.min().item()
+                shift_max = shift.max().item()
+                self.logger.info(f"VALIDATION Step {self.global_step} - Scale: mean={scale_mean:.4f}, range=[{scale_min:.4f}, {scale_max:.4f}]")
+                self.logger.info(f"VALIDATION Step {self.global_step} - Shift: mean={shift_mean:.4f}, range=[{shift_min:.4f}, {shift_max:.4f}]")
+                self.logger.info(f"VALIDATION Step {self.global_step} - Relative depth: mean={relative_depth.mean():.4f}, range=[{relative_depth.min():.4f}, {relative_depth.max():.4f}]")
 
-            # Note: attention_weights_multi_layer will be garbage collected automatically
-            # No need to manually set to None (validation also needs attention weights)
+            # Apply shift lower bound constraint (Option 1)
+            # Ensure pred stays positive even for far depths (e.g., 300m → inverse = 0.333)
+            GLOBAL_MIN_INVERSE = 100.0 / 300.0  # 0.333 (300m max depth assumption)
+            shift_lower_bound = -scale.abs() * GLOBAL_MIN_INVERSE  # [B, T]
+            shift_clamped = torch.clamp(shift, min=shift_lower_bound)  # [B, T]
 
-            # Apply Mamba temporal modeling to modulated (metric-aware) feature
-            # Mamba is trainable in Phase 1+, so gradients flow through it
-            path_1_temporal = model.dpt_features_to_mamba(
-                input_shape=(B_orig, T_orig, None, H, W),
-                dpt_features=path_1_modulated,
-                in_dpt_layer=0  # Single layer index
-            )  # Returns (B*T, dpt_dim, h, w) with temporal consistency
+            # Apply scale/shift to relative depth with clamped shift
+            scale_flat = scale.view(B_orig * T_orig, 1, 1, 1)  # [B*T, 1, 1, 1]
+            shift_flat = shift_clamped.view(B_orig * T_orig, 1, 1, 1)  # [B*T, 1, 1, 1]
+            pred_depth_inverse_100 = scale_flat * relative_depth + shift_flat  # [B*T, 1, H, W] in 100/m
 
-            # Pass through DPT output head (trainable)
-            out = model.depth_head.scratch.output_conv1(path_1_temporal)
-            out = F.interpolate(out, (H, W), mode="bilinear", align_corners=True)
-            out = model.depth_head.scratch.output_conv2(out)
+            # DEBUG: Check pred_depth_inverse_100 after scale/shift
+            if self.rank == 0 and (self.global_step % 1000 == 0 or self.global_step < 10):
+                self.logger.info(f"TRAINING Step {self.global_step} - Shift clamped: mean={shift_clamped.mean():.4f}, range=[{shift_clamped.min():.4f}, {shift_clamped.max():.4f}]")
+                self.logger.info(f"TRAINING Step {self.global_step} - Pred inverse 100: mean={pred_depth_inverse_100.mean():.4f}, range=[{pred_depth_inverse_100.min():.4f}, {pred_depth_inverse_100.max():.4f}]")
 
-            # Prediction is already positive (Softplus activation in output_conv2)
-            # Shape: (B*T, 1, H, W)
-            pred_depth_inverse = out
+        # Reshape GT from (B, T, 1, H, W) to (B*T, 1, H, W)
+        gt_depth_inverse_flat = rearrange(gt_depth_inverse_100, 'b t 1 h w -> (b t) 1 h w')
 
-        # Compute loss (outside autocast for stability)
-        # Reshape GT from (B, T, 1, H, W) to (B*T, H, W)
-        gt_depth_inverse_flat = rearrange(gt_depth_inverse_100, 'b t 1 h w -> (b t) h w')
+        # Flatten for loss computation
+        pred_depth_flat = pred_depth_inverse_100.flatten()  # [B*T*H*W] inverse depth (100/m)
+        gt_depth_flat = gt_depth_inverse_flat.flatten()  # [B*T*H*W] inverse depth (100/m)
 
-        # Remove channel dimension from prediction
-        pred_depth_inverse_flat = pred_depth_inverse.squeeze(1)  # (B*T, H, W)
-
-        # DEBUG: Check values in first few steps
-        if self.global_step < 5:
-            self.logger.info(f"DEBUG - Pred inverse depth: min={pred_depth_inverse_flat.min():.4f}, max={pred_depth_inverse_flat.max():.4f}, mean={pred_depth_inverse_flat.mean():.4f}")
-
-        # Clamp prediction to reasonable range to prevent NaN
-        pred_depth_inverse_flat = torch.clamp(pred_depth_inverse_flat, min=1e-3, max=1e4)
-
-        # Follow original FlashDepth: use ONLY GT valid mask (no 70m threshold, no pred check)
-        # GT depth is already scaled to 100/m (inverse depth: 100/m)
-        # Invalid pixels are marked as -1, which becomes -100 after scaling
-        # So we just need to check for >= 0 to exclude invalid pixels (originally -1)
-        valid_mask = (gt_depth_inverse_flat >= 0)  # Exclude only invalid pixels (originally -1)
+        # Valid mask: GT valid + Pred positive (no 70m restriction in training, like original FlashDepth)
+        valid_mask = (gt_depth_flat >= 0) & (pred_depth_flat > 0)
 
         if valid_mask.sum() == 0:
             self.logger.error("No valid GT pixels in batch!")
             return {'loss': 0.0}
 
-        # Compute loss (like original FlashDepth)
+        # Resize importance map to depth map size and flatten
+        importance_map_resized = F.interpolate(
+            importance_map.view(B_orig * T_orig, 1, patch_h, patch_w),
+            size=(H, W),
+            mode='bilinear',
+            align_corners=True
+        )  # [B*T, 1, H, W]
+        importance_flat = importance_map_resized.flatten()  # [B*T*H*W]
+
+        # Compute fg_ratio (alpha) - fraction of high-importance pixels
+        importance_threshold = importance_flat.mean()
+        fg_mask = (importance_flat > importance_threshold)
+        fg_ratio = fg_mask.float().mean()
+
+        # Importance-weighted Log L1 Loss (in inverse depth space)
         with torch.amp.autocast('cuda', enabled=False):
-            loss = self.loss_fn(
-                pred_depth_inverse_flat.float(),
-                gt_depth_inverse_flat.float(),
-                valid_mask.float()
+            epsilon = 1e-3
+            # pred_depth_flat and gt_depth_flat are already inverse depth (100/m)
+            # Compute log L1 loss directly in inverse depth space
+            loss = torch.abs(
+                torch.log(pred_depth_flat.float() + epsilon) -
+                torch.log(gt_depth_flat.float() + epsilon)
             )
+            weighted_loss = loss * (1.0 + fg_ratio * importance_flat.float())
+            final_loss = weighted_loss[valid_mask].mean()
 
         # Backward pass (outside autocast for numerical stability)
         self.optimizer.zero_grad()
-        loss.backward()
+        final_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
         self.optimizer.step()
         self.scheduler.step()
 
         return {
-            'loss': loss.item()
+            'loss': final_loss.item()
         }
 
     @torch.no_grad()
@@ -1395,64 +1218,57 @@ class Gear5Trainer:
                 )  # Returns [path_4, path_3, path_2, path_1]
                 path_1 = dpt_features[-1]  # Extract path_1: (B*T, dpt_dim, h, w)
 
-                # Gear5: Collect CLS tokens and attention weights from multiple layers
-                # Use encoder_indices to index into encoder_features
-                # Step 1: encoder_indices = [0, 1, 2, 3] (all 4 layers)
-                # Step 2: encoder_indices = [1, 2] (middle 2 layers)
+                # Gear5: Extract 2-layer CLS tokens and attention weights
+                # For ViT-L: layers [11, 23], encoder_indices = [1, 3]
+                # For ViT-S: layers [5, 11], encoder_indices = [1, 3]
                 cls_tokens_list = [
-                    encoder_features[i][:, 0]  # CLS token from each layer
+                    encoder_features[i][:, 0]  # CLS token: [B*T, embed_dim]
                     for i in self.encoder_indices
                 ]
-                attention_weights_multi_layer = [
-                    model.pretrained.blocks[block_idx].attn.attn_weights.detach()
+                attention_weights_list = [
+                    model.pretrained.blocks[block_idx].attn.attn_weights  # [B*T, num_heads, N+1, N+1]
                     for block_idx in self.target_blocks
                 ]
 
-                # Apply Gear5 modulation BEFORE Mamba (metric-aware feature)
-                # Inputs/outputs: (B*T, ...)
-                gear5_outputs = model.gear5_metric_head(
-                    cls_tokens_list=cls_tokens_list,
-                    patch_tokens=patch_tokens,
-                    attention_weights_multi_layer=attention_weights_multi_layer,
-                    dpt_features=path_1,
-                    patch_h=patch_h,
-                    patch_w=patch_w,
-                    step=self.step
-                )
+                # Average 2-layer CLS tokens and reshape to [B, T, embed_dim]
+                cls_tokens_avg = torch.stack(cls_tokens_list, dim=0).mean(dim=0)  # [B*T, embed_dim]
+                cls_tokens = rearrange(cls_tokens_avg, '(b t) d -> b t d', b=B_orig, t=T_orig)  # [B, T, embed_dim]
 
-                path_1_modulated = gear5_outputs['modulated_features']
-                scale = gear5_outputs['scale']
-                shift = gear5_outputs['shift']
-
-                # Step 2: Extract additional outputs
-                if self.step == 2:
-                    importance_map = gear5_outputs['importance_map']
-                    fg_features = gear5_outputs['fg_features']
-                    fg_mask = gear5_outputs['fg_mask']
-                    bg_mask = 1.0 - fg_mask  # Derive BG mask from FG mask
-                else:
-                    # Step 1: Set to None
-                    importance_map = None
-                    fg_features = None
-                    fg_mask = None
-                    bg_mask = None
-
-                # Note: attention_weights_multi_layer will be garbage collected automatically
-                # No need to manually set to None (validation also needs attention weights)
-
-                # Apply Mamba temporal modeling to modulated feature
+                # Apply Mamba temporal modeling (frozen)
                 path_1_temporal = model.dpt_features_to_mamba(
                     input_shape=(B_orig, T_orig, None, H, W),
-                    dpt_features=path_1_modulated,
+                    dpt_features=path_1,
                     in_dpt_layer=0
-                )  # Returns (B*T, dpt_dim, h, w) with temporal consistency
+                )  # [B*T, dpt_dim, h, w]
 
-                # Get depth (at model resolution)
+                # Get relative depth from frozen output_conv
                 out = model.depth_head.scratch.output_conv1(path_1_temporal)
                 out = F.interpolate(out, (H, W), mode="bilinear", align_corners=True)
-                out = model.depth_head.scratch.output_conv2(out)
+                relative_depth = model.depth_head.scratch.output_conv2(out)  # [B*T, 1, H, W]
 
-                pred_depth_inverse = out  # [B*T, 1, H, W] at model resolution
+                # Get scale/shift/importance_map from Gear5MetricHead
+                gear5_outputs = model.gear5_metric_head(
+                    cls_tokens=cls_tokens,  # [B, T, 1024]
+                    attention_weights_list=attention_weights_list,  # List of 2 attention weights
+                    patch_h=patch_h,
+                    patch_w=patch_w
+                )
+
+                scale = gear5_outputs['scale']  # [B, T]
+                shift = gear5_outputs['shift']  # [B, T]
+                importance_map = gear5_outputs['importance_map']  # [B, T, patch_h, patch_w]
+
+                # Apply shift lower bound constraint (Option 1)
+                GLOBAL_MIN_INVERSE = 100.0 / 300.0  # 0.333 (300m max depth assumption)
+                shift_lower_bound = -scale.abs() * GLOBAL_MIN_INVERSE  # [B, T]
+                shift_clamped = torch.clamp(shift, min=shift_lower_bound)  # [B, T]
+
+                # Apply scale/shift to relative depth with clamped shift
+                scale_flat = scale.view(B_orig * T_orig, 1, 1, 1)  # [B*T, 1, 1, 1]
+                shift_flat = shift_clamped.view(B_orig * T_orig, 1, 1, 1)  # [B*T, 1, 1, 1]
+                pred_depth_inverse_100 = scale_flat * relative_depth + shift_flat  # [B*T, 1, H, W] in 100/m
+
+                pred_depth_inverse = pred_depth_inverse_100  # [B*T, 1, H, W] inverse depth (100/m)
 
                 # Reshape GT from (B, T, 1, H, W) to (B*T, 1, H, W)
                 gt_depth_inverse_flat = rearrange(gt_depth_inverse_100, 'b t 1 h w -> (b t) 1 h w')
@@ -1473,22 +1289,89 @@ class Gear5Trainer:
                 if self.global_step == 0 and batch_idx == 0 and self.rank == 0:
                     self.logger.info(f"DEBUG VALIDATION - Pred after interpolate: min={pred_depth_inverse.min():.4f}, max={pred_depth_inverse.max():.4f}")
 
-                # Compute loss for entire sequence
-                # Follow original FlashDepth: use ONLY GT valid mask
-                # GT depth is already scaled to 100/m
-                # Reshape GT from (B, T, 1, H, W) to (B*T, 1, H, W) for mask computation
-                valid_mask = (gt_depth_inverse_flat >= 0).float()  # Exclude only invalid pixels (originally -1)
-
-                # Save masks for visualization (use actual_valid_mask for visualization)
-                # For visualization: we'll compute separate masks at 70m threshold for display purposes only
+                # Get GT resolution for loss computation and visualization
                 H_gt, W_gt = gt_depth_inverse_flat.shape[-2:]
-                gt_valid_mask_vis = actual_valid_mask.view(B_orig * T_orig, 1, H_gt, W_gt).bool()  # Actual space <70m (for visualization)
-                canonical_gt_valid = gt_valid_mask_vis.cpu()  # [B*T, 1, H_gt, W_gt] - at GT resolution
-                canonical_pred_valid = (pred_depth_inverse > 0).cpu()  # Basic validity for visualization
+
+                # Compute importance-weighted validation loss
+                # Flatten for loss computation
+                pred_depth_flat = pred_depth_inverse.flatten()
+                gt_depth_flat = gt_depth_inverse_flat.flatten()
+
+                # Valid mask: GT valid + Pred positive (no 70m restriction in validation, like original FlashDepth)
+                valid_mask = (gt_depth_flat >= 0) & (pred_depth_flat > 0)
+
+                # Resize importance map to depth map size and flatten
+                importance_map_resized = F.interpolate(
+                    importance_map.view(B_orig * T_orig, 1, patch_h, patch_w),
+                    size=(H_gt, W_gt),
+                    mode='bilinear',
+                    align_corners=True
+                )  # [B*T, 1, H_gt, W_gt]
+                importance_flat = importance_map_resized.flatten()
+
+                # Compute fg_ratio (alpha)
+                importance_threshold = importance_flat.mean()
+                fg_mask_flat = (importance_flat > importance_threshold)
+                fg_ratio = fg_mask_flat.float().mean()
+
+                # Save masks for visualization
+                canonical_gt_valid = (gt_depth_inverse_flat > 0).cpu()  # [B*T, 1, H_gt, W_gt] - GT valid pixels
+                canonical_pred_valid = (pred_depth_inverse > 0).cpu()  # [B*T, 1, H_gt, W_gt] - Pred valid pixels
 
                 if valid_mask.sum() > 0:
-                    loss_batch = self.loss_fn(pred_depth_inverse, gt_depth_inverse_flat, valid_mask)
-                    frame_losses = [loss_batch.float()]
+                    # DEBUG: Check for negative or zero values before log
+                    if self.rank == 0 and (self.global_step % 1000 == 0 or self.global_step < 10):
+                        pred_min = pred_depth_flat[valid_mask].min().item()
+                        pred_max = pred_depth_flat[valid_mask].max().item()
+                        gt_min = gt_depth_flat[valid_mask].min().item()
+                        gt_max = gt_depth_flat[valid_mask].max().item()
+                        self.logger.info(f"VALIDATION Step {self.global_step} - Pred range: [{pred_min:.4f}, {pred_max:.4f}]")
+                        self.logger.info(f"VALIDATION Step {self.global_step} - GT range: [{gt_min:.4f}, {gt_max:.4f}]")
+
+                        # Check for negative values
+                        pred_negative = (pred_depth_flat[valid_mask] < 0).sum().item()
+                        gt_negative = (gt_depth_flat[valid_mask] < 0).sum().item()
+                        if pred_negative > 0 or gt_negative > 0:
+                            self.logger.warning(f"VALIDATION - Negative values detected! Pred: {pred_negative}, GT: {gt_negative}")
+
+                    # Importance-weighted Log L1 Loss (in inverse depth space)
+                    epsilon = 1e-3
+                    # pred_depth_flat and gt_depth_flat are already inverse depth (100/m)
+                    # Compute log L1 loss directly in inverse depth space
+                    # IMPORTANT: Only compute loss on valid pixels to avoid NaN from negative values
+                    pred_valid = pred_depth_flat[valid_mask].float()
+                    gt_valid = gt_depth_flat[valid_mask].float()
+                    importance_valid = importance_flat[valid_mask].float()
+
+                    # Additional safety: filter out non-positive values
+                    positive_mask = (pred_valid > 0) & (gt_valid > 0)
+                    if positive_mask.sum() == 0:
+                        self.logger.warning(f"VALIDATION Step {self.global_step} - No positive depth values!")
+                        frame_losses = []
+                    else:
+                        pred_positive = pred_valid[positive_mask]
+                        gt_positive = gt_valid[positive_mask]
+                        importance_positive = importance_valid[positive_mask]
+
+                        loss = torch.abs(
+                            torch.log(pred_positive + epsilon) -
+                            torch.log(gt_positive + epsilon)
+                        )
+
+                        # Compute fg_ratio for this positive subset
+                        fg_ratio_positive = (importance_positive > importance_threshold).float().mean()
+
+                        weighted_loss = loss * (1.0 + fg_ratio_positive * importance_positive)
+                        loss_batch = weighted_loss.mean()
+
+                        # Check for NaN
+                        if torch.isnan(loss_batch):
+                            self.logger.error(f"VALIDATION Step {self.global_step} - NaN loss detected!")
+                            self.logger.error(f"  pred_positive range: [{pred_positive.min():.4f}, {pred_positive.max():.4f}]")
+                            self.logger.error(f"  gt_positive range: [{gt_positive.min():.4f}, {gt_positive.max():.4f}]")
+                            frame_losses = []
+                        else:
+                            frame_losses = [loss_batch.float()]
                 else:
                     frame_losses = []
 
@@ -1535,46 +1418,25 @@ class Gear5Trainer:
                                 canonical_gt_valid_vis = canonical_gt_valid_seq[:, 0]  # [B, 1, H, W]
                                 canonical_pred_valid_vis = canonical_pred_valid_seq[:, 0]
 
-                                # Step 2: Include importance map and masks
-                                if self.step == 2:
-                                    # Reshape importance/mask maps to (B, T, ...) and select first frame
-                                    importance_map_seq = rearrange(importance_map, '(b t) c h w -> b t c h w', b=B_orig, t=T_orig)
-                                    fg_mask_seq = rearrange(fg_mask, '(b t) c h w -> b t c h w', b=B_orig, t=T_orig)
-                                    bg_mask_seq = rearrange(bg_mask, '(b t) c h w -> b t c h w', b=B_orig, t=T_orig)
+                                # Unified: Include importance map
+                                # importance_map from gear5_outputs is [B, T, patch_h, patch_w]
+                                # Select first frame: [B, patch_h, patch_w]
+                                importance_map_vis = importance_map[:, 0]  # [B, patch_h, patch_w]
 
-                                    importance_map_vis = importance_map_seq[:, 0]  # [B, C, h, w]
-                                    fg_mask_vis = fg_mask_seq[:, 0]
-                                    bg_mask_vis = bg_mask_seq[:, 0]
+                                # Resize importance map to GT resolution
+                                importance_map_resized_vis = F.interpolate(
+                                    importance_map_vis.unsqueeze(1), size=(gt_h, gt_w), mode='bilinear', align_corners=True
+                                )  # [B, 1, gt_h, gt_w]
 
-                                    # Resize importance map to GT resolution
-                                    importance_map_resized = F.interpolate(
-                                        importance_map_vis, size=(gt_h, gt_w), mode='bilinear', align_corners=True
-                                    )
-
-                                    # Resize FG/BG masks to GT resolution
-                                    fg_mask_resized = F.interpolate(
-                                        fg_mask_vis, size=(gt_h, gt_w), mode='bilinear', align_corners=True
-                                    )
-                                    bg_mask_resized = F.interpolate(
-                                        bg_mask_vis, size=(gt_h, gt_w), mode='bilinear', align_corners=True
-                                    )
-
-                                    # Step 2: Include all outputs
-                                    model_outputs = {
-                                        'pred_depth': pred_depth_metric,  # [B, 1, gt_h, gt_w] at GT resolution
-                                        'importance_map': importance_map_resized.float().cpu(),  # [B, 1, gt_h, gt_w]
-                                        'fg_mask': fg_mask_resized.float().cpu(),  # [B, 1, gt_h, gt_w]
-                                        'bg_mask': bg_mask_resized.float().cpu(),   # [B, 1, gt_h, gt_w]
-                                        'canonical_gt_valid': canonical_gt_valid_vis,  # [B, 1, H, W] - canonical space mask
-                                        'canonical_pred_valid': canonical_pred_valid_vis  # [B, 1, H, W] - canonical space mask
-                                    }
-                                else:
-                                    # Step 1: Only pred_depth and canonical masks (no importance map/fg/bg masks)
-                                    model_outputs = {
-                                        'pred_depth': pred_depth_metric,  # [B, 1, gt_h, gt_w] at GT resolution
-                                        'canonical_gt_valid': canonical_gt_valid_vis,  # [B, 1, H, W] - canonical space mask
-                                        'canonical_pred_valid': canonical_pred_valid_vis  # [B, 1, H, W] - canonical space mask
-                                    }
+                                # Unified: Include all outputs + scale/shift
+                                model_outputs = {
+                                    'pred_depth': pred_depth_metric,  # [B, 1, gt_h, gt_w]
+                                    'importance_map': importance_map_resized_vis.float().cpu(),  # [B, 1, gt_h, gt_w]
+                                    'canonical_gt_valid': canonical_gt_valid_vis,  # [B, 1, H, W]
+                                    'canonical_pred_valid': canonical_pred_valid_vis,  # [B, 1, H, W]
+                                    'scale': scale[:, 0:1].cpu(),  # [B, 1] - first frame
+                                    'shift': shift[:, 0:1].cpu()   # [B, 1] - first frame
+                                }
 
                                 # For visualization, we need [B, T, ...] format like training
                                 # But we only have one frame (t=0), so unsqueeze T dimension
@@ -1582,7 +1444,7 @@ class Gear5Trainer:
                                     img_t_resized.unsqueeze(1).float().cpu(),  # [B, 1, C, gt_h, gt_w] at GT resolution
                                     gt_depth_metric.unsqueeze(1),  # [B, 1, gt_h, gt_w]
                                     dataset_idx,
-                                    focal_lengths[:, 0:1].float().cpu()  # [B, 1] - resized focal length for first frame
+                                    focal_lengths_actual[:, 0:1].float().cpu()  # [B, 1] - original focal length for first frame
                                 )
 
                                 # FPS removed from training (only measured in test_gear3.py)
@@ -1593,23 +1455,12 @@ class Gear5Trainer:
                                     'val_loss': loss_batch.item() if len(frame_losses) > 0 else 0.0
                                 }
 
-                                # Extract layer_weights for visualization (multi_layer separation only, Step 2 only)
-                                layer_weights = None
-                                if self.separation_method == 'multi_layer' and self.step == 2:
-                                    try:
-                                        # Handle DDP wrapping
-                                        model = self.model.module if hasattr(self.model, 'module') else self.model
-                                        # Gear5: multi_layer_fusion is in fg_modulation_head (Step 2 only)
-                                        fusion_weights = model.gear5_metric_head.fg_modulation_head.multi_layer_fusion.fusion_weights
-                                        layer_weights = torch.softmax(fusion_weights, dim=0).detach().cpu().numpy()
-                                    except Exception as e:
-                                        self.logger.warning(f"Failed to extract layer_weights: {e}")
-
+                                # No layer_weights in unified Gear5 (GRU-based, not multi-layer fusion)
                                 # Save with dataset and sequence-specific name
                                 save_name = f"validation_{current_dataset}_seq{seq_num:03d}_step_{self.global_step:06d}"
                                 self.val_visualizer.create_validation_summary(
                                     sample_batch, model_outputs, self.global_step,
-                                    save_name=save_name, fps=current_fps, loss_dict=val_loss_dict, dataset_name=current_dataset, layer_weights=layer_weights, config=self.config
+                                    save_name=save_name, fps=current_fps, loss_dict=val_loss_dict, dataset_name=current_dataset, config=self.config
                                 )
                                 config['saved'].append(seq_num)
                                 self.logger.info(f"Saved validation visualization: {current_dataset} sequence {seq_num} ({len(config['saved'])}/{len(config['sequences'])})")
@@ -1619,10 +1470,7 @@ class Gear5Trainer:
 
                     # Clear intermediate tensors to free memory after each sequence
                     del encoder_features, attention_weights, patch_tokens, dpt_features, path_1, path_1_temporal
-                    del path_1_modulated, pred_depth_inverse
-                    # Clear step-2-only tensors (importance_map, fg_features, fg_mask, bg_mask)
-                    if self.step == 2:
-                        del importance_map, fg_features, fg_mask, bg_mask
+                    del relative_depth, pred_depth_inverse, importance_map
                     # Always clear cache after each sequence to prevent OOM during validation
                     torch.cuda.empty_cache()                # Track sequence count (regardless of valid pixels)
                 if current_dataset not in dataset_sequence_counts:
@@ -1680,8 +1528,8 @@ class Gear5Trainer:
 
             self.logger.info(f"Overall Average Loss: {avg_loss:.4f} (from {num_batches} sequences)")
 
-            # WARNING: Check if validation set is too small (Phase 2/3)
-            if self.step >= 2 and num_batches < 20:
+            # WARNING: Check if validation set is too small (Phase 2)
+            if self.phase >= 2 and num_batches < 20:
                 self.logger.warning(
                     f"⚠️  SMALL VALIDATION SET: Only {num_batches} batches evaluated! "
                     f"Consider increasing max_val_batches for more reliable validation."
@@ -1722,7 +1570,7 @@ class Gear5Trainer:
             'dataset_losses': self.dataset_losses,  # Save per-dataset validation losses
             'num_sequences': self.num_sequences,  # Save number of sequences per dataset
             'config': OmegaConf.to_container(self.config, resolve=True),
-            'phase': self.step
+            'phase': self.phase
         }
 
         torch.save(checkpoint, checkpoint_path)
