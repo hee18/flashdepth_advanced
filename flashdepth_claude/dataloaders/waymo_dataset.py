@@ -1,7 +1,6 @@
 import os
 import numpy as np
 import logging
-import pandas as pd
 from .base_dataset_pairs import BaseDatasetPairs
 
 
@@ -73,11 +72,8 @@ class WaymoDepth(BaseDatasetPairs):
         """
         Get focal length for Waymo dataset.
 
-        Waymo provides per-sequence intrinsics in camera_calibration/*.parquet files.
-        For waymo_seg: Files are in waymo_seg/waymo_seg/camera_calibration/ directory.
-        For waymo: Files are in each sequence's camera_calibration/ directory.
-        Fields: f_u (fx), f_v (fy), c_u (cx), c_v (cy), and distortion coefficients.
-        Values are for original 1920×1280 resolution.
+        Reads from intrinsics.npy file in the sequence directory.
+        Intrinsics are stored as [fx, fy, cx, cy] for original 1920×1280 resolution.
 
         Args:
             pair (dict): Data pair with 'image' and 'depth' paths
@@ -86,51 +82,37 @@ class WaymoDepth(BaseDatasetPairs):
         Returns:
             float: Focal length in pixels for current image shape
         """
-        # Extract sequence name from path (e.g., segment-XXXXX)
+        # Extract sequence directory from path
         img_path = pair['image']
         # Path format: .../waymo/val/segment-XXXXX/FRONT/rgb/original/0000.jpg
         parts = img_path.split('/')
         sequence_idx = [i for i, p in enumerate(parts) if p.startswith('segment-')]
+
         if not sequence_idx:
             # Fallback to typical value scaled to current width
             logging.warning(f"Could not extract sequence name from {img_path}, using typical fx=2059.0 for 1920 width")
             fx_fallback = 2059.0 * (image_shape[1] / 1920)
             return fx_fallback
 
-        sequence_name = parts[sequence_idx[0]]
-        
-        # Determine calibration path based on dataset type
-        if self.dataset_name == 'waymo_seg':
-            # waymo_seg: Central calibration directory at waymo_seg/waymo_seg/camera_calibration/
-            # Directory structure: {data_root}/waymo_seg/waymo_seg/camera_calibration/
-            seq_id = sequence_name.replace('segment-', '')
-            calib_path = os.path.join(self.data_root, 'waymo_seg', 'waymo_seg', 'camera_calibration', f'{seq_id}.parquet')
-        else:
-            # waymo: Per-sequence calibration directory
-            calib_path = os.path.join('/'.join(parts[:sequence_idx[0]+1]), 'camera_calibration', f'{sequence_name}_FRONT.parquet')
+        # Construct path to intrinsics file
+        # From: .../segment-XXXXX/FRONT/rgb/original/0000.jpg
+        # To:   .../segment-XXXXX/FRONT/intrinsics.npy
+        seq_dir = '/'.join(parts[:sequence_idx[0]+1])
+        intrinsics_path = os.path.join(seq_dir, 'FRONT', 'intrinsics.npy')
 
         try:
-            calib_df = pd.read_parquet(calib_path)
-            # Waymo uses full field names with component prefix
-            fx_original = float(calib_df['[CameraCalibrationComponent].intrinsic.f_u'].iloc[0])  # All frames in sequence share same intrinsics
-            
+            # Load intrinsics [fx, fy, cx, cy] for original 1920×1280 resolution
+            intrinsics = np.load(intrinsics_path)
+            fx_original = float(intrinsics[0])
+
             # Scale focal length to current image width (from original 1920)
             original_width = 1920
             current_width = image_shape[1]
             fx_scaled = fx_original * (current_width / original_width)
+
             return fx_scaled
-        except KeyError:
-            # Try alternative field name (older format)
-            try:
-                fx_original = float(calib_df['f_u'].iloc[0])
-                fx_scaled = fx_original * (image_shape[1] / 1920)
-                return fx_scaled
-            except Exception as e:
-                logging.warning(f"Error reading calibration from {calib_path}: {e}, using typical fx=2059.0 for 1920 width")
-                fx_fallback = 2059.0 * (image_shape[1] / 1920)
-                return fx_fallback
         except Exception as e:
-            logging.warning(f"Error reading calibration from {calib_path}: {e}, using typical fx=2059.0 for 1920 width")
+            logging.warning(f"Error reading intrinsics from {intrinsics_path}: {e}, using typical fx=2059.0 for 1920 width")
             fx_fallback = 2059.0 * (image_shape[1] / 1920)
             return fx_fallback
 

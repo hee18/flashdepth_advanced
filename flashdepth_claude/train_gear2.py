@@ -38,7 +38,7 @@ from datetime import timedelta
 from flashdepth.model import FlashDepth
 from utils.gear2_visualization import Gear2Visualizer
 from flashdepth.gear2_modules import Gear2MetricHead
-from flashdepth.gear3_upgrade_modules import Gear3UpgradeAblationHead
+from flashdepth.gear4_modules import Gear4AblationHead
 from dataloaders.combined_dataset import CombinedDataset
 from utils.helpers import *
 from utils.metric_depth_metrics import MetricDepthMetrics
@@ -670,20 +670,14 @@ class Gear2Trainer:
                     elif gt_depth.ndim == 4 and gt_depth.shape[1] != 1:
                         gt_depth = gt_depth.unsqueeze(2)
 
-                    # GT depth from dataloader is inverse depth (1/m), scale to 100/m
+                    # GT depth from dataloader is inverse depth (1/m), already in canonical space (fx=500)
                     gt_depth_inverse_100 = gt_depth * 100.0  # (1/m) * 100 = 100/m
+
+                    # NOTE: GT depth is already in canonical space (fx=500 at target resolution)
+                    # Canonical transformation is handled in the dataloader
 
                     # Get batch size for Mamba initialization
                     B, T = images.shape[:2]
-
-                    # Apply canonical space transformation if enabled (for visualization consistency)
-                    if self.config.get('use_canonical_space', False):
-                        CANONICAL_FX = self._get_canonical_focal_length()
-
-                        # Transform inverse depth directly to canonical space
-                        # inverse_canonical = inverse_actual * (fx_actual / CANONICAL_FX)
-                        fx_actual = focal_lengths.view(B, T, 1, 1, 1)
-                        gt_depth_inverse_100 = gt_depth_inverse_100 * (fx_actual / CANONICAL_FX)
 
                     # Initialize Mamba sequence for temporal processing
                     if hasattr(model, 'mamba'):
@@ -760,7 +754,8 @@ class Gear2Trainer:
                             images[:1, :1].float().cpu(),  # [1, 1, 3, H, W] - convert BFloat16 to Float32 first
                             gt_depth_metric[:1].float().cpu(),  # [1, 1, H, W] (already has channel dim)
                             dataset_idx,
-                            focal_lengths[:1, :1].float().cpu()  # [1, 1] - resized focal length
+                            fx_ratio[:1, :1].float().cpu(),  # [1, 1] - Metric3D fx_ratio
+                            resize_ratio[:1, :1].float().cpu()  # [1, 1] - Metric3D resize_ratio
                         )
                         model_outputs_cpu = {
                             'pred_depth': pred_depth_metric[:1].cpu(),  # [1, 1, H, W]
@@ -817,11 +812,15 @@ class Gear2Trainer:
 
     def train_step(self, batch):
         """Single training step with BFloat16 autocast"""
-        # Unpack batch (updated to include focal_lengths)
-        images, gt_depth, focal_lengths, dataset_idx = batch
+        # Unpack batch (Metric3D format: 8 elements)
+        images, gt_depth, focal_lengths_canonical, focal_lengths_actual, actual_valid_mask, fx_ratio, resize_ratio, dataset_idx = batch
         images = images.to(self.device)
         gt_depth = gt_depth.to(self.device)
-        focal_lengths = focal_lengths.to(self.device)  # Shape: (B, T)
+        focal_lengths_canonical = focal_lengths_canonical.to(self.device)  # Shape: (B, T)
+        focal_lengths_actual = focal_lengths_actual.to(self.device)
+        actual_valid_mask = actual_valid_mask.to(self.device)
+        fx_ratio = fx_ratio.to(self.device)
+        resize_ratio = resize_ratio.to(self.device)
 
         # Add channel dimension if needed
         if gt_depth.ndim == 3:
@@ -1014,8 +1013,8 @@ class Gear2Trainer:
             if batch is None:
                 continue
 
-            # Unpack batch (updated to include focal_lengths)
-            images, gt_depth, focal_lengths, dataset_idx = batch
+            # Unpack batch (Metric3D format: 8 elements)
+            images, gt_depth, focal_lengths_canonical, focal_lengths_actual, actual_valid_mask, fx_ratio, resize_ratio, dataset_idx = batch
 
             # Get dataset name for this batch (before frame loop)
             if isinstance(dataset_idx, str):
@@ -1031,7 +1030,11 @@ class Gear2Trainer:
             with torch.amp.autocast('cuda', dtype=torch.bfloat16):
                 images = images.to(self.device)
                 gt_depth = gt_depth.to(self.device)
-                focal_lengths = focal_lengths.to(self.device)  # Shape: (B, T)
+                focal_lengths_canonical = focal_lengths_canonical.to(self.device)  # Shape: (B, T)
+                focal_lengths_actual = focal_lengths_actual.to(self.device)
+                actual_valid_mask = actual_valid_mask.to(self.device)
+                fx_ratio = fx_ratio.to(self.device)
+                resize_ratio = resize_ratio.to(self.device)
 
                 # Add channel dimension if needed
                 if gt_depth.ndim == 3:
@@ -1041,17 +1044,11 @@ class Gear2Trainer:
 
                 B, T = images.shape[:2]
 
-                # GT depth from dataloader is inverse depth (1/m), scale to 100/m
+                # GT depth from dataloader is inverse depth (1/m), already in canonical space (fx=500)
                 gt_depth_inverse_100 = gt_depth * 100.0  # (1/m) * 100 = 100/m
 
-                # Apply canonical space transformation if enabled
-                if self.config.get('use_canonical_space', False):
-                    CANONICAL_FX = self._get_canonical_focal_length()
-
-                    # Transform inverse depth directly to canonical space
-                    # inverse_canonical = inverse_actual * (fx_actual / CANONICAL_FX)
-                    fx_actual = focal_lengths.view(B, T, 1, 1, 1)
-                    gt_depth_inverse_100 = gt_depth_inverse_100 * (fx_actual / CANONICAL_FX)
+                # NOTE: GT depth is already in canonical space (fx=500 at target resolution)
+                # Canonical transformation is handled in the dataloader
 
                 # Process all frames in sequence (like original FlashDepth)
                 frame_losses = []
@@ -1191,7 +1188,8 @@ class Gear2Trainer:
                                         img_t_resized.unsqueeze(1).float().cpu(),  # [B, 1, C, gt_h, gt_w] at GT resolution
                                         gt_depth_metric.unsqueeze(1).float().cpu(),  # [B, 1, gt_h, gt_w]
                                         dataset_idx,
-                                        focal_lengths[:, 0:1].float().cpu()  # [B, 1] - resized focal length for first frame
+                                        fx_ratio[:, 0:1].float().cpu(),  # [B, 1] - Metric3D fx_ratio for first frame
+                                        resize_ratio[:, 0:1].float().cpu()  # [B, 1] - Metric3D resize_ratio for first frame
                                     )
 
                                     # FPS removed from training (only measured in test_gear2.py)

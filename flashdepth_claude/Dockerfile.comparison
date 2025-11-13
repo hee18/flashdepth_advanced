@@ -21,10 +21,10 @@ RUN apt-get update && apt-get install -y \
     libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Miniconda
-RUN wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O /tmp/miniconda.sh && \
-    bash /tmp/miniconda.sh -b -p /opt/conda && \
-    rm /tmp/miniconda.sh
+# Install Miniforge (conda-forge only, no Anaconda ToS issues)
+RUN wget https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh -O /tmp/miniforge.sh && \
+    bash /tmp/miniforge.sh -b -p /opt/conda && \
+    rm /tmp/miniforge.sh
 
 ENV PATH="/opt/conda/bin:$PATH"
 
@@ -34,94 +34,148 @@ RUN conda init bash && \
 
 # Create conda environments for each method
 # Note: Actual package installations should be done based on each method's requirements.txt
+# Using pip for package installation to avoid conda channel issues
+
+# DepthAnythingV2 environment (torch 2.1.1)
+RUN conda create -n depthanythingv2 python=3.10 -y && \
+    /opt/conda/envs/depthanythingv2/bin/pip install --no-cache-dir \
+        torch==2.1.1 \
+        torchvision==0.16.1 \
+        "numpy<2" \
+        opencv-python \
+        matplotlib \
+        open3d
 
 # Video-Depth-Anything environment (torch 2.1.1)
 RUN conda create -n vda python=3.10 -y && \
     /opt/conda/envs/vda/bin/pip install --no-cache-dir \
         torch==2.1.1 \
         torchvision==0.16.1 \
-        numpy \
+        xformers==0.0.23 \
+        numpy==1.24.0 \
         opencv-python \
         matplotlib \
-        tqdm
+        tqdm \
+        decord \
+        einops==0.4.1 \
+        imageio==2.37.0 \
+        imageio-ffmpeg==0.4.7 \
+        easydict
 
 # DepthCrafter environment (torch 2.0.1, diffusers)
 RUN conda create -n depthcrafter python=3.9 -y && \
     /opt/conda/envs/depthcrafter/bin/pip install --no-cache-dir \
         torch==2.0.1 \
-        torchvision==0.15.1 \
+        torchvision==0.15.2 \
         diffusers==0.29.1 \
-        transformers \
-        numpy \
+        transformers==4.41.2 \
+        xformers==0.0.20 \
+        accelerate==0.30.1 \
+        numpy==1.26.4 \
         opencv-python \
-        matplotlib
+        matplotlib==3.8.4 \
+        decord==0.6.0 \
+        mediapy==1.2.0 \
+        fire==0.6.0 \
+        Pillow
 
 # Metric3D environment (torch 2.0.1, xformers)
 RUN conda create -n metric3d python=3.10 -y && \
     /opt/conda/envs/metric3d/bin/pip install --no-cache-dir \
         torch==2.0.1 \
-        torchvision==0.15.1 \
+        torchvision==0.15.2 \
         xformers==0.0.21 \
-        numpy \
+        "numpy<2" \
         opencv-python \
         matplotlib \
-        timm
+        timm \
+        DateTime \
+        plyfile \
+        mmcv-lite \
+        mmengine \
+        yapf
 
 # UniDepth environment (torch 2.4.0, triton)
 RUN conda create -n unidepth python=3.11 -y && \
     /opt/conda/envs/unidepth/bin/pip install --no-cache-dir \
         torch==2.4.0 \
         torchvision==0.19.0 \
+        torchaudio==2.4.0 \
         triton \
         numpy \
         opencv-python \
         matplotlib \
-        einops
+        einops \
+        h5py \
+        tables \
+        tabulate \
+        timm \
+        scipy \
+        trimesh \
+        xformers>=0.0.26 \
+        huggingface-hub \
+        protobuf \
+        termcolor \
+        wandb
 
-# ZoeDepth environment (torch 2.0.1)
+# ZoeDepth environment (torch 1.13.1 - official requirement)
 RUN conda create -n zoedepth python=3.10 -y && \
     /opt/conda/envs/zoedepth/bin/pip install --no-cache-dir \
-        torch==2.0.1 \
-        torchvision==0.15.1 \
-        numpy \
+        torch==1.13.1 \
+        torchvision==0.14.1 \
+        "numpy<2" \
         opencv-python \
         matplotlib \
-        timm
+        timm==0.6.12 \
+        huggingface-hub==0.11.1 \
+        wandb==0.13.9
 
 # DepthPro environment (torch 2.4.0)
-RUN conda create -n depthpro python=3.11 -y && \
+RUN conda create -n depthpro python=3.9 -y && \
     /opt/conda/envs/depthpro/bin/pip install --no-cache-dir \
         torch==2.4.0 \
         torchvision==0.19.0 \
-        numpy \
+        "numpy<2" \
         opencv-python \
         matplotlib \
-        pillow
+        pillow \
+        pillow_heif \
+        timm
 
 # CUT3R environment (torch 2.1.1)
 RUN conda create -n cut3r python=3.10 -y && \
     /opt/conda/envs/cut3r/bin/pip install --no-cache-dir \
         torch==2.1.1 \
         torchvision==0.16.1 \
-        numpy \
+        numpy==1.26.4 \
         opencv-python \
         matplotlib \
-        roma
+        roma \
+        gradio \
+        lpips \
+        trimesh \
+        einops \
+        scipy \
+        accelerate \
+        transformers
 
-# Set working directory
-WORKDIR /workspace
-
-# Copy project files
-COPY . /workspace/
-
-# Install common dependencies in each environment
-RUN for env in vda depthcrafter metric3d unidepth zoedepth depthpro cut3r; do \
+# Install common dependencies in each environment (before copying project files for better caching)
+RUN for env in depthanythingv2 vda depthcrafter metric3d unidepth zoedepth depthpro cut3r; do \
         /opt/conda/envs/$env/bin/pip install --no-cache-dir \
             hydra-core \
             omegaconf \
             Pillow \
-            scipy; \
+            scipy \
+            h5py \
+            pandas \
+            tqdm; \
     done
+
+# Set working directory
+WORKDIR /workspace
+
+# Copy project files (last to maximize Docker cache efficiency)
+COPY . /workspace/
 
 # Default command
 CMD ["/bin/bash"]

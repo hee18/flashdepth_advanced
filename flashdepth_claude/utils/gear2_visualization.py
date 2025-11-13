@@ -55,7 +55,7 @@ class Gear2Visualizer:
             fig: Matplotlib figure object
         """
         try:
-            images, gt_depth, dataset_idx, focal_lengths = sample_batch
+            images, gt_depth, dataset_idx, fx_ratio, resize_ratio = sample_batch
             pred_depth = model_outputs['pred_depth']
             importance_map = model_outputs.get('importance_map', None)  # Will be None for Gear2
 
@@ -351,25 +351,14 @@ class Gear2Visualizer:
             ax9.text(0.05, y_pos, f'Dataset: {dataset_str}', fontsize=11, transform=ax9.transAxes)
             y_pos -= 0.10
 
-            # Focal length and depth range info (resized)
-            if focal_lengths is not None and torch.is_tensor(focal_lengths):
-                # Extract first batch, first/middle frame
-                fx_value = focal_lengths[0, 0].item() if focal_lengths.ndim >= 2 else focal_lengths[0].item()
+            # Metric3D canonicalization ratios (from dataloader)
+            if fx_ratio is not None and resize_ratio is not None:
+                # Extract ratios (from Metric3D canonicalization)
+                fx_ratio_value = fx_ratio[0, 0].item() if fx_ratio.ndim >= 2 else fx_ratio[0].item()
+                resize_ratio_value = resize_ratio[0, 0].item() if resize_ratio.ndim >= 2 else resize_ratio[0].item()
 
-                # Show valid GT range (canonical 70m, and actual space equivalent for reference)
-                use_canonical = config.get('use_canonical_space', False) if config is not None else False
-                if use_canonical:
-                    # Get canonical focal length from config
-                    CANONICAL_FX = 1000.0  # Fixed canonical focal length for all resolutions
-
-                    # Actual space equivalent: depth_actual = 70 × (fx_actual / CANONICAL_FX)
-                    valid_gt_max_actual = 70.0 * (fx_value / CANONICAL_FX)
-                    ax9.text(0.05, y_pos, f'resized_fx: {fx_value:.1f}, valid: 70.0m (canon={valid_gt_max_actual:.1f}m actual)', fontsize=10,
-                            transform=ax9.transAxes, bbox=dict(boxstyle="round", facecolor='lightyellow'))
-                else:
-                    # No canonical space - GT is in actual space
-                    ax9.text(0.05, y_pos, f'resized_fx: {fx_value:.1f}, valid_gt_max: 70.000m (actual)', fontsize=10,
-                            transform=ax9.transAxes, bbox=dict(boxstyle="round", facecolor='lightyellow'))
+                ax9.text(0.05, y_pos, f'fx_ratio: {fx_ratio_value:.3f} | resize_ratio: {resize_ratio_value:.3f}', fontsize=10,
+                        transform=ax9.transAxes, bbox=dict(boxstyle="round", facecolor='lightyellow'))
                 y_pos -= 0.10
 
             # FG:BG ratio → N/A for Gear2

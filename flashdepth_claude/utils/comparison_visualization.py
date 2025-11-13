@@ -155,28 +155,27 @@ def visualize_sequence_simplified(images, pred_depths, gt_depths, valid_mask,
     logger.info(f"Saved simplified visualization: {save_path}")
 
 
-def visualize_best_frame_simplified(image, pred_depth, gt_depth, sequence_id, frame_idx,
-                                     abs_rel, fps, save_dir, frame_metrics=None,
-                                     seg_mask=None, class_metrics=None):
+def visualize_best_frame_simplified(image, gt_depth, pred_depth, metrics,
+                                     save_dir, sequence_id, frame_idx,
+                                     dataset_name=None, focal_length=None):
     """
-    Save simplified best frame visualization (2x3 grid, no Gear-specific elements)
+    Save improved best frame visualization (3×3 grid with Valid Mask and Depth Distribution)
 
     Layout:
-        Row 1: Input Image | GT Depth | Pred Depth
-        Row 2: [Empty/Logo] | Error Map | Metrics
+        Row 0: Input Image | GT Depth | Pred Depth
+        Row 1: Valid Mask | Error Map | Depth Metrics (with Dataset info)
+        Row 2: Depth Distribution (2 cols) | Empty
 
     Args:
         image: [3, H, W] or [H, W, 3] - RGB image
-        pred_depth: [H, W] - Predicted metric depth
         gt_depth: [H, W] - Ground truth metric depth
+        pred_depth: [H, W] - Predicted metric depth
+        metrics: dict - Pre-computed metrics dictionary
+        save_dir: Path - Save directory
         sequence_id: int - Sequence index
         frame_idx: int - Frame index
-        abs_rel: float - AbsRel metric
-        fps: float - Optional FPS
-        save_dir: Path - Save directory
-        frame_metrics: dict - Optional pre-computed metrics (includes boundary_f1)
-        seg_mask: np.ndarray - Optional segmentation mask
-        class_metrics: dict - Optional per-class metrics
+        dataset_name: str - Optional dataset name (e.g., 'eth3d/pipes')
+        focal_length: float - Optional focal length
     """
     # Convert tensors to numpy
     if isinstance(image, torch.Tensor):
@@ -194,21 +193,24 @@ def visualize_best_frame_simplified(image, pred_depth, gt_depth, sequence_id, fr
     image = (image - image.min()) / (image.max() - image.min() + 1e-8)
     image = np.clip(image, 0, 1)
 
-    # Create figure with 2x3 grid
-    fig = plt.figure(figsize=(15, 10))
-    gs = gridspec.GridSpec(2, 3, figure=fig, hspace=0.3, wspace=0.3)
+    # Create figure with 3×3 grid
+    fig = plt.figure(figsize=(15, 12))
+    gs = gridspec.GridSpec(3, 3, figure=fig,
+                          height_ratios=[1, 1, 1],
+                          hspace=0.35, wspace=0.3)
 
-    # ==================== Row 1: Images and Depths ====================
-
-    # 1. Input Image
-    ax0 = fig.add_subplot(gs[0, 0])
-    ax0.imshow(image)
-    ax0.set_title('Input Image', fontsize=14, fontweight='bold')
-    ax0.axis('off')
-
-    # 2. GT Depth
-    ax1 = fig.add_subplot(gs[0, 1])
     MAX_DEPTH = 70.0
+
+    # ==================== Row 0: Input, GT, Pred ====================
+
+    # Row 0, Col 0: Input Image
+    ax_img = fig.add_subplot(gs[0, 0])
+    ax_img.imshow(image)
+    ax_img.set_title('Input Image', fontsize=12, fontweight='bold', pad=8)
+    ax_img.axis('off')
+
+    # Row 0, Col 1: GT Depth
+    ax_gt = fig.add_subplot(gs[0, 1])
     gt_valid = (gt_depth > 0) & (gt_depth < MAX_DEPTH)
     gt_display = np.where(gt_valid, gt_depth, np.nan)
 
@@ -220,34 +222,34 @@ def visualize_best_frame_simplified(image, pred_depth, gt_depth, sequence_id, fr
 
     cmap_gt = plt.cm.plasma_r.copy()
     cmap_gt.set_bad(color='black')
-    im1 = ax1.imshow(gt_display, cmap=cmap_gt, vmin=gt_vmin, vmax=gt_vmax)
-    ax1.set_title('Ground Truth Depth (m)', fontsize=14, fontweight='bold')
-    ax1.axis('off')
-    plt.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
+    im_gt = ax_gt.imshow(gt_display, cmap=cmap_gt, vmin=gt_vmin, vmax=gt_vmax)
+    ax_gt.set_title('Ground Truth Depth (m)', fontsize=12, fontweight='bold', pad=8)
+    ax_gt.axis('off')
+    plt.colorbar(im_gt, ax=ax_gt, fraction=0.046, pad=0.04)
 
-    # 3. Predicted Depth
-    ax2 = fig.add_subplot(gs[0, 2])
+    # Row 0, Col 2: Predicted Depth
+    ax_pred = fig.add_subplot(gs[0, 2])
     pred_valid = (pred_depth > 0) & (pred_depth < MAX_DEPTH)
     pred_display = np.where(pred_valid, pred_depth, np.nan)
 
     cmap_pred = plt.cm.plasma_r.copy()
     cmap_pred.set_bad(color='black')
-    im2 = ax2.imshow(pred_display, cmap=cmap_pred, vmin=gt_vmin, vmax=gt_vmax)
-    ax2.set_title('Predicted Depth (m)', fontsize=14, fontweight='bold')
-    ax2.axis('off')
-    plt.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
+    im_pred = ax_pred.imshow(pred_display, cmap=cmap_pred, vmin=gt_vmin, vmax=gt_vmax)
+    ax_pred.set_title('Predicted Depth (m)', fontsize=12, fontweight='bold', pad=8)
+    ax_pred.axis('off')
+    plt.colorbar(im_pred, ax=ax_pred, fraction=0.046, pad=0.04)
 
-    # ==================== Row 2: Empty/Logo, Error Map, Metrics ====================
+    # ==================== Row 1: Valid Mask, Error Map, Metrics ====================
 
-    # 4. Empty or Project Logo
-    ax3 = fig.add_subplot(gs[1, 0])
-    ax3.text(0.5, 0.5, 'FlashDepth\nComparison',
-             ha='center', va='center', fontsize=16, fontweight='bold',
-             bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.8))
-    ax3.axis('off')
+    # Row 1, Col 0: Valid Mask (GT valid only, 70m threshold)
+    ax_valid = fig.add_subplot(gs[1, 0])
+    valid_mask_vis = gt_valid.astype(np.uint8)
+    ax_valid.imshow(valid_mask_vis, cmap='gray', vmin=0, vmax=1)
+    ax_valid.set_title('Valid Mask (GT ≤70m)', fontsize=12, fontweight='bold', pad=8)
+    ax_valid.axis('off')
 
-    # 5. Absolute Error Map
-    ax4 = fig.add_subplot(gs[1, 1])
+    # Row 1, Col 1: Absolute Error Map
+    ax_error = fig.add_subplot(gs[1, 1])
     error_valid_mask = gt_valid & pred_valid
     abs_error = np.abs(pred_depth - gt_depth)
     abs_error_masked = np.where(error_valid_mask, abs_error, np.nan)
@@ -257,77 +259,94 @@ def visualize_best_frame_simplified(image, pred_depth, gt_depth, sequence_id, fr
     else:
         error_vmax = 1
 
-    im4 = ax4.imshow(abs_error_masked, cmap='hot', vmin=0, vmax=error_vmax)
-    ax4.set_title(f'Absolute Error (m)\nMean: {np.nanmean(abs_error_masked):.3f}',
-                 fontsize=14, fontweight='bold')
-    ax4.axis('off')
-    plt.colorbar(im4, ax=ax4, fraction=0.046, pad=0.04)
+    im_error = ax_error.imshow(abs_error_masked, cmap='hot', vmin=0, vmax=error_vmax)
+    ax_error.set_title(f'Absolute Error (m)\nMean: {np.nanmean(abs_error_masked):.3f}',
+                      fontsize=12, fontweight='bold', pad=8)
+    ax_error.axis('off')
+    plt.colorbar(im_error, ax=ax_error, fraction=0.046, pad=0.04)
 
-    # 6. Depth Metrics
-    ax5 = fig.add_subplot(gs[1, 2])
-    y_pos = 0.95
+    # Row 1, Col 2: Depth Metrics (with Dataset info)
+    ax_metrics = fig.add_subplot(gs[1, 2])
 
-    # Sequence info
-    ax5.text(0.05, y_pos, f'Seq {sequence_id+1} Frame {frame_idx}', fontsize=11,
-            transform=ax5.transAxes, bbox=dict(boxstyle="round", facecolor='wheat'),
-            fontweight='bold')
-    y_pos -= 0.15
+    # Build metrics text
+    text_lines = []
 
-    # FPS if available
-    if fps is not None:
-        ax5.text(0.05, y_pos, f'FPS: {fps:.1f}', fontsize=10,
-                transform=ax5.transAxes, bbox=dict(boxstyle="round", facecolor='lightgreen'))
-        y_pos -= 0.12
+    # Dataset info
+    if dataset_name:
+        text_lines.append(f"Dataset: {dataset_name}")
+    else:
+        text_lines.append("Dataset: unknown")
 
-    # Compute metrics if valid pixels exist
-    if error_valid_mask.sum() > 0:
-        valid_gt = torch.from_numpy(gt_depth[error_valid_mask])
-        valid_pred = torch.from_numpy(pred_depth[error_valid_mask])
+    # Sequence and frame info
+    text_lines.append(f"Seq: {sequence_id} | Frame: {frame_idx}")
+    text_lines.append("")  # Blank line
 
-        rmse = torch.sqrt(torch.mean((valid_pred - valid_gt) ** 2))
-        mae = torch.mean(torch.abs(valid_pred - valid_gt))
+    # Metrics from dictionary
+    text_lines.append(f"MAE:    {metrics.get('mae', 0):.3f}")
+    text_lines.append(f"RMSE:   {metrics.get('rmse', 0):.3f}")
+    text_lines.append(f"AbsRel: {metrics.get('abs_rel', 0):.3f}")
+    text_lines.append(f"δ1:     {metrics.get('a1', 0):.3f}")
+    text_lines.append(f"δ2:     {metrics.get('a2', 0):.3f}")
+    text_lines.append(f"δ3:     {metrics.get('a3', 0):.3f}")
+    text_lines.append(f"F1:     {metrics.get('boundary_f1', 0):.3f}")
 
-        threshold = 1.25
-        max_ratio = torch.max(valid_pred / valid_gt, valid_gt / valid_pred)
-        delta_1 = (max_ratio < threshold).float().mean()
-        delta_2 = (max_ratio < threshold ** 2).float().mean()
-        delta_3 = (max_ratio < threshold ** 3).float().mean()
+    # Add focal length if available
+    if focal_length is not None:
+        text_lines.append("")
+        text_lines.append(f"fx:     {focal_length:.1f}")
 
-        ax5.text(0.05, y_pos, f'AbsRel: {abs_rel:.4f}', fontsize=10,
-                transform=ax5.transAxes, bbox=dict(boxstyle="round", facecolor='lightcoral'))
-        y_pos -= 0.10
-        ax5.text(0.05, y_pos, f'δ1: {delta_1:.3f}', fontsize=10,
-                transform=ax5.transAxes, bbox=dict(boxstyle="round", facecolor='lightgreen'))
-        y_pos -= 0.10
-        ax5.text(0.05, y_pos, f'δ2: {delta_2:.3f}', fontsize=10,
-                transform=ax5.transAxes, bbox=dict(boxstyle="round", facecolor='lightgreen'))
-        y_pos -= 0.10
-        ax5.text(0.05, y_pos, f'δ3: {delta_3:.3f}', fontsize=10,
-                transform=ax5.transAxes, bbox=dict(boxstyle="round", facecolor='lightgreen'))
-        y_pos -= 0.10
-        ax5.text(0.05, y_pos, f'RMSE: {rmse:.3f}m', fontsize=9,
-                transform=ax5.transAxes, bbox=dict(boxstyle="round", facecolor='wheat'))
-        y_pos -= 0.10
-        ax5.text(0.05, y_pos, f'MAE: {mae:.3f}m', fontsize=9,
-                transform=ax5.transAxes, bbox=dict(boxstyle="round", facecolor='lightblue'))
-        y_pos -= 0.10
+    text = "\n".join(text_lines)
+    ax_metrics.text(0.05, 0.95, text, fontsize=10,
+                   verticalalignment='top', family='monospace',
+                   transform=ax_metrics.transAxes)
+    ax_metrics.set_title('Depth Metrics', fontsize=12, fontweight='bold', pad=8)
+    ax_metrics.axis('off')
 
-        # Add boundary F1 score if available
-        if frame_metrics is not None and 'boundary_f1' in frame_metrics:
-            boundary_f1 = frame_metrics['boundary_f1']
-            ax5.text(0.05, y_pos, f'F1: {boundary_f1:.3f}', fontsize=9,
-                    transform=ax5.transAxes, bbox=dict(boxstyle="round", facecolor='lavender'))
-            y_pos -= 0.10
+    # ==================== Row 2: Depth Distribution + Empty ====================
 
-    ax5.set_title('Depth Metrics', fontsize=14, fontweight='bold')
-    ax5.axis('off')
+    # Row 2, Cols 0-1: Depth Distribution Histogram
+    ax_dist = fig.add_subplot(gs[2, 0:2])
+
+    # Compute valid masks
+    valid_mask_both = gt_valid & pred_valid
+
+    if valid_mask_both.sum() > 0:
+        gt_valid_pixels = gt_depth[valid_mask_both]
+        pred_valid_pixels = pred_depth[valid_mask_both]
+
+        # Compute histogram bins
+        all_depths = np.concatenate([gt_valid_pixels, pred_valid_pixels])
+        bins = np.linspace(all_depths.min(), all_depths.max(), 50)
+
+        # Plot histograms
+        ax_dist.hist(gt_valid_pixels, bins=bins, alpha=0.6,
+                    label='Ground Truth', color='blue', density=True)
+        ax_dist.hist(pred_valid_pixels, bins=bins, alpha=0.6,
+                    label='Predicted', color='red', density=True)
+
+        ax_dist.set_xlabel('Depth (m)', fontsize=10)
+        ax_dist.set_ylabel('Density', fontsize=10)
+        ax_dist.set_title('Depth Distribution (Valid Pixels ≤70m)', fontsize=12, fontweight='bold')
+        ax_dist.legend(fontsize=9, loc='upper right')
+        ax_dist.grid(True, alpha=0.3)
+    else:
+        ax_dist.text(0.5, 0.5, 'No valid pixels for distribution',
+                    ha='center', va='center', fontsize=11,
+                    transform=ax_dist.transAxes)
+        ax_dist.set_title('Depth Distribution', fontsize=12, fontweight='bold')
+        ax_dist.axis('off')
+
+    # Row 2, Col 2: Empty (reserved for future use)
+    ax_empty = fig.add_subplot(gs[2, 2])
+    ax_empty.axis('off')
 
     # Overall title
-    plt.suptitle(f'Comparison Method: Sequence {sequence_id} Best Frame {frame_idx}',
-                fontsize=16, fontweight='bold')
+    abs_rel_value = metrics.get('abs_rel', 0)
+    plt.suptitle(f'Best Frame Visualization: Sequence {sequence_id}, Frame {frame_idx}',
+                fontsize=14, fontweight='bold')
 
     plt.tight_layout()
-    save_path = save_dir / f"best_frame_seq{sequence_id}_{frame_idx}_absrel_{abs_rel:.4f}.png"
+    save_path = save_dir / f"best_frame_seq{sequence_id}_{frame_idx}_absrel_{abs_rel_value:.4f}.png"
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
 

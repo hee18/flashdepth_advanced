@@ -83,7 +83,7 @@ class SintelDepth(BaseDatasetPairs):
                         f"<0: {(depth < 0).sum()}")
 
         sky_mask = depth > 1e4
-        
+
         depth[invalid_mask] = -1
         inverse_depth = 1 / depth
         inverse_depth[sky_mask] = 0

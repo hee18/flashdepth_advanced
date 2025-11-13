@@ -407,3 +407,101 @@ def format_metrics(metrics: Dict, precision: int = 4) -> str:
                     lines.append(f"{key.upper():>12}: {metrics[key]:.{precision}f}")
 
     return "\n".join(lines)
+
+
+class RelativeDepthMetrics:
+    """
+    Metrics for relative (scale-invariant) depth estimation evaluation
+    """
+
+    def __init__(self):
+        self.logger = logging.getLogger(__name__)
+
+    @staticmethod
+    def compute_relative_depth_metrics(pred: torch.Tensor, gt: torch.Tensor,
+                                       valid_mask: Optional[torch.Tensor] = None) -> Dict[str, float]:
+        """
+        Compute metrics for relative depth estimation
+
+        For relative depth, only scale-invariant metrics are meaningful:
+        - Boundary F1: Edge-aware metric (scale-invariant)
+        - Scale-invariant AbsRel and δ1 (optional, for comparison)
+
+        Args:
+            pred: Predicted relative depth [H, W] or [N, H, W]
+            gt: Ground truth depth [H, W] or [N, H, W]
+            valid_mask: Valid pixels mask [H, W] or [N, H, W]
+
+        Returns:
+            Dictionary containing:
+            - boundary_f1: Scale-invariant boundary F1 score
+            - abs_rel_si: Scale-invariant absolute relative error
+            - a1: Scale-invariant δ1 threshold accuracy
+        """
+        if valid_mask is None:
+            valid_mask = (gt > 0)
+
+        # Compute scale-shift invariant alignment first
+        si_metrics = MetricDepthMetrics.compute_scale_shift_invariant_metrics(
+            pred, gt, valid_mask
+        )
+
+        # Convert to numpy for boundary F1 computation
+        pred_np = pred.cpu().numpy() if isinstance(pred, torch.Tensor) else pred
+        gt_np = gt.cpu().numpy() if isinstance(gt, torch.Tensor) else gt
+
+        # Compute scale-invariant boundary F1 score
+        try:
+            boundary_f1 = SI_boundary_F1(pred_np, gt_np, t_min=1.05, t_max=1.25, N=10)
+        except Exception as e:
+            boundary_f1 = 0.0
+
+        return {
+            "boundary_f1": float(boundary_f1),
+            "abs_rel_si": si_metrics["abs_rel"],  # Scale-invariant AbsRel
+            "a1": si_metrics["a1"],  # Scale-invariant δ1
+        }
+
+    @staticmethod
+    def compute_tae_scale_invariant(pred_t: torch.Tensor, pred_t_next: torch.Tensor,
+                                    gt_t: torch.Tensor, gt_t_next: torch.Tensor,
+                                    valid_mask_t: torch.Tensor, valid_mask_t_next: torch.Tensor) -> float:
+        """
+        Compute scale-invariant Temporal Alignment Error (TAE)
+
+        For relative depth, we need to align scale per frame pair before computing TAE,
+        since the absolute scale of predictions may vary frame-to-frame.
+
+        Args:
+            pred_t: Predicted depth at frame t [H, W]
+            pred_t_next: Predicted depth at frame t+1 [H, W]
+            gt_t: Ground truth depth at frame t [H, W]
+            gt_t_next: Ground truth depth at frame t+1 [H, W]
+            valid_mask_t: Valid pixels at frame t [H, W]
+            valid_mask_t_next: Valid pixels at frame t+1 [H, W]
+
+        Returns:
+            tae_si: Scale-invariant TAE value
+        """
+        # Combine valid masks for both frames
+        valid_both = valid_mask_t & valid_mask_t_next
+
+        if valid_both.sum() == 0:
+            return float('inf')
+
+        # Compute optimal scale per frame using median scaling
+        scale_t = torch.median(gt_t[valid_both] / (pred_t[valid_both] + 1e-8))
+        scale_t_next = torch.median(gt_t_next[valid_both] / (pred_t_next[valid_both] + 1e-8))
+
+        # Align predictions to GT scale
+        pred_t_aligned = pred_t * scale_t
+        pred_t_next_aligned = pred_t_next * scale_t_next
+
+        # Compute temporal changes (frame-to-frame differences)
+        pred_change = pred_t_next_aligned - pred_t_aligned
+        gt_change = gt_t_next - gt_t
+
+        # Compute TAE on the changes (using valid mask)
+        tae_si = torch.abs(pred_change[valid_both] - gt_change[valid_both]).mean()
+
+        return tae_si.item()

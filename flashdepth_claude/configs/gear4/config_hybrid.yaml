@@ -1,12 +1,13 @@
-# Gear2 Configuration - ViT-S variant
-# Stage 1: Train on 5 datasets (518×518)
-# Use for: Initial training with ViT-S backbone
+# Gear4 Configuration - Hybrid variant (ViT-S student + ViT-L teacher)
+# Stage 2: Train on mvs-synth, spring (2K resolution)
+# Use for: High-resolution training with teacher-student fusion
 
 # General settings
 config_dir: null # overwrite by --config-path
 inference: false
-load: configs/flashdepth-s/iter_14001.pth  # FlashDepth-S pretrained weights
-phase: 1  # Stage 1: Base training (518×518)
+load: configs/flashdepth/iter_43002.pth  # FlashDepth-hybrid checkpoint (for ViT-DPT overwrite)
+gear_checkpoint: train_results/results_XX/gear4_s/best.pth  # Gear3 Upgrade-S Stage 1 checkpoint (for Gear modules)
+phase: 2  # Stage 2: Hybrid training (2K resolution)
 
 # Canonical space settings
 canonical_focal_length: 1000.0  # Fixed canonical focal length for all resolutions
@@ -15,36 +16,38 @@ use_canonical_space: true  # ENABLED - all training data normalized to canonical
 # Dataset configuration
 dataset:
   data_root: null # change data path
-  resolution: 'base'  # 518x518
-  video_length: 5
-  train_datasets: [mvs-synth, dynamicreplica, tartanair, pointodyssey, spring]
+  resolution: '2k'  # 2K resolution for Stage 2
+  video_length: 1  # Minimal setting for 2K + multi-layer attention (4 blocks) + gradient_checkpointing
+  train_datasets: [mvs-synth, spring]  # Only high-res datasets
   val_datasets: [sintel, waymo_seg]
 
 # Training configuration
 training:
-  batch_size: 4  # Per GPU (effective 8 with 2 GPUs in DDP) - full sequence processing: 4*5 = 20 frames/GPU
-  workers: 8      # Optimized for 96 CPU cores
-  iterations: 40001  # Reduced from 60001 (best model at step 2k, overfitting after)
+  batch_size: 1   # Smaller batch size for 2K resolution (full sequence: 1*2=2 frames/GPU)
+  workers: 2      # Optimized for 96 CPU cores
+  iterations: 40001  # Same as Stage 1
+  gradient_checkpointing: true  # CRITICAL for 2K resolution - saves ~50% memory
   save_freq: 5000
   val_freq: 1000  # Validation every 1k steps
   log_freq: 100
   wandb: false
-  wandb_name: "gear3_upgrade_s_stage1"
+  wandb_name: "gear4_hybrid_stage2"
 
   # Learning rates (Gear2 specific)
-  gear3_upgrade_lr: 1.0e-4  # For new Gear2 modules
-  mamba_lr: 1.0e-4  # For Mamba (train from scratch)
-  final_head_lr: 5.0e-5  # For output_conv1/2
+  gear4_lr: 1.0e-4  # For Gear2 modules (fine-tune)
+  mamba_lr: 1.0e-4  # For Mamba (fine-tune)
+  final_head_lr: 5.0e-5  # For output_conv1/2 (fine-tune)
+  fusion_lr: 1.0e-4  # For hybrid fusion (from scratch)
   weight_decay: 1.0e-6
 
   # FPS measurement
   measure_fps: true  # Measure forward pass FPS (inference speed)
   fps_log_freq: 100  # Log FPS every N steps
 
-# Model configuration (ViT-S)
+# Model configuration (ViT-S student)
 model:
   # ViT configuration
-  vit_size: "vits"
+  vit_size: "vits"  # Student uses ViT-S
   patch_size: 14
   attn_class: "MemEffAttention"
 
@@ -61,22 +64,28 @@ model:
   use_transformer_rnn: false
   use_xlstm: false
 
-# Hybrid model (not used in Stage 1)
+# Hybrid model configuration
 hybrid_configs:
-  use_hybrid: false
+  use_hybrid: true
+  teacher_model_path: train_results/results_XX/gear4_l/best.pth  # Gear2-L Stage 1 checkpoint
+  teacher_resolution: 490
+  layers_to_skip: [1,2,3]  # Only path_4 is used for fusion
+  num_blocks: 4
+  mlp_expand: 2
+  num_heads: 2
 
 # Evaluation configuration
 eval:
   compile: false
   metrics: true
   save_grid: true
-  outfolder: "test_gear3_upgrade_s"
+  outfolder: "test_gear4_hybrid"
   test_datasets: [sintel]
-  test_dataset_resolution: 'base'
+  test_dataset_resolution: '2k'
   random_input: null
   out_video: true  # Enable video/GIF saving
   out_mp4: false   # false=GIF, true=MP4
-  save_res: 518    # Video height (original resolution, matches test resolution)
+  save_res: 518    # Video height for visualization
   video_fps: 24    # Frames per second for MP4 (FlashDepth default)
   gif_duration: 110  # Duration per frame in milliseconds for GIF
   save_depth_npy: false  # Save raw depth as .npy files
@@ -87,6 +96,3 @@ eval:
 object_wise:
   enabled: false  # Enable object-wise evaluation (set via CLI: object_wise.enabled=true)
   dataset: waymo_seg  # Dataset type for object-wise eval: waymo_seg, sintel
-
-# Gear3 Upgrade specific settings
-separation_method: cls_seg  # FG/BG separation method: cls_seg (CLS token), kmeans, multi_layer

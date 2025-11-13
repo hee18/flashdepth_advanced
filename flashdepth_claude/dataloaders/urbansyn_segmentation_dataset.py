@@ -253,9 +253,10 @@ def urbansyn_collate_fn(batch):
     sample = batch[0]
 
     # Add batch dimension
+    # Use 'images' and 'depths' (plural) to match ComparisonDataset format
     return {
-        'image': sample['image'].unsqueeze(0),  # (1, T, 3, H, W)
-        'depth': sample['depth'].unsqueeze(0),  # (1, T, H, W)
+        'images': sample['image'].unsqueeze(0),  # (1, T, 3, H, W) - Changed to 'images' (plural)
+        'depths': sample['depth'].unsqueeze(0),  # (1, T, H, W) - Changed to 'depths' (plural)
         'segmentations': sample['segmentations'].unsqueeze(0),  # (1, T, H, W)
         'focal_lengths': sample['focal_lengths'].unsqueeze(0),  # (1, T)
         'sequence_name': sample['sequence_name']

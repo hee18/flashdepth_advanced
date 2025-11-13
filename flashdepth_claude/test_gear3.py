@@ -54,9 +54,9 @@ def get_canonical_focal_length(config):
         config: Configuration dict
 
     Returns:
-        float: Canonical focal length (always 1000.0)
+        float: Canonical focal length (always 500.0)
     """
-    return 1000.0
+    return 500.0
 
 # Setup logging
 logging.basicConfig(
@@ -415,16 +415,29 @@ class Gear3Tester:
         if len(batch) == 0:
             return None
 
-        # CombinedDataset returns (images, depths, focal_lengths, dataset_name) tuple for val/test splits
+        # CombinedDataset returns tuple for val/test splits
         # Convert to dict format for easier access
         if len(batch) > 0 and isinstance(batch[0], tuple):
-            images, depths, focal_lengths, names = zip(*batch)
-            return {
-                'image': torch.stack(images, dim=0),
-                'depth': torch.stack(depths, dim=0),
-                'focal_lengths': torch.stack(focal_lengths, dim=0),
-                'dataset_name': names
-            }
+            if len(batch[0]) == 8:  # New Metric3D format with fx_ratio and resize_ratio
+                images, depths, focal_lengths_canonical, focal_lengths_actual, actual_valid_masks, fx_ratios, resize_ratios, names = zip(*batch)
+                return {
+                    'image': torch.stack(images, dim=0),
+                    'depth': torch.stack(depths, dim=0),
+                    'focal_lengths': torch.stack(focal_lengths_canonical, dim=0),  # Canonical (500.0)
+                    'focal_lengths_actual': torch.stack(focal_lengths_actual, dim=0),  # Original focal lengths
+                    'actual_valid_mask': torch.stack(actual_valid_masks, dim=0),
+                    'fx_ratio': torch.stack(fx_ratios, dim=0),  # NEW: 500 / fx_actual
+                    'resize_ratio': torch.stack(resize_ratios, dim=0),  # NEW: total resize ratio
+                    'dataset_name': names
+                }
+            else:  # Old format (backwards compatibility)
+                images, depths, focal_lengths, names = zip(*batch)
+                return {
+                    'image': torch.stack(images, dim=0),
+                    'depth': torch.stack(depths, dim=0),
+                    'focal_lengths': torch.stack(focal_lengths, dim=0),
+                    'dataset_name': names
+                }
 
         # Segmentation datasets return dict with 'images' key, rename to 'image' for compatibility
         if len(batch) > 0 and isinstance(batch[0], dict) and 'images' in batch[0]:
@@ -532,6 +545,22 @@ class Gear3Tester:
         gt_depth = batch['depth'].to(self.device)  # [1, T, H, W]
         focal_lengths = batch['focal_lengths'].to(self.device)  # [1, T]
 
+        # Extract Metric3D canonicalization ratios from batch (if available)
+        if 'fx_ratio' in batch and 'resize_ratio' in batch:
+            fx_ratio = batch['fx_ratio'].to(self.device)  # [1, T] - focal length ratio (500 / fx_actual)
+            resize_ratio = batch['resize_ratio'].to(self.device)  # [1, T] - total resize ratio
+        else:
+            # Fallback for datasets without Metric3D canonicalization
+            fx_ratio = None
+            resize_ratio = None
+
+        # Extract actual_valid_mask from batch (if available)
+        # This mask is computed in actual space (before canonical transform) with 70m threshold
+        if 'actual_valid_mask' in batch:
+            actual_valid_mask = batch['actual_valid_mask'].to(self.device)  # [1, T, H, W]
+        else:
+            actual_valid_mask = None
+
         # Add channel dimension if needed
         if gt_depth.ndim == 3:
             gt_depth = gt_depth.unsqueeze(2)  # [1, T, 1, H, W]
@@ -542,22 +571,21 @@ class Gear3Tester:
         B, T = images.shape[:2]
         assert B == 1, "Batch size must be 1 for testing"
 
-        # Dataloader gives inverse depth (1/m), scale to 100/m for training
-        gt_depth_inverse_100 = gt_depth * 100.0  # [1, T, 1, H, W] in 100/m
+        # Dataloader gives inverse depth (1/m), already in canonical space (fx=500), scale to 100/m
+        gt_depth_inverse_100 = gt_depth * 100.0  # [1, T, 1, H, W] in canonical 100/m
 
-        # Apply canonical space transformation to GT if enabled (for BOTH masks AND metrics calculation)
-        # This ensures consistency with training/validation which use canonical space
+        # NOTE: GT depth is already in canonical space (fx=500 at target resolution)
+        # Canonical transformation is handled in the dataloader
         CANONICAL_FX = get_canonical_focal_length(self.config)
-        use_canonical = self.config.get('use_canonical_space', False)
-        if use_canonical:
-            # Transform GT to canonical space for masks and metrics
-            # inverse_canonical = inverse_actual * (fx_actual / CANONICAL_FX)
-            fx_actual = focal_lengths.view(1, T, 1, 1, 1)  # [1, T, 1, 1, 1]
-            gt_depth_inverse_100 = gt_depth_inverse_100 * (fx_actual / CANONICAL_FX)
 
-        # Create canonical valid masks (70m threshold in canonical space)
-        MIN_INVERSE_CANONICAL = 100.0 / 70.0
-        canonical_gt_valid = (gt_depth_inverse_100 > MIN_INVERSE_CANONICAL)  # [1, T, 1, H, W]
+        # Create canonical valid masks (70m threshold)
+        # Use actual_valid_mask (computed in actual space) if available
+        if actual_valid_mask is not None:
+            canonical_gt_valid = actual_valid_mask.unsqueeze(2)  # [1, T, 1, H, W] - Actual space mask
+        else:
+            # Fallback: compute from canonical depth
+            MIN_INVERSE_CANONICAL = 100.0 / 70.0
+            canonical_gt_valid = (gt_depth_inverse_100 > MIN_INVERSE_CANONICAL)  # [1, T, 1, H, W]
 
         # Storage for predictions
         pred_depths = []
@@ -954,7 +982,9 @@ class Gear3Tester:
                 fps,  # Add FPS
                 seg_mask_for_viz,  # Add segmentation mask
                 class_metrics_for_viz,  # Add class metrics
-                frame_metrics[best_frame_idx] if best_frame_idx < len(frame_metrics) else None  # Add frame metrics (includes boundary_f1)
+                frame_metrics[best_frame_idx] if best_frame_idx < len(frame_metrics) else None,  # Add frame metrics (includes boundary_f1)
+                fx_ratio[0, best_frame_idx].item() if fx_ratio is not None else None,  # NEW: Metric3D fx_ratio
+                resize_ratio[0, best_frame_idx].item() if resize_ratio is not None else None  # NEW: Metric3D resize_ratio
             )
 
         return metrics
@@ -1122,9 +1152,10 @@ class Gear3Tester:
 
     def _save_best_frame_visualizations(self, image, pred_depth, gt_depth, importance_map,
                                         fg_features, bg_features, sequence_id, frame_idx, abs_rel, fps=None,
-                                        seg_mask=None, class_metrics=None, frame_metrics=None):
+                                        seg_mask=None, class_metrics=None, frame_metrics=None,
+                                        fx_ratio=None, resize_ratio=None):
         """
-        Save best frame visualization matching train_gear3_upgrade layout
+        Save best frame visualization matching train_gear4 layout
 
         Creates a comprehensive 4x3 grid visualization with format:
             best_frame_seq{N}_{frame_idx}_absrel_{abs_rel:.4f}.png
@@ -1239,7 +1270,7 @@ class Gear3Tester:
             align_corners=True
         ).squeeze().numpy()
 
-        # Create figure with 4x3 grid layout matching train_gear3_upgrade
+        # Create figure with 4x3 grid layout matching train_gear4
         fig = plt.figure(figsize=(15, 16))
         gs = gridspec.GridSpec(4, 3, figure=fig, hspace=0.3, wspace=0.3)
 
@@ -1370,6 +1401,12 @@ class Gear3Tester:
         if fps is not None:
             ax9.text(0.05, y_pos, f'FPS: {fps:.1f}', fontsize=10,
                     transform=ax9.transAxes, bbox=dict(boxstyle="round", facecolor='lightgreen'))
+            y_pos -= 0.10
+
+        # Metric3D canonicalization ratios
+        if fx_ratio is not None and resize_ratio is not None:
+            ax9.text(0.05, y_pos, f'fx_ratio: {fx_ratio:.3f} | resize_ratio: {resize_ratio:.3f}', fontsize=10,
+                    transform=ax9.transAxes, bbox=dict(boxstyle="round", facecolor='lightyellow'))
             y_pos -= 0.10
 
         # Depth metrics (computed on pixels where both GT and Pred are valid)

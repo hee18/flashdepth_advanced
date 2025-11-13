@@ -1,0 +1,109 @@
+# Gear5 FiLM Configuration - Temporal FiLM-style Feature Modulation
+# Single-Stage: FiLM modulates DPT features before Mamba using 2-layer CLS tokens
+# Architecture: Frozen Encoder/DPT + Trainable Gear5FilmHead + Trainable Mamba + Trainable output_conv2
+# Modulation: Channel-wise gamma/beta applied to DPT path_1 features before temporal modeling
+
+# General settings
+config_dir: null # overwrite by --config-path
+inference: false
+load: configs/flashdepth-l/iter_10001.pth  # FlashDepth-L pretrained weights (ViT + DPT + Mamba + output_conv)
+
+# Canonical space settings
+canonical_focal_length: 1000.0  # Fixed canonical focal length for all resolutions
+use_canonical_space: true  # ENABLED - all training data normalized to canonical focal length
+
+# Loss function selection (Gear5 style)
+# Options: 'log_l1' (default, regular Log L1), 'importance' (importance-weighted Log L1)
+# Can be changed via CLI: +loss_type=importance
+loss_type: "log_l1"
+
+# ========== Gear5 FiLM Specific Settings ==========
+# FiLM Architecture:
+#   - 2-layer CLS tokens [11, 23] for ViT-L (averaged, following Gear5 pattern)
+#   - GlobalFeatureNetwork: CLS tokens → global semantic features
+#   - ModulationNetwork: global features → channel-wise gamma/beta
+#   - SimpleFeatureModulator: Applies gamma/beta to DPT path_1 features
+#   - Modulated features then go through Mamba temporal modeling
+# Frozen: ViT encoder (~304M params), DPT (~35M params), output_conv1
+# Trainable: Gear5FilmHead (~132K params), Mamba (~0.9M params), output_conv2 (~0.6K params)
+
+# Dataset configuration
+dataset:
+  data_root: null # change data path
+  resolution: 'base'  # 518x518
+  video_length: 5
+  train_datasets: [mvs-synth, dynamicreplica, tartanair, pointodyssey, spring]
+  val_datasets: [sintel, waymo_seg]
+
+# Training configuration
+training:
+  batch_size: 20  # Per GPU (effective 40 with 2 GPUs in DDP)
+  workers: 8      # Optimized for 96 CPU cores
+  iterations: 40001
+  save_freq: 5000
+  val_freq: 1000  # Validation every 1k steps
+  log_freq: 100
+  wandb: false
+  wandb_name: "gear5_film_phase1"
+
+  # Learning rates
+  # Gear5FilmHead + Mamba + output_conv2 are trainable
+  film_lr: 1.0e-4     # FiLM modules learning rate
+  mamba_lr: 1.0e-5    # Mamba learning rate (lower than FiLM)
+  output_lr: 1.0e-5   # output_conv2 learning rate
+  weight_decay: 1.0e-6
+
+  # FPS measurement
+  measure_fps: true
+  fps_log_freq: 100
+
+# Model configuration
+model:
+  # ViT configuration
+  vit_size: "vitl"
+  patch_size: 14
+  attn_class: "MemEffAttention"
+
+  # Gear5 FiLM attention layer selection (2-layer CLS tokens)
+  target_blocks: [11, 23]  # ViT-L: layers 11, 23
+  target_blocks_s: [5, 11]  # ViT-S: layers 5, 11 (for Phase 2 hybrid)
+
+  # Mamba configuration (trainable in Gear5 FiLM)
+  use_mamba: true
+  mamba_type: "add"
+  num_mamba_layers: 4
+  downsample_mamba: [0.1]
+  mamba_pos_embed: null
+  mamba_in_dpt_layer: [1]
+  mamba_d_conv: 4
+  mamba_d_state: 256
+  use_hydra: false
+  use_transformer_rnn: false
+  use_xlstm: false
+
+# Hybrid model (not used in Phase 1)
+hybrid_configs:
+  use_hybrid: false
+
+# Evaluation configuration
+eval:
+  compile: false
+  metrics: true
+  save_grid: true
+  outfolder: "test_gear5_film"
+  test_datasets: [sintel]
+  test_dataset_resolution: 'base'
+  random_input: null
+  out_video: true
+  out_mp4: false
+  save_res: 518
+  video_fps: 24
+  gif_duration: 110
+  save_depth_npy: false
+  save_vis_map: true  # Save gamma/beta visualizations
+  dummy_timing: false
+
+# Object-wise evaluation configuration
+object_wise:
+  enabled: false  # Enable object-wise evaluation (set via CLI: object_wise.enabled=true)
+  dataset: waymo_seg  # Dataset type for object-wise eval: waymo_seg, sintel

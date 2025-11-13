@@ -32,7 +32,7 @@ project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
 
 from flashdepth.model import FlashDepth
-from flashdepth.gear3_upgrade_modules import Gear3UpgradeMetricHead
+from flashdepth.gear4_modules import Gear4MetricHead
 from dataloaders.combined_dataset import CombinedDataset
 from dataloaders.waymo_segmentation_dataset import WaymoSegmentationDataset, collate_fn as waymo_collate_fn
 from dataloaders.urbansyn_dataset import UrbanSynDepth
@@ -54,9 +54,9 @@ def get_canonical_focal_length(config):
         config: Configuration dict
 
     Returns:
-        float: Canonical focal length (always 1000.0)
+        float: Canonical focal length (always 500.0)
     """
-    return 1000.0
+    return 500.0
 
 # Setup logging
 logging.basicConfig(
@@ -66,7 +66,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-class Gear3UpgradeTester:
+class Gear4Tester:
     """
     Test harness for Gear3 Upgrade model.
 
@@ -121,41 +121,27 @@ class Gear3UpgradeTester:
         embed_dim = 1024 if model.encoder == 'vitl' else 384
         dpt_dim = 256 if model.encoder == 'vitl' else 64
         num_heads = 16 if model.encoder == 'vitl' else 6
-        separation_method = self.config.get('separation_method', 'cls_seg')
 
-        model.gear3_upgrade_head = Gear3UpgradeMetricHead(
+        model.gear4_head = Gear3UpgradeMetricHead(
             embed_dim=embed_dim,
             dpt_dim=dpt_dim,
-            num_heads=num_heads,
-            separation_method=separation_method
+            num_heads=num_heads
         )
 
-        # Enable attention weights storage
-        # - 'multi_layer': Enable for multiple blocks (encoder-specific)
-        #   - ViT-L (24 blocks): [3, 10, 16, 22]
-        #   - ViT-S (12 blocks): [2, 5, 8, 11]
-        # - Other methods: Enable only last block
-        if separation_method == 'multi_layer':
-            # Multi-layer: enable attention storage for specified blocks
-            if model.encoder == 'vitl':
-                target_blocks = [3, 10, 16, 22]  # ViT-L
-            else:
-                target_blocks = [2, 5, 8, 11]  # ViT-S
-
-            for i, block in enumerate(model.pretrained.blocks):
-                if i in target_blocks:
-                    block.attn.store_attn_weights = True
-                    logger.info(f"Enabled attention weights storage for block {i}")
-                else:
-                    block.attn.store_attn_weights = False
+        # Enable attention weights storage for multi-layer fusion
+        # - ViT-L (24 blocks): [3, 10, 16, 22]
+        # - ViT-S (12 blocks): [2, 5, 8, 11]
+        if model.encoder == 'vitl':
+            target_blocks = [3, 10, 16, 22]  # ViT-L
         else:
-            # Other methods: enable only last block
-            for i, block in enumerate(model.pretrained.blocks):
-                if i == len(model.pretrained.blocks) - 1:
-                    block.attn.store_attn_weights = True
-                    logger.info(f"Enabled attention weights storage for block {i} (last block)")
-                else:
-                    block.attn.store_attn_weights = False
+            target_blocks = [2, 5, 8, 11]  # ViT-S
+
+        for i, block in enumerate(model.pretrained.blocks):
+            if i in target_blocks:
+                block.attn.store_attn_weights = True
+                logger.info(f"Enabled attention weights storage for block {i}")
+            else:
+                block.attn.store_attn_weights = False
 
         # Load checkpoint
         checkpoint_path = self.config.get('load')
@@ -172,11 +158,11 @@ class Gear3UpgradeTester:
                 else:
                     state_dict = checkpoint
 
-                # Convert gear3_head keys to gear3_upgrade_head for backward compatibility
+                # Convert gear3_head keys to gear4_head for backward compatibility
                 converted_state_dict = {}
                 for key, value in state_dict.items():
                     if key.startswith('gear3_head.'):
-                        new_key = key.replace('gear3_head.', 'gear3_upgrade_head.', 1)
+                        new_key = key.replace('gear3_head.', 'gear4_head.', 1)
                         converted_state_dict[new_key] = value
                         logger.debug(f"Converted key: {key} -> {new_key}")
                     else:
@@ -479,16 +465,29 @@ class Gear3UpgradeTester:
         if len(batch) == 0:
             return None
 
-        # CombinedDataset returns (images, depths, focal_lengths, dataset_name) tuple for val/test splits
+        # CombinedDataset returns tuple for val/test splits
         # Convert to dict format for easier access
         if len(batch) > 0 and isinstance(batch[0], tuple):
-            images, depths, focal_lengths, names = zip(*batch)
-            return {
-                'image': torch.stack(images, dim=0),
-                'depth': torch.stack(depths, dim=0),
-                'focal_lengths': torch.stack(focal_lengths, dim=0),
-                'dataset_name': names
-            }
+            if len(batch[0]) == 8:  # New Metric3D format with fx_ratio and resize_ratio
+                images, depths, focal_lengths_canonical, focal_lengths_actual, actual_valid_masks, fx_ratios, resize_ratios, names = zip(*batch)
+                return {
+                    'image': torch.stack(images, dim=0),
+                    'depth': torch.stack(depths, dim=0),
+                    'focal_lengths': torch.stack(focal_lengths_canonical, dim=0),  # Canonical (500.0)
+                    'focal_lengths_actual': torch.stack(focal_lengths_actual, dim=0),  # Original focal lengths
+                    'actual_valid_mask': torch.stack(actual_valid_masks, dim=0),
+                    'fx_ratio': torch.stack(fx_ratios, dim=0),  # NEW: 500 / fx_actual
+                    'resize_ratio': torch.stack(resize_ratios, dim=0),  # NEW: total resize ratio
+                    'dataset_name': names
+                }
+            else:  # Old format (backwards compatibility)
+                images, depths, focal_lengths, names = zip(*batch)
+                return {
+                    'image': torch.stack(images, dim=0),
+                    'depth': torch.stack(depths, dim=0),
+                    'focal_lengths': torch.stack(focal_lengths, dim=0),
+                    'dataset_name': names
+                }
 
         # Segmentation datasets return dict with 'images' key, rename to 'image' for compatibility
         if len(batch) > 0 and isinstance(batch[0], dict) and 'images' in batch[0]:
@@ -602,6 +601,22 @@ class Gear3UpgradeTester:
         gt_depth = batch['depth'].to(self.device)  # [1, T, H, W] or [T, H, W] - val split has no channel dim
         focal_lengths = batch['focal_lengths'].to(self.device)  # [1, T]
 
+        # Extract Metric3D canonicalization ratios from batch (if available)
+        if 'fx_ratio' in batch and 'resize_ratio' in batch:
+            fx_ratio = batch['fx_ratio'].to(self.device)  # [1, T] - focal length ratio (500 / fx_actual)
+            resize_ratio = batch['resize_ratio'].to(self.device)  # [1, T] - total resize ratio
+        else:
+            # Fallback for datasets without Metric3D canonicalization
+            fx_ratio = None
+            resize_ratio = None
+
+        # Extract actual_valid_mask from batch (if available)
+        # This mask is computed in actual space (before canonical transform) with 70m threshold
+        if 'actual_valid_mask' in batch:
+            actual_valid_mask = batch['actual_valid_mask'].to(self.device)  # [1, T, H, W]
+        else:
+            actual_valid_mask = None
+
         # Add batch dimension if missing (WaymoSegmentationDataset returns [T, H, W])
         if gt_depth.ndim == 3:
             gt_depth = gt_depth.unsqueeze(0)  # [1, T, H, W]
@@ -613,21 +628,21 @@ class Gear3UpgradeTester:
         B, T = images.shape[:2]
         assert B == 1, "Batch size must be 1 for testing"
 
-        # Dataloader gives inverse depth (1/m), scale to 100/m for training
-        gt_depth_inverse_100 = gt_depth * 100.0  # [1, T, 1, H, W] in 100/m
+        # Dataloader gives inverse depth (1/m), already in canonical space (fx=500), scale to 100/m
+        gt_depth_inverse_100 = gt_depth * 100.0  # [1, T, 1, H, W] in canonical 100/m
 
-        # Apply canonical transformation to GT (for BOTH masks AND metrics calculation)
-        # This ensures consistency with training/validation which use canonical space
+        # NOTE: GT depth is already in canonical space (fx=500 at target resolution)
+        # Canonical transformation is handled in the dataloader
         CANONICAL_FX = get_canonical_focal_length(self.config)
-        use_canonical = self.config.get('use_canonical_space', False)
-        if use_canonical:
-            # inverse_canonical = inverse_actual * (fx_actual / CANONICAL_FX)
-            fx_actual = focal_lengths.view(1, T, 1, 1, 1)
-            gt_depth_inverse_100 = gt_depth_inverse_100 * (fx_actual / CANONICAL_FX)
 
-        # Create canonical valid masks (70m threshold in canonical space)
-        MIN_INVERSE_CANONICAL = 100.0 / 70.0
-        canonical_gt_valid = (gt_depth_inverse_100 > MIN_INVERSE_CANONICAL)  # [1, T, 1, H, W]
+        # Create canonical valid masks (70m threshold)
+        # Use actual_valid_mask (computed in actual space) if available
+        if actual_valid_mask is not None:
+            canonical_gt_valid = actual_valid_mask.unsqueeze(2)  # [1, T, 1, H, W] - Actual space mask
+        else:
+            # Fallback: compute from canonical depth
+            MIN_INVERSE_CANONICAL = 100.0 / 70.0
+            canonical_gt_valid = (gt_depth_inverse_100 > MIN_INVERSE_CANONICAL)  # [1, T, 1, H, W]
 
         # Storage for predictions
         pred_depths = []
@@ -654,24 +669,16 @@ class Gear3UpgradeTester:
             )
 
             # Collect attention weights (multi_layer or last block only)
-            if self.config.get('separation_method', 'cls_seg') == 'multi_layer':
-                # Multi-layer: collect from specified blocks
-                if self.model.encoder == 'vitl':
-                    target_blocks = [3, 10, 16, 22]
-                else:
-                    target_blocks = [2, 5, 8, 11]
-                attention_weights_multi_layer_warmup = [
-                    self.model.pretrained.blocks[i].attn.attn_weights for i in target_blocks
-                ]
-                attention_weights_warmup = None  # Not used in multi_layer mode
+            # Multi-layer: collect from specified blocks
+            if self.model.encoder == 'vitl':
+                target_blocks = [3, 10, 16, 22]
             else:
-                # Other methods: use last block only
-                last_block = self.model.pretrained.blocks[-1]
-                attention_weights_warmup = last_block.attn.attn_weights
-                attention_weights_multi_layer_warmup = None
+                target_blocks = [2, 5, 8, 11]
+            attention_weights_multi_layer_warmup = [
+                self.model.pretrained.blocks[i].attn.attn_weights for i in target_blocks
+            ]
 
             patch_tokens_warmup = encoder_features_warmup[-1]  # [B, N+1, embed_dim] (includes CLS)
-            cls_token_warmup = patch_tokens_warmup[:, 0]  # [B, embed_dim]
             h_warmup, w_warmup = img_warmup.shape[2:]
             patch_h_warmup = h_warmup // self.model.patch_size
             patch_w_warmup = w_warmup // self.model.patch_size
@@ -683,9 +690,9 @@ class Gear3UpgradeTester:
             path_1_warmup = dpt_features_warmup[-1]
 
             # Apply Gear3 Upgrade modulation
-            path_1_modulated_warmup, _, _, _, _, _ = self.model.gear3_upgrade_head(
-                patch_tokens_warmup, attention_weights_warmup, [path_1_warmup], patch_h_warmup, patch_w_warmup,
-                cls_token=cls_token_warmup, attention_weights_multi_layer=attention_weights_multi_layer_warmup
+            path_1_modulated_warmup, _, _, _, _, _ = self.model.gear4_head(
+                patch_tokens_warmup, None, [path_1_warmup], patch_h_warmup, patch_w_warmup,
+                cls_token=None, attention_weights_multi_layer=attention_weights_multi_layer_warmup
             )
 
             # Apply Mamba temporal processing
@@ -728,26 +735,17 @@ class Gear3UpgradeTester:
                     img_t.unsqueeze(0), self.model.intermediate_layer_idx[self.model.encoder]
                 )
 
-                # Collect attention weights (multi_layer or last block only)
-                if self.config.get('separation_method', 'cls_seg') == 'multi_layer':
-                    # Multi-layer: collect from specified blocks
-                    if self.model.encoder == 'vitl':
-                        target_blocks = [3, 10, 16, 22]
-                    else:
-                        target_blocks = [2, 5, 8, 11]
-                    attention_weights_multi_layer = [
-                        self.model.pretrained.blocks[i].attn.attn_weights for i in target_blocks
-                    ]
-                    attention_weights = None  # Not used in multi_layer mode
+                # Collect attention weights from multi-layer
+                if self.model.encoder == 'vitl':
+                    target_blocks = [3, 10, 16, 22]
                 else:
-                    # Other methods: use last block only
-                    last_block = self.model.pretrained.blocks[-1]
-                    attention_weights = last_block.attn.attn_weights
-                    attention_weights_multi_layer = None
+                    target_blocks = [2, 5, 8, 11]
+                attention_weights_multi_layer = [
+                    self.model.pretrained.blocks[i].attn.attn_weights for i in target_blocks
+                ]
 
                 # Get patch tokens from last encoder layer (includes CLS token)
                 patch_tokens = encoder_features[-1]  # [B, N+1, embed_dim]
-                cls_token = patch_tokens[:, 0]  # [B, embed_dim]
 
                 # Get DPT features first (without Mamba)
                 h, w = img_t.shape[1:]
@@ -758,10 +756,9 @@ class Gear3UpgradeTester:
                 path_1 = dpt_features[-1]
 
                 # Apply Gear3 Upgrade modulation (produces FG/BG masks)
-                # Pass cls_token for cls_seg mode support
-                path_1_modulated, importance_map, fg_features, bg_features, fg_mask, bg_mask = self.model.gear3_upgrade_head(
-                    patch_tokens, attention_weights, [path_1], patch_h, patch_w,
-                    cls_token=cls_token, attention_weights_multi_layer=attention_weights_multi_layer
+                path_1_modulated, importance_map, fg_features, bg_features, fg_mask, bg_mask = self.model.gear4_head(
+                    patch_tokens, None, [path_1], patch_h, patch_w,
+                    cls_token=None, attention_weights_multi_layer=attention_weights_multi_layer
                 )
 
                 # Apply Mamba temporal processing
@@ -800,7 +797,7 @@ class Gear3UpgradeTester:
                 pred_depth_metric = 100.0 / (pred_depth_inverse_100[0] + 1e-8)  # [1, H, W]
 
                 # Upsample importance_map to image resolution for smooth visualization
-                # (like train_gear3_upgrade.py does before passing to visualizer)
+                # (like train_gear4.py does before passing to visualizer)
                 h_full, w_full = img_t.shape[1:]  # Image resolution
                 importance_map_resized = F.interpolate(
                     importance_map, size=(h_full, w_full), mode='bilinear', align_corners=True
@@ -1006,32 +1003,26 @@ class Gear3UpgradeTester:
         if len(frame_metrics) > 0:
             logger.info(f"Best frame for sequence {sequence_id}: Frame {best_frame_idx} (AbsRel={best_frame_abs_rel:.4f})")
 
-            # Extract layer_weights for visualization (multi_layer separation only)
+            # Extract layer_weights for visualization
             layer_weights = None
-            separation_method = self.config.get('separation_method', 'cls_seg')
-            logger.info(f"Separation method: {separation_method}")
-
-            if separation_method == 'multi_layer':
-                try:
-                    logger.info(f"Attempting to extract layer_weights...")
-                    logger.info(f"Model has gear3_upgrade_head: {hasattr(self.model, 'gear3_upgrade_head')}")
-                    if hasattr(self.model, 'gear3_upgrade_head'):
-                        # Use same attribute name as training: multi_layer_fusion.fusion_weights
-                        logger.info(f"gear3_upgrade_head has multi_layer_fusion: {hasattr(self.model.gear3_upgrade_head, 'multi_layer_fusion')}")
-                        if hasattr(self.model.gear3_upgrade_head, 'multi_layer_fusion'):
-                            fusion_weights = self.model.gear3_upgrade_head.multi_layer_fusion.fusion_weights
-                            layer_weights = torch.softmax(fusion_weights, dim=0).detach().cpu().numpy()
-                            logger.info(f"Successfully extracted layer_weights: {layer_weights}")
-                        else:
-                            logger.warning(f"gear3_upgrade_head does not have multi_layer_fusion attribute")
+            try:
+                logger.info(f"Attempting to extract layer_weights...")
+                logger.info(f"Model has gear4_head: {hasattr(self.model, 'gear4_head')}")
+                if hasattr(self.model, 'gear4_head'):
+                    # Use same attribute name as training: multi_layer_fusion.fusion_weights
+                    logger.info(f"gear4_head has multi_layer_fusion: {hasattr(self.model.gear4_head, 'multi_layer_fusion')}")
+                    if hasattr(self.model.gear4_head, 'multi_layer_fusion'):
+                        fusion_weights = self.model.gear4_head.multi_layer_fusion.fusion_weights
+                        layer_weights = torch.softmax(fusion_weights, dim=0).detach().cpu().numpy()
+                        logger.info(f"Successfully extracted layer_weights: {layer_weights}")
                     else:
-                        logger.warning(f"Model does not have gear3_upgrade_head attribute")
-                except Exception as e:
-                    logger.error(f"Failed to extract layer_weights: {e}")
-                    import traceback
-                    traceback.print_exc()
-            else:
-                logger.info(f"Skipping layer_weights extraction (separation_method={separation_method}, not 'multi_layer')")
+                        logger.warning(f"gear4_head does not have multi_layer_fusion attribute")
+                else:
+                    logger.warning(f"Model does not have gear4_head attribute")
+            except Exception as e:
+                logger.error(f"Failed to extract layer_weights: {e}")
+                import traceback
+                traceback.print_exc()
 
             # Get segmentation and actual frame number for best frame
             if self.object_wise_enabled and seg_masks_np is not None:
@@ -1068,7 +1059,9 @@ class Gear3UpgradeTester:
                 seg_mask_for_viz,  # Add segmentation mask (only if matches best_frame)
                 class_metrics_for_viz,  # Add class metrics
                 layer_weights,  # Add layer weights
-                frame_metrics[best_frame_idx] if best_frame_idx < len(frame_metrics) else None  # Add frame metrics (includes boundary_f1)
+                frame_metrics[best_frame_idx] if best_frame_idx < len(frame_metrics) else None,  # Add frame metrics (includes boundary_f1)
+                fx_ratio[0, best_frame_idx].item() if fx_ratio is not None else None,  # NEW: Metric3D fx_ratio
+                resize_ratio[0, best_frame_idx].item() if resize_ratio is not None else None  # NEW: Metric3D resize_ratio
             )
 
         return metrics
@@ -1232,9 +1225,10 @@ class Gear3UpgradeTester:
 
     def _save_best_frame_visualizations(self, image, pred_depth, gt_depth, importance_map,
                                         fg_mask, bg_mask, sequence_id, frame_idx, abs_rel, fps=None,
-                                        seg_mask=None, class_metrics=None, layer_weights=None, frame_metrics=None):
+                                        seg_mask=None, class_metrics=None, layer_weights=None, frame_metrics=None,
+                                        fx_ratio=None, resize_ratio=None):
         """
-        Save best frame visualization matching train_gear3_upgrade layout
+        Save best frame visualization matching train_gear4 layout
 
         Creates a comprehensive 4x3 grid visualization with format:
             best_frame_seq{N}_{frame_idx}_absrel_{abs_rel:.4f}.png
@@ -1350,7 +1344,7 @@ class Gear3UpgradeTester:
             align_corners=True
         ).squeeze().numpy()
 
-        # Create figure with 4x3 grid layout matching train_gear3_upgrade
+        # Create figure with 4x3 grid layout matching train_gear4
         fig = plt.figure(figsize=(15, 16))
         gs = gridspec.GridSpec(4, 3, figure=fig, hspace=0.3, wspace=0.3)
 
@@ -1507,6 +1501,12 @@ class Gear3UpgradeTester:
                     transform=ax9.transAxes, bbox=dict(boxstyle="round", facecolor='lightyellow'))
             y_pos -= 0.08
 
+        # Metric3D canonicalization ratios
+        if fx_ratio is not None and resize_ratio is not None:
+            ax9.text(0.05, y_pos, f'fx_ratio: {fx_ratio:.3f} | resize_ratio: {resize_ratio:.3f}', fontsize=10,
+                    transform=ax9.transAxes, bbox=dict(boxstyle="round", facecolor='lightyellow'))
+            y_pos -= 0.10
+
         # Depth metrics (computed on pixels where both GT and Pred are valid)
         if error_valid_mask.sum() > 0:
             valid_gt = torch.from_numpy(gt_depth[error_valid_mask])
@@ -1624,7 +1624,7 @@ class Gear3UpgradeTester:
         return aggregated
 
 
-@hydra.main(version_base=None, config_path="configs/gear3_upgrade", config_name="config")
+@hydra.main(version_base=None, config_path="configs/gear4", config_name="config")
 def main(config: DictConfig):
     """Main entry point"""
     import os
@@ -1632,7 +1632,7 @@ def main(config: DictConfig):
     # Override config for testing
     config.inference = True
 
-    tester = Gear3UpgradeTester(config)
+    tester = Gear4Tester(config)
     tester.test()
 
 

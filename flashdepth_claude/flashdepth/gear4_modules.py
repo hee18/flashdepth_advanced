@@ -78,131 +78,7 @@ def process_attention_to_importance(attention_weights, patch_h, patch_w, remove_
     return attn_map
 
 
-# ==================== Option 1: CLS-based Light Segmentation ====================
-
-class LightSegmentationHead(nn.Module):
-    """
-    Lightweight segmentation using CLS token (no external model).
-
-    Uses CLS token to generate FG/BG queries, then computes similarity with patch tokens.
-    Self-supervised via depth consistency loss.
-
-    Overhead: ~1-2ms
-    """
-    def __init__(self, embed_dim=1024, hidden_dim=256):
-        super().__init__()
-        # CLS token -> segmentation queries
-        self.fg_query = nn.Linear(embed_dim, hidden_dim)
-        self.bg_query = nn.Linear(embed_dim, hidden_dim)
-
-        # Patch tokens -> keys
-        self.key_proj = nn.Linear(embed_dim, hidden_dim)
-
-        # Temperature for sharpness control
-        self.temperature = nn.Parameter(torch.tensor(0.1))
-
-    def forward(self, cls_token, patch_tokens, patch_h, patch_w):
-        """
-        Args:
-            cls_token: [B, embed_dim]
-            patch_tokens: [B, num_patches, embed_dim]
-            patch_h, patch_w: Spatial dimensions
-
-        Returns:
-            fg_prob: [B, 1, patch_h, patch_w] - FG probability map
-            bg_prob: [B, 1, patch_h, patch_w] - BG probability map
-        """
-        B = cls_token.shape[0]
-
-        # Generate FG/BG queries from CLS token
-        fg_query = self.fg_query(cls_token)  # [B, hidden_dim]
-        bg_query = self.bg_query(cls_token)  # [B, hidden_dim]
-
-        # Project patch tokens to keys
-        keys = self.key_proj(patch_tokens)  # [B, num_patches, hidden_dim]
-
-        # Compute similarity scores
-        fg_sim = torch.matmul(keys, fg_query.unsqueeze(-1)).squeeze(-1)  # [B, num_patches]
-        bg_sim = torch.matmul(keys, bg_query.unsqueeze(-1)).squeeze(-1)
-
-        # Softmax over FG/BG (temperature scaling)
-        logits = torch.stack([fg_sim, bg_sim], dim=-1)  # [B, num_patches, 2]
-        probs = torch.softmax(logits / self.temperature, dim=-1)
-
-        # Extract FG and BG probabilities
-        fg_prob = probs[:, :, 0].reshape(B, 1, patch_h, patch_w)
-        bg_prob = probs[:, :, 1].reshape(B, 1, patch_h, patch_w)
-
-        return fg_prob, bg_prob
-
-
-# ==================== Option 2: Differentiable K-means ====================
-
-class DifferentiableKMeans(nn.Module):
-    """
-    Soft K-means clustering for importance scores.
-
-    Uses EM algorithm with soft assignments (differentiable).
-    Automatically finds bimodal separation (FG vs BG).
-
-    Overhead: ~5-10ms (10 iterations)
-    """
-    def __init__(self, n_clusters=2, n_iters=10):
-        super().__init__()
-        self.n_clusters = n_clusters
-        self.n_iters = n_iters
-
-        # Learnable initial centroids (optional, for stability)
-        self.init_centroids = nn.Parameter(torch.tensor([0.3, 0.7]))  # Low, High
-
-    def forward(self, importance_scores, temperature=0.1):
-        """
-        Args:
-            importance_scores: [B, 1, patch_h, patch_w] - importance map
-            temperature: Softmax temperature (lower = harder assignment)
-
-        Returns:
-            fg_prob: [B, 1, patch_h, patch_w] - FG cluster probability
-            bg_prob: [B, 1, patch_h, patch_w] - BG cluster probability
-            centroids: [B, 2] - cluster centers
-        """
-        B, _, patch_h, patch_w = importance_scores.shape
-
-        # Flatten to [B, N] for clustering
-        x = importance_scores.flatten(2).squeeze(1)  # [B, num_patches]
-        N = x.shape[1]
-        K = self.n_clusters
-
-        # Initialize centroids (learnable initialization)
-        centroids = self.init_centroids.unsqueeze(0).expand(B, -1)  # [B, K]
-
-        # EM algorithm
-        for _ in range(self.n_iters):
-            # E-step: Soft assignment
-            distances = (x.unsqueeze(-1) - centroids.unsqueeze(1)) ** 2  # [B, N, K]
-            assignments = torch.softmax(-distances / temperature, dim=-1)  # [B, N, K]
-
-            # M-step: Update centroids
-            weighted_sum = (x.unsqueeze(-1) * assignments).sum(dim=1)  # [B, K]
-            weights_sum = assignments.sum(dim=1)  # [B, K]
-            centroids = weighted_sum / (weights_sum + 1e-8)
-
-        # Identify FG cluster (higher centroid)
-        fg_cluster_idx = centroids.argmax(dim=-1, keepdim=True)  # [B, 1]
-        bg_cluster_idx = centroids.argmin(dim=-1, keepdim=True)
-
-        # Extract FG/BG probabilities
-        fg_prob_flat = assignments.gather(-1, fg_cluster_idx.unsqueeze(1).expand(-1, N, -1)).squeeze(-1)
-        bg_prob_flat = assignments.gather(-1, bg_cluster_idx.unsqueeze(1).expand(-1, N, -1)).squeeze(-1)
-
-        # Reshape to spatial
-        fg_prob = fg_prob_flat.reshape(B, 1, patch_h, patch_w)
-        bg_prob = bg_prob_flat.reshape(B, 1, patch_h, patch_w)
-
-        return fg_prob, bg_prob, centroids
-
-
-# ==================== Option 3: Multi-layer Attention Fusion ====================
+# ==================== Multi-layer Attention Fusion ====================
 
 class MultiLayerAttentionFusion(nn.Module):
     """
@@ -479,7 +355,7 @@ class FeatureModulator(nn.Module):
 
 # ==================== Main Gear3 Upgrade Head ====================
 
-class Gear3UpgradeMetricHead(nn.Module):
+class Gear4MetricHead(nn.Module):
     """
     Gear3 Upgrade: Enhanced FG/BG separation with multiple strategies.
 
@@ -488,22 +364,14 @@ class Gear3UpgradeMetricHead(nn.Module):
         2. 'kmeans': Differentiable K-means clustering
         3. 'multi_layer': Multi-layer attention fusion
     """
-    def __init__(self, embed_dim=1024, dpt_dim=256, separation_method='cls_seg', num_heads=16, uniform_fusion_weights=False):
+    def __init__(self, embed_dim=1024, dpt_dim=256, num_heads=16, uniform_fusion_weights=False):
         super().__init__()
 
-        self.separation_method = separation_method
         self.embed_dim = embed_dim
         self.num_heads = num_heads
 
-        # Method-specific modules
-        if separation_method == 'cls_seg':
-            self.segmentation_head = LightSegmentationHead(embed_dim=embed_dim)
-        elif separation_method == 'kmeans':
-            self.kmeans = DifferentiableKMeans(n_clusters=2, n_iters=10)
-        elif separation_method == 'multi_layer':
-            self.multi_layer_fusion = MultiLayerAttentionFusion(num_layers=4, uniform_weights=uniform_fusion_weights)
-        else:
-            raise ValueError(f"Unknown separation_method: {separation_method}")
+        # Multi-layer attention fusion (only separation method)
+        self.multi_layer_fusion = MultiLayerAttentionFusion(num_layers=4, uniform_weights=uniform_fusion_weights)
 
         # Common modules
         self.fg_bg_networks = ForegroundBackgroundNetworks(
@@ -517,18 +385,18 @@ class Gear3UpgradeMetricHead(nn.Module):
         # Count parameters
         total_params = sum(p.numel() for p in self.parameters())
         trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        logging.info(f"Gear3 Upgrade Head ({separation_method}): {trainable_params:,} / {total_params:,} trainable parameters")
+        logging.info(f"Gear3 Upgrade Head (multi_layer): {trainable_params:,} / {total_params:,} trainable parameters")
 
     def forward(self, patch_tokens, attention_weights, dpt_features, patch_h, patch_w,
                 attention_weights_multi_layer=None, cls_token=None):
         """
         Args:
             patch_tokens: [B, num_patches+1, embed_dim] from Layer 23 (includes CLS token at index 0)
-            attention_weights: [B, num_heads, N+1, N+1] from Layer 23
+            attention_weights: [B, num_heads, N+1, N+1] from Layer 23 (unused, kept for compatibility)
             dpt_features: List of [B, dpt_dim, H, W] for 4 DPT layers
             patch_h, patch_w: Spatial dimensions
-            attention_weights_multi_layer: List of attention from [Layer 4, 11, 17, 23] (for multi_layer mode)
-            cls_token: [B, embed_dim] (for cls_seg mode)
+            attention_weights_multi_layer: List of attention from [Layer 4, 11, 17, 23]
+            cls_token: [B, embed_dim] (unused, kept for compatibility)
 
         Returns:
             path_1_modulated: [B, dpt_dim, H, W]
@@ -541,45 +409,21 @@ class Gear3UpgradeMetricHead(nn.Module):
         # Remove CLS token to get patch-only tokens
         patch_tokens_only = patch_tokens[:, 1:, :]  # [B, num_patches, embed_dim]
 
-        # Step 1: Generate importance map and FG/BG masks
-        if self.separation_method == 'cls_seg':
-            # CLS-based segmentation
-            assert cls_token is not None, "cls_token required for cls_seg mode"
-            fg_mask, bg_mask = self.segmentation_head(cls_token, patch_tokens_only, patch_h, patch_w)
-            importance_map = fg_mask  # Use FG probability as importance
-            # cls_seg: masks are already soft (softmax output), no need for importance_map weighting
-            use_importance_weighting = False
+        # Step 1: Generate importance map and FG/BG masks using multi-layer attention fusion
+        assert attention_weights_multi_layer is not None, "attention_weights_multi_layer required"
+        importance_map = self.multi_layer_fusion(attention_weights_multi_layer, patch_h, patch_w)
 
-        elif self.separation_method == 'kmeans':
-            # K-means clustering on attention
-            importance_map = process_attention_to_importance(attention_weights, patch_h, patch_w)
-            fg_mask, bg_mask, centroids = self.kmeans(importance_map)
-            # kmeans: masks are already soft (soft assignment), no need for importance_map weighting
-            use_importance_weighting = False
-
-        elif self.separation_method == 'multi_layer':
-            # Multi-layer attention fusion
-            assert attention_weights_multi_layer is not None, "attention_weights_multi_layer required for multi_layer mode"
-            importance_map = self.multi_layer_fusion(attention_weights_multi_layer, patch_h, patch_w)
-
-            # Simple mean-based FG/BG split for fused importance
-            importance_flat = importance_map.flatten(2).squeeze(1)
-            threshold = importance_flat.mean(dim=1, keepdim=True)
-            fg_mask = (importance_flat > threshold).float().reshape(importance_map.shape)
-            bg_mask = (importance_flat <= threshold).float().reshape(importance_map.shape)
-            # multi_layer: masks are binary, need importance_map for soft weighting (matches Gear3)
-            use_importance_weighting = True
+        # Simple mean-based FG/BG split for fused importance
+        importance_flat = importance_map.flatten(2).squeeze(1)
+        threshold = importance_flat.mean(dim=1, keepdim=True)
+        fg_mask = (importance_flat > threshold).float().reshape(importance_map.shape)
+        bg_mask = (importance_flat <= threshold).float().reshape(importance_map.shape)
 
         # Step 2: Generate FG/BG features
-        # Pass importance_map for multi_layer (binary masks need soft weighting like Gear3)
-        if use_importance_weighting:
-            fg_features, bg_features = self.fg_bg_networks(
-                patch_tokens_only, fg_mask, bg_mask, importance_map=importance_map
-            )
-        else:
-            fg_features, bg_features = self.fg_bg_networks(
-                patch_tokens_only, fg_mask, bg_mask, importance_map=None
-            )
+        # Binary masks need importance_map for soft weighting (matches Gear3)
+        fg_features, bg_features = self.fg_bg_networks(
+            patch_tokens_only, fg_mask, bg_mask, importance_map=importance_map
+        )
 
         # Step 3: Get modulation parameters
         fg_gamma, fg_beta, bg_gamma, bg_beta = self.modulation_networks(
@@ -651,7 +495,7 @@ class MultiLayerCLSNetwork(nn.Module):
         return global_feature
 
 
-class Gear3UpgradeAblationHead(nn.Module):
+class Gear4AblationHead(nn.Module):
     """
     Ablation Study: Multi-layer CLS features WITHOUT FG/BG separation.
     

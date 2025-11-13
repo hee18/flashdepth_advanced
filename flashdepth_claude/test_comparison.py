@@ -31,9 +31,10 @@ project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
 
 from dataloaders.combined_dataset import CombinedDataset
+from dataloaders.comparison_dataset import ComparisonDataset, comparison_collate_fn
 from dataloaders.waymo_segmentation_dataset import WaymoSegmentationDataset, collate_fn as waymo_collate_fn
 from dataloaders.urbansyn_segmentation_dataset import UrbanSynSegmentationDataset, urbansyn_collate_fn
-from utils.metric_depth_metrics import MetricDepthMetrics
+from utils.metric_depth_metrics import MetricDepthMetrics, RelativeDepthMetrics
 from utils.object_wise_evaluation import ObjectWiseMetrics
 from utils.comparison_visualization import visualize_sequence_simplified, visualize_best_frame_simplified
 
@@ -62,6 +63,14 @@ class ComparisonTester:
         self.adapter = adapter
         self.device = torch.device(f"cuda:{config.get('gpu', 0)}" if torch.cuda.is_available() else "cpu")
 
+        # Depth mode and visualization settings
+        self.depth_mode = config.get('depth_mode', 'metric')
+        self.frame_interval = config.get('frame_interval', None)
+
+        logger.info(f"Depth evaluation mode: {self.depth_mode}")
+        if self.frame_interval is not None:
+            logger.info(f"Frame interval for visualization: {self.frame_interval}")
+
         # Setup save directory
         dataset_name = config.get('dataset', 'waymo')
         self.save_dir = Path(config.get('results_dir', f'refer_test/test_results/{method_name}/{dataset_name}'))
@@ -78,8 +87,9 @@ class ComparisonTester:
             self.object_wise_metrics = ObjectWiseMetrics(dataset_name=self.object_wise_dataset)
             logger.info(f"Object-wise evaluation enabled for {self.object_wise_dataset}")
 
-        # Metrics calculator
+        # Metrics calculators
         self.metrics = MetricDepthMetrics()
+        self.relative_metrics = RelativeDepthMetrics()
 
         # Load model
         self.model = self._setup_model()
@@ -98,6 +108,9 @@ class ComparisonTester:
         model = self.adapter.load_model(checkpoint_path)
         model = model.to(self.device)
         model.eval()
+
+        # Set adapter device for inference
+        self.adapter.device = self.device
 
         logger.info(f"Model loaded successfully")
         return model
@@ -118,31 +131,30 @@ class ComparisonTester:
                 dataset = WaymoSegmentationDataset(
                     data_root=data_root,
                     split='val',
-                    video_length=video_length,
-                    stride=1
+                    video_length=video_length
                 )
                 collate_fn = waymo_collate_fn
             elif base_dataset_name == 'urbansyn':
                 dataset = UrbanSynSegmentationDataset(
                     data_root=data_root,
                     split='val',
-                    video_length=video_length,
-                    stride=1
+                    video_length=video_length
                 )
                 collate_fn = urbansyn_collate_fn
             else:
                 raise ValueError(f"Unknown segmentation dataset: {dataset_name}")
         else:
-            # Standard datasets
-            dataset = CombinedDataset(
+            # Standard datasets - use ComparisonDataset for fair comparison
+            # ComparisonDataset provides ORIGINAL resolution images
+            # Use 'val' split to match FlashDepth's validation/test procedure
+            # For ETH3D: excludes first 8 scenes (same as FlashDepth)
+            dataset = ComparisonDataset(
+                dataset_name=dataset_name,
                 data_root=data_root,
-                datasets=[dataset_name],
                 split='val',
-                video_length=video_length,
-                stride=1,
-                use_canonical_space=False  # Comparison methods don't use canonical space
+                video_length=video_length
             )
-            collate_fn = None
+            collate_fn = comparison_collate_fn
 
         loader = torch.utils.data.DataLoader(
             dataset,
@@ -186,27 +198,45 @@ class ComparisonTester:
         """Test on a single sequence"""
         # Get inputs
         if 'images' in batch:
-            images = batch['images'].to(self.device)  # [1, T, 3, H, W] or [T, 3, H, W]
-            if images.ndim == 4:
-                images = images.unsqueeze(0)
+            # ComparisonDataset format (original resolution)
+            images = batch['images'].to(self.device)  # [1, T, 3, H, W]
+            gt_depths = batch['depths'].to(self.device)  # [1, T, H, W] - already in meters!
+            intrinsics = batch.get('intrinsics', None)
+            if intrinsics is not None:
+                intrinsics = intrinsics.to(self.device)  # [1, T, 4] - fx, fy, cx, cy
         else:
+            # Legacy CombinedDataset format (resized)
             images = batch['image'].to(self.device)  # [1, T, 3, H, W]
+            gt_depths = batch['depth'].to(self.device)  # [1, T, H, W] - inverse depth!
+            intrinsics = None
 
-        gt_depth = batch['depth'].to(self.device)  # [1, T, H, W] or [T, H, W]
-        if gt_depth.ndim == 3:
-            gt_depth = gt_depth.unsqueeze(0)
-        if gt_depth.ndim == 4:
-            gt_depth = gt_depth.unsqueeze(2)  # [1, T, 1, H, W]
-
-        focal_lengths = batch.get('focal_lengths', None)
-        if focal_lengths is not None:
-            focal_lengths = focal_lengths.to(self.device)
+        # Ensure proper dimensions
+        if images.ndim == 4:
+            images = images.unsqueeze(0)  # [T, 3, H, W] -> [1, T, 3, H, W]
+        if gt_depths.ndim == 3:
+            gt_depths = gt_depths.unsqueeze(0)  # [T, H, W] -> [1, T, H, W]
 
         B, T = images.shape[:2]
         assert B == 1, "Batch size must be 1 for testing"
 
-        # GT is in meters (1/m format, so convert: depth_m = 1 / (gt_depth + eps))
-        gt_depth_metric = 1.0 / (gt_depth + 1e-8)  # [1, T, 1, H, W] in meters
+        # Process GT depth
+        # ComparisonDataset: depths are already in meters
+        # CombinedDataset: depths are inverse depth (1/m), need conversion
+        if 'images' in batch:
+            # ComparisonDataset - already in meters
+            gt_depth_processed = gt_depths.unsqueeze(2)  # [1, T, 1, H, W]
+        else:
+            # CombinedDataset - convert from inverse depth
+            gt_depth_processed = 1.0 / (gt_depths + 1e-8)  # [1, T, H, W] -> meters
+            gt_depth_processed = gt_depth_processed.unsqueeze(2)  # [1, T, 1, H, W]
+
+        # Get focal lengths (for models that need them)
+        if intrinsics is not None:
+            focal_lengths = intrinsics[:, :, 0]  # [1, T] - fx values
+        else:
+            focal_lengths = batch.get('focal_lengths', None)
+            if focal_lengths is not None:
+                focal_lengths = focal_lengths.to(self.device)
 
         # Storage for predictions
         pred_depths = []
@@ -230,10 +260,34 @@ class ComparisonTester:
 
             img_t = images[0, t]  # [3, H, W]
 
+            # Check if image is ImageNet normalized (from segmentation datasets)
+            # ComparisonDataset returns [0, 1] range
+            # Segmentation datasets return ImageNet normalized
+            is_imagenet_normalized = (img_t.min() < -2.0 or img_t.max() > 2.0)
+
+            # Unnormalize if needed (most models expect [0, 1] range)
+            if is_imagenet_normalized:
+                # Unnormalize ImageNet: x_original = x * std + mean
+                mean = torch.tensor([0.485, 0.456, 0.406], device=img_t.device).view(3, 1, 1)
+                std = torch.tensor([0.229, 0.224, 0.225], device=img_t.device).view(3, 1, 1)
+                img_t_unnorm = img_t * std + mean  # Back to [0, 1] range
+            else:
+                img_t_unnorm = img_t
+
+            # Prepare intrinsics for this frame
+            # ComparisonDataset provides full intrinsics [fx, fy, cx, cy]
+            # Legacy datasets provide only focal length (scalar)
+            if intrinsics is not None:
+                frame_intrinsics = intrinsics[0, t]  # [4] - fx, fy, cx, cy
+            elif focal_lengths is not None:
+                frame_intrinsics = focal_lengths[0, t]  # scalar
+            else:
+                frame_intrinsics = None
+
             # Method-specific inference using adapter
             pred_depth_t = self.adapter.inference(
-                img_t.unsqueeze(0),  # [1, 3, H, W]
-                intrinsics=focal_lengths[0, t] if focal_lengths is not None else None
+                img_t_unnorm.unsqueeze(0),  # [1, 3, H, W] in [0, 1] range
+                intrinsics=frame_intrinsics
             )  # Returns [1, H, W] in meters
 
             # Store prediction
@@ -256,13 +310,31 @@ class ComparisonTester:
         # Stack predictions
         pred_depths = torch.stack(pred_depths, dim=0)  # [T, 1, H, W]
 
+        # Resize GT depth to match prediction size if needed
+        # This handles cases where dataloader provides original resolution GT
+        # but model outputs resized depth (e.g., ZoeDepth with internal resizing)
+        gt_depth_processed_cpu = gt_depth_processed[0].cpu()  # [T, 1, H, W]
+        pred_H, pred_W = pred_depths.shape[2:]
+        gt_H, gt_W = gt_depth_processed_cpu.shape[2:]
+
+        if (gt_H != pred_H) or (gt_W != pred_W):
+            logger.info(f"Resizing GT depth from {gt_H}x{gt_W} to {pred_H}x{pred_W} to match prediction")
+            gt_depth_processed_cpu = torch.nn.functional.interpolate(
+                gt_depth_processed_cpu,  # [T, 1, H, W]
+                size=(pred_H, pred_W),
+                mode='nearest'  # Use nearest to preserve depth values
+            )
+
         # Compute metrics
         pred_depths_cpu = pred_depths.cpu()
-        gt_depth_metric_cpu = gt_depth_metric[0].cpu()  # [T, 1, H, W]
+
+        # Track best frame (criteria differs by depth mode)
+        if self.depth_mode == 'relative':
+            best_frame_f1 = 0.0  # For relative: maximize F1
 
         for t in range(pred_depths.shape[0]):
             pred_frame = pred_depths_cpu[t, 0]  # [H, W]
-            gt_frame = gt_depth_metric_cpu[t, 0]  # [H, W]
+            gt_frame = gt_depth_processed_cpu[t, 0]  # [H, W]
 
             # Create valid mask
             MAX_DEPTH = 70.0
@@ -271,15 +343,25 @@ class ComparisonTester:
             valid_mask = gt_valid_mask & pred_valid_mask
 
             if valid_mask.sum() > 0:
-                frame_metric = self.metrics.compute_metric_depth_metrics(
-                    pred_frame, gt_frame, valid_mask
-                )
-                frame_metrics.append(frame_metric)
+                # Compute metrics based on depth mode
+                if self.depth_mode == 'metric':
+                    frame_metric = self.metrics.compute_metric_depth_metrics(
+                        pred_frame, gt_frame, valid_mask
+                    )
+                    # Track best frame (lowest AbsRel for metric)
+                    if frame_metric['abs_rel'] < best_frame_abs_rel:
+                        best_frame_abs_rel = frame_metric['abs_rel']
+                        best_frame_idx = t
+                else:  # relative
+                    frame_metric = self.relative_metrics.compute_relative_depth_metrics(
+                        pred_frame, gt_frame, valid_mask
+                    )
+                    # Track best frame (highest F1 for relative)
+                    if frame_metric['boundary_f1'] > best_frame_f1:
+                        best_frame_f1 = frame_metric['boundary_f1']
+                        best_frame_idx = t
 
-                # Track best frame
-                if frame_metric['abs_rel'] < best_frame_abs_rel:
-                    best_frame_abs_rel = frame_metric['abs_rel']
-                    best_frame_idx = t
+                frame_metrics.append(frame_metric)
 
         # Average metrics
         if len(frame_metrics) == 0:
@@ -297,18 +379,28 @@ class ComparisonTester:
             for t in range(len(pred_depths) - 1):
                 pred_t = pred_depths_cpu[t, 0]
                 pred_t_next = pred_depths_cpu[t + 1, 0]
-                gt_t = gt_depth_metric_cpu[t, 0]
-                gt_t_next = gt_depth_metric_cpu[t + 1, 0]
+                gt_t = gt_depth_processed_cpu[t, 0]
+                gt_t_next = gt_depth_processed_cpu[t + 1, 0]
 
                 valid_t = (gt_t > 0) & (gt_t < MAX_DEPTH) & (pred_t > 0) & (pred_t < MAX_DEPTH)
                 valid_t_next = (gt_t_next > 0) & (gt_t_next < MAX_DEPTH) & (pred_t_next > 0) & (pred_t_next < MAX_DEPTH)
-                valid_both = valid_t & valid_t_next
 
-                if valid_both.sum() > 0:
-                    pred_change = pred_t_next - pred_t
-                    gt_change = gt_t_next - gt_t
-                    tae = torch.abs(pred_change[valid_both] - gt_change[valid_both]).mean()
-                    tae_errors.append(tae.item())
+                if valid_t.sum() > 0 and valid_t_next.sum() > 0:
+                    if self.depth_mode == 'metric':
+                        # Metric depth: direct frame-to-frame comparison
+                        valid_both = valid_t & valid_t_next
+                        if valid_both.sum() > 0:
+                            pred_change = pred_t_next - pred_t
+                            gt_change = gt_t_next - gt_t
+                            tae = torch.abs(pred_change[valid_both] - gt_change[valid_both]).mean()
+                            tae_errors.append(tae.item())
+                    else:  # relative
+                        # Relative depth: scale-invariant TAE
+                        tae_si = self.relative_metrics.compute_tae_scale_invariant(
+                            pred_t, pred_t_next, gt_t, gt_t_next, valid_t, valid_t_next
+                        )
+                        if tae_si < float('inf'):
+                            tae_errors.append(tae_si)
 
             metrics['tae'] = np.mean(tae_errors) if len(tae_errors) > 0 else 0.0
         else:
@@ -325,7 +417,7 @@ class ComparisonTester:
                 per_frame_class_metrics = []
                 for t in range(len(seg_masks_np)):
                     pred_frame = pred_depths_cpu[t, 0].numpy()
-                    gt_frame = gt_depth_metric_cpu[t, 0].numpy()
+                    gt_frame = gt_depth_processed_cpu[t, 0].numpy()
                     seg_mask_frame = seg_masks_np[t]
 
                     # Resize segmentation if needed
@@ -355,29 +447,45 @@ class ComparisonTester:
 
         # Visualize sequence (simplified version without importance maps)
         visualize_sequence_simplified(
-            images[0], pred_depths, gt_depth_metric[0],
-            valid_mask=(gt_depth_metric[0] > 0),
+            images[0], pred_depths, gt_depth_processed[0],
+            valid_mask=(gt_depth_processed[0] > 0),
             sequence_id=sequence_id,
             metrics=metrics,
             fps=fps,
             save_dir=self.save_dir,
-            focal_lengths=focal_lengths[0] if focal_lengths is not None else None
+            focal_lengths=focal_lengths[0] if focal_lengths is not None else None,
+            frame_interval=self.frame_interval  # Pass frame interval for visualization
         )
 
         # Save best frame visualization
         if len(frame_metrics) > 0:
-            logger.info(f"Best frame for sequence {sequence_id}: Frame {best_frame_idx} (AbsRel={best_frame_abs_rel:.4f})")
+            # Log best frame with appropriate metric
+            if self.depth_mode == 'metric':
+                logger.info(f"Best frame for sequence {sequence_id}: Frame {best_frame_idx} (AbsRel={best_frame_abs_rel:.4f})")
+                best_metric_value = best_frame_abs_rel
+            else:  # relative
+                logger.info(f"Best frame for sequence {sequence_id}: Frame {best_frame_idx} (F1={best_frame_f1:.4f})")
+                best_metric_value = best_frame_f1
+
+            # Extract dataset name from batch
+            dataset_name = batch.get('dataset_name', 'unknown')
+
+            # Extract focal length for this frame
+            if focal_lengths is not None and focal_lengths.shape[1] > best_frame_idx:
+                frame_focal_length = focal_lengths[0, best_frame_idx].item()
+            else:
+                frame_focal_length = None
 
             visualize_best_frame_simplified(
-                images[0, best_frame_idx],  # [3, H, W]
-                pred_depths[best_frame_idx, 0],  # [H, W]
-                gt_depth_metric[0, best_frame_idx, 0],  # [H, W]
-                sequence_id,
-                best_frame_idx,
-                best_frame_abs_rel,
-                fps,
-                self.save_dir,
-                frame_metrics=frame_metrics[best_frame_idx] if best_frame_idx < len(frame_metrics) else None
+                image=images[0, best_frame_idx],  # [3, H, W]
+                gt_depth=gt_depth_processed[0, best_frame_idx, 0],  # [H, W]
+                pred_depth=pred_depths[best_frame_idx, 0],  # [H, W]
+                metrics=frame_metrics[best_frame_idx] if best_frame_idx < len(frame_metrics) else {},
+                save_dir=self.save_dir,
+                sequence_id=sequence_id,
+                frame_idx=best_frame_idx,
+                dataset_name=dataset_name,
+                focal_length=frame_focal_length
             )
 
         return metrics
@@ -451,6 +559,16 @@ def main():
     parser.add_argument('--objwise', action='store_true',
                        help='Enable object-wise evaluation')
 
+    # New options for depth mode and model-specific settings
+    parser.add_argument('--depth-mode', type=str, default='metric', choices=['metric', 'relative'],
+                       help='Depth evaluation mode: metric (absolute depth) or relative (scale-invariant)')
+    parser.add_argument('--indoor', action='store_true',
+                       help='Use indoor checkpoint (for depthanythingv2 only)')
+    parser.add_argument('--metric', action='store_true',
+                       help='Use metric mode (for videodepthanything only)')
+    parser.add_argument('--frame-interval', type=int, default=None,
+                       help='Frame interval for sequence.png visualization')
+
     args = parser.parse_args()
 
     # Build method name with version
@@ -472,14 +590,22 @@ def main():
         'object_wise': {
             'enabled': args.objwise,
             'dataset': args.dataset.replace('_seg', '')
-        }
+        },
+        # New depth mode and model-specific settings
+        'depth_mode': args.depth_mode,
+        'indoor': args.indoor,
+        'metric': args.metric,
+        'frame_interval': args.frame_interval
     }
 
     # Import and create adapter
     try:
         if args.method == 'vda':
             from adapters.video_depth_anything_adapter import VideoDepthAnythingAdapter
-            adapter = VideoDepthAnythingAdapter()
+            adapter = VideoDepthAnythingAdapter(metric=args.metric)
+        elif args.method == 'depthanythingv2':
+            from adapters.depth_anything_v2_adapter import DepthAnythingV2Adapter
+            adapter = DepthAnythingV2Adapter(indoor=args.indoor)
         elif args.method == 'depthcrafter':
             from adapters.depthcrafter_adapter import DepthCrafterAdapter
             adapter = DepthCrafterAdapter()

@@ -43,8 +43,8 @@ import time
 from datetime import timedelta
 
 from flashdepth.model import FlashDepth
-from utils.gear3_upgrade_visualization import Gear3UpgradeVisualizer
-from flashdepth.gear3_upgrade_modules import Gear3UpgradeMetricHead
+from utils.gear4_visualization import Gear4Visualizer
+from flashdepth.gear4_modules import Gear4MetricHead
 from dataloaders.combined_dataset import CombinedDataset
 from utils.helpers import *
 from utils.metric_depth_metrics import MetricDepthMetrics
@@ -81,7 +81,7 @@ def init_distributed():
 
 
 
-class Gear3UpgradeTrainer:
+class Gear4Trainer:
     """
     Trainer for Gear3 metric depth learning.
 
@@ -197,12 +197,12 @@ class Gear3UpgradeTrainer:
 
     def _get_canonical_focal_length(self):
         """
-        Get canonical focal length (fixed at 1000.0 for all resolutions).
+        Get canonical focal length (fixed at 500.0 for all resolutions).
 
         Returns:
-            float: Canonical focal length (always 1000.0)
+            float: Canonical focal length (always 500.0)
         """
-        return 1000.0
+        return 500.0
 
     def _setup_model(self):
         """Initialize FlashDepth with Gear3 metric head"""
@@ -253,7 +253,7 @@ class Gear3UpgradeTrainer:
                     for k, v in state_dict.items():
                         # Exclude modules that receive modulated features
                         if any(x in k for x in ['mamba', 'hybrid_fusion', 'teacher_model',
-                                                'output_conv1', 'output_conv2', 'gear3_upgrade_head']):
+                                                'output_conv1', 'output_conv2', 'gear4_head']):
                             excluded_keys.append(k)
                         else:
                             loaded_dict[k] = v
@@ -277,15 +277,12 @@ class Gear3UpgradeTrainer:
         dpt_dim = 256 if model.encoder == 'vitl' else 64
         num_heads = 16 if model.encoder == 'vitl' else 6
 
-        # Get separation method from config (default: 'cls_seg')
-        separation_method = self.config.get('separation_method', 'cls_seg')
-        self.separation_method = separation_method
-        self.logger.info(f"Using FG/BG separation method: {separation_method}")
+        # Using multi-layer attention fusion for FG/BG separation
+        self.logger.info("Using FG/BG separation method: multi_layer")
 
-        model.gear3_upgrade_head = Gear3UpgradeMetricHead(
+        model.gear4_head = Gear3UpgradeMetricHead(
             embed_dim=embed_dim,
             dpt_dim=dpt_dim,
-            separation_method=separation_method,
             num_heads=num_heads
         )
 
@@ -330,7 +327,7 @@ class Gear3UpgradeTrainer:
                     for k, v in hybrid_state_dict.items():
                         # Include only encoder and DPT refinement (same as Phase 1 loading)
                         if not any(x in k for x in ['mamba', 'hybrid_fusion', 'teacher_model',
-                                                     'output_conv1', 'output_conv2', 'gear3_upgrade_head']):
+                                                     'output_conv1', 'output_conv2', 'gear4_head']):
                             loaded_hybrid[k] = v
 
                     # Overwrite ViT-DPT parameters
@@ -340,20 +337,14 @@ class Gear3UpgradeTrainer:
                 else:
                     self.logger.warning(f"Hybrid checkpoint {hybrid_path} not found! Using Phase 1 ViT-DPT weights.")
 
-        # Enable attention weights storage
-        # - 'multi_layer': Enable for multiple blocks (encoder-specific)
-        #   - ViT-L (24 blocks): [4, 11, 17, 23] (aligned with DPT layers)
-        #   - ViT-S (12 blocks): [2, 5, 8, 11]
-        # - Others: Enable ONLY for last block (saves memory)
-        if separation_method == 'multi_layer':
-            # Use encoder-specific block indices for proportional coverage
-            multi_layer_blocks = {
-                'vitl': [4, 11, 17, 23],
-                'vits': [2, 5, 8, 11]
-            }
-            target_blocks = multi_layer_blocks[model.encoder]
-        else:
-            target_blocks = [len(model.pretrained.blocks) - 1]
+        # Enable attention weights storage for multi-layer fusion
+        # - ViT-L (24 blocks): [4, 11, 17, 23] (aligned with DPT layers)
+        # - ViT-S (12 blocks): [2, 5, 8, 11]
+        multi_layer_blocks = {
+            'vitl': [4, 11, 17, 23],
+            'vits': [2, 5, 8, 11]
+        }
+        target_blocks = multi_layer_blocks[model.encoder]
 
         for i, block in enumerate(model.pretrained.blocks):
             if i in target_blocks:
@@ -362,8 +353,7 @@ class Gear3UpgradeTrainer:
             else:
                 block.attn.store_attn_weights = False
 
-        if separation_method == 'multi_layer':
-            self.logger.info(f"Multi-layer attention fusion: storing attention from blocks {target_blocks}")
+        self.logger.info(f"Multi-layer attention fusion: storing attention from blocks {target_blocks}")
 
         # Store target blocks for use in training/validation steps
         self.target_blocks = target_blocks
@@ -412,7 +402,7 @@ class Gear3UpgradeTrainer:
         gear3_params = 0
 
         for name, param in model.named_parameters():
-            if 'gear3_upgrade_head' in name:
+            if 'gear4_head' in name:
                 # Gear3 modules: trainable
                 param.requires_grad = True
                 gear3_params += param.numel()
@@ -456,7 +446,7 @@ class Gear3UpgradeTrainer:
                 continue
 
             # Keep trainable parts in train mode
-            if any(keyword in name for keyword in ['gear3_upgrade_head', 'mamba', 'output_conv']):
+            if any(keyword in name for keyword in ['gear4_head', 'mamba', 'output_conv']):
                 continue
 
             # Set frozen parts to eval mode
@@ -580,7 +570,7 @@ class Gear3UpgradeTrainer:
 
         for name, param in self.model.named_parameters():
             if param.requires_grad:
-                if 'gear3_upgrade_head' in name:
+                if 'gear4_head' in name:
                     gear3_params.append(param)
                 elif 'mamba' in name:
                     mamba_params.append(param)
@@ -691,30 +681,31 @@ class Gear3UpgradeTrainer:
                     model = self.model.module if isinstance(self.model, DDP) else self.model
 
                     # Unpack and move to device (batch is still on CPU from dataloader)
-                    images, gt_depth, focal_lengths, dataset_idx = batch
+                    images, gt_depth, focal_lengths_canonical, focal_lengths_actual, actual_valid_mask, fx_ratio, resize_ratio, dataset_idx = batch
                     images = images.to(self.device)
                     gt_depth = gt_depth.to(self.device)
-                    focal_lengths = focal_lengths.to(self.device)
+                    focal_lengths_canonical = focal_lengths_canonical.to(self.device)
+                    focal_lengths_actual = focal_lengths_actual.to(self.device)
+                    actual_valid_mask = actual_valid_mask.to(self.device)
+                    fx_ratio = fx_ratio.to(self.device)
+                    resize_ratio = resize_ratio.to(self.device)
+
+                    # Use canonical focal lengths for processing
+                    focal_lengths = focal_lengths_canonical
 
                     if gt_depth.ndim == 3:
                         gt_depth = gt_depth.unsqueeze(1)
                     elif gt_depth.ndim == 4 and gt_depth.shape[1] != 1:
                         gt_depth = gt_depth.unsqueeze(2)
 
-                    # GT depth from dataloader is inverse depth (1/m), scale to 100/m for training
+                    # GT depth from dataloader is inverse depth (1/m), already in canonical space (fx=500)
                     gt_depth_inverse_100 = gt_depth * 100.0  # (1/m) * 100 = 100/m
+
+                    # NOTE: GT depth is already in canonical space (fx=500 at target resolution)
+                    # Canonical transformation is handled in the dataloader
 
                     # Get batch size for Mamba initialization
                     B_orig, T_orig, C, H, W = images.shape
-
-                    # Apply canonical space transformation if enabled (for visualization consistency)
-                    if self.config.get('use_canonical_space', False):
-                        CANONICAL_FX = self._get_canonical_focal_length()
-
-                        # Transform inverse depth directly to canonical space
-                        # inverse_canonical = inverse_actual * (fx_actual / CANONICAL_FX)
-                        fx_actual = focal_lengths.view(B_orig, T_orig, 1, 1, 1)
-                        gt_depth_inverse_100 = gt_depth_inverse_100 * (fx_actual / CANONICAL_FX)
 
                     # Initialize Mamba sequence for temporal processing
                     if hasattr(model, 'mamba'):
@@ -739,24 +730,17 @@ class Gear3UpgradeTrainer:
                         )
                         path_1 = dpt_features[-1]  # Extract path_1
 
-                        # Prepare inputs based on separation_method
-                        attention_weights_multi_layer = None
-                        cls_token = None
-
-                        if self.separation_method == 'multi_layer':
-                            # Collect attention weights from multiple layers (encoder-specific)
-                            attention_weights_multi_layer = [
-                                model.pretrained.blocks[i].attn.attn_weights
-                                for i in self.target_blocks
-                            ]
-                        elif self.separation_method == 'cls_seg':
-                            cls_token = encoder_features[-1][:, 0]  # [B*T, embed_dim]
+                        # Collect attention weights from multiple layers (encoder-specific)
+                        attention_weights_multi_layer = [
+                            model.pretrained.blocks[i].attn.attn_weights
+                            for i in self.target_blocks
+                        ]
 
                         # Apply Gear modulation BEFORE Mamba
-                        path_1_modulated, importance_map, fg_features, bg_features, fg_mask, bg_mask = model.gear3_upgrade_head(
+                        path_1_modulated, importance_map, fg_features, bg_features, fg_mask, bg_mask = model.gear4_head(
                             patch_tokens, attention_weights, [path_1], patch_h, patch_w,
                             attention_weights_multi_layer=attention_weights_multi_layer,
-                            cls_token=cls_token
+                            cls_token=None
                         )
 
                         # Apply Mamba temporal modeling to modulated feature
@@ -821,7 +805,8 @@ class Gear3UpgradeTrainer:
                             images[:1, :1].float().cpu(),  # [1, 1, 3, H, W] - convert BFloat16 to Float32 first
                             gt_depth_metric[:1].float().cpu(),  # [1, 1, H, W]
                             dataset_idx,
-                            focal_lengths[:1, :1].float().cpu()  # [1, 1] - resized focal length
+                            fx_ratio[:1, :1].float().cpu(),      # [1, 1] - focal length ratio (500 / fx_actual)
+                            resize_ratio[:1, :1].float().cpu()   # [1, 1] - total resize ratio (Metric3D)
                         )
                         model_outputs_cpu = {
                             'pred_depth': pred_depth_metric_vis[:1].cpu(),  # [1, 1, H, W]
@@ -835,17 +820,16 @@ class Gear3UpgradeTrainer:
                         # FPS removed from training (only measured in test_gear3.py)
                         current_fps = None
 
-                        # Extract layer_weights for visualization (multi_layer separation only)
+                        # Extract layer_weights for visualization
                         layer_weights = None
-                        if self.separation_method == 'multi_layer':
-                            try:
-                                # Handle DDP wrapping
-                                model = self.model.module if hasattr(self.model, 'module') else self.model
-                                # Get softmax-normalized weights
-                                fusion_weights = model.gear3_upgrade_head.multi_layer_fusion.fusion_weights
-                                layer_weights = torch.softmax(fusion_weights, dim=0).detach().cpu().numpy()
-                            except Exception as e:
-                                self.logger.warning(f"Failed to extract layer_weights: {e}")
+                        try:
+                            # Handle DDP wrapping
+                            model = self.model.module if hasattr(self.model, 'module') else self.model
+                            # Get softmax-normalized weights
+                            fusion_weights = model.gear4_head.multi_layer_fusion.fusion_weights
+                            layer_weights = torch.softmax(fusion_weights, dim=0).detach().cpu().numpy()
+                        except Exception as e:
+                            self.logger.warning(f"Failed to extract layer_weights: {e}")
 
                         # Pass loss_dict and layer_weights for visualization
                         self.train_visualizer.create_validation_summary(
@@ -892,11 +876,18 @@ class Gear3UpgradeTrainer:
 
     def train_step(self, batch):
         """Single training step with BFloat16 autocast"""
-        # Unpack batch (updated to include focal_lengths)
-        images, gt_depth, focal_lengths, dataset_idx = batch
+        # Unpack batch (now includes fx_ratio and resize_ratio from Metric3D canonicalization)
+        images, gt_depth, focal_lengths_canonical, focal_lengths_actual, actual_valid_mask, fx_ratio, resize_ratio, dataset_idx = batch
         images = images.to(self.device)
         gt_depth = gt_depth.to(self.device)
-        focal_lengths = focal_lengths.to(self.device)  # Shape: (B, T)
+        focal_lengths_canonical = focal_lengths_canonical.to(self.device)
+        focal_lengths_actual = focal_lengths_actual.to(self.device)
+        actual_valid_mask = actual_valid_mask.to(self.device)
+        fx_ratio = fx_ratio.to(self.device)  # NEW: Shape (B, T), focal length ratios (500 / fx_actual)
+        resize_ratio = resize_ratio.to(self.device)  # NEW: Shape (B, T), total resize ratios
+
+        # Use canonical focal lengths for rest of processing
+        focal_lengths = focal_lengths_canonical  # For backward compatibility with existing code
 
         # Add channel dimension if needed
         if gt_depth.ndim == 3:
@@ -914,28 +905,16 @@ class Gear3UpgradeTrainer:
             self.logger.info(f"DEBUG - Raw GT depth from dataloader: min={gt_depth.min():.4f}, max={gt_depth.max():.4f}, shape={gt_depth.shape}")
             self.logger.info(f"DEBUG - GT depth has {(gt_depth > 0).sum()} valid pixels out of {gt_depth.numel()} total")
 
-        # GT depth from dataloader is inverse depth (1/m), scale to 100/m for training
-        # This matches FlashDepth's relative depth scale (≈ 100/metric_depth)
+        # GT depth from dataloader is inverse depth (1/m), already in canonical space (fx=500)
         gt_depth_inverse_100 = gt_depth * 100.0  # (1/m) * 100 = 100/m
+
+        # NOTE: GT depth is already in canonical space (fx=500 at target resolution)
+        # Canonical transformation is handled in the dataloader
 
         # DEBUG: Check after scaling to 100/m
         if self.global_step < 5:
-            self.logger.info(f"DEBUG - After scaling to 100/m: min={gt_depth_inverse_100.min():.4f}, max={gt_depth_inverse_100.max():.4f}")
+            self.logger.info(f"DEBUG - Canonical inverse_100: min={gt_depth_inverse_100.min():.4f}, max={gt_depth_inverse_100.max():.4f}")
             self.logger.info(f"DEBUG - Has {(gt_depth_inverse_100 > 0).sum()} valid pixels")
-
-        # Apply canonical space transformation if enabled
-        if self.config.get('use_canonical_space', False):
-            CANONICAL_FX = self._get_canonical_focal_length()
-
-            # Transform inverse depth directly to canonical space
-            # inverse_canonical = inverse_actual * (fx_actual / CANONICAL_FX)
-            fx_actual = focal_lengths.view(B, T, 1, 1, 1)
-            gt_depth_inverse_100 = gt_depth_inverse_100 * (fx_actual / CANONICAL_FX)
-
-            if self.global_step < 5:
-                self.logger.info(f"DEBUG - Canonical space enabled (CANONICAL_FX={CANONICAL_FX})")
-                self.logger.info(f"DEBUG - fx_actual range: {fx_actual.min():.1f} - {fx_actual.max():.1f}")
-                self.logger.info(f"DEBUG - After canonical transform: min={gt_depth_inverse_100.min():.4f}, max={gt_depth_inverse_100.max():.4f}")
 
         # Forward pass following original FlashDepth pattern (whole sequence at once)
         # Initialize Mamba sequence (critical for temporal processing!)
@@ -970,28 +949,20 @@ class Gear3UpgradeTrainer:
                 )  # Returns [path_4, path_3, path_2, path_1], each (B*T, dpt_dim, h, w)
                 path_1 = dpt_features[-1]  # Extract path_1: (B*T, dpt_dim, h, w)
 
-            # Prepare inputs based on separation_method
-            attention_weights_multi_layer = None
-            cls_token = None
-
-            if self.separation_method == 'multi_layer':
-                # Collect attention weights from multiple layers (encoder-specific)
-                # Each has shape (B*T, num_heads, N, N)
-                attention_weights_multi_layer = [
-                    model.pretrained.blocks[i].attn.attn_weights.detach()
-                    for i in self.target_blocks
-                ]
-            elif self.separation_method == 'cls_seg':
-                with torch.no_grad():
-                    cls_token = patch_tokens[:, 0]  # (B*T, embed_dim)
+            # Collect attention weights from multiple layers (encoder-specific)
+            # Each has shape (B*T, num_heads, N, N)
+            attention_weights_multi_layer = [
+                model.pretrained.blocks[i].attn.attn_weights.detach()
+                for i in self.target_blocks
+            ]
 
             # Apply Gear3 Upgrade modulation to path_1 (BEFORE Mamba)
             # This makes the feature metric-aware before temporal modeling
             # Inputs: (B*T, ...), Output: (B*T, ...)
-            path_1_modulated, importance_map, fg_features, bg_features, fg_mask, bg_mask = model.gear3_upgrade_head(
+            path_1_modulated, importance_map, fg_features, bg_features, fg_mask, bg_mask = model.gear4_head(
                 patch_tokens, attention_weights, [path_1], patch_h, patch_w,
                 attention_weights_multi_layer=attention_weights_multi_layer,
-                cls_token=cls_token
+                cls_token=None
             )
 
             # Note: attention_weights_multi_layer will be garbage collected automatically
@@ -1112,8 +1083,11 @@ class Gear3UpgradeTrainer:
             if batch is None:
                 continue
 
-            # Unpack batch (updated to include focal_lengths)
-            images, gt_depth, focal_lengths, dataset_idx = batch
+            # Unpack batch (now includes fx_ratio and resize_ratio from Metric3D canonicalization)
+            images, gt_depth, focal_lengths_canonical, focal_lengths_actual, actual_valid_mask, fx_ratio, resize_ratio, dataset_idx = batch
+
+            # Use canonical focal lengths for processing
+            focal_lengths = focal_lengths_canonical
 
             # Get dataset name for this batch (before frame loop)
             if isinstance(dataset_idx, str):
@@ -1150,17 +1124,11 @@ class Gear3UpgradeTrainer:
 
                 B, T = images.shape[:2]
 
-                # GT depth from dataloader is inverse depth (1/m), scale to 100/m for training
+                # GT depth from dataloader is inverse depth (1/m), already in canonical space (fx=500)
                 gt_depth_inverse_100 = gt_depth * 100.0  # (1/m) * 100 = 100/m
 
-                # Apply canonical space transformation if enabled
-                if self.config.get('use_canonical_space', False):
-                    CANONICAL_FX = self._get_canonical_focal_length()
-
-                    # Transform inverse depth directly to canonical space
-                    # inverse_canonical = inverse_actual * (fx_actual / CANONICAL_FX)
-                    fx_actual = focal_lengths.view(B, T, 1, 1, 1)
-                    gt_depth_inverse_100 = gt_depth_inverse_100 * (fx_actual / CANONICAL_FX)
+                # NOTE: GT depth is already in canonical space (fx=500 at target resolution)
+                # Canonical transformation is handled in the dataloader
 
                 # Initialize Mamba sequence for temporal processing
                 if hasattr(model, 'mamba'):
@@ -1187,25 +1155,18 @@ class Gear3UpgradeTrainer:
                 )  # Returns [path_4, path_3, path_2, path_1]
                 path_1 = dpt_features[-1]  # Extract path_1: (B*T, dpt_dim, h, w)
 
-                # Prepare inputs based on separation_method
-                attention_weights_multi_layer = None
-                cls_token = None
-
-                if self.separation_method == 'multi_layer':
-                    # Collect attention weights from multiple layers (encoder-specific)
-                    attention_weights_multi_layer = [
-                        model.pretrained.blocks[i].attn.attn_weights.detach()
-                        for i in self.target_blocks
-                    ]
-                elif self.separation_method == 'cls_seg':
-                    cls_token = patch_tokens[:, 0]  # (B*T, embed_dim)
+                # Collect attention weights from multiple layers (encoder-specific)
+                attention_weights_multi_layer = [
+                    model.pretrained.blocks[i].attn.attn_weights.detach()
+                    for i in self.target_blocks
+                ]
 
                 # Apply Gear modulation BEFORE Mamba (metric-aware feature)
                 # Inputs/outputs: (B*T, ...)
-                path_1_modulated, importance_map, fg_features, bg_features, fg_mask, bg_mask = model.gear3_upgrade_head(
+                path_1_modulated, importance_map, fg_features, bg_features, fg_mask, bg_mask = model.gear4_head(
                     patch_tokens, attention_weights, [path_1], patch_h, patch_w,
                     attention_weights_multi_layer=attention_weights_multi_layer,
-                    cls_token=cls_token
+                    cls_token=None
                 )
 
                 # Note: attention_weights_multi_layer will be garbage collected automatically
@@ -1358,17 +1319,16 @@ class Gear3UpgradeTrainer:
                                     'val_loss': loss_batch.item() if len(frame_losses) > 0 else 0.0
                                 }
 
-                                # Extract layer_weights for visualization (multi_layer separation only)
+                                # Extract layer_weights for visualization
                                 layer_weights = None
-                                if self.separation_method == 'multi_layer':
-                                    try:
-                                        # Handle DDP wrapping
-                                        model = self.model.module if hasattr(self.model, 'module') else self.model
-                                        # Get softmax-normalized weights
-                                        fusion_weights = model.gear3_upgrade_head.multi_layer_fusion.fusion_weights
-                                        layer_weights = torch.softmax(fusion_weights, dim=0).detach().cpu().numpy()
-                                    except Exception as e:
-                                        self.logger.warning(f"Failed to extract layer_weights: {e}")
+                                try:
+                                    # Handle DDP wrapping
+                                    model = self.model.module if hasattr(self.model, 'module') else self.model
+                                    # Get softmax-normalized weights
+                                    fusion_weights = model.gear4_head.multi_layer_fusion.fusion_weights
+                                    layer_weights = torch.softmax(fusion_weights, dim=0).detach().cpu().numpy()
+                                except Exception as e:
+                                    self.logger.warning(f"Failed to extract layer_weights: {e}")
 
                                 # Save with dataset and sequence-specific name
                                 save_name = f"validation_{current_dataset}_seq{seq_num:03d}_step_{self.global_step:06d}"
@@ -1498,7 +1458,7 @@ def main(config: DictConfig):
     rank, world_size, local_rank = init_distributed()
 
     # Create trainer
-    trainer = Gear3UpgradeTrainer(config, rank, world_size, local_rank)
+    trainer = Gear4Trainer(config, rank, world_size, local_rank)
     trainer.train()
 
     # Cleanup

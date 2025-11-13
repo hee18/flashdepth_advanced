@@ -4,11 +4,35 @@ test_results/
 checkpoints/
 *.pth
 *.ckpt
+*.pt
+
+# Exclude refer_test entirely (mounted via volume in docker-compose)
+refer_test/
+
+# Exclude dataset directory (mounted via volume)
+Datasets/
+
+# Exclude mamba directory (large compiled files)
+mamba/
+
+# Exclude outputs and visualizations
+outputs/
+visualizations/
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.mp4
+*.avi
+*.npz
+*.npy
 
 # Development files
 .git/
 .gitignore
 *.md
+README.md
+CLAUDE.md
 __pycache__/
 *.pyc
 *.pyo
@@ -32,3 +56,10 @@ Thumbs.db
 # Temporary files
 *.tmp
 *.log
+*.cache/
+.triton_cache/
+
+# Docker files (don't need to copy themselves)
+Dockerfile*
+docker-compose.yml
+.dockerignore

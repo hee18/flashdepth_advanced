@@ -111,9 +111,6 @@ class CombinedDataset(Dataset):
                         self.reshape_list[dataset]['resolution'] = (1036,518)
                     elif dataset in ['unreal4k']:
                         self.reshape_list[dataset]['resolution'] = (924,518)
-                    elif dataset in ['tartanair']:
-                        self.reshape_list[dataset]['resolution'] = (518, 518)
-                        self.reshape_list[dataset]['crop_type'] = 'center' 
 
 
         elif resolution == '2k':
@@ -252,22 +249,34 @@ class CombinedDataset(Dataset):
         )
         return fx
 
-    def _apply_canonical_transform(self, inverse_depth_actual, fx_actual):
+    def _apply_canonical_transform(self, inverse_depth_actual, fx_actual,
+                                   original_h, original_w,
+                                   target_resolution, resize_factor=1.0):
         """
-        Apply canonical transformation to inverse depth and compute actual space valid mask.
+        Apply Metric3D-style canonical transformation to inverse depth.
 
-        Canonical space: fx=500 at 518×518 resolution
+        This follows Metric3D's principle: when resizing images, focal length should
+        be scaled proportionally. If actual resize differs from theoretical resize
+        (fx_ratio), GT depth must be corrected.
+
+        Canonical space: fx=500 at target_resolution (e.g., 518×518 or 784×518)
 
         Args:
             inverse_depth_actual (np.ndarray or torch.Tensor): Inverse depth in actual space (1/m)
-            fx_actual (float): Actual focal length in pixels
+            fx_actual (float): Actual focal length in pixels at original resolution
+            original_h (int): Original image height
+            original_w (int): Original image width
+            target_resolution (tuple): Target (height, width) after resize+crop
+            resize_factor (float): Dataset-specific pre-resize factor (default: 1.0)
 
         Returns:
-            tuple: (inverse_depth_canonical, fx_canonical, fx_actual, actual_valid_mask)
-                - inverse_depth_canonical: Inverse depth in canonical space (1/m)
+            tuple: (inverse_depth_canonical, fx_canonical, fx_actual, actual_valid_mask, fx_ratio, resize_ratio)
+                - inverse_depth_canonical: Corrected inverse depth for canonical space (1/m)
                 - fx_canonical: Canonical focal length (500.0)
-                - fx_actual: Original actual focal length (for visualization)
+                - fx_actual: Original actual focal length (for reference)
                 - actual_valid_mask: Valid mask in actual space (<70m)
+                - fx_ratio: Focal length ratio (CANONICAL_FX / fx_actual)
+                - resize_ratio: Total resize ratio (resize_factor × small_resize_ratio)
         """
         # Convert to numpy for computation
         is_torch = isinstance(inverse_depth_actual, torch.Tensor)
@@ -284,10 +293,29 @@ class CombinedDataset(Dataset):
         # Compute actual space valid mask: depth > 0 AND depth < 70m
         actual_valid_mask = (depth_actual > 0) & (depth_actual < ACTUAL_MAX_DEPTH)
 
-        # Apply canonical transformation to inverse depth
-        # For inverse depth: inverse_canonical = inverse_actual × (fx_actual / fx_canonical)
-        canonical_ratio = fx_actual / CANONICAL_FOCAL_LENGTH
-        inverse_canonical_np = inverse_np * canonical_ratio
+        # Metric3D-style canonicalization
+        # Step 1: Apply dataset-specific pre-resize
+        pre_h = int(original_h * resize_factor)
+        pre_w = int(original_w * resize_factor)
+
+        # Step 2: Compute small_resize_ratio (shorter side matches target)
+        # NOTE: target_resolution is stored as (W, H), not (H, W)!
+        target_w, target_h = target_resolution  # Unpack as (W, H)
+        small_resize_ratio = max(target_w / pre_w, target_h / pre_h)  # W→W, H→H
+
+        # Step 3: Focal length ratio
+        fx_ratio = CANONICAL_FOCAL_LENGTH / fx_actual  # 500 / fx_actual
+
+        # Step 4: Total resize ratio (original → final)
+        total_resize_ratio = resize_factor * small_resize_ratio
+
+        # Step 5: Depth correction for inverse depth space
+        # Theory: depth_metric_corrected = depth_actual × (actual_resize / theoretical_resize)
+        #         theoretical_resize = fx_ratio (to match focal length change)
+        #         actual_resize = total_resize_ratio
+        # For inverse depth: inverse_corrected = inverse_actual × (total_resize_ratio / fx_ratio)
+        depth_correction_ratio = total_resize_ratio / fx_ratio
+        inverse_canonical_np = inverse_np * depth_correction_ratio
 
         # Convert back to torch if input was torch
         if is_torch:
@@ -296,8 +324,8 @@ class CombinedDataset(Dataset):
         else:
             inverse_canonical = inverse_canonical_np
 
-        # Return fx_actual for visualization (shows original dataset focal length)
-        return inverse_canonical, CANONICAL_FOCAL_LENGTH, fx_actual, actual_valid_mask
+        # Return fx_ratio and resize_ratio for visualization
+        return inverse_canonical, CANONICAL_FOCAL_LENGTH, fx_actual, actual_valid_mask, fx_ratio, total_resize_ratio
 
     def __len__(self):
         return len(self.pairs)
@@ -317,6 +345,12 @@ class CombinedDataset(Dataset):
             focal_lengths_canonical = []
             focal_lengths_actual = []
             actual_valid_masks = []
+            fx_ratios = []  # NEW
+            resize_ratios = []  # NEW
+
+            # Get dataset-specific settings
+            target_resolution = self.reshape_list[dataset_idx]['resolution']  # (H, W)
+            resize_factor = self.reshape_list[dataset_idx].get('resize_factor', 1.0)
 
             for pair in scene:
                 # Debug: check if pair is string or dict
@@ -331,13 +365,13 @@ class CombinedDataset(Dataset):
                     # Keep GT at ORIGINAL resolution (like original FlashDepth)
                     # Prediction will be interpolated to GT resolution during validation
 
-                    # Get focal length for this frame
-                    image_shape = image.shape[1:]  # (H, W) from (C, H, W)
-                    fx_actual = self._get_focal_length(dataset_idx, pair, image_shape)
+                    # Get focal length for this frame (at original resolution)
+                    original_h, original_w = depth_inverse_actual.shape
+                    fx_actual = self._get_focal_length(dataset_idx, pair, (original_h, original_w))
 
-                    # Apply canonical transformation (now returns 4 values)
-                    depth_inverse_canonical, fx_canonical, fx_actual_returned, actual_valid_mask = self._apply_canonical_transform(
-                        depth_inverse_actual, fx_actual
+                    # Apply Metric3D-style canonical transformation (now returns 6 values)
+                    depth_inverse_canonical, fx_canonical, fx_actual_returned, actual_valid_mask, fx_ratio, resize_ratio = self._apply_canonical_transform(
+                        depth_inverse_actual, fx_actual, original_h, original_w, target_resolution, resize_factor
                     )
 
                     images.append(image)
@@ -350,6 +384,8 @@ class CombinedDataset(Dataset):
                     focal_lengths_canonical.append(fx_canonical) # 500.0
                     focal_lengths_actual.append(fx_actual_returned) # Original fx for visualization
                     actual_valid_masks.append(actual_valid_mask) # Actual space mask (<70m)
+                    fx_ratios.append(fx_ratio)  # NEW
+                    resize_ratios.append(resize_ratio)  # NEW
                 except Exception as e:
                     print(f"Error loading validation pair: {e}")
                     continue
@@ -362,11 +398,15 @@ class CombinedDataset(Dataset):
             return_name = dataset_idx
             focal_lengths_canonical_tensor = torch.tensor(focal_lengths_canonical, dtype=torch.float32)
             focal_lengths_actual_tensor = torch.tensor(focal_lengths_actual, dtype=torch.float32)
+            fx_ratio_tensor = torch.tensor(fx_ratios, dtype=torch.float32)  # NEW
+            resize_ratio_tensor = torch.tensor(resize_ratios, dtype=torch.float32)  # NEW
             return (torch.stack(images).float(),
                     torch.stack(depths_canonical).float(),
                     focal_lengths_canonical_tensor,
                     focal_lengths_actual_tensor,
                     torch.stack(actual_valid_masks).bool(),
+                    fx_ratio_tensor,  # NEW
+                    resize_ratio_tensor,  # NEW
                     return_name)
 
 
@@ -384,18 +424,24 @@ class CombinedDataset(Dataset):
             focal_lengths_canonical = []
             focal_lengths_actual = []
             actual_valid_masks = []
+            fx_ratios = []  # NEW
+            resize_ratios = []  # NEW
+
+            # Get dataset-specific settings
+            target_resolution = self.reshape_list[dataset_idx]['resolution']  # (H, W)
+            resize_factor = self.reshape_list[dataset_idx].get('resize_factor', 1.0)
 
             for pair in scene:
                 image, _current_crop = _load_and_process_image(pair['image'], **self.reshape_list[dataset_idx])
                 depth_inverse_actual = self.depth_read_list[dataset_idx](pair['depth'], is_inverse=True) # Load inverse depth (1/m)
 
-                # Get focal length for this frame
-                image_shape = image.shape[1:]  # (H, W) from (C, H, W)
-                fx_actual = self._get_focal_length(dataset_idx, pair, image_shape)
+                # Get focal length for this frame (at original resolution)
+                original_h, original_w = depth_inverse_actual.shape
+                fx_actual = self._get_focal_length(dataset_idx, pair, (original_h, original_w))
 
-                # Apply canonical transformation (now returns 4 values)
-                depth_inverse_canonical, fx_canonical, fx_actual_returned, actual_valid_mask = self._apply_canonical_transform(
-                    depth_inverse_actual, fx_actual
+                # Apply Metric3D-style canonical transformation (now returns 6 values)
+                depth_inverse_canonical, fx_canonical, fx_actual_returned, actual_valid_mask, fx_ratio, resize_ratio = self._apply_canonical_transform(
+                    depth_inverse_actual, fx_actual, original_h, original_w, target_resolution, resize_factor
                 )
 
                 images.append(image)
@@ -408,15 +454,21 @@ class CombinedDataset(Dataset):
                 focal_lengths_canonical.append(fx_canonical) # 500.0
                 focal_lengths_actual.append(fx_actual_returned) # Original fx for visualization
                 actual_valid_masks.append(actual_valid_mask) # Actual space mask (<70m)
+                fx_ratios.append(fx_ratio)  # NEW
+                resize_ratios.append(resize_ratio)  # NEW
 
             return_name = os.path.join(dataset_idx, pair['scene_name'])
             focal_lengths_canonical_tensor = torch.tensor(focal_lengths_canonical, dtype=torch.float32)
             focal_lengths_actual_tensor = torch.tensor(focal_lengths_actual, dtype=torch.float32)
+            fx_ratio_tensor = torch.tensor(fx_ratios, dtype=torch.float32)  # NEW
+            resize_ratio_tensor = torch.tensor(resize_ratios, dtype=torch.float32)  # NEW
             return (torch.stack(images).float(),
                     torch.stack(depths_canonical).float(),
                     focal_lengths_canonical_tensor,
                     focal_lengths_actual_tensor,
                     torch.stack(actual_valid_masks).bool(),
+                    fx_ratio_tensor,  # NEW
+                    resize_ratio_tensor,  # NEW
                     return_name)
 
 
@@ -483,6 +535,12 @@ class CombinedDataset(Dataset):
         focal_lengths_canonical = []
         focal_lengths_actual = []
         actual_valid_masks = []
+        fx_ratios = []  # NEW: Focal length ratios
+        resize_ratios = []  # NEW: Total resize ratios
+
+        # Get dataset-specific settings
+        target_resolution = self.reshape_list[dataset_idx]['resolution']  # (H, W)
+        resize_factor = self.reshape_list[dataset_idx].get('resize_factor', 1.0)
 
         # Transform scene-relative indices to dataset-relative indices
         sequence_indices = [scene_start_idx + s for s in sequence_indices]
@@ -504,10 +562,10 @@ class CombinedDataset(Dataset):
             original_h, original_w = depth_inverse_actual.shape
             fx_actual = self._get_focal_length(dataset_idx, pair, (original_h, original_w))
 
-            # Apply canonical transformation BEFORE resizing (now returns 4 values)
-            # This computes actual space mask at original resolution
-            depth_inverse_canonical, fx_canonical, fx_actual_returned, actual_valid_mask = self._apply_canonical_transform(
-                depth_inverse_actual, fx_actual
+            # Apply Metric3D-style canonical transformation (now returns 6 values)
+            # This corrects GT depth based on actual vs theoretical resize ratios
+            depth_inverse_canonical, fx_canonical, fx_actual_returned, actual_valid_mask, fx_ratio, resize_ratio = self._apply_canonical_transform(
+                depth_inverse_actual, fx_actual, original_h, original_w, target_resolution, resize_factor
             )
 
             # Convert back to numpy for resizing
@@ -534,6 +592,8 @@ class CombinedDataset(Dataset):
             focal_lengths_canonical.append(fx_canonical)
             focal_lengths_actual.append(fx_actual_returned)
             actual_valid_masks.append(mask_resized)
+            fx_ratios.append(fx_ratio)  # NEW
+            resize_ratios.append(resize_ratio)  # NEW
 
         try:
             images = torch.stack(images, dim=0)  # [T, C, H, W]
@@ -541,6 +601,8 @@ class CombinedDataset(Dataset):
             focal_lengths_canonical_tensor = torch.tensor(focal_lengths_canonical, dtype=torch.float32)  # [T]
             focal_lengths_actual_tensor = torch.tensor(focal_lengths_actual, dtype=torch.float32)  # [T]
             actual_valid_masks_stacked = torch.stack(actual_valid_masks, dim=0)  # [T, H, W]
+            fx_ratio_tensor = torch.tensor(fx_ratios, dtype=torch.float32)  # [T] - NEW
+            resize_ratio_tensor = torch.tensor(resize_ratios, dtype=torch.float32)  # [T] - NEW
         except Exception as e:
             print(f"Error stacking tensors in dataset {dataset_idx}: {e}")
             print(f"Images length: {len(images)}")
@@ -556,5 +618,7 @@ class CombinedDataset(Dataset):
                 focal_lengths_canonical_tensor,
                 focal_lengths_actual_tensor,
                 actual_valid_masks_stacked,
+                fx_ratio_tensor,  # NEW
+                resize_ratio_tensor,  # NEW
                 dataset_idx)
        

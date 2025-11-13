@@ -549,10 +549,22 @@ class Gear5Tester:
         if len(batch) == 0:
             return None
 
-        # CombinedDataset returns (images, depths, focal_lengths, actual_valid_mask, dataset_name) tuple for val/test splits
+        # CombinedDataset returns tuple for val/test splits
         # Convert to dict format for easier access
         if len(batch) > 0 and isinstance(batch[0], tuple):
-            if len(batch[0]) == 5:  # New format with actual_valid_mask
+            if len(batch[0]) == 8:  # New Metric3D format with fx_ratio and resize_ratio
+                images, depths, focal_lengths_canonical, focal_lengths_actual, actual_valid_masks, fx_ratios, resize_ratios, names = zip(*batch)
+                return {
+                    'image': torch.stack(images, dim=0),
+                    'depth': torch.stack(depths, dim=0),
+                    'focal_lengths': torch.stack(focal_lengths_canonical, dim=0),  # Canonical (500.0)
+                    'focal_lengths_actual': torch.stack(focal_lengths_actual, dim=0),  # Original focal lengths
+                    'actual_valid_mask': torch.stack(actual_valid_masks, dim=0),
+                    'fx_ratio': torch.stack(fx_ratios, dim=0),  # NEW: 500 / fx_actual
+                    'resize_ratio': torch.stack(resize_ratios, dim=0),  # NEW: total resize ratio
+                    'dataset_name': names
+                }
+            elif len(batch[0]) == 5:  # Old format with actual_valid_mask (backwards compatibility)
                 images, depths, focal_lengths, actual_valid_masks, names = zip(*batch)
                 return {
                     'image': torch.stack(images, dim=0),
@@ -561,7 +573,7 @@ class Gear5Tester:
                     'actual_valid_mask': torch.stack(actual_valid_masks, dim=0),
                     'dataset_name': names
                 }
-            else:  # Old format without actual_valid_mask (for backwards compatibility)
+            else:  # Older format without actual_valid_mask (for backwards compatibility)
                 images, depths, focal_lengths, names = zip(*batch)
                 return {
                     'image': torch.stack(images, dim=0),
@@ -707,16 +719,44 @@ class Gear5Tester:
         # Canonical transformation is now handled in the dataloader
         CANONICAL_FX = get_canonical_focal_length(self.config)  # 500.0
 
-        # Get fx_actual for de-canonical visualization (retrieve from dataset intrinsics)
-        # focal_lengths tensor now contains canonical fx (500.0), so we need to get actual fx
-        dataset_name = batch.get('dataset_name', ['unknown'])[0]
-        if isinstance(dataset_name, (list, tuple)):
-            dataset_name = dataset_name[0]
-        fx_actual = self._get_actual_focal_length(dataset_name, images.shape)
+        # Get fx_actual for de-canonical visualization
+        # FIXED: Use actual per-frame focal lengths from batch instead of dataset-wide typical_fx
+        # This is critical for datasets like Sintel where fx varies significantly per frame
+        # (e.g., Sintel seq4 has fx=1120, but typical_fx fallback gives 715.4 - 36% error!)
 
-        # Compute de-canonical ratios once for this sequence
-        de_canonical_ratio_inverse = CANONICAL_FX / fx_actual  # For inverse depth space: canonical → actual
-        de_canonical_ratio_metric = fx_actual / CANONICAL_FX   # For metric depth space: canonical → actual
+        if 'focal_lengths_actual' in batch:
+            # Best: Use per-frame actual focal lengths from dataloader
+            fx_actual_tensor = batch['focal_lengths_actual'].to(self.device)  # [1, T]
+            fx_actual_first = fx_actual_tensor[0, 0].item()  # First frame for logging
+        elif 'fx_ratio' in batch:
+            # Alternative: Compute from fx_ratio (fx_actual = CANONICAL_FX / fx_ratio)
+            fx_ratio_tensor = batch['fx_ratio'].to(self.device)  # [1, T]
+            fx_actual_tensor = CANONICAL_FX / fx_ratio_tensor  # [1, T]
+            fx_actual_first = fx_actual_tensor[0, 0].item()
+        else:
+            # Fallback: Use dataset-wide typical_fx (less accurate for per-frame datasets)
+            dataset_name = batch.get('dataset_name', ['unknown'])[0]
+            if isinstance(dataset_name, (list, tuple)):
+                dataset_name = dataset_name[0]
+            fx_actual_first = self._get_actual_focal_length(dataset_name, images.shape)
+            fx_actual_tensor = torch.full((1, T), fx_actual_first, device=self.device)  # [1, T]
+            logger.warning(f"Using fallback typical_fx={fx_actual_first:.1f} (may be inaccurate for per-frame datasets!)")
+
+        # Compute de-canonical ratios (per-frame for accurate de-canonicalization)
+        de_canonical_ratio_inverse = CANONICAL_FX / fx_actual_tensor  # [1, T] - For inverse depth space: canonical → actual
+        de_canonical_ratio_metric = fx_actual_tensor / CANONICAL_FX   # [1, T] - For metric depth space: canonical → actual
+
+        # Log for first frame
+        logger.info(f"fx_actual (frame 0): {fx_actual_first:.1f} pixels")
+
+        # Extract Metric3D canonicalization ratios from batch (if available)
+        if 'fx_ratio' in batch and 'resize_ratio' in batch:
+            fx_ratio = batch['fx_ratio'].to(self.device)  # [1, T] - focal length ratio (500 / fx_actual)
+            resize_ratio = batch['resize_ratio'].to(self.device)  # [1, T] - total resize ratio
+        else:
+            # Fallback for datasets without Metric3D canonicalization
+            fx_ratio = None
+            resize_ratio = None
 
         # Use actual space valid mask from dataloader if available
         # Otherwise fallback to computing from canonical depth
@@ -889,7 +929,8 @@ class Gear5Tester:
 
                 # De-canonicalization: convert from canonical space to actual space (inverse depth)
                 # pred_inverse_actual = pred_inverse_canonical * (CANONICAL_FX / fx_actual)
-                pred_depth_inverse_100 = pred_depth_inverse_100 * de_canonical_ratio_inverse  # [1, 1, H, W] in actual space
+                # Use per-frame fx_actual for correct de-canonicalization
+                pred_depth_inverse_100 = pred_depth_inverse_100 * de_canonical_ratio_inverse[0, t]  # [1, 1, H, W] in actual space
 
                 # Interpolate prediction to GT resolution (like train_gear5.py validation)
                 gt_t_shape = gt_t_inverse.shape[-2:]  # GT original resolution
@@ -1143,6 +1184,8 @@ class Gear5Tester:
                 'importance_map': importance_maps[best_frame_idx, 0],  # [H, W]
                 'scale': scales[best_frame_idx, 0],  # scalar
                 'shift': shifts[best_frame_idx, 0],  # scalar
+                'fx_ratio': fx_ratio[0, best_frame_idx].item() if fx_ratio is not None else None,  # scalar - NEW
+                'resize_ratio': resize_ratio[0, best_frame_idx].item() if resize_ratio is not None else None,  # scalar - NEW
             }
 
             self._save_best_frame_visualizations(
@@ -1444,7 +1487,7 @@ class Gear5Tester:
             align_corners=True
         ).squeeze().numpy()
 
-        # Create figure with 4x3 grid layout matching train_gear3_upgrade
+        # Create figure with 4x3 grid layout matching train_gear4
         fig = plt.figure(figsize=(15, 16))
         gs = gridspec.GridSpec(4, 3, figure=fig, hspace=0.3, wspace=0.3)
 

@@ -1,4 +1,4 @@
-# Gear2 Configuration - ViT-L variant
+# Gear4 Configuration - ViT-L variant
 # Stage 1: Train on 5 datasets (518×518)
 # Use for: Initial training with ViT-L backbone
 
@@ -29,10 +29,10 @@ training:
   val_freq: 1000  # Validation every 1k steps
   log_freq: 100
   wandb: false
-  wandb_name: "gear3_upgrade_l_stage1"
+  wandb_name: "gear4_l_stage1"
 
   # Learning rates (Gear2 specific)
-  gear3_upgrade_lr: 1.0e-4  # For new Gear2 modules
+  gear4_lr: 1.0e-4  # For new Gear2 modules
   mamba_lr: 1.0e-4  # For Mamba (train from scratch)
   final_head_lr: 5.0e-5  # For output_conv1/2
   weight_decay: 1.0e-6
@@ -70,7 +70,7 @@ eval:
   compile: false
   metrics: true
   save_grid: true
-  outfolder: "test_gear3_upgrade_l"
+  outfolder: "test_gear4_l"
   test_datasets: [sintel]
   test_dataset_resolution: 'base'
   random_input: null
@@ -87,6 +87,3 @@ eval:
 object_wise:
   enabled: false  # Enable object-wise evaluation (set via CLI: object_wise.enabled=true)
   dataset: waymo_seg  # Dataset type for object-wise eval: waymo_seg, sintel
-
-# Gear3 Upgrade specific settings
-separation_method: cls_seg  # FG/BG separation method: cls_seg (CLS token), kmeans, multi_layer

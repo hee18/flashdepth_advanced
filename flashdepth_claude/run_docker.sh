@@ -38,15 +38,18 @@ show_usage() {
     echo "  train_gear3 Start Gear3 training (single GPU)"
     echo "  train_gear3_ddp Start Gear3 training with 2 GPUs (GPU 0,1)"
     echo "  test_gear3  Start Gear3 testing with default settings"
-    echo "  train_gear3_upgrade Start Gear3 Upgrade training (single GPU) - Enhanced FG/BG separation"
-    echo "  train_gear3_upgrade_ddp Start Gear3 Upgrade training with 2 GPUs (GPU 0,1)"
-    echo "  test_gear3_upgrade  Start Gear3 Upgrade testing (supports --separation option)"
+    echo "  train_gear4 Start Gear4 training (single GPU) - Enhanced FG/BG separation"
+    echo "  train_gear4_ddp Start Gear4 training with 2 GPUs (GPU 0,1)"
+    echo "  test_gear4  Start Gear4 testing"
     echo "  train_gear5     Start Gear5 training - Two-stage Global + FG modulation"
     echo "  train_gear5_ddp Start Gear5 training with 2 GPUs (GPU 0,1) - Two-stage Global + FG modulation"
     echo "  test_gear5      Start Gear5 testing"
+    echo "  train_gear5_film     Start Gear5 FiLM training - Channel-wise FiLM modulation before Mamba"
+    echo "  train_gear5_film_ddp Start Gear5 FiLM training with 2 GPUs (GPU 0,1)"
+    echo "  test_gear5_film      Start Gear5 FiLM testing"
     echo "  test_gear2_objwise  Start Gear2 object-wise evaluation (Waymo segmentation)"
     echo "  test_gear3_objwise  Start Gear3 object-wise evaluation (Waymo segmentation)"
-    echo "  test_gear3_upgrade_objwise  Start Gear3 Upgrade object-wise evaluation"
+    echo "  test_gear4_objwise  Start Gear4 object-wise evaluation"
     echo "  test_gear5_objwise  Start Gear5 object-wise evaluation"
     echo "  test_original_flashdepth  Test original FlashDepth (without Gear modules) for comparison"
     echo "  shell       Start interactive shell in container"
@@ -67,7 +70,6 @@ show_usage() {
     echo "  --measure-fps BOOL    Enable/disable FPS measurement (default: true)"
     echo "  --config-variant VARIANT  Set Gear config variant: l, s, hybrid (default: l for Stage 1)"
     echo "  --nuscenes            Enable nuScenes fine-tuning mode (Stage 3)"
-    echo "  --separation METHOD  Set FG/BG separation method: cls_seg, kmeans, multi_layer (default: cls_seg)"
     echo "  --dataset DATASET     Set object-wise evaluation dataset: waymo (default: waymo)"
     echo "  --resolution MODE    Set resolution mode for testing: base (518x518), 2k (1918x1078) (default: base)"
     echo "  --config VARIANT     Set FlashDepth config: flashdepth, flashdepth-l, flashdepth-s (default: flashdepth-l)"
@@ -75,6 +77,7 @@ show_usage() {
     echo "  --no-video           Skip video (GIF/MP4) generation for faster testing"
     echo "  --whole-seq-test BOOL    Use all sequences in dataset (true) or first 8 sequences only (false, default: false)"
     echo "  --canon BOOL         Use canonical focal length normalization (default: true)"
+    echo "  --loss TYPE          Set loss type for Gear5: log_l1 (default), importance (importance-weighted)"
     echo ""
     echo "Note: Regularization losses are deprecated. Importance map now uses raw DINOv2 attention (frozen)."
     echo ""
@@ -93,17 +96,15 @@ show_usage() {
     echo "  $0 test_gear3                         # Start Gear3 testing with defaults"
     echo "  $0 test_gear3 --vid-len 25 --gpu 1    # Test Gear3 with custom settings"
     echo "  $0 test_gear3 --single-sequence /data/datasets/dynamicreplica/train/0b10c6-3_obj_source_left  # Test single sequence"
-    echo "  $0 train_gear3_upgrade                # Start Gear3 Upgrade training (cls_seg method)"
-    echo "  $0 train_gear3_upgrade --separation kmeans  # Train with K-means clustering"
-    echo "  $0 train_gear3_upgrade_ddp --separation multi_layer  # DDP with multi-layer fusion"
-    echo "  $0 test_gear3_upgrade                 # Start Gear3 Upgrade testing with defaults (cls_seg)"
-    echo "  $0 test_gear3_upgrade --separation kmeans --gpu 1  # Test with K-means separation method"
-    echo "  $0 test_gear3_upgrade --vid-len 25 --frame-interval 5  # Custom video length and interval"
-    echo "  $0 test_gear3_upgrade --dataset waymo --gpu 2  # Test on Waymo dataset"
-    echo "  $0 test_gear3_upgrade --vid-len 200 --no-video --gpu 2  # Fast testing without video generation"
+    echo "  $0 train_gear4                # Start Gear4 training"
+    echo "  $0 train_gear4_ddp            # DDP training with 2 GPUs"
+    echo "  $0 test_gear4                 # Start Gear4 testing"
+    echo "  $0 test_gear4 --vid-len 25 --frame-interval 5  # Custom video length and interval"
+    echo "  $0 test_gear4 --dataset waymo --gpu 2  # Test on Waymo dataset"
+    echo "  $0 test_gear4 --vid-len 200 --no-video --gpu 2  # Fast testing without video generation"
     echo "  $0 test_gear2_objwise --dataset waymo_seg --config-variant l --gpu 0  # Object-wise evaluation on Waymo"
     echo "  $0 test_gear3_objwise --dataset waymo_seg --config-variant l --gpu 1  # Object-wise evaluation on Waymo"
-    echo "  $0 test_gear3_upgrade_objwise --dataset waymo_seg --config-variant l --separation kmeans --gpu 2  # Gear3 Upgrade object-wise"
+    echo "  $0 test_gear4_objwise --dataset waymo_seg --config-variant l --gpu 2  # Gear4 object-wise"
     echo "  $0 test_gear5_objwise --dataset waymo_seg --gpu 0  # Gear5 object-wise evaluation"
     echo "  $0 test_gear5_objwise --dataset urbansyn --gpu 1  # Gear5 object-wise evaluation on UrbanSyn"
     echo "  $0 train_gear2_ddp --config-variant hybrid --gear-checkpoint train_results/gear2_s/best.pth  # Hybrid training with Gear-S weights"
@@ -130,7 +131,6 @@ SINGLE_SEQUENCE=""  # Path to single sequence directory (optional)
 MEASURE_FPS="true"
 CONFIG_VARIANT="l"  # Gear config variant: l (Stage 1 ViT-L), s (Stage 1 ViT-S), hybrid (Stage 2)
 NUSCENES="false"  # nuScenes fine-tuning mode (Stage 3)
-SEPARATION_METHOD="multi_layer"  # FG/BG separation method for Gear3 Upgrade (cls_seg, kmeans, multi_layer)
 CONFIG="flashdepth-l"  # FlashDepth config variant (flashdepth, flashdepth-l, flashdepth-s)
 INVERSE="false"  # Inverse colormap for depth visualization (original FlashDepth only)
 OBJWISE_DATASET=""  # Dataset for evaluation (waymo) - empty means use config default
@@ -138,12 +138,13 @@ RESOLUTION="base"  # Resolution mode for testing (base, 2k) - default to base (5
 NO_VIDEO="false"  # Skip video (GIF/MP4) generation for faster testing
 WHOLE_SEQ_TEST="false"  # Use all sequences in dataset (true) or first 8 sequences only (false, default)
 USE_CANONICAL="true"  # Use canonical focal length normalization (default: true)
+LOSS_TYPE="log_l1"  # Loss type for Gear5 training: log_l1 (default), importance (importance-weighted)
 
 # Parse arguments
 USER_BATCH_SIZE=""  # Track if user explicitly set batch size
 while [[ $# -gt 0 ]]; do
     case $1 in
-        build|train|test|train_gear2|train_gear2_ddp|test_gear2|train_gear3|train_gear3_ddp|test_gear3|train_gear3_upgrade|train_gear3_upgrade_ddp|test_gear3_upgrade|train_gear5|train_gear5_ddp|test_gear5|test_gear2_objwise|test_gear3_objwise|test_gear3_upgrade_objwise|test_gear5_objwise|test_original_flashdepth|shell|clean|logs)
+        build|train|test|train_gear2|train_gear2_ddp|test_gear2|train_gear3|train_gear3_ddp|test_gear3|train_gear4|train_gear4_ddp|test_gear4|train_gear5|train_gear5_ddp|test_gear5|train_gear5_film|train_gear5_film_ddp|test_gear5_film|test_gear2_objwise|test_gear3_objwise|test_gear4_objwise|test_gear5_objwise|test_original_flashdepth|shell|clean|logs)
             COMMAND="$1"
             shift
             ;;
@@ -200,10 +201,6 @@ while [[ $# -gt 0 ]]; do
             NUSCENES="true"
             shift
             ;;
-        --separation)
-            SEPARATION_METHOD="$2"
-            shift 2
-            ;;
         --dataset)
             OBJWISE_DATASET="$2"
             shift 2
@@ -232,6 +229,10 @@ while [[ $# -gt 0 ]]; do
             USE_CANONICAL="$2"
             shift 2
             ;;
+        --loss)
+            LOSS_TYPE="$2"
+            shift 2
+            ;;
         -h|--help)
             show_usage
             exit 0
@@ -243,10 +244,6 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
-
-# Normalize separation method (convert hyphens to underscores for Python compatibility)
-# User can use --separation multi-layer but Python expects multi_layer
-SEPARATION_METHOD="${SEPARATION_METHOD//-/_}"
 
 # Set CUDA_VISIBLE_DEVICES environment variable
 export CUDA_VISIBLE_DEVICES=$GPU_ID
@@ -556,7 +553,7 @@ case $COMMAND in
         eval $DOCKER_CMD
         ;;
 
-    train_gear3_upgrade)
+    train_gear4)
         # Auto-select checkpoint based on config variant if user didn't specify
         if [ "$FLASHDEPTH_CHECKPOINT" = "configs/flashdepth-l/iter_10001.pth" ]; then
             # User didn't specify checkpoint, auto-select based on variant
@@ -587,11 +584,10 @@ case $COMMAND in
             RES_NAME="base"
         fi
 
-        echo "Starting Gear3 Upgrade training (Single GPU) - Enhanced FG/BG Separation..."
+        echo "Starting Gear4 training (Single GPU) - Enhanced FG/BG Separation..."
         echo "Configuration:"
         echo "  - Config variant: $CONFIG_VARIANT"
         echo "  - nuScenes mode: $NUSCENES"
-        echo "  - Separation method: $SEPARATION_METHOD"
         echo "  - Batch size: $BATCH_SIZE"
         echo "  - Workers: $WORKERS"
         echo "  - Total iterations: $TOTAL_ITERS"
@@ -601,15 +597,14 @@ case $COMMAND in
         echo "  - Canonical focal length: $CANONICAL_FX ($RES_NAME resolution)"
         echo ""
 
-        # Build train_gear3_upgrade command with config variant
-        DOCKER_CMD="CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm flashdepth python train_gear3_upgrade.py \
-            --config-path configs/gear3_upgrade \
+        # Build train_gear4 command with config variant
+        DOCKER_CMD="CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm flashdepth python train_gear4.py \
+            --config-path configs/gear4 \
             --config-name config_$CONFIG_VARIANT \
             dataset.data_root=/data/datasets \
             training.batch_size=$BATCH_SIZE \
             training.workers=$WORKERS \
             training.iterations=$TOTAL_ITERS \
-            separation_method=$SEPARATION_METHOD \
             use_canonical_space=$USE_CANONICAL \
             +results_dir=$RESULTS_DIR"
 
@@ -618,7 +613,7 @@ case $COMMAND in
             DOCKER_CMD="$DOCKER_CMD +nuscenes=true"
         fi
 
-        # Add checkpoint loading - Gear3 Upgrade requires FlashDepth or Gear3 Upgrade pretrained weights
+        # Add checkpoint loading - Gear4 requires FlashDepth or Gear4 pretrained weights
         if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
             DOCKER_CMD="$DOCKER_CMD load=$FLASHDEPTH_CHECKPOINT"
         fi
@@ -626,7 +621,7 @@ case $COMMAND in
         eval $DOCKER_CMD
         ;;
 
-    train_gear3_upgrade_ddp)
+    train_gear4_ddp)
         # Auto-select checkpoint based on config variant if user didn't specify
         if [ "$FLASHDEPTH_CHECKPOINT" = "configs/flashdepth-l/iter_10001.pth" ]; then
             # User didn't specify checkpoint, auto-select based on variant
@@ -673,11 +668,10 @@ case $COMMAND in
             RES_NAME="base"
         fi
 
-        echo "Starting Gear3 Upgrade training (Multi-GPU: 0,1) - Enhanced FG/BG Separation..."
+        echo "Starting Gear4 training (Multi-GPU: 0,1) - Enhanced FG/BG Separation..."
         echo "Configuration:"
         echo "  - Config variant: $CONFIG_VARIANT"
         echo "  - nuScenes mode: $NUSCENES"
-        echo "  - Separation method: $SEPARATION_METHOD"
         echo "  - Batch size per GPU: $BATCH_SIZE"
         echo "  - Effective batch size: $((BATCH_SIZE * 2))"
         echo "  - Workers per GPU: $ACTUAL_WORKERS"
@@ -696,15 +690,14 @@ case $COMMAND in
             flashdepth torchrun \
             --standalone \
             --nproc_per_node=2 \
-            train_gear3_upgrade.py \
-            --config-path configs/gear3_upgrade \
+            train_gear4.py \
+            --config-path configs/gear4 \
             --config-name config_$CONFIG_VARIANT \
             dataset.data_root=/data/datasets \
             training.batch_size=$BATCH_SIZE \
             training.workers=$ACTUAL_WORKERS \
             training.iterations=$TOTAL_ITERS \
             training.measure_fps=$MEASURE_FPS \
-            separation_method=$SEPARATION_METHOD \
             use_canonical_space=$USE_CANONICAL \
             +results_dir=$RESULTS_DIR"
 
@@ -826,16 +819,15 @@ case $COMMAND in
         CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm flashdepth $TEST_CMD
         ;;
 
-    test_gear3_upgrade)
-        # Set default checkpoint for gear3_upgrade if not explicitly provided
+    test_gear4)
+        # Set default checkpoint for gear4 if not explicitly provided
         if [ "$FLASHDEPTH_CHECKPOINT" == "configs/flashdepth-l/iter_10001.pth" ]; then
-            FLASHDEPTH_CHECKPOINT="train_results/results_14/gear_3_upgrade/phase_1/best.pth"
+            FLASHDEPTH_CHECKPOINT="train_results/results_14/gear_4/phase_1/best.pth"
         fi
 
-        echo "Starting Gear3 Upgrade testing - Enhanced FG/BG Separation..."
+        echo "Starting Gear4 testing - Enhanced FG/BG Separation..."
         echo "Configuration:"
         echo "  - Config variant: $CONFIG_VARIANT"
-        echo "  - Separation method: $SEPARATION_METHOD"
         echo "  - GPU: $GPU_ID"
         echo "  - Results directory: $RESULTS_DIR"
         echo "  - Video length: $VID_LEN"
@@ -849,8 +841,8 @@ case $COMMAND in
         fi
         echo ""
 
-        # Build test_gear3_upgrade command with config variant
-        TEST_CMD="python test_gear3_upgrade.py --config-path configs/gear3_upgrade --config-name config_$CONFIG_VARIANT dataset.data_root=/data/datasets +results_dir=$RESULTS_DIR +gpu=$GPU_ID separation_method=$SEPARATION_METHOD"
+        # Build test_gear4 command with config variant
+        TEST_CMD="python test_gear4.py --config-path configs/gear4 --config-name config_$CONFIG_VARIANT dataset.data_root=/data/datasets +results_dir=$RESULTS_DIR +gpu=$GPU_ID"
 
         # Override dataset if specified
         if [ -n "$OBJWISE_DATASET" ]; then
@@ -878,7 +870,7 @@ case $COMMAND in
             TEST_CMD="$TEST_CMD +single_sequence=$SINGLE_SEQUENCE"
         fi
 
-        # Run test_gear3_upgrade.py with custom parameters (with GPU selection)
+        # Run test_gear4.py with custom parameters (with GPU selection)
         CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm flashdepth $TEST_CMD
         ;;
 
@@ -943,16 +935,14 @@ case $COMMAND in
         CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm flashdepth $TEST_CMD
         ;;
 
-    test_gear3_upgrade_objwise)
-        # Object-wise evaluation for Gear3 Upgrade
+    test_gear4_objwise)
+        # Object-wise evaluation for Gear4
         OBJWISE_DATASET=${OBJWISE_DATASET:-waymo_seg}  # Default to waymo_seg
-        SEPARATION_METHOD=${SEPARATION_METHOD:-kmeans}  # Default separation method
 
-        echo "Starting Gear3 Upgrade Object-Wise Evaluation..."
+        echo "Starting Gear4 Object-Wise Evaluation..."
         echo "Configuration:"
         echo "  - Config variant: $CONFIG_VARIANT"
         echo "  - Dataset: $OBJWISE_DATASET"
-        echo "  - Separation method: $SEPARATION_METHOD"
         echo "  - GPU: $GPU_ID"
         echo "  - Results directory: $RESULTS_DIR"
         echo "  - Video length: $VID_LEN"
@@ -960,7 +950,7 @@ case $COMMAND in
         echo ""
 
         # Build command with object-wise options
-        TEST_CMD="python test_gear3_upgrade.py --config-path configs/gear3_upgrade --config-name config_$CONFIG_VARIANT dataset.data_root=/data/datasets eval.test_datasets=[$OBJWISE_DATASET] +results_dir=$RESULTS_DIR +gpu=$GPU_ID separation_method=$SEPARATION_METHOD object_wise.enabled=true object_wise.dataset=${OBJWISE_DATASET/_seg/} +vid_len=$VID_LEN +whole_test=$WHOLE_TEST"
+        TEST_CMD="python test_gear4.py --config-path configs/gear4 --config-name config_$CONFIG_VARIANT dataset.data_root=/data/datasets eval.test_datasets=[$OBJWISE_DATASET] +results_dir=$RESULTS_DIR +gpu=$GPU_ID object_wise.enabled=true object_wise.dataset=${OBJWISE_DATASET/_seg/} +vid_len=$VID_LEN +whole_test=$WHOLE_TEST"
 
         if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
             TEST_CMD="$TEST_CMD load=$FLASHDEPTH_CHECKPOINT"
@@ -970,13 +960,14 @@ case $COMMAND in
         ;;
 
     train_gear5)
-        echo "Starting Gear5 training - Two-Stage Global + FG Modulation..."
+        echo "Starting Gear5 training..."
         echo "Configuration:"
         echo "  - Batch size: $BATCH_SIZE"
         echo "  - Workers: $WORKERS"
         echo "  - GPU: $GPU_ID"
         echo "  - Results directory: $RESULTS_DIR"
         echo "  - FlashDepth checkpoint: $FLASHDEPTH_CHECKPOINT"
+        echo "  - Loss type: $LOSS_TYPE"
         echo ""
 
         # Build train_gear5 command
@@ -989,6 +980,7 @@ case $COMMAND in
             training.iterations=$TOTAL_ITERS \
             +config_variant=$CONFIG_VARIANT \
             use_canonical_space=$USE_CANONICAL \
+            +loss_type=$LOSS_TYPE \
             +results_dir=$RESULTS_DIR"
 
         # Add FlashDepth checkpoint (ViT + DPT pretrained weights)
@@ -1022,7 +1014,7 @@ case $COMMAND in
             RES_NAME="base"
         fi
 
-        echo "Starting Gear5 training (Multi-GPU: 0,1) - Two-Stage Global + FG Modulation..."
+        echo "Starting Gear5 training (Multi-GPU: 0,1)..."
         echo "Configuration:"
         echo "  - Config variant: $CONFIG_VARIANT"
         echo "  - Resolution: $RES_NAME"
@@ -1034,6 +1026,7 @@ case $COMMAND in
         echo "  - Results directory: $RESULTS_DIR"
         echo "  - FPS measurement: $MEASURE_FPS"
         echo "  - FlashDepth checkpoint: $FLASHDEPTH_CHECKPOINT"
+        echo "  - Loss type: $LOSS_TYPE"
         echo ""
 
         DOCKER_CMD="CUDA_VISIBLE_DEVICES=0,1 docker compose run --rm \
@@ -1053,6 +1046,7 @@ case $COMMAND in
             training.measure_fps=$MEASURE_FPS \
             +config_variant=$CONFIG_VARIANT \
             use_canonical_space=$USE_CANONICAL \
+            +loss_type=$LOSS_TYPE \
             +results_dir=$RESULTS_DIR"
 
         # Add FlashDepth checkpoint (ViT + DPT pretrained weights)
@@ -1117,6 +1111,110 @@ case $COMMAND in
             +vid_len=$VID_LEN \
             +whole_seq_test=$WHOLE_TEST"
 
+        if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
+            TEST_CMD="$TEST_CMD load=$FLASHDEPTH_CHECKPOINT"
+        fi
+
+        CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm flashdepth $TEST_CMD
+        ;;
+
+    train_gear5_film)
+        echo "Starting Gear5 FiLM training..."
+        echo "Configuration:"
+        echo "  - Batch size: $BATCH_SIZE"
+        echo "  - Workers: $WORKERS"
+        echo "  - GPU: $GPU_ID"
+        echo "  - Results directory: $RESULTS_DIR"
+        echo "  - FlashDepth checkpoint: $FLASHDEPTH_CHECKPOINT"
+        echo "  - Loss type: $LOSS_TYPE"
+        echo ""
+
+        # Build train_gear5_film command
+        DOCKER_CMD="CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm flashdepth python train_gear5_film.py \
+            --config-path configs/gear5_film \
+            --config-name config \
+            dataset.data_root=/data/datasets \
+            training.batch_size=$BATCH_SIZE \
+            training.workers=$WORKERS \
+            training.iterations=$TOTAL_ITERS \
+            use_canonical_space=$USE_CANONICAL \
+            +loss_type=$LOSS_TYPE \
+            +results_dir=$RESULTS_DIR"
+
+        # Add FlashDepth checkpoint (ViT + DPT + Mamba pretrained weights)
+        if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
+            DOCKER_CMD="$DOCKER_CMD load=$FLASHDEPTH_CHECKPOINT"
+        fi
+
+        eval $DOCKER_CMD
+        ;;
+
+    train_gear5_film_ddp)
+        # Gear5 FiLM DDP training with 2 GPUs
+        ACTUAL_WORKERS=$WORKERS
+        CANONICAL_FX="500.0"
+
+        echo "Starting Gear5 FiLM training (Multi-GPU: 0,1)..."
+        echo "Configuration:"
+        echo "  - Batch size per GPU: $BATCH_SIZE"
+        echo "  - Effective batch size: $((BATCH_SIZE * 2))"
+        echo "  - Workers per GPU: $ACTUAL_WORKERS"
+        echo "  - Total iterations: $TOTAL_ITERS"
+        echo "  - GPUs: 0,1"
+        echo "  - Results directory: $RESULTS_DIR"
+        echo "  - FPS measurement: $MEASURE_FPS"
+        echo "  - FlashDepth checkpoint: $FLASHDEPTH_CHECKPOINT"
+        echo "  - Loss type: $LOSS_TYPE"
+        echo ""
+
+        DOCKER_CMD="CUDA_VISIBLE_DEVICES=0,1 docker compose run --rm \
+            -e GLOO_SOCKET_IFNAME=eth0 \
+            -e NCCL_SOCKET_IFNAME=eth0 \
+            -e NCCL_P2P_DISABLE=1 \
+            flashdepth torchrun \
+            --standalone \
+            --nproc_per_node=2 \
+            train_gear5_film.py \
+            --config-path configs/gear5_film \
+            --config-name config \
+            dataset.data_root=/data/datasets \
+            training.batch_size=$BATCH_SIZE \
+            training.workers=$ACTUAL_WORKERS \
+            training.iterations=$TOTAL_ITERS \
+            training.measure_fps=$MEASURE_FPS \
+            use_canonical_space=$USE_CANONICAL \
+            +loss_type=$LOSS_TYPE \
+            +results_dir=$RESULTS_DIR"
+
+        # Add FlashDepth checkpoint (ViT + DPT + Mamba pretrained weights)
+        if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
+            DOCKER_CMD="$DOCKER_CMD load=$FLASHDEPTH_CHECKPOINT"
+        fi
+
+        eval $DOCKER_CMD
+        ;;
+
+    test_gear5_film)
+        echo "Starting Gear5 FiLM testing..."
+        echo "Configuration:"
+        echo "  - Video length: $VID_LEN"
+        echo "  - Frame interval: $FRAME_INTERVAL"
+        echo "  - GPU: $GPU_ID"
+        echo "  - Results directory: $RESULTS_DIR"
+        echo "  - Checkpoint: $FLASHDEPTH_CHECKPOINT"
+        echo ""
+
+        # Build test_gear5_film command
+        TEST_CMD="python test_gear5_film.py \
+            --config-path configs/gear5_film \
+            --config-name config \
+            dataset.data_root=/data/datasets \
+            +results_dir=$RESULTS_DIR \
+            +gpu=$GPU_ID \
+            +vid_len=$VID_LEN \
+            +frame_interval=$FRAME_INTERVAL"
+
+        # Add checkpoint
         if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
             TEST_CMD="$TEST_CMD load=$FLASHDEPTH_CHECKPOINT"
         fi

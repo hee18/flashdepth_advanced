@@ -23,7 +23,6 @@ from PIL import Image
 import torch
 from torch.utils.data import Dataset
 import logging
-import pandas as pd
 import os
 
 logger = logging.getLogger(__name__)
@@ -114,7 +113,9 @@ class WaymoSegmentationDataset(Dataset):
         self.camera_name = camera_name
 
         # Paths for preprocessed dataset
-        self.waymo_root = self.data_root / split
+        # data_root should be the base path (e.g., /data/datasets)
+        # We need to add 'waymo_seg' subdirectory
+        self.waymo_root = self.data_root / 'waymo_seg' / split
 
         if not self.waymo_root.exists():
             raise ValueError(f"Waymo root not found: {self.waymo_root}")
@@ -298,52 +299,35 @@ class WaymoSegmentationDataset(Dataset):
     def __len__(self):
         return len(self.sequences)
 
-    def get_focal_length(self, sequence_name):
+    def get_focal_length(self, seq_dir):
         """
         Get focal length for Waymo Segmentation dataset.
 
-        Waymo provides per-sequence intrinsics in camera_calibration/*.parquet files.
-        Files are in central waymo_seg/waymo_seg/camera_calibration/ directory (not per-sequence).
-        Fields: f_u (fx), f_v (fy), c_u (cx), c_v (cy), and distortion coefficients.
-        Values are for original 1920×1280 resolution.
+        Reads from intrinsics.npy file in the sequence directory.
+        Intrinsics are stored as [fx, fy, cx, cy] for original 1920×1280 resolution.
 
         Args:
-            sequence_name (str): Sequence name (e.g., 'segment-XXXXX')
+            seq_dir (Path): Sequence directory path
 
         Returns:
             float: Focal length in pixels for current image resolution
         """
-        # Remove 'segment-' prefix from sequence name for filename
-        seq_id = sequence_name.replace('segment-', '')
-        
-        # Calibration files are in central waymo_seg/waymo_seg/camera_calibration/ directory
-        # Directory structure: {data_root}/waymo_seg/waymo_seg/camera_calibration/
-        calib_dir = self.data_root / 'waymo_seg' / 'waymo_seg' / 'camera_calibration'
-        calib_path = calib_dir / f'{seq_id}.parquet'
+        # Intrinsics are stored in each sequence directory
+        intrinsics_path = seq_dir / self.camera_name / 'intrinsics.npy'
 
         try:
-            calib_df = pd.read_parquet(calib_path)
-            # Waymo uses full field names with component prefix
-            fx_original = float(calib_df['[CameraCalibrationComponent].intrinsic.f_u'].iloc[0])  # All frames in sequence share same intrinsics
-            
+            # Load intrinsics [fx, fy, cx, cy] for original 1920×1280 resolution
+            intrinsics = np.load(intrinsics_path)
+            fx_original = float(intrinsics[0])
+
             # Scale focal length to current image width (from original 1920)
             original_width = 1920
             current_width = self.width
             fx_scaled = fx_original * (current_width / original_width)
-            
+
             return fx_scaled
-        except KeyError:
-            # Try alternative field name (older format)
-            try:
-                fx_original = float(calib_df['f_u'].iloc[0])
-                fx_scaled = fx_original * (self.width / 1920)
-                return fx_scaled
-            except Exception as e:
-                logger.warning(f"Error reading calibration from {calib_path}: {e}, using typical fx=2059.0 for 1920 width")
-                fx_fallback = 2059.0 * (self.width / 1920)
-                return fx_fallback
         except Exception as e:
-            logger.warning(f"Error reading calibration from {calib_path}: {e}, using typical fx=2059.0 for 1920 width")
+            logger.warning(f"Error reading intrinsics from {intrinsics_path}: {e}, using typical fx=2059.0 for 1920 width")
             fx_fallback = 2059.0 * (self.width / 1920)
             return fx_fallback
 
@@ -451,7 +435,7 @@ class WaymoSegmentationDataset(Dataset):
                 seg_mask = torch.from_numpy(seg_mask_np)
 
                 # Get focal length for this sequence (same for all frames in sequence)
-                fx = self.get_focal_length(sequence_name)
+                fx = self.get_focal_length(seq_dir)
 
                 # CRITICAL: Append in same order - image, depth, seg from SAME frame_idx
                 images.append(image)
@@ -499,10 +483,12 @@ def collate_fn(batch):
         return None
 
     # Stack tensors
+    # Use 'depths' (plural) to match ComparisonDataset format
     return {
         'images': torch.stack([item['images'] for item in batch]),
-        'depth': torch.stack([item['depth'] for item in batch]),
+        'depths': torch.stack([item['depth'] for item in batch]),  # Changed to 'depths' (plural)
         'segmentations': torch.stack([item['segmentations'] for item in batch]),  # Per-frame segmentations
+        'focal_lengths': torch.stack([item['focal_lengths'] for item in batch]),  # Focal lengths per frame
         'sequence_name': [item['sequence_name'] for item in batch],
         'frame_indices': [item['frame_indices'] for item in batch]  # Actual frame numbers
     }

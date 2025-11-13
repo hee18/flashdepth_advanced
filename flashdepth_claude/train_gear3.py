@@ -646,30 +646,31 @@ class Gear3Trainer:
                     model = self.model.module if isinstance(self.model, DDP) else self.model
 
                     # Unpack and move to device (batch is still on CPU from dataloader)
-                    images, gt_depth, focal_lengths, dataset_idx = batch
+                    images, gt_depth, focal_lengths_canonical, focal_lengths_actual, actual_valid_mask, fx_ratio, resize_ratio, dataset_idx = batch
                     images = images.to(self.device)
                     gt_depth = gt_depth.to(self.device)
-                    focal_lengths = focal_lengths.to(self.device)
+                    focal_lengths_canonical = focal_lengths_canonical.to(self.device)
+                    focal_lengths_actual = focal_lengths_actual.to(self.device)
+                    actual_valid_mask = actual_valid_mask.to(self.device)
+                    fx_ratio = fx_ratio.to(self.device)
+                    resize_ratio = resize_ratio.to(self.device)
+
+                    # Use canonical focal lengths for processing
+                    focal_lengths = focal_lengths_canonical
 
                     if gt_depth.ndim == 3:
                         gt_depth = gt_depth.unsqueeze(1)
                     elif gt_depth.ndim == 4 and gt_depth.shape[1] != 1:
                         gt_depth = gt_depth.unsqueeze(2)
 
-                    # GT depth from dataloader is inverse depth (1/m), scale to 100/m for training
+                    # GT depth from dataloader is inverse depth (1/m), already in canonical space (fx=500)
                     gt_depth_inverse_100 = gt_depth * 100.0  # (1/m) * 100 = 100/m
+
+                    # NOTE: GT depth is already in canonical space (fx=500 at target resolution)
+                    # Canonical transformation is handled in the dataloader
 
                     # Get batch size for Mamba initialization
                     B, T = images.shape[:2]
-
-                    # Apply canonical space transformation if enabled (for visualization consistency)
-                    if self.config.get('use_canonical_space', False):
-                        CANONICAL_FX = self._get_canonical_focal_length()
-
-                        # Transform inverse depth directly to canonical space
-                        # inverse_canonical = inverse_actual * (fx_actual / CANONICAL_FX)
-                        fx_actual = focal_lengths.view(B, T, 1, 1, 1)
-                        gt_depth_inverse_100 = gt_depth_inverse_100 * (fx_actual / CANONICAL_FX)
 
                     # Initialize Mamba sequence for temporal processing
                     if hasattr(model, 'mamba'):
@@ -739,7 +740,8 @@ class Gear3Trainer:
                             images[:1, :1].float().cpu(),  # [1, 1, 3, H, W] - convert BFloat16 to Float32 first
                             gt_depth_metric[:1].float().cpu(),  # [1, 1, H, W] (already has channel dim)
                             dataset_idx,
-                            focal_lengths[:1, :1].float().cpu()  # [1, 1] - resized focal length
+                            fx_ratio[:1, :1].float().cpu(),      # [1, 1] - focal length ratio (500 / fx_actual)
+                            resize_ratio[:1, :1].float().cpu()   # [1, 1] - total resize ratio (Metric3D)
                         )
                         model_outputs_cpu = {
                             'pred_depth': pred_depth_metric[:1].cpu(),  # [1, 1, H, W]
@@ -796,11 +798,18 @@ class Gear3Trainer:
 
     def train_step(self, batch):
         """Single training step with BFloat16 autocast"""
-        # Unpack batch (updated to include focal_lengths)
-        images, gt_depth, focal_lengths, dataset_idx = batch
+        # Unpack batch (now includes fx_ratio and resize_ratio from Metric3D canonicalization)
+        images, gt_depth, focal_lengths_canonical, focal_lengths_actual, actual_valid_mask, fx_ratio, resize_ratio, dataset_idx = batch
         images = images.to(self.device)
         gt_depth = gt_depth.to(self.device)
-        focal_lengths = focal_lengths.to(self.device)  # Shape: (B, T)
+        focal_lengths_canonical = focal_lengths_canonical.to(self.device)
+        focal_lengths_actual = focal_lengths_actual.to(self.device)
+        actual_valid_mask = actual_valid_mask.to(self.device)
+        fx_ratio = fx_ratio.to(self.device)  # NEW: Shape (B, T), focal length ratios (500 / fx_actual)
+        resize_ratio = resize_ratio.to(self.device)  # NEW: Shape (B, T), total resize ratios
+
+        # Use canonical focal lengths for rest of processing
+        focal_lengths = focal_lengths_canonical  # For backward compatibility with existing code
 
         # Add channel dimension if needed
         if gt_depth.ndim == 3:
@@ -987,8 +996,11 @@ class Gear3Trainer:
             if batch is None:
                 continue
 
-            # Unpack batch (updated to include focal_lengths)
-            images, gt_depth, focal_lengths, dataset_idx = batch
+            # Unpack batch (now includes fx_ratio and resize_ratio from Metric3D canonicalization)
+            images, gt_depth, focal_lengths_canonical, focal_lengths_actual, actual_valid_mask, fx_ratio, resize_ratio, dataset_idx = batch
+
+            # Use canonical focal lengths for processing
+            focal_lengths = focal_lengths_canonical
 
             # Get dataset name for this batch (before frame loop)
             if isinstance(dataset_idx, str):
@@ -1014,17 +1026,11 @@ class Gear3Trainer:
 
                 B, T = images.shape[:2]
 
-                # GT depth from dataloader is inverse depth (1/m), scale to 100/m for training
+                # GT depth from dataloader is inverse depth (1/m), already in canonical space (fx=500)
                 gt_depth_inverse_100 = gt_depth * 100.0  # (1/m) * 100 = 100/m
 
-                # Apply canonical space transformation if enabled
-                if self.config.get('use_canonical_space', False):
-                    CANONICAL_FX = self._get_canonical_focal_length()
-
-                    # Transform inverse depth directly to canonical space
-                    # inverse_canonical = inverse_actual * (fx_actual / CANONICAL_FX)
-                    fx_actual = focal_lengths.view(B, T, 1, 1, 1)
-                    gt_depth_inverse_100 = gt_depth_inverse_100 * (fx_actual / CANONICAL_FX)
+                # NOTE: GT depth is already in canonical space (fx=500 at target resolution)
+                # Canonical transformation is handled in the dataloader
 
                 # Initialize Mamba sequence for temporal processing
                 if hasattr(model, 'mamba'):

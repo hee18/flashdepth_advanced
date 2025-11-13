@@ -1,4 +1,4 @@
-# FlashDepth Gear3 Upgrade: 고급 FG/BG 분리 전략
+# FlashDepth Gear4: 고급 FG/BG 분리 전략
 
 **작성일**: 2025-10-23
 **최종 업데이트**: 2025-10-25 (Loss 구조 및 FAQ 추가)
@@ -6,7 +6,7 @@
 **목적**: 다양한 FG/BG 분리 방법을 통한 Feature-level Metric Depth 성능 향상
 
 **학습 가능 파라미터**: **약 9.5M / 329M (2.9%)** ⭐
-- Gear3 Upgrade modules: 4.8M (separation method에 따라 변동)
+- Gear4 modules: 4.8M (separation method에 따라 변동)
 - Mamba: 4.3M
 - output_conv: 0.3M
 
@@ -34,11 +34,11 @@
 
 ## 개요
 
-Gear3 Upgrade는 Gear3의 baseline (raw attention 기반 FG/BG 분리)을 확장하여 **3가지 고급 분리 방법**을 제공합니다.
+Gear4는 Gear3의 baseline (raw attention 기반 FG/BG 분리)을 확장하여 **3가지 고급 분리 방법**을 제공합니다.
 
-### Gear3 Baseline vs Gear3 Upgrade
+### Gear3 Baseline vs Gear4
 
-| 측면              | Gear3 Baseline        | Gear3 Upgrade                 |
+| 측면              | Gear3 Baseline        | Gear4                 |
 |------------------|----------------------|------------------------------|
 | **FG/BG 분리**    | Raw attention + mean | **3가지 방법 선택 가능**       |
 | **파라미터**      | 9.2M                 | **9.5M** (방법별 약간 차이)   |
@@ -58,7 +58,7 @@ Gear3 baseline의 **raw attention + mean threshold**는 대부분의 경우 잘 
 2. **특수 요구사항**: 특정 분리 기준이 필요한 경우 (예: semantic segmentation 기반)
 3. **Multi-scale 정보**: 단일 layer attention보다 여러 layer 조합이 robust할 수 있음
 
-Gear3 Upgrade는 이러한 상황에 대응하기 위해 **3가지 대안적 분리 방법**을 제공합니다.
+Gear4는 이러한 상황에 대응하기 위해 **3가지 대안적 분리 방법**을 제공합니다.
 
 ---
 
@@ -460,10 +460,10 @@ MultiLayerAttentionFusion:
 
 ### Loss 구조 (핵심!)
 
-**중요**: Gear3 Upgrade는 **단일 loss만 사용**합니다!
+**중요**: Gear4는 **단일 loss만 사용**합니다!
 
 ```python
-# train_gear3_upgrade.py의 train_step()
+# train_gear4.py의 train_step()
 loss = LogL1Loss(pred_inverse_depth, gt_inverse_depth, valid_mask)
 # = L1(log(pred), log(gt))
 
@@ -517,14 +517,14 @@ loss = LogL1Loss(pred_inverse_depth, gt_inverse_depth, valid_mask)
 ### 학습 설정 (Gear3와 동일)
 
 ```yaml
-# configs/gear3_upgrade/config.yaml
+# configs/gear4/config.yaml
 training:
   batch_size: 20        # Per GPU (effective 40 with DDP)
   workers: 8            # Optimized for 96 cores
   iterations: 40001
 
   # Learning rates
-  gear3_lr: 1.0e-4      # Gear3 Upgrade modules
+  gear4_lr: 1.0e-4      # Gear4 modules
   mamba_lr: 1.0e-4      # Mamba (from scratch)
 
 # Separation method 선택
@@ -548,8 +548,8 @@ Decay (30-100%):   1e-4 → 1e-6
 
 ```bash
 # Single GPU
-CUDA_VISIBLE_DEVICES=0 python train_gear3_upgrade.py \
-  --config-path configs/gear3_upgrade \
+CUDA_VISIBLE_DEVICES=0 python train_gear4.py \
+  --config-path configs/gear4 \
   dataset.data_root=/data/datasets \
   phase=1 \
   separation_method=cls_seg \
@@ -562,8 +562,8 @@ CUDA_VISIBLE_DEVICES=0 python train_gear3_upgrade.py \
 CUDA_VISIBLE_DEVICES=0,1 torchrun \
   --nproc_per_node=2 \
   --master_port=29500 \
-  train_gear3_upgrade.py \
-  --config-path configs/gear3_upgrade \
+  train_gear4.py \
+  --config-path configs/gear4 \
   dataset.data_root=/data/datasets \
   phase=1 \
   separation_method=cls_seg \
@@ -576,8 +576,8 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun \
 #### K-means Clustering (복잡한 장면용)
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python train_gear3_upgrade.py \
-  --config-path configs/gear3_upgrade \
+CUDA_VISIBLE_DEVICES=0 python train_gear4.py \
+  --config-path configs/gear4 \
   dataset.data_root=/data/datasets \
   phase=1 \
   separation_method=kmeans \
@@ -590,8 +590,8 @@ CUDA_VISIBLE_DEVICES=0 python train_gear3_upgrade.py \
 #### Multi-layer Fusion (Robustness 중시)
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python train_gear3_upgrade.py \
-  --config-path configs/gear3_upgrade \
+CUDA_VISIBLE_DEVICES=0 python train_gear4.py \
+  --config-path configs/gear4 \
   dataset.data_root=/data/datasets \
   phase=1 \
   separation_method=multi_layer \
@@ -605,7 +605,7 @@ CUDA_VISIBLE_DEVICES=0 python train_gear3_upgrade.py \
 
 ```bash
 python test_gear3.py \
-  --config-path configs/gear3_upgrade \
+  --config-path configs/gear4 \
   separation_method=cls_seg \
   +flashdepth_checkpoint=train_results/results_cls_seg/final.pth \
   +results_dir=test_results/results_cls_seg \
@@ -703,7 +703,7 @@ BG Mask (61.5%)  ← 61.5%가 background
 from flashdepth.gear3_modules import Gear3MetricHead
 
 # CORRECT:
-from flashdepth.gear3_upgrade_modules import Gear3UpgradeMetricHead
+from flashdepth.gear4_modules import Gear3UpgradeMetricHead
 ```
 
 ### 2. "cls_token required for cls_seg mode"
@@ -776,7 +776,7 @@ separation_method=cls_seg  # Softmax → adaptive ratio
 
 **A**: 현재 코드에는 구현되어 있지 않습니다!
 
-Gear3 Upgrade는 **오직 depth prediction loss (LogL1Loss)만 사용**합니다. 다른 auxiliary loss 없이 end-to-end로 학습됩니다.
+Gear4는 **오직 depth prediction loss (LogL1Loss)만 사용**합니다. 다른 auxiliary loss 없이 end-to-end로 학습됩니다.
 
 왜 추가 loss가 필요 없는가:
 - Depth를 잘 예측하려면 FG/BG 분리도 잘 되어야 함 → 자동으로 최적화됨
@@ -884,7 +884,7 @@ Self-supervised 원리:
 
 ### Baseline (Gear3) 대비 언제 사용?
 
-**Gear3 Upgrade 사용을 고려해야 하는 경우**:
+**Gear4 사용을 고려해야 하는 경우**:
 - ✅ **복잡한 multi-object 장면**: K-means가 더 정확한 분리
 - ✅ **Semantic 정보 필요**: CLS-based가 global understanding 제공
 - ✅ **Multi-scale robustness**: Multi-layer가 다양한 scale 커버
@@ -904,7 +904,7 @@ Self-supervised 원리:
 flashdepth_claude/
 ├── flashdepth/
 │   ├── gear3_modules.py                # Gear3 baseline
-│   ├── gear3_upgrade_modules.py        # ⭐ 3가지 분리 방법
+│   ├── gear4_modules.py        # ⭐ 3가지 분리 방법
 │   │   ├── LightSegmentationHead      # CLS-based
 │   │   ├── DifferentiableKMeans       # K-means
 │   │   ├── MultiLayerAttentionFusion  # Multi-layer
@@ -915,14 +915,14 @@ flashdepth_claude/
 │   └── original_dpt.py
 ├── utils/
 │   ├── gear3_visualization.py         # Gear3 baseline viz
-│   └── gear3_upgrade_visualization.py # ⭐ FG/BG mask 오버레이
+│   └── gear4_visualization.py # ⭐ FG/BG mask 오버레이
 ├── configs/
 │   ├── gear3/
 │   │   └── config.yaml                # Gear3 baseline
-│   └── gear3_upgrade/
+│   └── gear4/
 │       └── config.yaml                # ⭐ separation_method 옵션
 ├── train_gear3.py                     # Gear3 baseline
-├── train_gear3_upgrade.py             # ⭐ Gear3 Upgrade
+├── train_gear4.py             # ⭐ Gear4
 ├── test_gear3.py                      # Test script (both 지원)
 └── GEAR3_UPGRADE_USAGE.md             # ⭐ 이 문서
 ```
@@ -931,9 +931,9 @@ flashdepth_claude/
 
 ## 요약
 
-### 핵심 차이점 (Gear3 vs Gear3 Upgrade)
+### 핵심 차이점 (Gear3 vs Gear4)
 
-| 측면 | Gear3 Baseline | Gear3 Upgrade |
+| 측면 | Gear3 Baseline | Gear4 |
 |-----|---------------|---------------|
 | **FG/BG 분리** | Raw attention + mean | **3가지 방법 선택** |
 | **Common Modules** | FG/BG, Modulation, Modulator | **100% 동일** ⭐ |
