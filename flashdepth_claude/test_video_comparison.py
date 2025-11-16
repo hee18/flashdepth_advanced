@@ -1,20 +1,16 @@
 #!/usr/bin/env python3
 """
-Test script for IMAGE depth estimation methods (frame-by-frame processing)
+Test script for VIDEO depth estimation methods
 
-Evaluation framework for single-frame image depth estimation models.
-Each frame is processed independently.
+Evaluation framework for video-based depth estimation methods that process
+entire sequences at once (not frame-by-frame).
 
-Supported IMAGE models:
-- Depth-Anything-V2 (depthanythingv2)
-- Metric3D v1/v2 (metric3d)
-- UniDepth v1/v2 (unidepth)
-- ZoeDepth (zoedepth)
-- DepthPro (depthpro)
-- CUT3R (cut3r)
+Supported methods:
+- Video-Depth-Anything (vda) - Processes [B, T, C, H, W]
+- DepthCrafter (depthcrafter) - Processes [T, C, H, W] or [T, H, W, C]
 
-For VIDEO models (Video-Depth-Anything, DepthCrafter):
-Use test_video_comparison.py instead.
+Note: For single-frame image depth models (Metric3D, UniDepth, DepthPro, etc.),
+use test_comparison.py instead.
 """
 
 import os
@@ -49,9 +45,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-class ComparisonTester:
+class VideoComparisonTester:
     """
-    Unified tester for comparison depth estimation methods
+    Tester for VIDEO depth estimation methods (sequence-based processing)
     """
 
     def __init__(self, method_name, config, adapter):
@@ -379,83 +375,72 @@ class ComparisonTester:
             if focal_lengths is not None:
                 focal_lengths = focal_lengths.to(self.device)
 
-        # Storage for predictions
-        pred_depths = []
+        # Check if images are ImageNet normalized (from segmentation datasets)
+        # ComparisonDataset returns [0, 1] range
+        # Segmentation datasets return ImageNet normalized
+        sample_img = images[0, 0]  # Check first frame
+        is_imagenet_normalized = (sample_img.min() < -2.0 or sample_img.max() > 2.0)
 
-        # FPS measurement
-        warmup_frames = min(5, T)
-        start_time = None
+        # Unnormalize if needed (video models expect [0, 1] range)
+        if is_imagenet_normalized:
+            # Unnormalize ImageNet: x_original = x * std + mean
+            mean = torch.tensor([0.485, 0.456, 0.406], device=images.device).view(1, 1, 3, 1, 1)
+            std = torch.tensor([0.229, 0.224, 0.225], device=images.device).view(1, 1, 3, 1, 1)
+            images_unnorm = images * std + mean  # [1, T, 3, H, W] back to [0, 1]
+        else:
+            images_unnorm = images
+
+        # Process entire sequence at once (VIDEO MODEL)
+        logger.info(f"Processing {T} frames as a single video sequence...")
+
+        # FPS measurement - warmup with first inference, then measure
+        import time
+
+        # Warmup run
+        logger.info("Warmup inference...")
+        torch.cuda.synchronize()
+        with torch.no_grad():
+            _ = self.adapter.inference(
+                images_unnorm,  # [1, T, 3, H, W]
+                intrinsics=intrinsics  # [1, T, 4] or None
+            )
+
+        # Timed run
+        logger.info("Timed inference...")
+        torch.cuda.synchronize()
+        start_time = time.time()
+
+        with torch.no_grad():
+            pred_depths = self.adapter.inference(
+                images_unnorm,  # [1, T, 3, H, W]
+                intrinsics=intrinsics  # [1, T, 4] or None
+            )  # Returns [1, T, H, W] in meters
+
+        torch.cuda.synchronize()
+        end_time = time.time()
+
+        # Calculate FPS
+        inference_time = end_time - start_time
+        fps = T / inference_time if inference_time > 0 else 0
+        logger.info(f"Inference time: {inference_time:.4f}s for {T} frames")
+        logger.info(f"FPS: {fps:.2f}")
+
+        # Log GPU memory usage
+        if torch.cuda.is_available():
+            gpu_mem_allocated = torch.cuda.memory_allocated(self.device) / 1e9
+            gpu_mem_reserved = torch.cuda.memory_reserved(self.device) / 1e9
+            logger.info(f"GPU Memory: Allocated={gpu_mem_allocated:.2f}GB, Reserved={gpu_mem_reserved:.2f}GB")
+
+        # Ensure correct shape [T, 1, H, W] for compatibility with visualization
+        if pred_depths.ndim == 4 and pred_depths.shape[0] == 1:
+            pred_depths = pred_depths[0]  # [1, T, H, W] -> [T, H, W]
+        if pred_depths.ndim == 3:
+            pred_depths = pred_depths.unsqueeze(1)  # [T, H, W] -> [T, 1, H, W]
 
         # Best frame tracking
         best_frame_idx = 0
         best_frame_abs_rel = float('inf')
         frame_metrics = []
-
-        # Process each frame
-        for t in range(T):
-            # Start timing after warmup
-            if t == warmup_frames:
-                torch.cuda.synchronize()
-                import time
-                start_time = time.time()
-
-            img_t = images[0, t]  # [3, H, W]
-
-            # Check if image is ImageNet normalized (from segmentation datasets)
-            # ComparisonDataset returns [0, 1] range
-            # Segmentation datasets return ImageNet normalized
-            is_imagenet_normalized = (img_t.min() < -2.0 or img_t.max() > 2.0)
-
-            # Unnormalize if needed (most models expect [0, 1] range)
-            if is_imagenet_normalized:
-                # Unnormalize ImageNet: x_original = x * std + mean
-                mean = torch.tensor([0.485, 0.456, 0.406], device=img_t.device).view(3, 1, 1)
-                std = torch.tensor([0.229, 0.224, 0.225], device=img_t.device).view(3, 1, 1)
-                img_t_unnorm = img_t * std + mean  # Back to [0, 1] range
-            else:
-                img_t_unnorm = img_t
-
-            # Prepare intrinsics for this frame
-            # ComparisonDataset provides full intrinsics [fx, fy, cx, cy]
-            # Legacy datasets provide only focal length (scalar)
-            if intrinsics is not None:
-                frame_intrinsics = intrinsics[0, t]  # [4] - fx, fy, cx, cy
-            elif focal_lengths is not None:
-                frame_intrinsics = focal_lengths[0, t]  # scalar
-            else:
-                frame_intrinsics = None
-
-            # Method-specific inference using adapter
-            pred_depth_t = self.adapter.inference(
-                img_t_unnorm.unsqueeze(0),  # [1, 3, H, W] in [0, 1] range
-                intrinsics=frame_intrinsics
-            )  # Returns [1, H, W] in meters
-
-            # Log GPU memory usage after first frame
-            if t == 0 and torch.cuda.is_available():
-                gpu_mem_allocated = torch.cuda.memory_allocated(self.device) / 1e9
-                gpu_mem_reserved = torch.cuda.memory_reserved(self.device) / 1e9
-                logger.info(f"GPU Memory after frame 0: Allocated={gpu_mem_allocated:.2f}GB, Reserved={gpu_mem_reserved:.2f}GB")
-
-            # Store prediction
-            pred_depths.append(pred_depth_t)
-
-            # End timing
-            if t == T - 1 and start_time is not None:
-                torch.cuda.synchronize()
-                end_time = time.time()
-
-        # Calculate FPS
-        if start_time is not None:
-            inference_time = end_time - start_time
-            fps = (T - warmup_frames) / inference_time if inference_time > 0 else 0
-            logger.info(f"Inference time: {inference_time:.4f}s for {T - warmup_frames} frames")
-            logger.info(f"FPS: {fps:.2f}")
-        else:
-            fps = 0
-
-        # Stack predictions
-        pred_depths = torch.stack(pred_depths, dim=0)  # [T, 1, H, W]
 
         # Upsample predictions to match GT original resolution for visualization
         # This handles cases where model outputs resized depth (e.g., 518x518)
@@ -869,9 +854,9 @@ class ComparisonTester:
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Test IMAGE depth estimation methods (frame-by-frame processing)')
+    parser = argparse.ArgumentParser(description='Test VIDEO depth estimation methods')
     parser.add_argument('--method', type=str, required=True,
-                       help='Method name: metric3d, unidepth, zoedepth, depthpro, cut3r, depthanythingv2 (IMAGE models only, for VIDEO models use test_video_comparison.py)')
+                       help='Method name: vda, depthcrafter (video models only)')
     parser.add_argument('--version', type=str, default=None,
                        help='Method version (for metric3d, unidepth): v1, v2')
     parser.add_argument('--dataset', type=str, default='waymo',
@@ -909,179 +894,76 @@ def main():
 
     args = parser.parse_args()
 
-    # Reject VIDEO models (they need test_video_comparison.py)
+    # Validate method is a video model
     VIDEO_MODELS = ['vda', 'depthcrafter']
-    if args.method in VIDEO_MODELS:
-        logger.error(f"❌ Error: '{args.method}' is a video model")
-        logger.error(f"   Video models process entire sequences, not frame-by-frame")
-        logger.error(f"   Use test_video_comparison.py (or ./run_video_comparison.sh) instead")
-        logger.error(f"")
-        logger.error(f"   Example: python test_video_comparison.py --method {args.method} --dataset {args.dataset}")
-        logger.error(f"   Or:      ./run_video_comparison.sh {args.method} --dataset {args.dataset}")
+    if args.method not in VIDEO_MODELS:
+        logger.error(f"❌ Error: '{args.method}' is not a video model")
+        logger.error(f"   This script is for VIDEO models only: {', '.join(VIDEO_MODELS)}")
+        logger.error(f"   For image models (metric3d, unidepth, depthpro, etc.), use test_comparison.py instead")
         sys.exit(1)
 
-    # Check UnrealStereo4K --seq
+    # Check UnrealStereo4K --seq requirement
     if args.dataset.lower() == 'unrealstereo4k':
-        if args.seq is not None:
-            # Single sequence mode
-            if args.seq < 0 or args.seq > 8:
-                logger.error(f"❌ UnrealStereo4K --seq must be between 0 and 8, got {args.seq}")
-                sys.exit(1)
-            logger.info(f"UnrealStereo4K: Testing sequence {args.seq} only")
-            seq_list = [args.seq]
-        else:
-            # Auto mode: test all sequences 0-8
-            logger.info("UnrealStereo4K: Testing ALL sequences (0-8)")
-            seq_list = list(range(9))  # [0, 1, 2, 3, 4, 5, 6, 7, 8]
-    else:
-        seq_list = [args.seq]  # For other datasets, seq is None or ignored
+        if args.seq is None:
+            logger.error("❌ UnrealStereo4K requires --seq option (0-8)")
+            logger.error("   Example: --dataset unrealstereo4k --seq 0")
+            sys.exit(1)
+        if args.seq < 0 or args.seq > 8:
+            logger.error(f"❌ UnrealStereo4K --seq must be between 0 and 8, got {args.seq}")
+            sys.exit(1)
+        logger.info(f"UnrealStereo4K: Testing sequence {args.seq} only")
 
     # Build method name with version
     method_name = args.method
     if args.version:
         method_name = f"{args.method}_{args.version}"
 
-    # Base results directory
-    base_results_dir = args.results_dir or f'refer_test/test_results/{method_name}/{args.dataset}'
+    # Create config
+    config = {
+        'method': args.method,
+        'version': args.version,
+        'dataset': args.dataset,
+        'data_root': args.data_root,
+        'checkpoint_path': args.checkpoint,
+        'results_dir': args.results_dir or f'refer_test/test_results/{method_name}/{args.dataset}',
+        'gpu': args.gpu,
+        'workers': args.workers,
+        'video_length': args.video_length,
+        'object_wise': {
+            'enabled': args.objwise,
+            'dataset': args.dataset.replace('_seg', '')
+        },
+        # New depth mode and model-specific settings
+        'depth_mode': args.depth_mode,
+        'indoor': args.indoor,
+        'metric': args.metric,
+        'frame_interval': args.frame_interval,
+        'only_clone': (args.only_clone == 'true'),  # Convert string to bool
+        'visualization': (args.visualization == 'true'),  # Convert string to bool
+        'unrealstereo4k_seq': args.seq  # Sequence number for UnrealStereo4K (None for other datasets)
+    }
 
-    # Import and create adapter (once, before loop)
+    # Import and create adapter (VIDEO MODELS ONLY)
     try:
         if args.method == 'vda':
             from adapters.video_depth_anything_adapter import VideoDepthAnythingAdapter
             adapter = VideoDepthAnythingAdapter(metric=args.metric)
-        elif args.method == 'depthanythingv2':
-            from adapters.depth_anything_v2_adapter import DepthAnythingV2Adapter
-            adapter = DepthAnythingV2Adapter(indoor=args.indoor)
         elif args.method == 'depthcrafter':
             from adapters.depthcrafter_adapter import DepthCrafterAdapter
             adapter = DepthCrafterAdapter()
-        elif args.method == 'metric3d':
-            from adapters.metric3d_adapter import Metric3DAdapter
-            adapter = Metric3DAdapter(version=args.version or 'v2')
-        elif args.method == 'unidepth':
-            from adapters.unidepth_adapter import UniDepthAdapter
-            adapter = UniDepthAdapter(version=args.version or 'v2')
-        elif args.method == 'zoedepth':
-            from adapters.zoedepth_adapter import ZoeDepthAdapter
-            adapter = ZoeDepthAdapter()
-        elif args.method == 'depthpro':
-            from adapters.depthpro_adapter import DepthProAdapter
-            adapter = DepthProAdapter()
-        elif args.method == 'cut3r':
-            from adapters.cut3r_adapter import CUT3RAdapter
-            adapter = CUT3RAdapter()
         else:
-            raise ValueError(f"Unknown method: {args.method}")
+            # Should never reach here due to earlier validation
+            raise ValueError(f"Unknown video method: {args.method}")
     except ImportError as e:
         logger.error(f"Failed to import adapter for {args.method}: {e}")
         logger.error("Make sure the adapter is implemented in adapters/ directory")
         sys.exit(1)
 
-    # Loop through sequences (for UnrealStereo4K) or run once (for other datasets)
-    all_seq_results = []
+    # Create tester and run
+    tester = VideoComparisonTester(method_name, config, adapter)
+    tester.test()
 
-    for seq_idx in seq_list:
-        # For UnrealStereo4K multi-sequence mode
-        if args.dataset.lower() == 'unrealstereo4k' and len(seq_list) > 1:
-            logger.info(f"\n{'='*80}")
-            logger.info(f"Testing UnrealStereo4K sequence {seq_idx}/{len(seq_list)-1}")
-            logger.info(f"{'='*80}\n")
-            # Create per-sequence results directory
-            results_dir = f"{base_results_dir}/seq{seq_idx}"
-        else:
-            results_dir = base_results_dir
-
-        # Create config for this sequence
-        config = {
-            'method': args.method,
-            'version': args.version,
-            'dataset': args.dataset,
-            'data_root': args.data_root,
-            'checkpoint_path': args.checkpoint,
-            'results_dir': results_dir,
-            'gpu': args.gpu,
-            'workers': args.workers,
-            'video_length': args.video_length,
-            'object_wise': {
-                'enabled': args.objwise,
-                'dataset': args.dataset.replace('_seg', '')
-            },
-            # New depth mode and model-specific settings
-            'depth_mode': args.depth_mode,
-            'indoor': args.indoor,
-            'metric': args.metric,
-            'frame_interval': args.frame_interval,
-            'only_clone': (args.only_clone == 'true'),  # Convert string to bool
-            'visualization': (args.visualization == 'true'),  # Convert string to bool
-            'unrealstereo4k_seq': seq_idx  # Current sequence number
-        }
-
-        # Create tester and run
-        tester = ComparisonTester(method_name, config, adapter)
-        tester.test()
-
-        # Collect results if testing multiple sequences
-        if len(seq_list) > 1:
-            # Read the results JSON
-            results_json_path = Path(results_dir) / "results.json"
-            if results_json_path.exists():
-                with open(results_json_path, 'r') as f:
-                    seq_results = json.load(f)
-                    all_seq_results.append({
-                        'sequence': seq_idx,
-                        'metrics': seq_results
-                    })
-                logger.info(f"Sequence {seq_idx} results saved")
-
-        # Clear GPU cache between sequences
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            logger.info("GPU cache cleared")
-
-    # If multiple sequences, compute and save aggregated results
-    if len(seq_list) > 1 and all_seq_results:
-        logger.info(f"\n{'='*80}")
-        logger.info("Computing aggregated results across all sequences")
-        logger.info(f"{'='*80}\n")
-
-        # Compute average metrics
-        avg_metrics = {}
-        metric_keys = list(all_seq_results[0]['metrics'].keys())
-
-        for key in metric_keys:
-            values = [r['metrics'][key] for r in all_seq_results if key in r['metrics']]
-            if values and isinstance(values[0], (int, float)):
-                avg_metrics[key] = sum(values) / len(values)
-            else:
-                # Skip non-numeric metrics
-                avg_metrics[key] = values[0] if values else None
-
-        # Save aggregated results
-        aggregated_results = {
-            'method': method_name,
-            'dataset': args.dataset,
-            'num_sequences': len(seq_list),
-            'sequences_tested': list(range(len(seq_list))),
-            'average_metrics': avg_metrics,
-            'per_sequence_results': all_seq_results
-        }
-
-        aggregated_path = Path(base_results_dir) / "aggregated_results.json"
-        aggregated_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(aggregated_path, 'w') as f:
-            json.dump(aggregated_results, f, indent=2)
-
-        logger.info(f"\n{'='*80}")
-        logger.info("AGGREGATED RESULTS (Average across all sequences)")
-        logger.info(f"{'='*80}")
-        for key, value in avg_metrics.items():
-            if isinstance(value, float):
-                logger.info(f"{key}: {value:.4f}")
-            else:
-                logger.info(f"{key}: {value}")
-        logger.info(f"Aggregated results saved to: {aggregated_path}")
-
-    logger.info("\nTesting completed successfully!")
+    logger.info("Testing completed successfully!")
 
 
 if __name__ == '__main__':

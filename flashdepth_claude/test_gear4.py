@@ -307,7 +307,7 @@ class Gear4Tester:
             test_dataset,
             batch_size=1,
             shuffle=False,
-            num_workers=0,  # Single process for testing
+            num_workers=self.config.training.get('workers', 0),  # Use config workers (default 0 for testing)
             pin_memory=True,
             collate_fn=collate_fn
         )

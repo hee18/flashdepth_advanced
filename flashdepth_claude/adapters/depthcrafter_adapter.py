@@ -119,79 +119,73 @@ class DepthCrafterAdapter(MethodAdapter):
 
     def inference(self, image, intrinsics=None):
         """
-        Run DepthCrafter inference on single frame
+        Run DepthCrafter inference on video sequence
 
         Args:
-            image: torch.Tensor [1, 3, H, W] - Input image (0-1 normalized, RGB)
+            image: torch.Tensor [1, T, 3, H, W] - Input video sequence (0-1 normalized, RGB)
             intrinsics: Optional camera intrinsics (not used)
 
         Returns:
-            depth: torch.Tensor [1, H, W] - Relative depth (0-1 normalized)
-
-        Note: DepthCrafter is designed for video sequences. For single frame,
-        we process it as a 1-frame video, which may not utilize temporal features.
+            depth: torch.Tensor [1, T, H, W] - Relative depth (0-1 normalized)
         """
-        # Get original size
-        H_orig, W_orig = image.shape[2:]
+        # Handle both single frame [1, 3, H, W] and sequence [1, T, 3, H, W]
+        if image.ndim == 4:
+            image = image.unsqueeze(1)  # [1, 1, 3, H, W]
 
-        # Resize while keeping aspect ratio (do on GPU first for large images)
+        B, T, C, H_orig, W_orig = image.shape
+        assert B == 1, "Batch size must be 1"
+
+        # Resize while keeping aspect ratio
         scale = min(self.max_res / H_orig, self.max_res / W_orig)
         if scale < 1.0:
             new_H = int(H_orig * scale)
             new_W = int(W_orig * scale)
-            # Ensure dimensions are divisible by 64 (required by diffusion model)
             new_H = (new_H // 64) * 64
             new_W = (new_W // 64) * 64
 
-            # Resize on GPU using PyTorch (much faster for large images like ETH3D)
             import torch.nn.functional as F
             image_resized = F.interpolate(
-                image,  # [1, 3, H, W]
+                image.view(T, C, H_orig, W_orig),
                 size=(new_H, new_W),
                 mode='bilinear',
                 align_corners=False
-            )  # [1, 3, new_H, new_W]
+            )
         else:
-            image_resized = image
+            image_resized = image.squeeze(0)
+            new_H, new_W = H_orig, W_orig
 
-        # Optimize: Convert to uint8 on GPU first (4x smaller transfer)
-        # For large images (e.g., ETH3D 6205x4135), this is much faster
-        image_uint8 = (image_resized[0] * 255.0).to(torch.uint8)  # [3, H, W] on GPU
+        # Convert to [T, H, W, 3] numpy format
+        image_uint8 = (image_resized * 255.0).to(torch.uint8)
+        frames_np = image_uint8.cpu().numpy().transpose(0, 2, 3, 1)
 
-        # Transfer to CPU (uint8 is 4x smaller than float32)
-        image_np = image_uint8.cpu().numpy()  # [3, H, W]
-        image_np = image_np.transpose(1, 2, 0)  # [H, W, 3]
-
-        # Convert to frames format (add temporal dimension)
-        frames = np.expand_dims(image_np, axis=0)  # [1, H, W, 3]
-
-        # Run diffusion pipeline
+        # Run diffusion pipeline on entire sequence
         with torch.inference_mode():
             res = self.pipe(
-                frames,
-                height=frames.shape[1],
-                width=frames.shape[2],
+                frames_np,
+                height=new_H,
+                width=new_W,
                 output_type="np",
                 guidance_scale=self.guidance_scale,
                 num_inference_steps=self.num_inference_steps,
-                window_size=1,  # Single frame
-                overlap=0,
-            ).frames[0]  # [T, H, W, 3]
+                window_size=min(T, self.window_size),
+                overlap=min(T//4, 25),
+            ).frames[0]
 
-        # Convert RGB output to single channel
+        # Convert RGB output to single channel and normalize
         depth_np = res.sum(-1) / res.shape[-1]  # [T, H, W]
-        depth_np = depth_np[0]  # [H, W] - first (and only) frame
+        depth_list = []
+        for t in range(T):
+            depth_t = depth_np[t]
+            depth_t = (depth_t - depth_t.min()) / (depth_t.max() - depth_t.min() + 1e-8)
 
-        # Normalize to [0, 1]
-        depth_np = (depth_np - depth_np.min()) / (depth_np.max() - depth_np.min() + 1e-8)
+            if scale < 1.0:
+                import cv2
+                depth_t = cv2.resize(depth_t, (W_orig, H_orig), interpolation=cv2.INTER_LINEAR)
 
-        # Resize back to original resolution if needed
-        if scale < 1.0:
-            import cv2
-            depth_np = cv2.resize(depth_np, (W_orig, H_orig), interpolation=cv2.INTER_LINEAR)
+            depth_list.append(depth_t)
 
-        # Convert to torch
-        depth = torch.from_numpy(depth_np).unsqueeze(0)  # [1, H, W]
+        depth = np.stack(depth_list, axis=0)
+        depth = torch.from_numpy(depth).unsqueeze(0)  # [1, T, H, W]
 
         if self.device is not None:
             depth = depth.to(self.device)

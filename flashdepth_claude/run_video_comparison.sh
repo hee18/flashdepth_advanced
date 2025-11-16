@@ -1,17 +1,16 @@
 #!/bin/bash
 #
-# Run IMAGE depth estimation methods evaluation (frame-by-frame)
+# Run VIDEO depth estimation methods evaluation
 #
-# Usage: ./run_comparison.sh <method> [options]
+# Usage: ./run_video_comparison.sh <method> [options]
 #
-# Methods: metric3d, unidepth, zoedepth, depthpro, cut3r, depthanythingv2
+# Methods: vda, depthcrafter (video models only)
 #
 # Examples:
-#   ./run_comparison.sh metric3d --version v2 --dataset sintel --gpu 1
-#   ./run_comparison.sh unidepth --version v1 --dataset kitti --gpu 0 --objwise
-#   ./run_comparison.sh depthpro --dataset waymo --gpu 0
+#   ./run_video_comparison.sh vda --dataset waymo --gpu 0
+#   ./run_video_comparison.sh depthcrafter --dataset sintel --gpu 1
 #
-# For VIDEO models (vda, depthcrafter), use ./run_video_comparison.sh
+# Note: For image models (metric3d, unidepth, depthpro, etc.), use ./run_comparison.sh
 #
 
 set -e
@@ -38,21 +37,15 @@ VISUALIZATION="true"  # Enable visualizations by default
 # Help function
 show_help() {
     cat << EOF
-IMAGE Depth Models Evaluation Script (frame-by-frame processing)
+VIDEO Depth Estimation Methods Evaluation Script
 
-Usage: ./run_comparison.sh <method> [options]
+Usage: ./run_video_comparison.sh <method> [options]
 
-Methods (IMAGE MODELS - process one frame at a time):
-  depthanythingv2  Depth-Anything-V2 (metric depth)
-  metric3d         Metric3D (specify --version v1 or v2)
-  unidepth         UniDepth (specify --version v1 or v2)
-  zoedepth         ZoeDepth
-  depthpro         DepthPro (Apple ML)
-  cut3r            CUT3R
+Methods (VIDEO MODELS ONLY):
+  vda              Video-Depth-Anything (processes entire sequences)
+  depthcrafter     DepthCrafter (diffusion-based video model)
 
-For VIDEO models (process entire sequences):
-  Use ./run_video_comparison.sh instead
-  Supported: vda (Video-Depth-Anything), depthcrafter
+Note: For image models (metric3d, unidepth, depthpro, etc.), use ./run_comparison.sh instead
 
 Options:
   --dataset <name>         Dataset name (default: waymo)
@@ -168,28 +161,14 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Validate method
-# Reject VIDEO models (they need test_video_comparison.py)
+# Validate method (VIDEO MODELS ONLY)
 case $METHOD in
     vda|depthcrafter)
-        echo "❌ Error: '$METHOD' is a video model"
-        echo "   Video models process entire sequences, not frame-by-frame"
-        echo "   Use ./run_video_comparison.sh instead for video models"
-        echo ""
-        echo "   Example: ./run_video_comparison.sh $METHOD --dataset $DATASET --gpu $GPU_ID"
-        exit 1
-        ;;
-esac
-
-# Validate IMAGE models
-case $METHOD in
-    depthanythingv2|metric3d|unidepth|zoedepth|depthpro|cut3r)
         ;;
     *)
-        echo "Error: Unknown method '$METHOD'"
-        echo "Valid IMAGE methods: depthanythingv2, metric3d, unidepth, zoedepth, depthpro, cut3r"
-        echo ""
-        echo "For VIDEO methods (vda, depthcrafter), use ./run_video_comparison.sh"
+        echo "❌ Error: '$METHOD' is not a video model"
+        echo "   This script supports VIDEO MODELS ONLY: vda, depthcrafter"
+        echo "   For image models (metric3d, unidepth, depthpro, etc.), use ./run_comparison.sh instead"
         exit 1
         ;;
 esac
@@ -247,7 +226,7 @@ else
     CONTAINER_GPU=$GPU_ID
 fi
 
-CMD="python test_comparison.py"
+CMD="python test_video_comparison.py"
 CMD="$CMD --method $METHOD"
 CMD="$CMD --dataset $DATASET"
 CMD="$CMD --data-root $DATA_ROOT"

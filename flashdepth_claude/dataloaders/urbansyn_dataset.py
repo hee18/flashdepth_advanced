@@ -71,10 +71,15 @@ class UrbanSynDepth(BaseDatasetPairs):
         depth = cv2.imread(path, cv2.IMREAD_ANYDEPTH).astype(np.float32)
         depth *= 1e5
 
-        ss_path = path.replace('depth/depth_', 'ss/ss_').replace('.exr', '.png')
+        # UrbanSyn segmentation mask path: ss_color/ss_color_XXXX.png
+        ss_path = path.replace('depth/depth_', 'ss_color/ss_color_').replace('.exr', '.png')
         segmentation_mask = cv2.imread(ss_path, cv2.IMREAD_ANYDEPTH)  # only need one channel for the id values
 
-        assert depth.shape == segmentation_mask.shape, 'depth and seg mask should have same shape'
+        # Check if segmentation mask was loaded successfully
+        if segmentation_mask is None:
+            raise FileNotFoundError(f"Segmentation mask not found: {ss_path}")
+
+        assert depth.shape == segmentation_mask.shape, f'depth and seg mask should have same shape (depth: {depth.shape}, mask: {segmentation_mask.shape})'
 
         sky_mask = segmentation_mask == 10  # class ID 10 => sky
         depth[sky_mask] = -1  # avoid division issues

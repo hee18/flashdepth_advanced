@@ -1,27 +1,30 @@
 # GEAR5: Metric Depth Enhancement System
 
-This document covers two distinct approaches for enhancing FlashDepth with metric depth capabilities:
-- **Gear5**: GRU-based temporal scale/shift prediction (original)
-- **Gear5 FiLM**: FiLM-style channel-wise feature modulation (variant)
+This document covers three variants for enhancing FlashDepth with metric depth capabilities:
+- **Gear5 (GRU)**: GRU-based temporal scale/shift prediction (default)
+- **Gear5 (Mamba)**: Mamba2-based temporal scale/shift prediction (lightweight alternative)
+- **Gear5 FiLM**: FiLM-style channel-wise feature modulation (trainable Mamba)
 
-Both share common components (CLS token extraction, importance map generation) but differ in their modulation strategies.
+All variants share common components (CLS token extraction, importance map generation) but differ in their temporal modeling and modulation strategies.
 
 ---
 
 ## Table of Contents
 - [Architecture Overview](#architecture-overview)
-- [Gear5 (Original): GRU-Based Temporal Modulation](#gear5-original-gru-based-temporal-modulation)
+- [Gear5 GRU: GRU-Based Temporal Modulation](#gear5-gru-gru-based-temporal-modulation)
+- [Gear5 Mamba: Mamba2-Based Temporal Modulation](#gear5-mamba-mamba2-based-temporal-modulation)
 - [Gear5 FiLM: Channel-Wise Feature Modulation](#gear5-film-channel-wise-feature-modulation)
 - [Comparison](#comparison)
 - [Loss Functions](#loss-functions)
 - [Training & Testing](#training--testing)
 - [Configuration](#configuration)
+- [Recent Updates](#recent-updates)
 
 ---
 
 ## Architecture Overview
 
-Both Gear5 variants extend FlashDepth with metric depth prediction capabilities by:
+All Gear5 variants extend FlashDepth with metric depth prediction capabilities by:
 1. Extracting semantic features from multi-layer CLS tokens
 2. Generating importance maps from attention weights for loss weighting
 3. Applying learned transformations to enhance depth predictions
@@ -29,34 +32,37 @@ Both Gear5 variants extend FlashDepth with metric depth prediction capabilities 
 **Key Shared Components**:
 - **Multi-layer CLS Token Extraction**: Layers [11, 23] for ViT-L, [5, 11] for ViT-S
 - **ImportanceMapGenerator**: CLS-to-patch attention → importance map for loss weighting
-- **Loss Functions**: Both support `log_l1` (standard) and `importance` (weighted) loss types
+- **Loss Functions**: All support `log_l1` (standard) and `importance` (weighted) loss types
 - **Canonical Space**: All training/inference uses canonical focal length (500.0 for 518×518, configurable via `canonical_focal_length`; on/off via `use_canonical_space`)
 
 **Key Differences**:
-| Component | Gear5 (Original) | Gear5 FiLM |
-|-----------|------------------|------------|
-| **Modulation Target** | Final relative depth map | DPT path_1 features (before Mamba) |
-| **Modulation Method** | GRU-based temporal scale/shift | Channel-wise FiLM (gamma/beta) |
-| **Temporal Modeling** | GRU inside head | Existing Mamba layers |
-| **Trainable Params** | ~132K (head only) | ~1.03M (head + Mamba + output_conv2) |
-| **Frozen Components** | Everything except Gear5Head | ViT + DPT + output_conv1 |
+| Component | Gear5 (GRU) | Gear5 (Mamba) | Gear5 FiLM |
+|-----------|-------------|---------------|------------|
+| **Modulation Target** | Final relative depth | Final relative depth | DPT path_1 features |
+| **Modulation Method** | GRU-based scale/shift | Mamba2-based scale/shift | FiLM gamma/beta |
+| **Temporal Backend** | Bi-GRU (in head) | Mamba2 (in head) | Mamba (existing) |
+| **Trainable Params** | ~132K | ~147K | ~1.03M |
+| **Frozen Components** | All except Gear5Head | All except Gear5Head | ViT + DPT + conv1 |
+| **Training Speed** | Fast | Fast | Slower |
+| **Memory Usage** | Low | Low | Higher |
 
 ---
 
-## Gear5 (Original): GRU-Based Temporal Modulation
+## Gear5 (GRU): GRU-Based Temporal Modulation
 
 ### Architecture
 
-Gear5 applies **temporal scale and shift** to the final relative depth output using a GRU-based predictor.
+Gear5 (GRU) applies **temporal scale and shift** to the final relative depth output using a GRU-based predictor.
 
 ```
 Video Input [B, T, 3, H, W]
     ↓
-ViT Encoder (Frozen)
+ ViT Encoder (Frozen)
     ↓
 CLS Tokens [Layers 11, 23] → ImportanceMapGenerator → Importance Map
     ↓                              ↓
 TemporalScalePredictor          Loss Weighting
+ (Bi-GRU, 2 layers)
     ↓
 Scale [B, T, 1, 1, 1], Shift [B, T, 1, 1, 1]
     ↓
@@ -65,42 +71,20 @@ Relative Depth × Scale + Shift = Metric Depth
 
 ### Key Components
 
-#### 1. ImportanceMapGenerator
-Generates spatial importance weights from CLS attention for loss weighting.
-
-```python
-class ImportanceMapGenerator(nn.Module):
-    """
-    Extract CLS-to-patch attention from multiple layers (11, 23)
-    Average across layers → Reshape → Remove register token → Normalize [0,1]
-
-    Input: List of [B*T, num_heads, N+1, N+1] attention weights
-    Output: [B, T, patch_h, patch_w] importance map
-    """
-```
-
-**Pipeline**:
-1. Extract CLS-to-patch attention from each layer: `attn[:, :, 0, 1:]`
-2. Average over heads: `[B, num_heads, N] → [B, N]`
-3. Average across layers (11, 23)
-4. Reshape to spatial: `[B, patch_h, patch_w]`
-5. Remove register token (highest attention patch) via 3×3 inpainting
-6. Percentile normalization (1-99 percentile → [0, 1])
-
-#### 2. TemporalScalePredictor
-Predicts scale and shift parameters using a GRU for temporal consistency.
+#### 1. TemporalScalePredictor (GRU)
+Predicts scale and shift parameters using a bidirectional GRU for temporal consistency.
 
 ```python
 class TemporalScalePredictor(nn.Module):
     """
-    CLS token [B, T, 1024] → Linear → GRU → Linear → Scale/Shift
+    CLS token [B, T, 1024] → Linear → Bi-GRU → Linear → Scale/Shift
 
     Architecture:
         - Input projection: 1024 → 256
         - Bi-directional GRU: hidden_dim=256, 2 layers
         - Output projection: 512 (bidirectional) → 2 (scale, shift)
 
-    Trainable params: ~132K (only this module is trained)
+    Trainable params: ~132K
     """
 ```
 
@@ -115,147 +99,119 @@ gru_output: [B, T, 512]  # 256 × 2 (bidirectional)
 scale_shift: [B, T, 2]
     ↓ Split
 scale: [B, T, 1, 1, 1] = exp(scale_raw)  # Ensures positive
-shift: [B, T, 1, 1, 1] = shift_raw        # Real number
+shift: [B, T, 1, 1, 1] = shift_raw        # Real number (can be negative)
 ```
 
 **Temporal Processing**: GRU processes sequence bidirectionally, ensuring each frame's scale/shift considers past and future context.
 
-#### 3. Gear5Head (Main Module)
+### Training Command
+
+```bash
+# Single GPU
+CUDA_VISIBLE_DEVICES=1 python train_gear5.py \
+  --config-path configs/gear5 \
+  training.iterations=60001 \
+  dataset.data_root=/path/to/datasets \
+  +loss_type=log_l1
+
+# Multi-GPU (DDP)
+./train_gear5_ddp.sh \
+  --config-path configs/gear5 \
+  --results-dir train_results/results_X/gear_5_gru/large/ \
+  --batch-size 20 \
+  --loss importance
+```
+
+**Key Parameters**:
+- `training.gear5_lr`: 1.0e-4 (TemporalScalePredictor learning rate)
+- `training.batch_size`: 20 per GPU (effective 40 with 2 GPUs)
+- Trainable params: ~132K
+
+---
+
+## Gear5 (Mamba): Mamba2-Based Temporal Modulation
+
+### Architecture
+
+Gear5 (Mamba) replaces the GRU with **Mamba2** for temporal scale/shift prediction, offering a lightweight alternative with similar parameter count.
+
+```
+Video Input [B, T, 3, H, W]
+    ↓
+ ViT Encoder (Frozen)
+    ↓
+CLS Tokens [Layers 11, 23] → ImportanceMapGenerator → Importance Map
+    ↓                              ↓
+TemporalScalePredictor          Loss Weighting
+ (Mamba2, 1 layer)
+    ↓
+Scale [B, T, 1, 1, 1], Shift [B, T, 1, 1, 1]
+    ↓
+Relative Depth × Scale + Shift = Metric Depth
+```
+
+### Key Components
+
+#### 1. TemporalScalePredictor (Mamba2)
+Uses Mamba2 for efficient temporal modeling with state-space architecture.
 
 ```python
-class Gear5Head(nn.Module):
-    def __init__(self, embed_dim=1024):
-        self.temporal_scale_predictor = TemporalScalePredictor(embed_dim)
-        self.importance_map_generator = ImportanceMapGenerator(num_layers=2)
+class TemporalScalePredictor(nn.Module):
+    """
+    CLS token [B, T, 1024] → Linear → Mamba2 → Linear → Scale/Shift
 
-    def forward(self, cls_tokens_multi_layer, attention_weights_list,
-                relative_depth, patch_h, patch_w):
-        """
-        Args:
-            cls_tokens_multi_layer: List of [B, T, 1024] from [Layer 11, 23]
-            attention_weights_list: List of [B*T, heads, N+1, N+1] from [Layer 11, 23]
-            relative_depth: [B, T, 1, H, W] normalized depth
-            patch_h, patch_w: Spatial patch dimensions (e.g., 37×37 for 518×518)
+    Architecture:
+        - Input projection: 1024 → 256
+        - Mamba2: d_model=256, d_state=64, d_conv=4, expand=2
+        - Output projection: 256 → 2 (scale, shift)
 
-        Returns:
-            dict with:
-                - metric_depth: [B, T, 1, H, W]
-                - scale: [B, T, 1, 1, 1]
-                - shift: [B, T, 1, 1, 1]
-                - importance_map: [B, T, patch_h, patch_w]
-        """
-        # Use last layer CLS token for scale/shift prediction
-        cls_token = cls_tokens_multi_layer[-1]  # [B, T, 1024]
-
-        # Predict scale and shift
-        scale, shift = self.temporal_scale_predictor(cls_token)
-
-        # Apply to relative depth
-        metric_depth = scale * relative_depth + shift
-
-        # Generate importance map for loss
-        importance_map = self.importance_map_generator(
-            attention_weights_list, patch_h, patch_w
-        )
-
-        return {
-            'metric_depth': metric_depth,
-            'scale': scale,
-            'shift': shift,
-            'importance_map': importance_map
-        }
+    Trainable params: ~147K
+    """
 ```
 
-### Dimension Flow
-
-```
-Input Video:        [B=2, T=5, C=3, H=518, W=518]
-                             ↓
-ViT Encoder (Frozen):
-  - Patch embedding:     [B*T=10, N=1369, embed=1024]
-  - Layer 11 output:     [B*T=10, N+1=1370, 1024]  (with CLS)
-  - Layer 23 output:     [B*T=10, N+1=1370, 1024]  (with CLS)
-
-CLS Token Extraction:
-  - Layer 11 CLS:        [B*T=10, 1024] → Reshape → [B=2, T=5, 1024]
-  - Layer 23 CLS:        [B*T=10, 1024] → Reshape → [B=2, T=5, 1024]
-  - cls_tokens_multi_layer = [[B, T, 1024], [B, T, 1024]]
-
-Attention Weights:
-  - Layer 11 attn:       [B*T=10, heads=16, N+1=1370, N+1=1370]
-  - Layer 23 attn:       [B*T=10, heads=16, N+1=1370, N+1=1370]
-
-TemporalScalePredictor:
-  cls_token (Layer 23):  [B=2, T=5, 1024]
-       ↓ Linear(1024→256)
-  cls_features:          [B=2, T=5, 256]
-       ↓ Bi-GRU(2 layers, hidden=256)
-  gru_output:            [B=2, T=5, 512]  # 256×2 bidirectional
-       ↓ Linear(512→2)
-  scale_shift:           [B=2, T=5, 2]
-       ↓ Split & Reshape
-  scale:                 [B=2, T=5, 1, 1, 1]
-  shift:                 [B=2, T=5, 1, 1, 1]
-
-ImportanceMapGenerator:
-  attention_weights_list: [[B*T=10, 16, 1370, 1370], [B*T=10, 16, 1370, 1370]]
-       ↓ Extract CLS-to-patch attn[:, :, 0, 1:]
-  cls_to_patch:          [B*T=10, 16, N=1369]
-       ↓ Mean over heads
-  cls_attention:         [B*T=10, N=1369]
-       ↓ Average layers 11, 23
-  cls_avg:               [B*T=10, N=1369]
-       ↓ Reshape to spatial
-  importance_map:        [B*T=10, 1, patch_h=37, patch_w=37]
-       ↓ Remove register token + normalize
-       ↓ Reshape temporal
-  importance_map:        [B=2, T=5, patch_h=37, patch_w=37]
-
-Metric Depth:
-  relative_depth:        [B=2, T=5, 1, H=518, W=518]
-  metric_depth:          scale × relative_depth + shift
-                         [B=2, T=5, 1, 518, 518]
-```
-
-### Parameter Count
-
-**Frozen Components** (~340M params):
-- ViT Encoder: ~304M
-- DPT: ~35M
-- Mamba: ~0.9M
-- output_conv: ~0.6K
-
-**Trainable Components** (~132K params):
-- TemporalScalePredictor:
-  - Input Linear: 1024×256 = 262K weights + 256 bias = 262,400
-  - Bi-GRU (2 layers): ~66K
-  - Output Linear: 512×2 = 1,024 + 2 bias = 1,026
-- ImportanceMapGenerator: 0 (no trainable params)
-- **Total trainable**: ~132K
-
-### Training Strategy
-
-**Freezing**:
+**Forward Flow**:
 ```python
-# Freeze entire FlashDepth model
-for param in model.pretrained.parameters():
-    param.requires_grad = False
-for param in model.depth_head.parameters():
-    param.requires_grad = False
-if model.use_mamba:
-    for param in model.mamba_temporal_modules.parameters():
-        param.requires_grad = False
-
-# Only train Gear5Head
-for param in model.gear5_head.parameters():
-    param.requires_grad = True
+cls_token: [B, T, 1024]  # Last layer CLS token (Layer 23)
+    ↓ Linear(1024 → 256)
+cls_features: [B, T, 256]
+    ↓ Mamba2(d_state=64, d_conv=4)
+mamba_output: [B, T, 256]
+    ↓ Linear(256 → 2)
+scale_shift: [B, T, 2]
+    ↓ Split
+scale: [B, T, 1, 1, 1] = exp(scale_raw)  # Ensures positive
+shift: [B, T, 1, 1, 1] = shift_raw        # Real number (can be negative)
 ```
 
-**Learning Rates**:
-- `gear5_lr`: 1.0e-4 (TemporalScalePredictor)
-- Weight decay: 1.0e-6
+**Advantages over GRU**:
+- More efficient temporal modeling with state-space mechanism
+- Better long-range dependency capture
+- Slightly higher parameter count (~147K vs ~132K)
 
-**Loss**: Log L1 in inverse depth space (100/m) with optional importance weighting.
+### Training Command
+
+```bash
+# Single GPU with Mamba2 backend
+CUDA_VISIBLE_DEVICES=1 python train_gear5.py \
+  --config-path configs/gear5 \
+  training.iterations=60001 \
+  dataset.data_root=/path/to/datasets \
+  +loss_type=log_l1 \
+  +use_mamba_predictor=true
+
+# Multi-GPU (DDP) - using Docker script
+./train_gear5_ddp.sh \
+  --config-path configs/gear5 \
+  --results-dir train_results/results_X/gear_5_mamba/large/ \
+  --batch-size 20 \
+  --loss importance \
+  --mamba  # Enable Mamba2 instead of GRU
+```
+
+**Key Parameters**:
+- `use_mamba_predictor`: true (use Mamba2 instead of GRU)
+- `training.gear5_lr`: 1.0e-4
+- Trainable params: ~147K
 
 ---
 
@@ -268,7 +224,7 @@ Gear5 FiLM applies **channel-wise FiLM modulation** to DPT features before Mamba
 ```
 Video Input [B, T, 3, H, W]
     ↓
-ViT Encoder (Frozen)
+ ViT Encoder (Frozen)
     ↓
 CLS Tokens [Layers 11, 23] → GlobalFeatureNetwork → ModulationNetwork
     ↓                              ↓                      ↓
@@ -283,10 +239,7 @@ ImportanceMapGenerator → Importance Map (Loss Weighting)
 
 ### Key Components
 
-#### 1. ImportanceMapGenerator
-Identical to Gear5 - generates spatial importance weights from CLS attention.
-
-#### 2. GlobalFeatureNetwork
+#### 1. GlobalFeatureNetwork
 Extracts global semantic features from CLS token.
 
 ```python
@@ -297,21 +250,10 @@ class GlobalFeatureNetwork(nn.Module):
     Architecture:
         - Linear(1024 → 512) → ReLU
         - Linear(512 → 256) → ReLU
-
-    Processes each frame independently, handles temporal dimension.
     """
-
-    def forward(self, cls_token):
-        """
-        Args:
-            cls_token: [B, T, 1024] from Layer 23
-
-        Returns:
-            global_feature: [B, T, 256]
-        """
 ```
 
-#### 3. ModulationNetwork
+#### 2. ModulationNetwork
 Generates channel-wise gamma and beta for FiLM modulation.
 
 ```python
@@ -322,257 +264,80 @@ class ModulationNetwork(nn.Module):
     Architecture:
         - Linear(256 → 512) → ReLU
         - Linear(512 → 512)  # First 256: gamma, Last 256: beta
-
-    Each channel gets its own gamma/beta, applied uniformly across spatial locations.
     """
-
-    def forward(self, global_feature):
-        """
-        Args:
-            global_feature: [B, T, 256]
-
-        Returns:
-            gamma: [B, T, 256]  # Channel-wise scaling
-            beta: [B, T, 256]   # Channel-wise shift
-        """
 ```
 
-**Key Concept - Channel-wise Modulation**:
-- 256 DPT channels = 256 information types
-- Each channel gets its own gamma/beta pair
-- All spatial locations (H×W) within a channel share the same gamma/beta
-- Formula: `modulated[b,t,c,x,y] = gamma[b,t,c] ⊙ feature[b,t,c,x,y] + beta[b,t,c]`
+**Key Concept**: Each of 256 DPT channels gets its own gamma/beta pair, applied uniformly across spatial locations.
 
-#### 4. SimpleFeatureModulator
-Applies channel-wise FiLM modulation to DPT features.
+#### 3. SimpleFeatureModulator
+Applies FiLM modulation: `feature * gamma + beta`
 
-```python
-class SimpleFeatureModulator(nn.Module):
-    """
-    Apply FiLM-style modulation: feature * gamma + beta (channel-wise)
-    """
+### Training Command
 
-    def forward(self, features, gamma, beta):
-        """
-        Args:
-            features: [B*T, C=256, H, W] DPT path_1 features
-            gamma: [B, T, 256] channel-wise scaling
-            beta: [B, T, 256] channel-wise shift
+```bash
+# Single GPU
+CUDA_VISIBLE_DEVICES=1 python train_gear5_film.py \
+  --config-path configs/gear5_film \
+  training.iterations=60001 \
+  dataset.data_root=/path/to/datasets \
+  +loss_type=log_l1
 
-        Returns:
-            modulated_features: [B*T, 256, H, W]
-        """
-        # Reshape gamma/beta to [B*T, C, 1, 1]
-        gamma_expanded = gamma.view(B*T, C, 1, 1)
-        beta_expanded = beta.view(B*T, C, 1, 1)
-
-        # Apply channel-wise modulation
-        return gamma_expanded * features + beta_expanded
+# Multi-GPU (DDP)
+./train_gear5_film_ddp.sh \
+  --config-path configs/gear5_film \
+  --results-dir train_results/results_X/gear_5_film/large/ \
+  --batch-size 20 \
+  --loss importance
 ```
 
-#### 5. Gear5FilmHead (Main Module)
-
-```python
-class Gear5FilmHead(nn.Module):
-    def __init__(self, embed_dim=1024, dpt_dim=256):
-        self.global_feature_net = GlobalFeatureNetwork(embed_dim, feature_dim=256)
-        self.modulation_net = ModulationNetwork(feature_dim=256, dpt_dim=dpt_dim)
-        self.feature_modulator = SimpleFeatureModulator()
-        self.importance_map_generator = ImportanceMapGenerator(num_layers=2)
-
-    def forward(self, cls_tokens_multi_layer, attention_weights_list,
-                dpt_features, patch_h, patch_w):
-        """
-        Args:
-            cls_tokens_multi_layer: List of [B, T, 1024] from [Layer 11, 23]
-            attention_weights_list: List of [B*T, heads, N+1, N+1] from [Layer 11, 23]
-            dpt_features: List of 4× [B*T, 256, H, W] DPT layer features
-            patch_h, patch_w: Spatial patch dimensions
-
-        Returns:
-            dict with:
-                - path_1_modulated: [B*T, 256, H, W]
-                - gamma: [B, T, 256]
-                - beta: [B, T, 256]
-                - importance_map: [B, T, patch_h, patch_w]
-        """
-        # Use last layer CLS token (Layer 23)
-        cls_token = cls_tokens_multi_layer[-1]  # [B, T, 1024]
-
-        # Generate global semantic feature
-        global_feature = self.global_feature_net(cls_token)  # [B, T, 256]
-
-        # Get modulation parameters
-        gamma, beta = self.modulation_net(global_feature)  # [B, T, 256] each
-
-        # Modulate ONLY path_1 (last DPT layer features)
-        path_1 = dpt_features[-1]  # [B*T, 256, H, W]
-        path_1_modulated = self.feature_modulator(path_1, gamma, beta)
-
-        # Generate importance map
-        importance_map = self.importance_map_generator(
-            attention_weights_list, patch_h, patch_w
-        )  # [B, T, patch_h, patch_w]
-
-        return {
-            'path_1_modulated': path_1_modulated,
-            'gamma': gamma,
-            'beta': beta,
-            'importance_map': importance_map
-        }
-```
-
-### Dimension Flow
-
-```
-Input Video:        [B=2, T=5, C=3, H=518, W=518]
-                             ↓
-ViT Encoder (Frozen):
-  - Layer 11 CLS:        [B*T=10, 1024] → Reshape → [B=2, T=5, 1024]
-  - Layer 23 CLS:        [B*T=10, 1024] → Reshape → [B=2, T=5, 1024]
-
-DPT (Frozen):
-  - path_1 (Layer 23):   [B*T=10, C=256, H=65, W=65]
-  - path_2 (Layer 11):   [B*T=10, C=512, H=65, W=65]
-  - path_3 (Layer 5):    [B*T=10, C=256, H=65, W=65]
-  - path_4 (Layer 2):    [B*T=10, C=256, H=65, W=65]
-
-GlobalFeatureNetwork:
-  cls_token (Layer 23):  [B=2, T=5, 1024]
-       ↓ Reshape to [B*T=10, 1024]
-       ↓ Linear(1024→512) → ReLU
-       ↓ Linear(512→256) → ReLU
-  global_feature:        [B*T=10, 256]
-       ↓ Reshape to [B=2, T=5, 256]
-
-ModulationNetwork:
-  global_feature:        [B=2, T=5, 256]
-       ↓ Reshape to [B*T=10, 256]
-       ↓ Linear(256→512) → ReLU
-       ↓ Linear(512→512)
-  params:                [B*T=10, 512]
-       ↓ Split into [B*T=10, 256] each
-  gamma:                 [B*T=10, 256] → Reshape → [B=2, T=5, 256]
-  beta:                  [B*T=10, 256] → Reshape → [B=2, T=5, 256]
-
-SimpleFeatureModulator:
-  path_1:                [B*T=10, C=256, H=65, W=65]
-  gamma:                 [B=2, T=5, 256] → Reshape → [B*T=10, 256, 1, 1]
-  beta:                  [B=2, T=5, 256] → Reshape → [B*T=10, 256, 1, 1]
-       ↓ Broadcast to [B*T=10, 256, 65, 65]
-  path_1_modulated:      gamma * path_1 + beta
-                         [B*T=10, 256, 65, 65]
-
-Mamba Temporal Processing (Trainable):
-  path_1_modulated:      [B*T=10, 256, 65, 65]
-       ↓ Reshape to [B=2, T=5, 256, 65, 65]
-       ↓ Mamba layers (4 layers, d_state=256)
-  temporal_features:     [B=2, T=5, 256, 65, 65]
-       ↓ Flatten to [B*T=10, 256, 65, 65]
-
-DPT Refinement Head (Frozen output_conv1 + Trainable output_conv2):
-  temporal_features:     [B*T=10, 256, 65, 65]
-       ↓ Upsample + fusion
-  depth_pred:            [B*T=10, 1, 518, 518]
-       ↓ Reshape temporal
-  metric_depth:          [B=2, T=5, 1, 518, 518]
-
-ImportanceMapGenerator:
-  attention_weights:     [[B*T=10, 16, 1370, 1370], [B*T=10, 16, 1370, 1370]]
-       ↓ CLS attention extraction + averaging
-  importance_map:        [B=2, T=5, patch_h=37, patch_w=37]
-```
-
-### Parameter Count
-
-**Frozen Components** (~339M params):
-- ViT Encoder: ~304M
-- DPT: ~35M
-- output_conv1: ~0.3K
-
-**Trainable Components** (~1.03M params):
-- Gear5FilmHead:
-  - GlobalFeatureNetwork: (1024×512 + 512×256) + bias ≈ 656K
-  - ModulationNetwork: (256×512 + 512×512) + bias ≈ 394K
-  - SimpleFeatureModulator: 0 (no params)
-  - ImportanceMapGenerator: 0 (no params)
-  - **Subtotal**: ~132K (per actual module implementation)
-- Mamba modules: ~0.9M
-- output_conv2: ~0.6K
-- **Total trainable**: ~1.03M
-
-### Training Strategy
-
-**Freezing**:
-```python
-# Freeze ViT encoder
-for param in model.pretrained.parameters():
-    param.requires_grad = False
-
-# Freeze DPT (except output_conv2)
-for name, param in model.depth_head.named_parameters():
-    if 'output_conv2' not in name:
-        param.requires_grad = False
-    else:
-        param.requires_grad = True
-
-# Train Mamba
-if model.use_mamba:
-    for param in model.mamba_temporal_modules.parameters():
-        param.requires_grad = True
-
-# Train Gear5FilmHead
-for param in model.gear5_film_head.parameters():
-    param.requires_grad = True
-```
-
-**Learning Rates**:
-- `film_lr`: 1.0e-4 (Gear5FilmHead modules)
-- `mamba_lr`: 1.0e-5 (Mamba temporal modules)
-- `output_lr`: 1.0e-5 (output_conv2)
-- Weight decay: 1.0e-6
-
-**Loss**: Log L1 in inverse depth space (100/m) with optional importance weighting.
+**Key Parameters**:
+- `training.film_lr`: 1.0e-4 (Gear5FilmHead learning rate)
+- `training.mamba_lr`: 1.0e-5 (Mamba temporal modules)
+- `training.output_lr`: 1.0e-5 (output_conv2)
+- Trainable params: ~1.03M (head + Mamba + conv2)
 
 ---
 
 ## Comparison
 
-### Side-by-Side Comparison
+### Feature Comparison
 
-| Feature | Gear5 (Original) | Gear5 FiLM |
-|---------|------------------|------------|
-| **Modulation Target** | Final relative depth map | DPT path_1 features |
-| **Modulation Timing** | After all processing | Before Mamba temporal modeling |
-| **Modulation Type** | Scalar scale/shift per frame | Channel-wise gamma/beta (256 channels) |
-| **Temporal Modeling** | GRU inside head (bidirectional) | Existing Mamba layers (4 layers) |
-| **CLS Token Usage** | Layer 23 only (for scale/shift) | Layer 23 only (for FiLM params) |
-| **Attention Usage** | Layers [11, 23] for importance map | Layers [11, 23] for importance map |
-| **Trainable Params** | ~132K (TemporalScalePredictor) | ~1.03M (head + Mamba + conv2) |
-| **Frozen Components** | Everything except Gear5Head | ViT + DPT + output_conv1 |
-| **Training Speed** | Faster (less trainable params) | Slower (more trainable params) |
-| **Modulation Granularity** | Coarse (1 scale + 1 shift per frame) | Fine (256 gamma + 256 beta per frame) |
-| **Loss Functions** | log_l1, importance | log_l1, importance |
+| Feature | Gear5 (GRU) | Gear5 (Mamba) | Gear5 FiLM |
+|---------|-------------|---------------|------------|
+| **Modulation Target** | Final depth map | Final depth map | DPT features |
+| **Modulation Timing** | After all processing | After all processing | Before Mamba |
+| **Modulation Type** | Scalar scale/shift | Scalar scale/shift | Channel-wise (256×) |
+| **Temporal Backend** | Bi-GRU (2 layers) | Mamba2 (1 layer) | Mamba (4 layers) |
+| **Trainable Params** | ~132K | ~147K | ~1.03M |
+| **Frozen Components** | All except head | All except head | ViT + DPT + conv1 |
+| **Training Speed** | Fast | Fast | Slower |
+| **Memory Usage** | Low | Low | Higher |
+| **Long-range Dependency** | Good (bidirectional) | Better (state-space) | Best (4-layer Mamba) |
+| **Modulation Granularity** | Coarse (1 scale/shift) | Coarse (1 scale/shift) | Fine (256 gamma/beta) |
 
 ### When to Use Which?
 
-**Use Gear5 (Original)** when:
-- You want minimal trainable parameters (~132K)
-- You need faster training and inference
-- You want explicit temporal consistency via GRU
-- Simple global scale/shift is sufficient
+**Use Gear5 (GRU)** when:
+- You want proven, stable temporal modeling
+- Minimal parameters (~132K) with bidirectional context
+- Standard training setup without special dependencies
+
+**Use Gear5 (Mamba)** when:
+- You want efficient state-space temporal modeling
+- Better long-range dependency capture than GRU
+- Similar parameter count (~147K) but better scaling
 
 **Use Gear5 FiLM** when:
 - You want fine-grained channel-wise modulation
 - You can afford more trainable parameters (~1.03M)
-- You want to leverage and refine Mamba's temporal modeling
-- You want modulation integrated early in the pipeline
+- You want modulation integrated early in pipeline
+- Best temporal modeling with 4-layer Mamba
 
 ---
 
 ## Loss Functions
 
-Both Gear5 variants support two loss types: `log_l1` (default) and `importance` (weighted).
+All Gear5 variants support two loss types with **NaN-safe** implementations.
 
 ### Log L1 Loss (Standard)
 
@@ -581,21 +346,24 @@ def log_l1_loss(pred, target, valid_mask):
     """
     Log L1 loss in inverse depth space (100/m)
 
-    Formula: L = |log(100/pred) - log(100/target)|
-           = |log(target) - log(pred)|  (after simplification)
+    Formula: L = |log(pred_inv) - log(target_inv)|
+    where pred_inv = 100/pred, target_inv = 100/target
 
-    Args:
-        pred: [B*T, 1, H, W] predicted metric depth (meters)
-        target: [B*T, 1, H, W] ground truth metric depth (meters)
-        valid_mask: [B*T, 1, H, W] boolean mask (True = valid pixel)
-
-    Returns:
-        Scalar loss (mean over valid pixels)
+    NaN-safe: Clamps values to [epsilon, +inf] before log
     """
-    pred_inv = 100.0 / (pred + 1e-8)
-    target_inv = 100.0 / (target + 1e-8)
+    epsilon = 1e-8
 
-    loss = torch.abs(torch.log(pred_inv + 1e-8) - torch.log(target_inv + 1e-8))
+    # Clamp to positive values BEFORE log (critical for NaN prevention)
+    pred = torch.clamp(pred, min=epsilon)
+    target = torch.clamp(target, min=epsilon)
+
+    pred_inv = 100.0 / (pred + epsilon)
+    target_inv = 100.0 / (target + epsilon)
+
+    loss = torch.abs(
+        torch.log(pred_inv + epsilon) -
+        torch.log(target_inv + epsilon)
+    )
 
     return loss[valid_mask].mean()
 ```
@@ -616,40 +384,30 @@ def importance_weighted_loss(pred, target, valid_mask, importance_map):
 
     Where:
         - L: Standard Log L1 loss per pixel
-        - importance: Spatial importance map from CLS attention [0, 1]
-        - fg_ratio: Fraction of high-attention pixels (importance > mean)
-        - Higher weights on semantically important regions
-
-    Args:
-        pred: [B*T, 1, H, W] predicted metric depth
-        target: [B*T, 1, H, W] ground truth metric depth
-        valid_mask: [B*T, 1, H, W] boolean mask
-        importance_map: [B, T, patch_h, patch_w] attention-based importance
-
-    Returns:
-        Scalar loss (mean over valid pixels)
+        - importance: Spatial map from CLS attention [0, 1]
+        - fg_ratio: Fraction of high-attention pixels
     """
-    # Compute base loss
-    pred_inv = 100.0 / (pred + 1e-8)
-    target_inv = 100.0 / (target + 1e-8)
-    loss = torch.abs(torch.log(pred_inv + 1e-8) - torch.log(target_inv + 1e-8))
+    # Compute base loss (NaN-safe)
+    epsilon = 1e-8
+    pred = torch.clamp(pred, min=epsilon)
+    target = torch.clamp(target, min=epsilon)
 
-    # Resize importance map to match depth resolution
-    B, T, patch_h, patch_w = importance_map.shape
+    pred_inv = 100.0 / (pred + epsilon)
+    target_inv = 100.0 / (target + epsilon)
+    loss = torch.abs(torch.log(pred_inv + epsilon) - torch.log(target_inv + epsilon))
+
+    # Resize importance map to depth resolution
     importance_resized = F.interpolate(
-        importance_map.view(B * T, 1, patch_h, patch_w),
+        importance_map.view(B*T, 1, patch_h, patch_w),
         size=(H, W), mode='bilinear', align_corners=True
-    )  # [B*T, 1, H, W]
+    )
 
-    importance_flat = importance_resized.flatten()
-
-    # Compute foreground ratio (pixels with importance > mean)
-    importance_threshold = importance_flat.mean()
-    fg_mask = (importance_flat > importance_threshold)
-    fg_ratio = fg_mask.float().mean()
+    # Compute foreground ratio
+    importance_threshold = importance_resized.mean()
+    fg_ratio = (importance_resized > importance_threshold).float().mean()
 
     # Apply importance weighting
-    weighted_loss = loss * (1.0 + fg_ratio * importance_flat.float())
+    weighted_loss = loss * (1.0 + fg_ratio * importance_resized)
 
     return weighted_loss[valid_mask].mean()
 ```
@@ -659,7 +417,33 @@ def importance_weighted_loss(pred, target, valid_mask, importance_map):
 python train_gear5.py --config-path configs/gear5 +loss_type=importance
 ```
 
-**Effect**: Higher loss weights on regions with high CLS attention (semantically important areas like objects), lower weights on background/less important regions.
+**Effect**: Higher loss weights on semantically important regions (high CLS attention), lower weights on background.
+
+---
+
+## Valid Mask Criteria
+
+**CRITICAL**: All Gear5 variants follow consistent valid mask criteria:
+
+### Training & Validation
+```python
+# Valid mask: GT > 0 (all valid pixels, no distance threshold)
+valid_mask = (gt_depth_inverse > 0) & (pred_depth_inverse > 0)
+```
+
+**No 70m threshold** in training/validation to use all available GT data.
+
+### Testing
+```python
+# Valid mask: 70m threshold (canonical space evaluation)
+MIN_INVERSE_DEPTH = 100.0 / 70.0  # 1.4286 (inverse of 70m)
+valid_mask = (gt_depth_inverse >= MIN_INVERSE_DEPTH) & (pred_depth_inverse > 0)
+```
+
+**Why 70m threshold in test?**
+- Canonical space (fx=500 at 518×518) evaluation standard
+- Ensures fair comparison across datasets
+- Filters out unreliable far-depth regions
 
 ---
 
@@ -667,70 +451,70 @@ python train_gear5.py --config-path configs/gear5 +loss_type=importance
 
 ### Training
 
-#### Gear5 (Original)
+#### Gear5 (GRU) - Default
 
-**Single GPU**:
 ```bash
+# Single GPU
 CUDA_VISIBLE_DEVICES=1 python train_gear5.py \
   --config-path configs/gear5 \
-  training.iterations=40001 \
+  training.iterations=60001 \
   dataset.data_root=/path/to/datasets \
   +loss_type=log_l1
-```
 
-**Multi-GPU (DDP)**:
-```bash
+# Multi-GPU (DDP)
 ./train_gear5_ddp.sh \
   --config-path configs/gear5 \
-  training.iterations=40001 \
-  dataset.data_root=/path/to/datasets \
-  +loss_type=importance
+  --results-dir train_results/results_X/gear_5_gru/large/ \
+  --batch-size 20 \
+  --loss importance
 ```
 
-**Key Parameters**:
-- `load`: Path to FlashDepth-L checkpoint (configs/flashdepth-l/iter_10001.pth)
-- `training.batch_size`: 20 per GPU (effective 40 with 2 GPUs in DDP)
-- `training.gear5_lr`: 1.0e-4 (TemporalScalePredictor learning rate)
-- `training.iterations`: 40001 (with save_freq=5000, val_freq=1000)
-- `loss_type`: 'log_l1' or 'importance'
+#### Gear5 (Mamba) - With Mamba2 Backend
+
+```bash
+# Single GPU
+CUDA_VISIBLE_DEVICES=1 python train_gear5.py \
+  --config-path configs/gear5 \
+  training.iterations=60001 \
+  dataset.data_root=/path/to/datasets \
+  +loss_type=log_l1 \
+  +use_mamba_predictor=true
+
+# Multi-GPU (DDP) - Docker
+./train_gear5_ddp.sh \
+  --config-path configs/gear5 \
+  --results-dir train_results/results_X/gear_5_mamba/large/ \
+  --batch-size 20 \
+  --loss importance \
+  --mamba  # Enable Mamba2 backend
+```
 
 #### Gear5 FiLM
 
-**Single GPU**:
 ```bash
+# Single GPU
 CUDA_VISIBLE_DEVICES=1 python train_gear5_film.py \
   --config-path configs/gear5_film \
-  training.iterations=40001 \
+  training.iterations=60001 \
   dataset.data_root=/path/to/datasets \
   +loss_type=log_l1
-```
 
-**Multi-GPU (DDP)**:
-```bash
+# Multi-GPU (DDP)
 ./train_gear5_film_ddp.sh \
   --config-path configs/gear5_film \
-  training.iterations=40001 \
-  dataset.data_root=/path/to/datasets \
-  +loss_type=importance
+  --results-dir train_results/results_X/gear_5_film/large/ \
+  --batch-size 20 \
+  --loss importance
 ```
-
-**Key Parameters**:
-- `load`: Path to FlashDepth-L checkpoint (configs/flashdepth-l/iter_10001.pth)
-- `training.batch_size`: 20 per GPU (effective 40 with 2 GPUs in DDP)
-- `training.film_lr`: 1.0e-4 (Gear5FilmHead learning rate)
-- `training.mamba_lr`: 1.0e-5 (Mamba temporal modules learning rate)
-- `training.output_lr`: 1.0e-5 (output_conv2 learning rate)
-- `training.iterations`: 40001
-- `loss_type`: 'log_l1' or 'importance'
 
 ### Testing
 
-#### Gear5 (Original)
+#### Gear5 (GRU/Mamba)
 
 ```bash
 CUDA_VISIBLE_DEVICES=1 python test_gear5.py \
   --config-path configs/gear5 \
-  --checkpoint train_results/results_X/gear_5/phase_1/checkpoint_step40000.pth \
+  --checkpoint train_results/results_X/gear_5/phase_1/checkpoint_step60000.pth \
   --results-dir test_results/gear5_results \
   --gpu 1
 ```
@@ -740,17 +524,18 @@ CUDA_VISIBLE_DEVICES=1 python test_gear5.py \
 ```bash
 CUDA_VISIBLE_DEVICES=1 python test_gear5_film.py \
   --config-path configs/gear5_film \
-  --checkpoint train_results/results_X/gear_5_film/phase_1/checkpoint_step40000.pth \
+  --checkpoint train_results/results_X/gear_5_film/phase_1/checkpoint_step60000.pth \
   --results-dir test_results/gear5_film_results \
   --gpu 1
 ```
 
 **Output**:
 - Depth predictions (npy/png)
-- Visualization grids (input, prediction, GT)
-- Metrics JSON (per-sequence and averaged)
-- Gamma/beta visualizations (FiLM only)
-- Importance maps (if enabled)
+- Visualization grids (input, prediction, GT, valid masks)
+- Metrics JSON (MAE, RMSE, AbsRel, δ1/δ2/δ3, TAE)
+- Scale/shift visualizations (GRU/Mamba variants)
+- Gamma/beta visualizations (FiLM variant)
+- Importance maps
 
 ### Docker Commands
 
@@ -759,22 +544,16 @@ CUDA_VISIBLE_DEVICES=1 python test_gear5_film.py \
 ./run_docker.sh build
 ```
 
-**Training (Gear5)**:
+**Training**:
 ```bash
-./run_docker.sh train_gear5 \
-  --loss importance \
-  --batch-size 20 \
-  --workers 8 \
-  --gpu 1
-```
+# Gear5 (GRU)
+./run_docker.sh train_gear5_ddp --loss importance --batch-size 20 --gpu 0,1
 
-**Training (Gear5 FiLM)**:
-```bash
-./run_docker.sh train_gear5_film \
-  --loss log_l1 \
-  --batch-size 20 \
-  --workers 8 \
-  --gpu 1
+# Gear5 (Mamba)
+./run_docker.sh train_gear5_ddp --loss importance --batch-size 20 --mamba --gpu 0,1
+
+# Gear5 FiLM
+./run_docker.sh train_gear5_film_ddp --loss log_l1 --batch-size 20 --gpu 0,1
 ```
 
 **Testing**:
@@ -787,117 +566,174 @@ CUDA_VISIBLE_DEVICES=1 python test_gear5_film.py \
 
 ## Configuration
 
-### Gear5 Config Example (`configs/gear5/config.yaml`)
+### Gear5 Config (`configs/gear5/config.yaml`)
 
 ```yaml
 # General settings
 config_dir: null
 inference: false
-load: configs/flashdepth-l/iter_10001.pth  # FlashDepth-L pretrained weights
+load: configs/flashdepth-l/iter_10001.pth  # FlashDepth-L weights
 
-# Canonical space settings
-canonical_focal_length: 500.0  # Fixed canonical focal length for 518×518 resolution (configurable)
-use_canonical_space: true  # Enable/disable canonicalization (on/off toggle)
+# Canonical space
+canonical_focal_length: 500.0  # For 518×518 resolution
+use_canonical_space: true
 
-# Loss function selection
-# Options: 'log_l1' (default), 'importance' (importance-weighted)
+# Loss function ('log_l1' or 'importance')
 loss_type: "log_l1"
 
-# Dataset configuration
+# Temporal predictor backend
+use_mamba_predictor: false  # false = GRU (default), true = Mamba2
+
+# Dataset
 dataset:
   data_root: null
-  resolution: 'base'  # 518x518
+  resolution: 'base'  # 518×518
   video_length: 5
   train_datasets: [mvs-synth, dynamicreplica, tartanair, pointodyssey, spring]
   val_datasets: [sintel, waymo_seg]
 
-# Training configuration
+# Training
 training:
-  batch_size: 20  # Per GPU (effective 40 with 2 GPUs in DDP)
+  batch_size: 20  # Per GPU
   workers: 8
-  iterations: 40001
+  iterations: 60001
   save_freq: 5000
   val_freq: 1000
   log_freq: 100
   wandb: false
-  wandb_name: "gear5_phase1"
 
-  # Learning rates
-  gear5_lr: 1.0e-4     # TemporalScalePredictor learning rate
+  # Learning rate
+  gear5_lr: 1.0e-4     # TemporalScalePredictor
   weight_decay: 1.0e-6
 
-# Model configuration
+# Model
 model:
   vit_size: "vitl"
   patch_size: 14
   attn_class: "MemEffAttention"
 
-  # Gear5 attention layer selection (2-layer CLS tokens)
-  target_blocks: [11, 23]  # ViT-L: layers 11, 23
-  target_blocks_s: [5, 11]  # ViT-S: layers 5, 11 (for Phase 2 hybrid)
+  # Attention layers for CLS extraction
+  target_blocks: [11, 23]      # ViT-L
+  target_blocks_s: [5, 11]     # ViT-S
 
-  # Mamba configuration (frozen in Gear5)
+  # Mamba (frozen in Gear5)
   use_mamba: true
   mamba_type: "add"
   num_mamba_layers: 4
-  downsample_mamba: [0.1]
-  mamba_pos_embed: null
   mamba_in_dpt_layer: [1]
   mamba_d_conv: 4
   mamba_d_state: 256
 
-# Evaluation configuration
+# Evaluation
 eval:
   compile: false
   metrics: true
   save_grid: true
-  outfolder: "test_gear5"
   test_datasets: [sintel]
-  save_vis_map: true  # Save importance map visualizations
+  save_vis_map: true
 ```
 
-### Gear5 FiLM Config Example (`configs/gear5_film/config.yaml`)
+### Gear5 FiLM Config (`configs/gear5_film/config.yaml`)
 
 ```yaml
-# (Similar structure to Gear5 config)
+# (Similar structure to Gear5)
 
-# Loss function selection (Gear5 FiLM style)
+# Loss function
 loss_type: "log_l1"
 
-# Training configuration
+# Training
 training:
   batch_size: 20
   workers: 8
-  iterations: 40001
-  save_freq: 5000
-  val_freq: 1000
+  iterations: 60001
 
-  # Learning rates
-  film_lr: 1.0e-4     # FiLM modules learning rate
-  mamba_lr: 1.0e-5    # Mamba learning rate (lower than FiLM)
-  output_lr: 1.0e-5   # output_conv2 learning rate
+  # Learning rates (3 separate rates)
+  film_lr: 1.0e-4      # FiLM modules
+  mamba_lr: 1.0e-5     # Mamba (trainable)
+  output_lr: 1.0e-5    # output_conv2
   weight_decay: 1.0e-6
 
-# Model configuration
+# Model
 model:
-  # (Same as Gear5)
-  use_mamba: true  # Trainable in Gear5 FiLM
-  # ... (Mamba configuration)
+  use_mamba: true  # Trainable in FiLM variant
+  # ... (same Mamba config)
 ```
+
+---
+
+## Recent Updates
+
+### NaN Loss Fix (2025-11-16)
+
+**Problem**: Occasional `loss=nan` during training due to:
+1. `log(negative_value)` or `log(0)` when shift is negative
+2. Invalid GT pixels (0 or negative) not filtered before log
+
+**Solution**: Added `torch.clamp(min=epsilon)` before all log operations:
+
+```python
+# train_gear5.py & train_gear5_film.py
+epsilon = 1e-8
+pred_depth_flat = torch.clamp(pred_depth_flat, min=epsilon)
+gt_depth_flat = torch.clamp(gt_depth_flat, min=epsilon)
+
+loss = torch.abs(
+    torch.log(pred_depth_flat + epsilon) -
+    torch.log(gt_depth_flat + epsilon)
+)
+```
+
+```python
+# utils/gear_losses.py (LogL1Loss)
+epsilon = 1e-8
+pred_valid = torch.clamp(pred_valid, min=epsilon)
+gt_valid = torch.clamp(gt_valid, min=epsilon)
+
+loss = F.l1_loss(
+    torch.log(pred_valid + epsilon),
+    torch.log(gt_valid + epsilon),
+    reduction='mean'
+)
+```
+
+**Files Modified**:
+- `train_gear5.py`: Lines 1073-1083
+- `train_gear5_film.py`: Lines 1013-1022
+- `utils/gear_losses.py`: Lines 48-69
+
+**Impact**: All Gear variants (2, 3, 4, 5, 5_film) now NaN-safe.
+
+### Valid Mask Standardization (2025-11-16)
+
+**Changes**:
+- Train/Validation: `GT > 0` (no 70m threshold)
+- Test: `GT >= 100/70` (70m threshold in canonical space)
+- Consistent across all Gear variants
+
+**Files Modified**:
+- `train_gear2.py`, `train_gear3.py`, `train_gear4.py`
+- `train_gear5.py`, `train_gear5_film.py`
 
 ---
 
 ## Summary
 
-**Gear5** provides lightweight, GRU-based temporal scale/shift prediction for metric depth, ideal for scenarios requiring minimal trainable parameters (~132K) and explicit temporal consistency.
+**Gear5 (GRU)**: Proven, stable GRU-based temporal scale/shift prediction (~132K params)
 
-**Gear5 FiLM** offers fine-grained channel-wise feature modulation integrated early in the pipeline, suitable for scenarios where you can afford more trainable parameters (~1.03M) and want to leverage Mamba's temporal modeling capabilities.
+**Gear5 (Mamba)**: Efficient Mamba2-based temporal modeling (~147K params) with better long-range dependencies
 
-Both variants:
-- Support canonical space normalization (focal length = 500.0 for 518×518, configurable)
+**Gear5 FiLM**: Fine-grained channel-wise modulation with trainable Mamba (~1.03M params)
+
+All variants:
+- Support canonical space normalization (fx=500 @ 518×518)
 - Generate importance maps for loss weighting
 - Support `log_l1` and `importance` loss types
-- Use multi-layer CLS tokens from DINOv2 [Layers 11, 23]
-- Trained on video datasets with metric depth ground truth
+- Use multi-layer CLS tokens [11, 23] from ViT-L
+- **NaN-safe** loss computation with clamping
+- Consistent valid mask criteria (train/val: GT>0, test: 70m threshold)
 
-Choose the variant that best fits your computational budget, modulation granularity needs, and training objectives.
+Choose based on:
+- **Parameter budget**: GRU/Mamba (~132-147K) vs FiLM (~1.03M)
+- **Temporal modeling**: GRU (bidirectional) vs Mamba2 (state-space) vs 4-layer Mamba
+- **Modulation granularity**: Scalar (GRU/Mamba) vs Channel-wise (FiLM)
+- **Training time**: Fast (GRU/Mamba) vs Slower (FiLM)

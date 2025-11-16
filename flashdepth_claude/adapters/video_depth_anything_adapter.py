@@ -119,43 +119,55 @@ class VideoDepthAnythingAdapter(MethodAdapter):
 
     def inference(self, image, intrinsics=None):
         """
-        Run Video-Depth-Anything inference on single frame
+        Run Video-Depth-Anything inference on video sequence
 
         Args:
-            image: torch.Tensor [1, 3, H, W] - Input image (0-1 normalized, RGB)
+            image: torch.Tensor [1, T, 3, H, W] - Input video sequence (0-1 normalized, RGB)
             intrinsics: Optional camera intrinsics (not used)
 
         Returns:
-            depth: torch.Tensor [1, H, W] - Predicted depth
+            depth: torch.Tensor [1, T, H, W] - Predicted depth sequence
                    Metric mode: depth in meters
                    Non-metric mode: relative depth (0-1 normalized)
         """
-        orig_H, orig_W = image.shape[2:]
+        # Handle both single frame [1, 3, H, W] and sequence [1, T, 3, H, W]
+        if image.ndim == 4:
+            # Single frame - add temporal dimension
+            image = image.unsqueeze(1)  # [1, 1, 3, H, W]
 
-        # Preprocess image (adds temporal dimension)
-        processed = self.preprocess(image)  # [1, 1, 3, H', W']
+        B, T, C, orig_H, orig_W = image.shape
+
+        # Preprocess each frame individually (preprocess expects [1, 3, H, W])
+        processed_frames = []
+        for t in range(T):
+            frame = image[:, t]  # [B, 3, H, W]
+            processed_frame = self.preprocess(frame)  # [1, 1, 3, H', W']
+            processed_frames.append(processed_frame.squeeze(1))  # [1, 3, H', W']
+
+        # Stack into sequence [B, T, 3, H', W']
+        processed = torch.cat(processed_frames, dim=0).unsqueeze(0)  # [1, T, 3, H', W']
 
         if self.device is not None:
             processed = processed.to(self.device)
 
-        # Run inference
+        # Run inference on entire sequence
         with torch.no_grad():
             with torch.autocast(device_type=str(self.device).split(':')[0] if self.device else 'cpu',
                                dtype=torch.float16, enabled=True):
-                depth = self.model.forward(processed)  # [1, 1, H', W']
-
-        # Remove temporal dimension
-        depth = depth.squeeze(1)  # [1, H', W']
+                depth = self.model.forward(processed)  # [B, T, H', W']
 
         # Resize back to original size
-        depth = F.interpolate(
-            depth.unsqueeze(1),
+        B, T, H_out, W_out = depth.shape
+        depth_reshaped = depth.view(B*T, 1, H_out, W_out)
+        depth_resized = F.interpolate(
+            depth_reshaped,
             size=(orig_H, orig_W),
             mode='bilinear',
             align_corners=True
-        ).squeeze(1)  # [1, H, W]
+        )  # [B*T, 1, H, W]
+        depth_resized = depth_resized.view(B, T, orig_H, orig_W)  # [B, T, H, W]
 
-        return depth
+        return depth_resized
 
     def get_required_env(self):
         return "vda"
