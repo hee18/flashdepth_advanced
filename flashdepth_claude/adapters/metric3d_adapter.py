@@ -65,8 +65,8 @@ class Metric3DAdapter(MethodAdapter):
 
         # Check for local checkpoint in multiple locations
         local_ckpt_paths = [
-            repo_path / 'weight' / ckpt_name,
             repo_path / 'checkpoints' / ckpt_name,
+            repo_path / 'weight' / ckpt_name,
             repo_path / ckpt_name,
         ]
 
@@ -117,16 +117,24 @@ class Metric3DAdapter(MethodAdapter):
         Returns:
             depth: torch.Tensor [1, H, W] - Metric depth in meters
         """
-        # Convert to numpy for preprocessing
-        rgb_origin = image[0].permute(1, 2, 0).cpu().numpy()  # [H, W, 3]
-        rgb_origin = (rgb_origin * 255).astype(np.uint8)
+        # Get original size
+        H_orig, W_orig = image.shape[2:]
 
-        H_orig, W_orig = rgb_origin.shape[:2]
-
-        # Resize keeping aspect ratio
+        # Resize keeping aspect ratio (do this on GPU first to avoid large CPU transfer)
         scale = min(self.input_size[0] / H_orig, self.input_size[1] / W_orig)
-        rgb = cv2.resize(rgb_origin, (int(W_orig * scale), int(H_orig * scale)),
-                        interpolation=cv2.INTER_LINEAR)
+        new_h, new_w = int(H_orig * scale), int(W_orig * scale)
+
+        # Resize on GPU using PyTorch (much faster than CPU cv2.resize for large images)
+        image_resized = F.interpolate(
+            image,  # [1, 3, H, W]
+            size=(new_h, new_w),
+            mode='bilinear',
+            align_corners=False
+        )  # [1, 3, new_h, new_w]
+
+        # Now convert to numpy (much smaller image)
+        rgb_origin = image_resized[0].permute(1, 2, 0).cpu().numpy()  # [new_h, new_w, 3]
+        rgb = (rgb_origin * 255).astype(np.uint8)
 
         # Scale intrinsics
         if intrinsics is not None:
@@ -153,23 +161,34 @@ class Metric3DAdapter(MethodAdapter):
             # Default focal length if not provided
             fx = 1000.0 * scale
 
-        # Padding to input_size
-        padding = [123.675, 116.28, 103.53]
-        h, w = rgb.shape[:2]
+        # Convert back to torch tensor on GPU for padding and normalization
+        # (faster than doing it in numpy on CPU)
+        rgb_torch = torch.from_numpy(rgb.transpose((2, 0, 1))).float().to(self.device)  # [3, H, W]
+        rgb_torch = rgb_torch.unsqueeze(0)  # [1, 3, H, W]
+
+        # Padding to input_size (on GPU)
+        h, w = rgb_torch.shape[2:]
         pad_h = self.input_size[0] - h
         pad_w = self.input_size[1] - w
         pad_h_half = pad_h // 2
         pad_w_half = pad_w // 2
-        rgb = cv2.copyMakeBorder(rgb, pad_h_half, pad_h - pad_h_half, pad_w_half,
-                                pad_w - pad_w_half, cv2.BORDER_CONSTANT, value=padding)
         pad_info = [pad_h_half, pad_h - pad_h_half, pad_w_half, pad_w - pad_w_half]
 
-        # Normalize
-        mean = torch.tensor([123.675, 116.28, 103.53]).float()[:, None, None]
-        std = torch.tensor([58.395, 57.12, 57.375]).float()[:, None, None]
-        rgb = torch.from_numpy(rgb.transpose((2, 0, 1))).float()
-        rgb = torch.div((rgb - mean), std)
-        rgb = rgb[None, :, :, :].to(self.device)
+        # Use PyTorch padding with constant value
+        padding_value = torch.tensor([123.675, 116.28, 103.53], device=self.device).view(1, 3, 1, 1)
+        rgb_torch = F.pad(rgb_torch, (pad_w_half, pad_w - pad_w_half, pad_h_half, pad_h - pad_h_half),
+                         mode='constant', value=0)
+        # Apply padding color
+        mask = torch.ones_like(rgb_torch)
+        mask = F.pad(torch.zeros(1, 1, h, w, device=self.device),
+                    (pad_w_half, pad_w - pad_w_half, pad_h_half, pad_h - pad_h_half),
+                    mode='constant', value=1)
+        rgb_torch = rgb_torch + mask * padding_value
+
+        # Normalize (on GPU)
+        mean = torch.tensor([123.675, 116.28, 103.53], device=self.device).float().view(1, 3, 1, 1)
+        std = torch.tensor([58.395, 57.12, 57.375], device=self.device).float().view(1, 3, 1, 1)
+        rgb = torch.div((rgb_torch - mean), std)
 
         # Inference
         with torch.no_grad():

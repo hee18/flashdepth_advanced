@@ -291,11 +291,17 @@ class Gear5Trainer:
                 self.logger.warning(f"Checkpoint {checkpoint_path} not found")
 
         # Add Gear5 metric head (unified single-stage)
-        # Uses 2-layer CLS tokens and GRU for temporal modeling
+        # Uses 2-layer CLS tokens and GRU/Mamba2 for temporal modeling
+        use_mamba_temporal = self.config.model.get('use_mamba_temporal', False)
+        self.logger.info(f"Gear5 TemporalScalePredictor backend: {'Mamba2' if use_mamba_temporal else 'GRU'}")
+        if use_mamba_temporal:
+            self.logger.warning("NOTE: FlashDepth's original Mamba modules will be FROZEN. Only TemporalScalePredictor's Mamba2 is trainable.")
+
         model.gear5_metric_head = Gear5MetricHead(
             embed_dim=embed_dim,
             feature_dim=256,
-            hidden_dim=128
+            hidden_dim=128,
+            use_mamba=use_mamba_temporal  # NEW: Support Mamba2 option
         )
 
         # Phase 2: Load Phase 1 checkpoint, then overwrite ViT+DPT with FlashDepth-S hybrid
@@ -679,7 +685,7 @@ class Gear5Trainer:
                 continue
 
             # Training step
-            loss_dict = self.train_step(batch)
+            loss_dict = self.train_step(batch, step)
             
             # Get learning rates
             lr_gear5 = self.optimizer.param_groups[0]['lr']
@@ -846,7 +852,7 @@ class Gear5Trainer:
                         importance_map_vis = importance_map[:, 0]  # [B, patch_h, patch_w]
                         importance_map_vis = importance_map_vis.unsqueeze(1)  # [B, 1, patch_h, patch_w]
 
-                        # Resize importance map to match image resolution
+                        # Resize importance map to match image resolution (for smooth visualization)
                         importance_map_resized = F.interpolate(
                             importance_map_vis, size=(H, W), mode='bilinear', align_corners=True
                         )
@@ -854,7 +860,7 @@ class Gear5Trainer:
                         # Include outputs with importance map + canonical masks + scale/shift
                         model_outputs_cpu = {
                             'pred_depth': pred_depth_metric_vis[:1].cpu(),  # [1, 1, H, W]
-                            'importance_map': importance_map_resized[:1].cpu(),  # [1, 1, H, W]
+                            'importance_map': importance_map_resized[:1].cpu(),  # [1, 1, H, W] - upsampled
                             'canonical_gt_valid': canonical_gt_valid_vis[:1].cpu(),  # [1, 1, H, W] - canonical space mask
                             'canonical_pred_valid': canonical_pred_valid_vis[:1].cpu(),  # [1, 1, H, W] - canonical space mask
                             'scale': scale[:1, :1].cpu(),  # [1, 1] - first batch, first frame
@@ -910,17 +916,22 @@ class Gear5Trainer:
         self.save_checkpoint('last.pth')
         self.logger.info("Training completed!")
 
-    def train_step(self, batch):
+    def train_step(self, batch, step):
         """Single training step with BFloat16 autocast"""
-        # Unpack batch (now includes fx_ratio and resize_ratio from Metric3D canonicalization)
-        images, gt_depth, focal_lengths_canonical, focal_lengths_actual, actual_valid_mask, fx_ratio, resize_ratio, dataset_idx = batch
+        if batch is None:
+            return None
+
+        # Unpack batch
+        images, gt_depth, focal_lengths_canonical, focal_lengths_actual, actual_valid_masks, fx_ratio, resize_ratio, dataset_idx = batch
+
+        # Move to device
         images = images.to(self.device)
         gt_depth = gt_depth.to(self.device)
-        focal_lengths_canonical = focal_lengths_canonical.to(self.device)  # Shape: (B, T), all 500.0 (canonical)
-        focal_lengths_actual = focal_lengths_actual.to(self.device)  # Shape: (B, T), original focal lengths
-        actual_valid_mask = actual_valid_mask.to(self.device)  # Shape: (B, T, H, W), actual space <70m
-        fx_ratio = fx_ratio.to(self.device)  # Shape: (B, T), focal length ratios (500 / fx_actual)
-        resize_ratio = resize_ratio.to(self.device)  # Shape: (B, T), total resize ratios
+        focal_lengths_canonical = focal_lengths_canonical.to(self.device)
+        focal_lengths_actual = focal_lengths_actual.to(self.device)
+        actual_valid_masks = actual_valid_masks.to(self.device)
+        fx_ratio = fx_ratio.to(self.device)
+        resize_ratio = resize_ratio.to(self.device)
 
         # Add channel dimension if needed
         if gt_depth.ndim == 3:
@@ -930,201 +941,166 @@ class Gear5Trainer:
 
         B, T = images.shape[:2]
 
+        # GT depth from dataloader is inverse depth (1/m), scale to 100/m
+        gt_depth_inverse_100 = gt_depth * 100.0
+
         # Get the actual model (unwrap DDP if needed)
         model = self.model.module if isinstance(self.model, DDP) else self.model
 
-        # DEBUG: Check raw GT depth values
-        if self.global_step < 5:  # Only log first few steps
-            self.logger.info(f"DEBUG - Raw GT depth from dataloader: min={gt_depth.min():.4f}, max={gt_depth.max():.4f}, shape={gt_depth.shape}")
-            self.logger.info(f"DEBUG - GT depth has {(gt_depth > 0).sum()} valid pixels out of {gt_depth.numel()} total")
-
-        # GT depth from dataloader is inverse depth (1/m), scale to 100/m for training
-        # This matches FlashDepth's relative depth scale (≈ 100/metric_depth)
-        gt_depth_inverse_100 = gt_depth * 100.0  # (1/m) * 100 = 100/m
-
-        # DEBUG: Check after scaling to 100/m
-        if self.global_step < 5:
-            self.logger.info(f"DEBUG - After scaling to 100/m: min={gt_depth_inverse_100.min():.4f}, max={gt_depth_inverse_100.max():.4f}")
-            self.logger.info(f"DEBUG - Has {(gt_depth_inverse_100 > 0).sum()} valid pixels")
-
-        # NOTE: GT depth is already in canonical space (fx=500 at 518×518)
-        # Canonical transformation is now handled in the dataloader
-        # focal_lengths_canonical tensor contains all 500.0 values (canonical focal length)
-        # focal_lengths_actual contains original focal lengths from datasets
-        CANONICAL_FX = self._get_canonical_focal_length()  # 500.0
-
-        if self.global_step < 5:
-            self.logger.info(f"DEBUG - Canonical space: CANONICAL_FX={CANONICAL_FX}, fx_canonical from dataloader: {focal_lengths_canonical[0,0]:.1f}")
-            self.logger.info(f"DEBUG - Original fx_actual from dataloader: {focal_lengths_actual[0,0]:.1f}")
-            self.logger.info(f"DEBUG - GT depth already in canonical space (transformed in dataloader)")
-
-        # Forward pass following original FlashDepth pattern (whole sequence at once)
         # Initialize Mamba sequence (critical for temporal processing!)
         if hasattr(model, 'mamba'):
             model.mamba.start_new_sequence()
 
-        # Reshape video from (B, T, C, H, W) to (B*T, C, H, W) for encoder
-        B_orig, T_orig, C, H, W = images.shape
-        images_flat = rearrange(images, 'b t c h w -> (b t) c h w')
-
-        patch_h, patch_w = H // model.patch_size, W // model.patch_size
-
-        # Use BFloat16 for forward pass
+        # Forward pass with BFloat16 autocast
         with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-            # Extract features from DINOv2 (frozen, no grad) - all frames at once
+            # Reshape video from (B, T, C, H, W) to (B*T, C, H, W) for encoder
+            B_orig, T_orig, C, H, W = images.shape
+            images_flat = rearrange(images, 'b t c h w -> (b t) c h w')
+
+            patch_h, patch_w = H // model.patch_size, W // model.patch_size
+
+            # Extract features from DINOv2 (frozen, no grad)
             with torch.no_grad():
                 encoder_features = model.pretrained.get_intermediate_layers(
                     images_flat, model.intermediate_layer_idx[model.encoder]
                 )
 
-                # Get attention weights from last block (B*T, num_heads, N, N)
-                last_block = model.pretrained.blocks[-1]
-                attention_weights = last_block.attn.attn_weights
+                # Get patch tokens from encoder layers (for DPT)
+                # encoder_features is a list of [B*T, N, C] tensors
 
-                # Get patch tokens from last encoder layer (B*T, N, C)
-                patch_tokens = encoder_features[-1]
+            # Extract 2-layer CLS tokens for Gear5 (from target_blocks [11, 23])
+            # target_blocks are absolute ViT block indices, need to map to encoder_features indices
+            target_blocks = self.config.model.target_blocks  # [11, 23] for ViT-L
+            intermediate_layers = model.intermediate_layer_idx[model.encoder]  # [4, 11, 17, 23] for ViT-L
 
-            # Get DPT features WITHOUT Mamba (DPT frozen, no grad)
+            # Map target_blocks to encoder_features indices
+            # e.g., target_blocks [11, 23] -> encoder_features indices [1, 3]
+            encoder_feature_indices = [intermediate_layers.index(block_idx) for block_idx in target_blocks]
+
+            # Get CLS tokens from target layers: encoder_features[i][:, 0] is CLS token
+            cls_tokens_list = []
+            attention_weights_list = []
+
+            for feat_idx, block_idx in zip(encoder_feature_indices, target_blocks):
+                # CLS token: [B*T, embed_dim]
+                cls_token = encoder_features[feat_idx][:, 0]
+                cls_tokens_list.append(cls_token)
+
+                # Get attention weights from corresponding block
+                # Access the block from pretrained model using absolute block index
+                block = model.pretrained.blocks[block_idx]
+                attn_weights = block.attn.attn_weights  # [B*T, num_heads, N+1, N+1]
+                attention_weights_list.append(attn_weights)
+
+            # Average CLS tokens across layers: [B*T, embed_dim]
+            cls_tokens_avg = torch.stack(cls_tokens_list, dim=0).mean(dim=0)  # [B*T, embed_dim]
+
+            # Reshape to [B, T, embed_dim]
+            cls_tokens = cls_tokens_avg.view(B_orig, T_orig, -1)
+
+            # Get DPT features and relative depth (frozen, no grad)
             with torch.no_grad():
                 dpt_features = model.depth_head.get_forward_features(
                     encoder_features, patch_h, patch_w
-                )  # Returns [path_4, path_3, path_2, path_1], each (B*T, dpt_dim, h, w)
+                )  # Returns [path_4, path_3, path_2, path_1]
                 path_1 = dpt_features[-1]  # Extract path_1: (B*T, dpt_dim, h, w)
 
-            # Gear5: Extract 2-layer CLS tokens and attention weights
-            # For ViT-L: layers [11, 23], encoder_indices = [1, 3]
-            # For ViT-S: layers [5, 11], encoder_indices = [1, 3]
-            with torch.no_grad():
-                cls_tokens_list = [
-                    encoder_features[i][:, 0]  # CLS token: [B*T, embed_dim]
-                    for i in self.encoder_indices
-                ]
-                attention_weights_list = [
-                    model.pretrained.blocks[block_idx].attn.attn_weights  # [B*T, num_heads, N+1, N+1]
-                    for block_idx in self.target_blocks
-                ]
-
-                # Average 2-layer CLS tokens and reshape to [B, T, embed_dim]
-                cls_tokens_avg = torch.stack(cls_tokens_list, dim=0).mean(dim=0)  # [B*T, embed_dim]
-                cls_tokens = rearrange(cls_tokens_avg, '(b t) d -> b t d', b=B_orig, t=T_orig)  # [B, T, embed_dim]
-
-            # Get DPT features (frozen, no grad)
-            with torch.no_grad():
-                dpt_features = model.depth_head.get_forward_features(
-                    encoder_features, patch_h, patch_w
-                )
-                path_1 = dpt_features[-1]  # [B*T, dpt_dim, h, w]
-
-            # Apply Mamba temporal modeling (frozen)
-            with torch.no_grad():
-                path_1_temporal = model.dpt_features_to_mamba(
-                    input_shape=(B_orig, T_orig, None, H, W),
-                    dpt_features=path_1,
-                    in_dpt_layer=0
-                )  # [B*T, dpt_dim, h, w]
-
-            # Get relative depth from frozen output_conv
-            with torch.no_grad():
-                out = model.depth_head.scratch.output_conv1(path_1_temporal)
-                out = F.interpolate(out, (H, W), mode="bilinear", align_corners=True)
-                relative_depth = model.depth_head.scratch.output_conv2(out)  # [B*T, 1, H, W]
-
-            # Get scale/shift/importance_map from Gear5MetricHead (trainable)
+            # Call Gear5MetricHead to get scale, shift, importance_map
             gear5_outputs = model.gear5_metric_head(
-                cls_tokens=cls_tokens,  # [B, T, 1024]
-                attention_weights_list=attention_weights_list,  # List of 2 attention weights
-                patch_h=patch_h,
-                patch_w=patch_w
+                cls_tokens,  # [B, T, embed_dim]
+                attention_weights_list,  # List of [B*T, num_heads, N+1, N+1]
+                patch_h,
+                patch_w
             )
 
             scale = gear5_outputs['scale']  # [B, T]
             shift = gear5_outputs['shift']  # [B, T]
             importance_map = gear5_outputs['importance_map']  # [B, T, patch_h, patch_w]
 
-            # DEBUG: Check scale/shift values at validation steps
-            if self.rank == 0 and (self.global_step % 1000 == 0 or self.global_step < 10):
-                scale_mean = scale.mean().item()
-                scale_min = scale.min().item()
-                scale_max = scale.max().item()
-                shift_mean = shift.mean().item()
-                shift_min = shift.min().item()
-                shift_max = shift.max().item()
-                self.logger.info(f"VALIDATION Step {self.global_step} - Scale: mean={scale_mean:.4f}, range=[{scale_min:.4f}, {scale_max:.4f}]")
-                self.logger.info(f"VALIDATION Step {self.global_step} - Shift: mean={shift_mean:.4f}, range=[{shift_min:.4f}, {shift_max:.4f}]")
-                self.logger.info(f"VALIDATION Step {self.global_step} - Relative depth: mean={relative_depth.mean():.4f}, range=[{relative_depth.min():.4f}, {relative_depth.max():.4f}]")
+            # Apply Mamba temporal modeling to DPT features (frozen, no grad needed)
+            with torch.no_grad():
+                path_1_temporal = model.dpt_features_to_mamba(
+                    input_shape=(B_orig, T_orig, None, H, W),
+                    dpt_features=path_1,
+                    in_dpt_layer=0
+                )  # Returns (B*T, dpt_dim, h, w) with temporal consistency
 
-            # Apply shift lower bound constraint (Option 1)
-            # Ensure pred stays positive even for far depths (e.g., 300m → inverse = 0.333)
-            GLOBAL_MIN_INVERSE = 100.0 / 300.0  # 0.333 (300m max depth assumption)
-            shift_lower_bound = -scale.abs() * GLOBAL_MIN_INVERSE  # [B, T]
-            shift_clamped = torch.clamp(shift, min=shift_lower_bound)  # [B, T]
+                # Pass through DPT output head (frozen)
+                out = model.depth_head.scratch.output_conv1(path_1_temporal)
+                out = F.interpolate(out, (H, W), mode="bilinear", align_corners=True)
+                out = model.depth_head.scratch.output_conv2(out)
 
-            # Apply scale/shift to relative depth with clamped shift
-            scale_flat = scale.view(B_orig * T_orig, 1, 1, 1)  # [B*T, 1, 1, 1]
-            shift_flat = shift_clamped.view(B_orig * T_orig, 1, 1, 1)  # [B*T, 1, 1, 1]
-            pred_depth_inverse_100 = scale_flat * relative_depth + shift_flat  # [B*T, 1, H, W] in 100/m
+                # Prediction is relative depth (inverse), already positive (Softplus activation)
+                # Shape: (B*T, 1, H, W)
+                pred_relative_inverse = out
 
-            # DEBUG: Check pred_depth_inverse_100 after scale/shift
-            if self.rank == 0 and (self.global_step % 1000 == 0 or self.global_step < 10):
-                self.logger.info(f"TRAINING Step {self.global_step} - Shift clamped: mean={shift_clamped.mean():.4f}, range=[{shift_clamped.min():.4f}, {shift_clamped.max():.4f}]")
-                self.logger.info(f"TRAINING Step {self.global_step} - Pred inverse 100: mean={pred_depth_inverse_100.mean():.4f}, range=[{pred_depth_inverse_100.min():.4f}, {pred_depth_inverse_100.max():.4f}]")
+                # Reshape to [B, T, 1, H, W]
+                pred_relative_inverse = pred_relative_inverse.view(B_orig, T_orig, 1, H, W)
 
-        # Reshape GT from (B, T, 1, H, W) to (B*T, 1, H, W)
-        gt_depth_inverse_flat = rearrange(gt_depth_inverse_100, 'b t 1 h w -> (b t) 1 h w')
+            # Apply scale and shift to convert relative depth to metric depth
+            # D_metric_inverse = scale * D_relative_inverse + shift
+            # Reshape scale and shift to match pred dimensions: [B, T] -> [B, T, 1, 1, 1]
+            scale_expanded = scale.view(B_orig, T_orig, 1, 1, 1)  # [B, T, 1, 1, 1]
+            shift_expanded = shift.view(B_orig, T_orig, 1, 1, 1)  # [B, T, 1, 1, 1]
 
-        # Flatten for loss computation
-        pred_depth_flat = pred_depth_inverse_100.flatten()  # [B*T*H*W] inverse depth (100/m)
-        gt_depth_flat = gt_depth_inverse_flat.flatten()  # [B*T*H*W] inverse depth (100/m)
+            # Apply transformation (this is where gradients flow to scale/shift!)
+            pred_metric_inverse = scale_expanded * pred_relative_inverse + shift_expanded  # [B, T, 1, H, W]
 
-        # Valid mask: GT valid + Pred positive (no 70m restriction in training, like original FlashDepth)
-        valid_mask = (gt_depth_flat >= 0) & (pred_depth_flat > 0)
-
-        if valid_mask.sum() == 0:
-            self.logger.error("No valid GT pixels in batch!")
-            return {'loss': 0.0}
-
-        # Compute loss based on loss_type
+        # Compute loss (outside autocast for numerical stability and gradient flow)
         with torch.amp.autocast('cuda', enabled=False):
-            epsilon = 1e-3
-            # pred_depth_flat and gt_depth_flat are already inverse depth (100/m)
-            # Compute log L1 loss directly in inverse depth space
+            # Canonical space validation masks (70m threshold)
+            MIN_INVERSE_DEPTH = 100.0 / 70.0  # 1.43 (100/m)
+            canonical_gt_valid = (gt_depth_inverse_100 > MIN_INVERSE_DEPTH)
+
+            # Combine with actual valid masks from dataloader
+            # actual_valid_masks: [B, T, H, W], need to add channel dim to match gt_depth: [B, T, 1, H, W]
+            canonical_gt_valid = canonical_gt_valid & actual_valid_masks.unsqueeze(2)
+
+            # Flatten for loss computation
+            pred_depth_flat = pred_metric_inverse.float().flatten()
+            gt_depth_flat = gt_depth_inverse_100.float().flatten()
+            valid_mask = canonical_gt_valid.flatten()
+
+            # Log L1 Loss (inverse depth space)
+            epsilon = 1e-8
             loss = torch.abs(
-                torch.log(pred_depth_flat.float() + epsilon) -
-                torch.log(gt_depth_flat.float() + epsilon)
+                torch.log(pred_depth_flat + epsilon) -
+                torch.log(gt_depth_flat + epsilon)
             )
 
             if self.loss_type == 'importance':
                 # Importance-weighted Log L1 Loss
-                # Resize importance map to depth map size and flatten
+                # Resize importance_map to image resolution (bilinear for smooth weighting)
                 importance_map_resized = F.interpolate(
-                    importance_map.view(B_orig * T_orig, 1, patch_h, patch_w),
+                    importance_map.float().view(B_orig * T_orig, 1, patch_h, patch_w),
                     size=(H, W),
                     mode='bilinear',
                     align_corners=True
                 )  # [B*T, 1, H, W]
                 importance_flat = importance_map_resized.flatten()  # [B*T*H*W]
 
-                # Compute fg_ratio (alpha) - fraction of high-importance pixels
+                # Compute fg_ratio from upsampled importance map (pixel-level)
                 importance_threshold = importance_flat.mean()
                 fg_mask = (importance_flat > importance_threshold)
-                fg_ratio = fg_mask.float().mean()
+                fg_ratio = fg_mask.float().mean().detach()  # Detach fg_ratio to avoid gradient issues
 
-                # Apply importance weighting
-                weighted_loss = loss * (1.0 + fg_ratio * importance_flat.float())
-                final_loss = weighted_loss[valid_mask].mean()
+                # Apply importance weighting - gradient flows through importance_flat
+                weights = 1.0 + fg_ratio * importance_flat
+                final_loss = (loss[valid_mask] * weights[valid_mask]).sum() / valid_mask.float().sum()
             else:
                 # Regular Log L1 Loss (no importance weighting)
                 final_loss = loss[valid_mask].mean()
+                fg_ratio = torch.tensor(0.0, device=self.device)
 
         # Backward pass (outside autocast for numerical stability)
         self.optimizer.zero_grad()
         final_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
         self.optimizer.step()
-        self.scheduler.step()
 
         return {
-            'loss': final_loss.item()
+            'loss': final_loss.item(),
+            'fg_ratio': fg_ratio.item() if self.loss_type == 'importance' else 0.0
         }
 
     @torch.no_grad()
@@ -1368,7 +1344,7 @@ class Gear5Trainer:
 
                         if self.loss_type == 'importance':
                             # Importance-weighted Log L1 Loss
-                            # Resize importance map to depth map size and flatten
+                            # Resize importance_map to image resolution (bilinear for smooth weighting)
                             importance_map_resized = F.interpolate(
                                 importance_map.view(B_orig * T_orig, 1, patch_h, patch_w),
                                 size=(H_gt, W_gt),
@@ -1379,7 +1355,7 @@ class Gear5Trainer:
                             importance_valid = importance_flat[valid_mask].float()
                             importance_positive = importance_valid[positive_mask]
 
-                            # Compute fg_ratio (alpha)
+                            # Compute fg_ratio from upsampled importance map (pixel-level)
                             importance_threshold = importance_flat.mean()
                             fg_ratio_positive = (importance_positive > importance_threshold).float().mean()
 
@@ -1449,7 +1425,7 @@ class Gear5Trainer:
                                 # Select first frame: [B, patch_h, patch_w]
                                 importance_map_vis = importance_map[:, 0]  # [B, patch_h, patch_w]
 
-                                # Resize importance map to GT resolution
+                                # Resize importance map to GT resolution (for smooth visualization)
                                 importance_map_resized_vis = F.interpolate(
                                     importance_map_vis.unsqueeze(1), size=(gt_h, gt_w), mode='bilinear', align_corners=True
                                 )  # [B, 1, gt_h, gt_w]
@@ -1457,7 +1433,7 @@ class Gear5Trainer:
                                 # Unified: Include all outputs + scale/shift
                                 model_outputs = {
                                     'pred_depth': pred_depth_metric,  # [B, 1, gt_h, gt_w]
-                                    'importance_map': importance_map_resized_vis.float().cpu(),  # [B, 1, gt_h, gt_w]
+                                    'importance_map': importance_map_resized_vis.float().cpu(),  # [B, 1, gt_h, gt_w] - upsampled
                                     'canonical_gt_valid': canonical_gt_valid_vis,  # [B, 1, H, W]
                                     'canonical_pred_valid': canonical_pred_valid_vis,  # [B, 1, H, W]
                                     'scale': scale[:, 0:1].cpu(),  # [B, 1] - first frame

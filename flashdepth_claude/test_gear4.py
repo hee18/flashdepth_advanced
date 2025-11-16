@@ -90,6 +90,10 @@ class Gear4Tester:
         self.object_wise_enabled = config.get('object_wise', {}).get('enabled', False)
         self.object_wise_dataset = config.get('object_wise', {}).get('dataset', 'waymo')
 
+        # Visualization control (master flag, default=True)
+        self.enable_visualization = config.get('visualization', True)
+        logger.info(f"Visualization: {'ENABLED' if self.enable_visualization else 'DISABLED (only JSON results)'}")
+
         # Frame interval for visualization (only applies to sequence.png, not video)
         self.frame_interval = None
 
@@ -293,7 +297,7 @@ class Gear4Tester:
                 root_dir=self.config.dataset.data_root,
                 enable_dataset_flags=test_datasets,
                 resolution=resolution,
-                split='val',  # Use 'val' split which returns dict format
+                split='test',  # Use 'test' split (full test dataset)
                 video_length=video_length
             )
             collate_fn = self._collate_fn
@@ -542,14 +546,43 @@ class Gear4Tester:
                 json.dump(avg_metrics, f, indent=2)
             logger.info(f"Results saved to {results_path}")
 
+            # Reorder per-sequence results
+            metric_order = ['abs_rel', 'a1', 'a2', 'a3', 'fps', 'tae', 'boundary_f1', 'mae', 'rmse']
+            reordered_metrics = []
+            for result in all_metrics:
+                reordered = {}
+                # First add sequence_id if it exists
+                if 'sequence_id' in result:
+                    reordered['sequence_id'] = result['sequence_id']
+                # Then add metrics in the desired order
+                for key in metric_order:
+                    if key in result:
+                        reordered[key] = result[key]
+                # Add any remaining keys
+                for key, value in result.items():
+                    if key not in reordered:
+                        reordered[key] = value
+                reordered_metrics.append(reordered)
+
             # Save per-sequence results
             per_sequence_path = self.save_dir / "per_sequence_results.json"
             with open(per_sequence_path, 'w') as f:
-                json.dump(all_metrics, f, indent=2)
+                json.dump(reordered_metrics, f, indent=2)
             logger.info(f"Per-sequence results saved to {per_sequence_path}")
 
             # Find and save best sequence (lowest abs_rel)
-            best_seq = min(all_metrics, key=lambda x: x['abs_rel'])
+            best_seq_raw = min(all_metrics, key=lambda x: x['abs_rel'])
+            # Reorder best_seq metrics
+            best_seq = {}
+            if 'sequence_id' in best_seq_raw:
+                best_seq['sequence_id'] = best_seq_raw['sequence_id']
+            for key in metric_order:
+                if key in best_seq_raw:
+                    best_seq[key] = best_seq_raw[key]
+            for key, value in best_seq_raw.items():
+                if key not in best_seq:
+                    best_seq[key] = value
+
             best_seq_path = self.save_dir / "best_sequence.json"
             with open(best_seq_path, 'w') as f:
                 json.dump(best_seq, f, indent=2)
@@ -598,7 +631,13 @@ class Gear4Tester:
                 images = images.unsqueeze(0)  # [1, T, 3, H, W]
         else:
             images = batch['image'].to(self.device)  # [1, T, 3, H, W]
-        gt_depth = batch['depth'].to(self.device)  # [1, T, H, W] or [T, H, W] - val split has no channel dim
+
+        # Handle both 'depths' (WaymoSegmentationDataset objwise) and 'depth' (CombinedDataset)
+        if 'depths' in batch:
+            gt_depth = batch['depths'].to(self.device)  # [1, T, H, W] - objwise mode
+        else:
+            gt_depth = batch['depth'].to(self.device)  # [1, T, H, W] or [T, H, W] - val split
+
         focal_lengths = batch['focal_lengths'].to(self.device)  # [1, T]
 
         # Extract Metric3D canonicalization ratios from batch (if available)
@@ -649,7 +688,6 @@ class Gear4Tester:
         importance_maps = []
         fg_mask_list = []
         bg_mask_list = []
-        canonical_pred_valid_all = []  # Store canonical pred masks
 
         # Best frame tracking
         best_frame_idx = 0
@@ -776,9 +814,8 @@ class Gear4Tester:
                 # Prediction is already positive (Softplus activation in output_conv2)
                 pred_depth_inverse_100 = out  # [1, 1, H, W] in 100/m_canonical
 
-                # Save canonical pred mask (before de-canonicalization!)
-                canonical_pred_valid_t = (pred_depth_inverse_100 > MIN_INVERSE_CANONICAL)  # [1, 1, H, W]
-                canonical_pred_valid_all.append(canonical_pred_valid_t.cpu())
+                # Note: We no longer save canonical pred masks
+                # Valid masks will be computed in actual space for evaluation
 
                 # De-canonicalization: convert from canonical space to actual metric space
                 if use_canonical:
@@ -832,11 +869,16 @@ class Gear4Tester:
         fg_mask_all = torch.stack(fg_mask_list, dim=0)  # [T, 1, patch_h, patch_w]
         bg_mask_all = torch.stack(bg_mask_list, dim=0)  # [T, 1, patch_h, patch_w]
 
-        # Convert GT to metric depth for evaluation: use canonical GT (consistent with training)
-        # This ensures metrics are computed in canonical space, same as training/validation
-        gt_depth_metric = 100.0 / (gt_depth_inverse_100[0] + 1e-8)  # [T, 1, H, W] in canonical meters
+        # Convert GT to metric depth for evaluation
+        # GT is in canonical space (fx=500), de-canonicalize to actual space (like test_gear5)
+        gt_depth_canonical = 100.0 / (gt_depth_inverse_100[0] + 1e-8)  # [T, 1, H, W] in canonical meters
 
-        # Compute metrics (both pred and GT are now in meters)
+        # De-canonicalize: depth_actual = depth_canonical × (fx_actual / fx_canonical)
+        # This converts from canonical space (fx=500) back to actual space
+        de_canonical_ratio = fx_actual_tensor[0] / CANONICAL_FX  # [T]
+        gt_depth_metric = gt_depth_canonical * de_canonical_ratio.view(T, 1, 1, 1)  # [T, 1, H, W] in actual meters
+
+        # Compute metrics (both pred and GT are now in actual meters)
         # Move to CPU and compute per-frame metrics (like test_metric_head.py)
         pred_depths_cpu = pred_depths.cpu()
         gt_depth_metric_cpu = gt_depth_metric.cpu()
@@ -844,12 +886,11 @@ class Gear4Tester:
         frame_metrics = []
         for t in range(pred_depths.shape[0]):
             # Get individual frames (already on CPU)
-            pred_frame = pred_depths_cpu[t, 0]  # [H, W]
-            gt_frame = gt_depth_metric_cpu[t, 0]  # [H, W]
+            pred_frame = pred_depths_cpu[t, 0]  # [H, W] in actual meters
+            gt_frame = gt_depth_metric_cpu[t, 0]  # [H, W] in actual meters
 
-            # Create valid mask for this frame (like train_gear3 validation)
-            # Use same MAX_DEPTH as Gear3Visualizer (70m)
-            MAX_DEPTH = 70.0
+            # Create valid mask for this frame in actual space (like test_gear5)
+            MAX_DEPTH = 70.0  # 70m in actual space
             gt_valid_mask = (gt_frame > 0) & (gt_frame < MAX_DEPTH)  # GT valid pixels
             pred_valid_mask = (pred_frame > 0) & (pred_frame < MAX_DEPTH)  # Filter extreme values
             valid_mask = gt_valid_mask & pred_valid_mask  # [H, W] bool tensor
@@ -978,11 +1019,15 @@ class Gear4Tester:
                 seg_masks_np = None
                 per_frame_class_metrics = []
 
-        # Recreate valid_mask on GPU for visualization
-        valid_mask = (gt_depth_metric > 0)  # [T, 1, H, W] on GPU
+        # Compute valid masks for visualization in actual space (like test_gear5)
+        # Both pred and GT are now in actual meters
+        MAX_DEPTH_VIS = 70.0  # 70m in actual space
+        gt_valid_mask_vis = (gt_depth_metric > 0) & (gt_depth_metric < MAX_DEPTH_VIS)  # [T, 1, H, W]
+        pred_valid_mask_vis = (pred_depths > 0) & (pred_depths < MAX_DEPTH_VIS)  # [T, 1, H, W]
+        valid_mask = gt_valid_mask_vis & pred_valid_mask_vis  # [T, 1, H, W]
 
         # Visualize
-        if self.config.eval.get('save_grid', True):
+        if self.enable_visualization and self.config.eval.get('save_grid', True):
             self._visualize_sequence(
                 images[0], pred_depths, gt_depth_metric, importance_maps,
                 valid_mask, sequence_id, metrics, fps, focal_lengths[0]
@@ -990,7 +1035,7 @@ class Gear4Tester:
 
         # Save video (GIF or MP4)
         # Note: frame_interval is NOT applied to video - use all frames
-        if self.config.eval.get('out_video', True):
+        if self.enable_visualization and self.config.eval.get('out_video', True):
             # Use original model resolution for images (following FlashDepth approach)
             # save_gifs_as_grid/save_grid_to_mp4 will handle downsampling to save_res
             save_video_util(
@@ -1000,7 +1045,7 @@ class Gear4Tester:
             )
 
         # Save best frame visualizations
-        if len(frame_metrics) > 0:
+        if self.enable_visualization and len(frame_metrics) > 0:
             logger.info(f"Best frame for sequence {sequence_id}: Frame {best_frame_idx} (AbsRel={best_frame_abs_rel:.4f})")
 
             # Extract layer_weights for visualization
@@ -1610,7 +1655,7 @@ class Gear4Tester:
     def _aggregate_metrics(self, all_metrics):
         """Aggregate metrics across sequences"""
         metric_keys = all_metrics[0].keys()
-        aggregated = {}
+        aggregated_raw = {}
 
         for key in metric_keys:
             # Skip nested dictionaries (like object_wise metrics)
@@ -1619,7 +1664,18 @@ class Gear4Tester:
 
             values = [m[key] for m in all_metrics if key in m]
             if values:
-                aggregated[key] = np.mean(values)
+                aggregated_raw[key] = np.mean(values)
+
+        # Reorder metrics: abs_rel, a1, a2, a3, fps, tae, f1, mae, rmse
+        metric_order = ['abs_rel', 'a1', 'a2', 'a3', 'fps', 'tae', 'boundary_f1', 'mae', 'rmse']
+        aggregated = {}
+        for key in metric_order:
+            if key in aggregated_raw:
+                aggregated[key] = aggregated_raw[key]
+        # Add any remaining metrics not in the order list
+        for key, value in aggregated_raw.items():
+            if key not in aggregated:
+                aggregated[key] = value
 
         return aggregated
 

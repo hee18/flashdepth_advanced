@@ -113,9 +113,9 @@ class WaymoSegmentationDataset(Dataset):
         self.camera_name = camera_name
 
         # Paths for preprocessed dataset
-        # data_root should be the base path (e.g., /data/datasets)
-        # We need to add 'waymo_seg' subdirectory
-        self.waymo_root = self.data_root / 'waymo_seg' / split
+        # data_root should point to waymo_seg directory (e.g., /data/datasets/waymo_seg)
+        # Just add the split (val/test)
+        self.waymo_root = self.data_root / split
 
         if not self.waymo_root.exists():
             raise ValueError(f"Waymo root not found: {self.waymo_root}")
@@ -358,20 +358,30 @@ class WaymoSegmentationDataset(Dataset):
             valid_frame_indices = []  # Track which frames have valid segmentation
 
             for frame_idx in frame_indices:
-                # Load segmentation FIRST to check if we should process this frame
+                # Load segmentation (objwise_mode determines if we skip frames without it)
                 seg_path = seg_dir / f'{frame_idx:04d}.png'
-                
-                if not seg_path.exists():
-                    # Segmentation file doesn't exist - skip this frame
-                    continue
-                
-                seg_mask = Image.open(seg_path)
-                seg_mask_np = np.array(seg_mask).astype(np.uint8)
-                
-                # Check if segmentation has any valid annotation (> 0 pixels)
-                if (seg_mask_np > 0).sum() == 0:
-                    # No annotation in this frame - skip
-                    continue
+
+                # Objwise mode: skip frames without valid segmentation
+                if self.objwise_mode:
+                    if not seg_path.exists():
+                        # Segmentation file doesn't exist - skip this frame
+                        continue
+
+                    seg_mask = Image.open(seg_path)
+                    seg_mask_np = np.array(seg_mask).astype(np.uint8)
+
+                    # Check if segmentation has any valid annotation (> 0 pixels)
+                    if (seg_mask_np > 0).sum() == 0:
+                        # No annotation in this frame - skip
+                        continue
+                else:
+                    # Standard mode: load segmentation if available, otherwise create dummy
+                    if seg_path.exists():
+                        seg_mask = Image.open(seg_path)
+                        seg_mask_np = np.array(seg_mask).astype(np.uint8)
+                    else:
+                        # Create dummy segmentation (all zeros) for frames without annotation
+                        seg_mask_np = np.zeros((self.height, self.width), dtype=np.uint8)
                 
                 # This frame has valid segmentation - NOW load image and depth
                 # Load RGB image and resize to (width, height)
@@ -428,11 +438,16 @@ class WaymoSegmentationDataset(Dataset):
                 depth_map_inverse[valid_depth_mask] = 1.0 / depth_map[valid_depth_mask]
 
                 depth_map = torch.from_numpy(depth_map_inverse).float()
-                
-                # Resize segmentation
-                seg_mask = seg_mask.resize((self.width, self.height), Image.NEAREST)
-                seg_mask_np = np.array(seg_mask).astype(np.uint8)
-                seg_mask = torch.from_numpy(seg_mask_np)
+
+                # Resize segmentation (handle both PIL Image and numpy array)
+                if isinstance(seg_mask_np, np.ndarray) and seg_mask_np.shape == (self.height, self.width):
+                    # Already at target resolution (dummy segmentation)
+                    seg_mask = torch.from_numpy(seg_mask_np)
+                else:
+                    # Need to resize (from PIL Image)
+                    seg_mask = seg_mask.resize((self.width, self.height), Image.NEAREST)
+                    seg_mask_np = np.array(seg_mask).astype(np.uint8)
+                    seg_mask = torch.from_numpy(seg_mask_np)
 
                 # Get focal length for this sequence (same for all frames in sequence)
                 fx = self.get_focal_length(seq_dir)
@@ -455,7 +470,11 @@ class WaymoSegmentationDataset(Dataset):
             segmentations = torch.stack(segmentations, dim=0)  # (T, H, W)
             focal_lengths_tensor = torch.tensor(focal_lengths, dtype=torch.float32)  # (T,)
 
-            logger.info(f"[DATASET] {sequence_name}: Loaded {len(images)} frames with segmentation (frames {valid_frame_indices})")
+            # Log only frame count and range (avoid printing long frame lists)
+            if len(valid_frame_indices) > 0:
+                logger.info(f"[DATASET] {sequence_name}: Loaded {len(images)} frames (range: {valid_frame_indices[0]}-{valid_frame_indices[-1]})")
+            else:
+                logger.info(f"[DATASET] {sequence_name}: Loaded {len(images)} frames")
 
             return {
                 'images': images,
@@ -463,7 +482,8 @@ class WaymoSegmentationDataset(Dataset):
                 'segmentations': segmentations,  # Changed to plural - per-frame
                 'focal_lengths': focal_lengths_tensor,  # Focal lengths for each frame
                 'sequence_name': sequence_name,
-                'frame_indices': valid_frame_indices  # Actual frame numbers
+                'frame_indices': valid_frame_indices,  # Actual frame numbers
+                'dataset_name': 'waymo_seg'  # For intrinsics lookup
             }
 
         except Exception as e:
@@ -487,6 +507,7 @@ def collate_fn(batch):
     return {
         'images': torch.stack([item['images'] for item in batch]),
         'depths': torch.stack([item['depth'] for item in batch]),  # Changed to 'depths' (plural)
+        'dataset_name': [item['dataset_name'] for item in batch],  # List of dataset names
         'segmentations': torch.stack([item['segmentations'] for item in batch]),  # Per-frame segmentations
         'focal_lengths': torch.stack([item['focal_lengths'] for item in batch]),  # Focal lengths per frame
         'sequence_name': [item['sequence_name'] for item in batch],

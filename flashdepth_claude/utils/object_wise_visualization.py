@@ -26,6 +26,7 @@ def create_object_wise_grid(
     class_metrics,
     class_names_dict,
     output_path,
+    object_classes=None,
     top_k=16,
     cmap='turbo'
 ):
@@ -40,12 +41,19 @@ def create_object_wise_grid(
         class_metrics: Dict mapping class names to metrics
         class_names_dict: Dict mapping class IDs to class names
         output_path: Path to save visualization
+        object_classes: Set of object class names to visualize (if None, use all)
         top_k: Number of top classes to visualize (default: 16 for 4x4 grid)
         cmap: Colormap for depth visualization
     """
+    # Filter for object classes only (if provided)
+    if object_classes is not None:
+        filtered_metrics = {k: v for k, v in class_metrics.items() if k in object_classes}
+    else:
+        filtered_metrics = class_metrics
+
     # Sort classes by pixel count (descending)
     sorted_classes = sorted(
-        class_metrics.items(),
+        filtered_metrics.items(),
         key=lambda x: x[1].get('num_pixels', 0),
         reverse=True
     )[:top_k]

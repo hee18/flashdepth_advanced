@@ -27,12 +27,12 @@ class DepthProAdapter(MethodAdapter):
         DepthPro automatically resizes to 1536x1536 in infer() method
         """
         from depth_pro import create_model_and_transforms
+        from depth_pro.depth_pro import DepthProConfig
 
         # Check for local checkpoint first
         if checkpoint_path is None:
             repo_path = Path(__file__).parent.parent / 'refer_test'
             local_ckpt_paths = [
-                repo_path / 'configs' / 'depthpro' / 'depth_pro.pt',
                 repo_path / 'ml-depth-pro' / 'checkpoints' / 'depth_pro.pt',
             ]
 
@@ -44,17 +44,56 @@ class DepthProAdapter(MethodAdapter):
         if checkpoint_path:
             print(f"Loading DepthPro model from local checkpoint...")
             print(f"Using local checkpoint: {checkpoint_path}")
+            # Create config with custom checkpoint path
+            config = DepthProConfig(
+                patch_encoder_preset="dinov2l16_384",
+                image_encoder_preset="dinov2l16_384",
+                checkpoint_uri=checkpoint_path,
+                decoder_features=256,
+                use_fov_head=True,
+                fov_encoder_preset="dinov2l16_384",
+            )
         else:
             print(f"Loading DepthPro model...")
             print(f"Local checkpoint not found. Will download from HuggingFace...")
+            # Use default config (downloads from HF)
+            config = None
 
         # Create model and transforms
         # Model will automatically resize inputs to 1536x1536
-        self.model, self.transform = create_model_and_transforms(
-            device=torch.device("cpu"),  # Will be moved to GPU later
-            precision=torch.half,
-            checkpoint_path=checkpoint_path if checkpoint_path else None,
-        )
+        # Suppress verbose model architecture output
+        import warnings
+        import logging
+        import sys
+        import io
+
+        # Temporarily redirect stdout to suppress model architecture print
+        old_stdout = sys.stdout
+        sys.stdout = io.StringIO()
+
+        # Temporarily suppress warnings and logging
+        old_warning_filters = warnings.filters[:]
+        warnings.filterwarnings('ignore')
+        logging.disable(logging.CRITICAL)
+
+        try:
+            if config:
+                self.model, self.transform = create_model_and_transforms(
+                    config=config,
+                    device=torch.device("cpu"),  # Will be moved to GPU later
+                    precision=torch.half,
+                )
+            else:
+                self.model, self.transform = create_model_and_transforms(
+                    device=torch.device("cpu"),
+                    precision=torch.half,
+                )
+        finally:
+            # Restore stdout, warnings, and logging
+            sys.stdout = old_stdout
+            warnings.filters[:] = old_warning_filters
+            logging.disable(logging.NOTSET)
+
         self.model.eval()
 
         print(f"DepthPro model loaded successfully")
@@ -74,9 +113,13 @@ class DepthProAdapter(MethodAdapter):
         """
         # Convert torch tensor to PIL Image for DepthPro
         # Input is [1, 3, H, W] in RGB 0-1 range
-        image_np = image[0].cpu().numpy()  # [3, H, W]
+
+        # Optimize: Convert to uint8 on GPU first (faster for large images)
+        image_uint8 = (image[0] * 255.0).to(torch.uint8)  # [3, H, W] on GPU
+
+        # Transfer to CPU (uint8 is 4x smaller than float32)
+        image_np = image_uint8.cpu().numpy()  # [3, H, W]
         image_np = image_np.transpose(1, 2, 0)  # [H, W, 3]
-        image_np = (image_np * 255).astype(np.uint8)  # 0-1 -> 0-255
         image_pil = Image.fromarray(image_np)
 
         # Apply transform (normalizes to [-1, 1] range)
@@ -108,6 +151,11 @@ class DepthProAdapter(MethodAdapter):
             else:
                 # Scalar value
                 f_px = float(intrinsics)
+
+            # Convert f_px to tensor (DepthPro expects tensor, not float)
+            f_px = torch.tensor(f_px, dtype=torch.float32)
+            if self.device is not None:
+                f_px = f_px.to(self.device)
 
         # Run inference
         # DepthPro automatically resizes to 1536x1536 and back

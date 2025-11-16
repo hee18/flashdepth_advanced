@@ -1,4 +1,4 @@
-FROM pytorch/pytorch:2.4.0-cuda11.8-cudnn9-devel
+FROM pytorch/pytorch:2.4.0-cuda12.4-cudnn9-devel
 
 # Prevent interactive prompts during build
 ENV DEBIAN_FRONTEND=noninteractive
@@ -22,20 +22,28 @@ WORKDIR /app
 COPY setup_env.sh /app/
 COPY mamba/ /app/mamba/
 
-# PyTorch is already installed in the base image (2.4.0 with CUDA 11.8)
+# PyTorch is already installed in the base image (2.4.0 with CUDA 12.4)
 # Install torchvision to match
 RUN pip install torchvision==0.19.0
 
 # Install other dependencies
-RUN pip install xformers==0.0.27.post2+cu118 --index-url https://download.pytorch.org/whl/cu118
 RUN pip install ipdb tqdm wandb
 RUN pip install matplotlib einops scipy h5py OpenEXR seaborn pandas
 RUN pip install hydra-core
 RUN pip install opencv-python pillow pyarrow
 RUN pip install packaging wheel
 
+# Install ninja for faster compilation
+RUN pip install ninja
+
+# Install xformers from source for CUDA 12.4 compatibility
+RUN MAX_JOBS=4 pip install -v -U git+https://github.com/facebookresearch/xformers.git@v0.0.27 --no-build-isolation
+
 # Install flash-attention
 RUN pip install flash-attn --no-build-isolation
+
+# Install causal-conv1d (required for Mamba2)
+RUN pip install causal-conv1d>=1.4.0 --no-build-isolation
 
 # Install local Mamba package
 WORKDIR /app/mamba

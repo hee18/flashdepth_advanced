@@ -71,7 +71,7 @@ eval:
   metrics: true
   save_grid: true
   outfolder: "test_gear2_s"
-  test_datasets: [sintel]
+  test_datasets: [sintel, waymo_seg, eth3d, urbansyn, unreal4k]  # All test datasets (not used in training)
   test_dataset_resolution: 'base'
   random_input: null
   out_video: true  # Enable video/GIF saving

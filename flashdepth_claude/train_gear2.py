@@ -730,15 +730,11 @@ class Gear2Trainer:
                         pred_depth_metric = 100.0 / (out + 1e-8)  # 100 / (100/m) = m
                         gt_depth_metric = 100.0 / (gt_t_inverse_100 + 1e-8)  # 100 / (100/m) = m
 
-                        # Compute canonical masks for visualization (70m threshold in canonical space)
-                        # Use same logic as training loss calculation (but no warmup)
-                        MIN_INVERSE_DEPTH_VIS = 100.0 / 70.0  # Canonical space 70m
-                        canonical_gt_valid_vis = (gt_t_inverse_100 > MIN_INVERSE_DEPTH_VIS)  # [B, 1, H, W]
+                        # Compute canonical masks for visualization (same as training/validation: >0)
+                        canonical_gt_valid_vis = (gt_t_inverse_100 > 0)  # [B, 1, H, W]
 
-                        # Training: Pred outlier filtering (200m, like training loss)
-                        MAX_DEPTH_OUTLIER_VIS = 200.0
-                        MIN_INVERSE_OUTLIER_VIS = 100.0 / MAX_DEPTH_OUTLIER_VIS
-                        canonical_pred_valid_vis = (pred_depth_inverse > MIN_INVERSE_OUTLIER_VIS)  # [B, 1, H, W]
+                        # Pred: Valid where prediction is positive (no 200m restriction)
+                        canonical_pred_valid_vis = (pred_depth_inverse > 0)  # [B, 1, H, W]
 
                         # Handle importance_map (None for Gear2)
                         if importance_map is not None:
@@ -791,7 +787,20 @@ class Gear2Trainer:
                     self.num_sequences = val_metrics.get('num_sequences', None)
 
                     if self.config.training.get('wandb', False):
-                        wandb.log({f'val/{k}': v for k, v in val_metrics.items()}, step=step)
+                        # Log overall validation metrics
+                        wandb_val_dict = {'val/loss': val_metrics['loss']}
+
+                        # Log per-dataset validation losses
+                        if 'dataset_losses' in val_metrics:
+                            for dataset, loss in val_metrics['dataset_losses'].items():
+                                wandb_val_dict[f'val/{dataset}_loss'] = loss
+
+                        # Log number of sequences per dataset
+                        if 'num_sequences' in val_metrics:
+                            for dataset, count in val_metrics['num_sequences'].items():
+                                wandb_val_dict[f'val/{dataset}_sequences'] = count
+
+                        wandb.log(wandb_val_dict, step=step)
 
                     # Save best model
                     if val_metrics['loss'] < self.best_val_loss:
@@ -883,11 +892,12 @@ class Gear2Trainer:
                 # Get patch tokens from last encoder layer (B*T, N, C)
                 patch_tokens = encoder_features[-1]
 
-            # Get DPT features WITHOUT Mamba
-            dpt_features = model.depth_head.get_forward_features(
-                encoder_features, patch_h, patch_w
-            )  # Returns [path_4, path_3, path_2, path_1]
-            path_1 = dpt_features[-1]  # Extract path_1: (B*T, dpt_dim, h, w)
+            # Get DPT features WITHOUT Mamba (frozen, no grad)
+            with torch.no_grad():
+                dpt_features = model.depth_head.get_forward_features(
+                    encoder_features, patch_h, patch_w
+                )  # Returns [path_4, path_3, path_2, path_1]
+                path_1 = dpt_features[-1]  # Extract path_1: (B*T, dpt_dim, h, w)
 
             # Extract multi-layer CLS tokens for ablation study
             # Get CLS tokens from layers 4, 11, 17, 23 (all encoder features)
@@ -932,27 +942,15 @@ class Gear2Trainer:
         pred_depth_inverse_flat = torch.clamp(pred_depth_inverse_flat, min=1e-3, max=1e4)
 
         # Compute valid mask: GT valid + Pred outlier filtering
-        # GT valid: Only compute loss where GT is valid (70m threshold)
+        # GT valid: Only compute loss where GT is valid (no depth restriction like FlashDepth and train_gear5)
         # Pred outlier: Filter out extreme predictions (>200m outliers)
-        if self.global_step < 100:
-            MIN_INVERSE_DEPTH = 100.0 / 200.0  # Relaxed: 200m threshold for first 100 steps
-        else:
-            MIN_INVERSE_DEPTH = 100.0 / 70.0   # Normal: 70m threshold after warmup
 
-        # GT valid mask: where GT depth is within valid range
-        gt_valid_mask = (gt_depth_inverse_flat > MIN_INVERSE_DEPTH)
-
-        # Pred outlier mask: filter extreme predictions (>200m is outlier)
-        MAX_DEPTH_OUTLIER = 200.0
-        MIN_INVERSE_OUTLIER = 100.0 / MAX_DEPTH_OUTLIER
-        pred_outlier_mask = (pred_depth_inverse_flat > MIN_INVERSE_OUTLIER)
-
-        # Final mask: GT valid AND pred not outlier
-        valid_mask = gt_valid_mask & pred_outlier_mask
+        # Valid mask: GT valid + Pred positive (no 70m or 200m restriction in training, like original FlashDepth)
+        valid_mask = (gt_depth_inverse_flat >= 0) & (pred_depth_inverse_flat > 0)
 
         if valid_mask.sum() == 0:
             self.logger.error("No valid GT & Pred pixels in batch!")
-            return {'loss': 0.0, 'depth_loss': 0.0}
+            return {'loss': 0.0, 'depth_loss': 0.0, 'grad_norm': 0.0}
 
         # Compute loss (like original FlashDepth)
         with torch.amp.autocast('cuda', enabled=False):
@@ -965,13 +963,23 @@ class Gear2Trainer:
         # Backward pass (outside autocast for numerical stability)
         self.optimizer.zero_grad()
         loss.backward()
+        
+        # Compute gradient norm BEFORE clipping
+        total_norm = 0.0
+        for p in self.model.parameters():
+            if p.grad is not None:
+                param_norm = p.grad.data.norm(2)
+                total_norm += param_norm.item() ** 2
+        total_norm = total_norm ** 0.5
+        
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
         self.optimizer.step()
         self.scheduler.step()
 
         return {
             'loss': loss.item(),
-            'depth_loss': loss.item()
+            'depth_loss': loss.item(),
+            'grad_norm': total_norm
         }
 
     @torch.no_grad()
@@ -1026,8 +1034,8 @@ class Gear2Trainer:
             else:
                 current_dataset = str(dataset_idx)
 
-            # Use BFloat16 autocast like original FlashDepth
-            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+            # Use BFloat16 autocast with no_grad for validation
+            with torch.no_grad(), torch.amp.autocast('cuda', dtype=torch.bfloat16):
                 images = images.to(self.device)
                 gt_depth = gt_depth.to(self.device)
                 focal_lengths_canonical = focal_lengths_canonical.to(self.device)  # Shape: (B, T)
@@ -1109,15 +1117,13 @@ class Gear2Trainer:
 
                     # Compute loss in inverse depth space (100/m)
                     # Validation: Use same threshold (70m) for both GT and Pred for fair evaluation
-                    MIN_INVERSE_DEPTH = 100.0 / 70.0  # 70m threshold (consistent with test)
+                    # GT valid mask: where GT depth is valid (>0), no 70m restriction
+                    gt_valid_mask = (gt_t_inverse_100 > 0)
 
-                    # GT valid mask: where GT depth is within valid range
-                    gt_valid_mask = (gt_t_inverse_100 >= MIN_INVERSE_DEPTH)
+                    # Pred valid mask: same as GT (>0)
+                    pred_valid_mask = (pred_depth_inverse > 0)
 
-                    # Pred valid mask: same threshold as GT for fair evaluation
-                    pred_valid_mask = (pred_depth_inverse >= MIN_INVERSE_DEPTH)
-
-                    # Final mask: GT valid AND pred valid (both use 70m threshold)
+                    # Final mask: GT valid AND pred valid
                     valid_mask = (gt_valid_mask & pred_valid_mask).float()
 
                     # Save canonical masks for visualization

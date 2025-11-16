@@ -6,22 +6,22 @@ Single-stage training approach:
     - Processing: FiLM-style modulation of DPT features before Mamba
     - Modulation: Channel-wise gamma and beta parameters from CLS tokens
     - Formula: modulated_feature = gamma ⊙ feature + beta (per channel)
-    - Output: Inverse depth from modulated features after Mamba + output_conv2
+    - Output: Inverse depth from modulated features after Mamba + output_conv1/2
 
 Freezing Strategy:
-    - Frozen: ViT encoder, DPT decoder, output_conv1
-    - Trainable: Gear5FilmHead, Mamba modules, output_conv2
+    - Frozen: ViT encoder, DPT decoder
+    - Trainable: Gear5FilmHead, Mamba modules, output_conv1/2
 
 Loss:
-    - Configurable loss function (silog, bce, log_l1, etc.)
+    - Configurable loss type: 'log_l1' (default) or 'importance' (weighted)
     - Applied directly on inverse depth predictions
-    - No importance map weighting (FiLM doesn't use attention-based importance)
+    - Supports importance map weighting for loss (FiLM generates importance map)
 
 Key features:
     - FiLM-style modulation instead of GRU-based scale/shift
     - Modulates intermediate features, not final depth output
     - Temporal consistency via Mamba (after modulation)
-    - Canonical space normalization (focal_length=500)
+    - Canonical space normalization (focal_length=500, configurable)
     - Resolution: 518×518 (Phase 1) or 2K (Phase 2)
 """
 
@@ -94,12 +94,11 @@ class Gear5FilmTrainer:
     Trainable parts:
         - Gear5FilmHead: FiLM modulation network (~262K parameters)
         - Mamba: Temporal processing modules
-        - output_conv2: Final depth prediction layer
+        - output_conv1/2: Final depth prediction layers (both trainable)
 
     Frozen parts:
         - ViT encoder (DINOv2)
         - DPT decoder
-        - output_conv1
     """
     def __init__(self, config, rank, world_size, local_rank):
         self.config = config
@@ -220,12 +219,12 @@ class Gear5FilmTrainer:
 
     def _get_canonical_focal_length(self):
         """
-        Get canonical focal length (fixed at 500.0 for 518×518 resolution).
+        Get canonical focal length from config.
 
         Returns:
-            float: Canonical focal length (always 500.0)
+            float: Canonical focal length (default 500.0 for 518×518 resolution)
         """
-        return 500.0
+        return self.config.get('canonical_focal_length', 500.0)
 
     def _setup_model(self):
         """Initialize FlashDepth with Gear5 FiLM head"""
@@ -288,7 +287,7 @@ class Gear5FilmTrainer:
                 self.logger.info(f"  - DINOv2 encoder: ✓ (will be frozen)")
                 self.logger.info(f"  - DPT decoder: ✓ (will be frozen)")
                 self.logger.info(f"  - Mamba modules: ✓ (will be trainable)")
-                self.logger.info(f"  - output_conv1/2: ✓ (conv1 frozen, conv2 trainable)")
+                self.logger.info(f"  - output_conv1/2: ✓ (both trainable)")
                 if excluded_keys:
                     self.logger.info(f"Excluded {len(excluded_keys)} parameters (gear5_film_head will be created)")
             else:
@@ -321,7 +320,7 @@ class Gear5FilmTrainer:
             self.logger.info(f"  - ViT (ViT-L): ✓ (will be overwritten with hybrid)")
             self.logger.info(f"  - DPT: ✓ (will be overwritten with hybrid)")
             self.logger.info(f"  - Mamba: ✓ (kept from Phase 1, trainable)")
-            self.logger.info(f"  - output_conv: ✓ (kept from Phase 1, conv2 trainable)")
+            self.logger.info(f"  - output_conv: ✓ (kept from Phase 1, both trainable)")
             self.logger.info(f"  - Gear5FilmHead: ✓ (kept from Phase 1, trainable)")
 
             # Step 2: Overwrite ViT + DPT with FlashDepth-S hybrid weights
@@ -354,7 +353,7 @@ class Gear5FilmTrainer:
                 self.logger.info(f"Phase 2: Overwritten {len(loaded_hybrid)} ViT + DPT parameters with hybrid weights")
                 self.logger.info(f"  - ViT (ViT-L + ViT-S + Cross Attn): ✓")
                 self.logger.info(f"  - DPT: ✓")
-                self.logger.info(f"  - Kept from Phase 1: Mamba (trainable), output_conv2 (trainable), Gear5FilmHead (trainable)")
+                self.logger.info(f"  - Kept from Phase 1: Mamba (trainable), output_conv1/2 (trainable), Gear5FilmHead (trainable)")
             else:
                 self.logger.warning(f"FlashDepth-S hybrid checkpoint {hybrid_path} not found! Using Phase 1 ViT + DPT.")
 
@@ -425,13 +424,12 @@ class Gear5FilmTrainer:
     def _configure_parameters(self, model):
         """
         Gear5 FiLM freezing strategy:
-            Frozen: ViT encoder, DPT decoder, output_conv1
-            Trainable: Gear5FilmHead, Mamba modules, output_conv2
+            Frozen: ViT encoder, DPT decoder
+            Trainable: Gear5FilmHead, Mamba modules, output_conv1/2
         """
         frozen_vit_dpt = 0
         trainable_mamba = 0
-        frozen_output_conv1 = 0
-        trainable_output_conv2 = 0
+        trainable_output_conv = 0
         trainable_film = 0
 
         for name, param in model.named_parameters():
@@ -446,15 +444,11 @@ class Gear5FilmTrainer:
                 param.requires_grad = True
                 trainable_mamba += param.numel()
 
-            # output_conv1: frozen
-            elif 'output_conv1' in name:
-                param.requires_grad = False
-                frozen_output_conv1 += param.numel()
-
-            # output_conv2: trainable
-            elif 'output_conv2' in name:
+            # output_conv (both 1 and 2): trainable
+            elif 'output_conv' in name:
                 param.requires_grad = True
-                trainable_output_conv2 += param.numel()
+                trainable_output_conv += param.numel()
+                self.logger.info(f"Trainable (output_conv): {name} - {param.shape}")
 
             # Everything else (ViT encoder, DPT decoder): frozen
             else:
@@ -465,15 +459,14 @@ class Gear5FilmTrainer:
         self.logger.info(f"=== Parameter Configuration (Phase {self.phase}) ===")
         self.logger.info(f"Frozen:")
         self.logger.info(f"  - ViT + DPT: {frozen_vit_dpt:,}")
-        self.logger.info(f"  - output_conv1: {frozen_output_conv1:,}")
 
         self.logger.info(f"Trainable:")
         self.logger.info(f"  - Gear5FilmHead: {trainable_film:,}")
         self.logger.info(f"  - Mamba: {trainable_mamba:,}")
-        self.logger.info(f"  - output_conv2: {trainable_output_conv2:,}")
+        self.logger.info(f"  - output_conv1/2: {trainable_output_conv:,}")
 
-        total_frozen = frozen_vit_dpt + frozen_output_conv1
-        total_trainable = trainable_film + trainable_mamba + trainable_output_conv2
+        total_frozen = frozen_vit_dpt
+        total_trainable = trainable_film + trainable_mamba + trainable_output_conv
         self.logger.info(f"Total frozen: {total_frozen:,}")
         self.logger.info(f"Total trainable: {total_trainable:,}")
 
@@ -491,7 +484,7 @@ class Gear5FilmTrainer:
                 continue
 
             # Keep trainable parts in train mode
-            if any(keyword in name for keyword in ['gear5_film_head', 'mamba', 'output_conv2']):
+            if any(keyword in name for keyword in ['gear5_film_head', 'mamba', 'output_conv']):
                 continue
 
             # Set frozen parts to eval mode
@@ -617,7 +610,7 @@ class Gear5FilmTrainer:
                     film_params.append(param)
                 elif 'mamba' in name:
                     mamba_params.append(param)
-                elif 'output_conv2' in name:
+                elif 'output_conv' in name:  # Include both output_conv1 and output_conv2
                     output_params.append(param)
 
         param_groups = [
@@ -779,51 +772,50 @@ class Gear5FilmTrainer:
                             for block_idx in self.target_blocks
                         ]
 
-                    # Apply FiLM modulation (trainable)
-                    film_outputs = model.gear5_film_head(
-                        cls_tokens_multi_layer,  # List of [B, T, embed_dim]
-                        attention_weights_list,  # List of 2 attention weights for importance map
-                        dpt_features,  # List of 4 DPT features [B*T, dpt_dim, h, w]
-                        patch_h, patch_w
-                    )
-                    path_1_modulated = film_outputs['path_1_modulated']  # [B*T, dpt_dim, h, w]
-                    gamma = film_outputs['gamma']  # [B, T, dpt_dim]
-                    beta = film_outputs['beta']  # [B, T, dpt_dim]
-                    importance_map = film_outputs['importance_map']  # [B, T, patch_h, patch_w]
+                        # Apply FiLM modulation (no grad needed for visualization)
+                        film_outputs = model.gear5_film_head(
+                            cls_tokens_multi_layer,  # List of [B, T, embed_dim]
+                            attention_weights_list,  # List of 2 attention weights for importance map
+                            dpt_features,  # List of 4 DPT features [B*T, dpt_dim, h, w]
+                            patch_h, patch_w
+                        )
+                        path_1_modulated = film_outputs['path_1_modulated']  # [B*T, dpt_dim, h, w]
+                        gamma = film_outputs['gamma']  # [B, T, dpt_dim]
+                        beta = film_outputs['beta']  # [B, T, dpt_dim]
+                        importance_map = film_outputs['importance_map']  # [B, T, patch_h, patch_w]
 
-                    # Apply Mamba to modulated features (trainable)
-                    path_1_temporal = model.dpt_features_to_mamba(
-                        input_shape=(B_orig, T_orig, None, H, W),
-                        dpt_features=path_1_modulated,  # [B*T, dpt_dim, h, w]
-                        in_dpt_layer=0
-                    )
+                        # Apply Mamba to modulated features (no grad needed for visualization)
+                        path_1_temporal = model.dpt_features_to_mamba(
+                            input_shape=(B_orig, T_orig, None, H, W),
+                            dpt_features=path_1_modulated,  # [B*T, dpt_dim, h, w]
+                            in_dpt_layer=0
+                        )
 
-                    # Final depth prediction
-                    with torch.no_grad():
-                        out = model.depth_head.scratch.output_conv1(path_1_temporal)  # Frozen
-                    out = F.interpolate(out, (H, W), mode="bilinear", align_corners=True)
-                    pred_depth_inverse = model.depth_head.scratch.output_conv2(out)  # Trainable [B*T, 1, H, W]
+                        # Final depth prediction (no grad needed for visualization)
+                        out = model.depth_head.scratch.output_conv1(path_1_temporal)
+                        out = F.interpolate(out, (H, W), mode="bilinear", align_corners=True)
+                        pred_depth_inverse = model.depth_head.scratch.output_conv2(out)  # [B*T, 1, H, W]
 
-                    # Convert to metric depth: 100/m -> m
-                    pred_depth_metric = 100.0 / (pred_depth_inverse + 1e-8)
+                        # Convert to metric depth: 100/m -> m
+                        pred_depth_metric = 100.0 / (pred_depth_inverse + 1e-8)
 
-                    # Reshape for visualization
-                    pred_depth_inverse_seq = rearrange(pred_depth_inverse, '(b t) 1 h w -> b t 1 h w', b=B_orig, t=T_orig)
-                    pred_depth_metric_seq = rearrange(pred_depth_metric, '(b t) 1 h w -> b t 1 h w', b=B_orig, t=T_orig)
-                    pred_depth_inverse_vis = pred_depth_inverse_seq[:, 0]  # [B, 1, H, W]
-                    pred_depth_metric_vis = pred_depth_metric_seq[:, 0]  # [B, 1, H, W]
+                        # Reshape for visualization
+                        pred_depth_inverse_seq = rearrange(pred_depth_inverse, '(b t) 1 h w -> b t 1 h w', b=B_orig, t=T_orig)
+                        pred_depth_metric_seq = rearrange(pred_depth_metric, '(b t) 1 h w -> b t 1 h w', b=B_orig, t=T_orig)
+                        pred_depth_inverse_vis = pred_depth_inverse_seq[:, 0]  # [B, 1, H, W]
+                        pred_depth_metric_vis = pred_depth_metric_seq[:, 0]  # [B, 1, H, W]
 
-                    # GT depth for first frame
-                    gt_depth_inverse_vis = gt_depth_inverse_100[:, 0]  # [B, 1, H, W]
-                    gt_depth_metric = 100.0 / (gt_depth_inverse_vis + 1e-8)
+                        # GT depth for first frame
+                        gt_depth_inverse_vis = gt_depth_inverse_100[:, 0]  # [B, 1, H, W]
+                        gt_depth_metric = 100.0 / (gt_depth_inverse_vis + 1e-8)
 
-                    # Compute canonical masks
-                    MIN_INVERSE_DEPTH_VIS = 100.0 / 70.0
-                    canonical_gt_valid_vis = (gt_depth_inverse_vis > MIN_INVERSE_DEPTH_VIS)
+                        # Compute canonical masks
+                        MIN_INVERSE_DEPTH_VIS = 100.0 / 70.0
+                        canonical_gt_valid_vis = (gt_depth_inverse_vis > MIN_INVERSE_DEPTH_VIS)
 
-                    MAX_DEPTH_OUTLIER_VIS = 200.0
-                    MIN_INVERSE_OUTLIER_VIS = 100.0 / MAX_DEPTH_OUTLIER_VIS
-                    canonical_pred_valid_vis = (pred_depth_inverse_vis > MIN_INVERSE_OUTLIER_VIS)
+                        MAX_DEPTH_OUTLIER_VIS = 200.0
+                        MIN_INVERSE_OUTLIER_VIS = 100.0 / MAX_DEPTH_OUTLIER_VIS
+                        canonical_pred_valid_vis = (pred_depth_inverse_vis > MIN_INVERSE_OUTLIER_VIS)
 
                     # Prepare visualization batch
                     sample_batch = (
@@ -834,10 +826,17 @@ class Gear5FilmTrainer:
                         resize_ratio[:1, :1].float().cpu()
                     )
 
+                    # Resize importance map to match image resolution (for smooth visualization)
+                    importance_map_vis = importance_map[:1, :1]  # [1, 1, patch_h, patch_w]
+                    importance_map_resized = F.interpolate(
+                        importance_map_vis, size=(H, W), mode='bilinear', align_corners=True
+                    )  # [1, 1, H, W]
+
                     model_outputs_cpu = {
                         'pred_depth': pred_depth_metric_vis[:1].cpu(),
                         'canonical_gt_valid': canonical_gt_valid_vis[:1].cpu(),
                         'canonical_pred_valid': canonical_pred_valid_vis[:1].cpu(),
+                        'importance_map': importance_map_resized.cpu(),  # [1, 1, H, W] - upsampled
                         'gamma': gamma[:1, :1].cpu(),  # [1, 1, dpt_dim]
                         'beta': beta[:1, :1].cpu()     # [1, 1, dpt_dim]
                     }
@@ -866,7 +865,20 @@ class Gear5FilmTrainer:
                     self.num_sequences = val_metrics.get('num_sequences', None)
 
                     if self.config.training.get('wandb', False):
-                        wandb.log({f'val/{k}': v for k, v in val_metrics.items()}, step=step)
+                        # Log overall validation metrics
+                        wandb_val_dict = {'val/loss': val_metrics['loss']}
+
+                        # Log per-dataset validation losses
+                        if 'dataset_losses' in val_metrics:
+                            for dataset, loss in val_metrics['dataset_losses'].items():
+                                wandb_val_dict[f'val/{dataset}_loss'] = loss
+
+                        # Log number of sequences per dataset
+                        if 'num_sequences' in val_metrics:
+                            for dataset, count in val_metrics['num_sequences'].items():
+                                wandb_val_dict[f'val/{dataset}_sequences'] = count
+
+                        wandb.log(wandb_val_dict, step=step)
 
                     # Save best model
                     if val_metrics['loss'] < self.best_val_loss:
@@ -971,9 +983,8 @@ class Gear5FilmTrainer:
                 in_dpt_layer=0
             )
 
-            # Final depth prediction
-            with torch.no_grad():
-                out = model.depth_head.scratch.output_conv1(path_1_temporal)  # Frozen
+            # Final depth prediction (both output_conv1/2 trainable)
+            out = model.depth_head.scratch.output_conv1(path_1_temporal)  # Trainable
             out = F.interpolate(out, (H, W), mode="bilinear", align_corners=True)
             pred_depth_inverse_100 = model.depth_head.scratch.output_conv2(out)  # Trainable [B*T, 1, H, W]
 
@@ -1003,7 +1014,7 @@ class Gear5FilmTrainer:
 
             if self.loss_type == 'importance':
                 # Importance-weighted Log L1 Loss
-                # Resize importance map to depth map size and flatten
+                # Resize importance_map to image resolution (bilinear for smooth weighting)
                 importance_map_resized = F.interpolate(
                     importance_map.view(B_orig * T_orig, 1, patch_h, patch_w),
                     size=(H, W),
@@ -1012,10 +1023,10 @@ class Gear5FilmTrainer:
                 )  # [B*T, 1, H, W]
                 importance_flat = importance_map_resized.flatten()  # [B*T*H*W]
 
-                # Compute fg_ratio (alpha) - fraction of high-importance pixels
+                # Compute fg_ratio from upsampled importance map (pixel-level)
                 importance_threshold = importance_flat.mean()
                 fg_mask = (importance_flat > importance_threshold)
-                fg_ratio = fg_mask.float().mean()
+                fg_ratio = fg_mask.float().mean().detach()  # Detach to avoid gradient issues
 
                 # Apply importance weighting
                 weighted_loss = loss * (1.0 + fg_ratio * importance_flat.float())
@@ -1027,12 +1038,22 @@ class Gear5FilmTrainer:
         # Backward pass (outside autocast for numerical stability)
         self.optimizer.zero_grad()
         final_loss.backward()
+
+        # Compute gradient norm BEFORE clipping
+        total_norm = 0.0
+        for p in self.model.parameters():
+            if p.grad is not None:
+                param_norm = p.grad.data.norm(2)
+                total_norm += param_norm.item() ** 2
+        total_norm = total_norm ** 0.5
+
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
         self.optimizer.step()
         self.scheduler.step()
 
         return {
-            'loss': final_loss.item()
+            'loss': final_loss.item(),
+            'grad_norm': total_norm
         }
 
     @torch.no_grad()
@@ -1099,8 +1120,8 @@ class Gear5FilmTrainer:
             if max_val_batches is not None and total_processed >= max_val_batches:
                 break
 
-            # Use BFloat16 autocast
-            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+            # Use BFloat16 autocast with no_grad for validation
+            with torch.no_grad(), torch.amp.autocast('cuda', dtype=torch.bfloat16):
                 images = images.to(self.device)
                 gt_depth = gt_depth.to(self.device)
                 focal_lengths_canonical = focal_lengths_canonical.to(self.device)
@@ -1155,7 +1176,7 @@ class Gear5FilmTrainer:
                     for block_idx in self.target_blocks
                 ]
 
-                # Apply FiLM modulation
+                # Apply FiLM modulation (no grad needed for validation)
                 film_outputs = model.gear5_film_head(
                     cls_tokens_multi_layer,
                     attention_weights_list,
@@ -1167,14 +1188,14 @@ class Gear5FilmTrainer:
                 beta = film_outputs['beta']
                 importance_map = film_outputs['importance_map']
 
-                # Apply Mamba
+                # Apply Mamba (no grad needed for validation)
                 path_1_temporal = model.dpt_features_to_mamba(
                     input_shape=(B_orig, T_orig, None, H, W),
                     dpt_features=path_1_modulated,
                     in_dpt_layer=0
                 )
 
-                # Final depth prediction
+                # Final depth prediction (no grad needed for validation)
                 out = model.depth_head.scratch.output_conv1(path_1_temporal)
                 out = F.interpolate(out, (H, W), mode="bilinear", align_corners=True)
                 pred_depth_inverse_100 = model.depth_head.scratch.output_conv2(out)
@@ -1204,6 +1225,8 @@ class Gear5FilmTrainer:
                 canonical_pred_valid = (pred_depth_inverse > 0).cpu()
 
                 if valid_mask.sum() > 0:
+                    # Compute validation loss based on loss_type
+                    epsilon = 1e-3
                     pred_valid = pred_depth_flat[valid_mask].float()
                     gt_valid = gt_depth_flat[valid_mask].float()
 
@@ -1215,9 +1238,35 @@ class Gear5FilmTrainer:
                         pred_positive = pred_valid[positive_mask]
                         gt_positive = gt_valid[positive_mask]
 
-                        # Compute loss
-                        loss_batch = self.loss_fn(pred_positive, gt_positive)
-                        loss_batch = loss_batch if torch.is_tensor(loss_batch) and loss_batch.dim() == 0 else loss_batch.mean()
+                        # Compute log L1 loss
+                        loss = torch.abs(
+                            torch.log(pred_positive + epsilon) -
+                            torch.log(gt_positive + epsilon)
+                        )
+
+                        if self.loss_type == 'importance':
+                            # Importance-weighted Log L1 Loss
+                            # Resize importance_map to image resolution (bilinear for smooth weighting)
+                            importance_map_resized = F.interpolate(
+                                importance_map.view(B_orig * T_orig, 1, patch_h, patch_w),
+                                size=(H_gt, W_gt),
+                                mode='bilinear',
+                                align_corners=True
+                            )  # [B*T, 1, H_gt, W_gt]
+                            importance_flat = importance_map_resized.flatten()
+                            importance_valid = importance_flat[valid_mask].float()
+                            importance_positive = importance_valid[positive_mask]
+
+                            # Compute fg_ratio from upsampled importance map (pixel-level)
+                            importance_threshold = importance_flat.mean()
+                            fg_ratio_positive = (importance_positive > importance_threshold).float().mean()
+
+                            # Apply importance weighting
+                            weighted_loss = loss * (1.0 + fg_ratio_positive * importance_positive)
+                            loss_batch = weighted_loss.mean()
+                        else:
+                            # Standard Log L1 Loss
+                            loss_batch = loss.mean()
 
                         if torch.isnan(loss_batch):
                             self.logger.error(f"VALIDATION Step {self.global_step} - NaN loss detected!")
@@ -1260,10 +1309,17 @@ class Gear5FilmTrainer:
                                 canonical_gt_valid_vis = canonical_gt_valid_seq[:, 0]
                                 canonical_pred_valid_vis = canonical_pred_valid_seq[:, 0]
 
+                                # Resize importance map to GT resolution (for smooth visualization)
+                                importance_map_vis = importance_map[:, 0:1]  # [B, 1, patch_h, patch_w]
+                                importance_map_resized_vis = F.interpolate(
+                                    importance_map_vis, size=(gt_h, gt_w), mode='bilinear', align_corners=True
+                                )  # [B, 1, gt_h, gt_w]
+
                                 model_outputs = {
                                     'pred_depth': pred_depth_metric,
                                     'canonical_gt_valid': canonical_gt_valid_vis,
                                     'canonical_pred_valid': canonical_pred_valid_vis,
+                                    'importance_map': importance_map_resized_vis.float().cpu(),  # [B, 1, gt_h, gt_w] - upsampled
                                     'gamma': gamma[:, 0:1].cpu(),
                                     'beta': beta[:, 0:1].cpu()
                                 }

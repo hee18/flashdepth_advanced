@@ -28,7 +28,8 @@ logger = logging.getLogger(__name__)
 
 def visualize_sequence_simplified(images, pred_depths, gt_depths, valid_mask,
                                    sequence_id, metrics, fps, save_dir,
-                                   frame_interval=None, focal_lengths=None, config=None):
+                                   frame_interval=None, focal_lengths=None, config=None,
+                                   seg_masks=None, objwise_enabled=False, object_classes=None):
     """
     Create simplified sequence visualization (3-row grid without importance maps)
 
@@ -44,6 +45,9 @@ def visualize_sequence_simplified(images, pred_depths, gt_depths, valid_mask,
         frame_interval: int - Optional frame sampling interval
         focal_lengths: [T] - Optional focal lengths
         config: dict - Optional configuration
+        seg_masks: [T, H, W] - Optional segmentation masks for object-wise mode
+        objwise_enabled: bool - Whether to overlay object masks
+        object_classes: list - List of object class names (e.g., ['vehicle', 'pedestrian'])
     """
     T = images.shape[0]
     frames_to_show = min(10, T)
@@ -64,11 +68,15 @@ def visualize_sequence_simplified(images, pred_depths, gt_depths, valid_mask,
         axes = axes.reshape(-1, 1)
 
     for col, t in enumerate(frame_indices):
-        # Row 0: Image
+        # Row 0: Image with optional object mask overlay
         img = images[t].permute(1, 2, 0).cpu().numpy()
         img = (img - img.min()) / (img.max() - img.min() + 1e-8)
         img = np.clip(img, 0, 1)
         img = (img * 255).astype(np.uint8)
+
+        # Overlay object mask if object-wise mode (no changes to img display)
+        # Object mask visualization is handled separately in object_wise_visualization.py
+
         axes[0, col].imshow(img)
         axes[0, col].set_title(f'Frame {t}')
         axes[0, col].axis('off')
@@ -157,13 +165,14 @@ def visualize_sequence_simplified(images, pred_depths, gt_depths, valid_mask,
 
 def visualize_best_frame_simplified(image, gt_depth, pred_depth, metrics,
                                      save_dir, sequence_id, frame_idx,
-                                     dataset_name=None, focal_length=None):
+                                     dataset_name=None, focal_length=None,
+                                     seg_mask=None, objwise_enabled=False, object_classes=None, class_names_dict=None):
     """
-    Save improved best frame visualization (3×3 grid with Valid Mask and Depth Distribution)
+    Save improved best frame visualization (3×3 grid with Valid/Object Mask and Depth Distribution)
 
     Layout:
         Row 0: Input Image | GT Depth | Pred Depth
-        Row 1: Valid Mask | Error Map | Depth Metrics (with Dataset info)
+        Row 1: Valid/Object Mask | Error Map | Depth Metrics (with Dataset info)
         Row 2: Depth Distribution (2 cols) | Empty
 
     Args:
@@ -176,6 +185,8 @@ def visualize_best_frame_simplified(image, gt_depth, pred_depth, metrics,
         frame_idx: int - Frame index
         dataset_name: str - Optional dataset name (e.g., 'eth3d/pipes')
         focal_length: float - Optional focal length
+        seg_mask: [H, W] - Optional segmentation mask for object-wise visualization
+        objwise_enabled: bool - Whether to show object mask instead of valid mask
     """
     # Convert tensors to numpy
     if isinstance(image, torch.Tensor):
@@ -239,13 +250,41 @@ def visualize_best_frame_simplified(image, gt_depth, pred_depth, metrics,
     ax_pred.axis('off')
     plt.colorbar(im_pred, ax=ax_pred, fraction=0.046, pad=0.04)
 
-    # ==================== Row 1: Valid Mask, Error Map, Metrics ====================
+    # ==================== Row 1: Valid/Object Mask, Error Map, Metrics ====================
 
-    # Row 1, Col 0: Valid Mask (GT valid only, 70m threshold)
+    # Row 1, Col 0: Valid Mask or Object Mask (depending on objwise mode)
     ax_valid = fig.add_subplot(gs[1, 0])
-    valid_mask_vis = gt_valid.astype(np.uint8)
-    ax_valid.imshow(valid_mask_vis, cmap='gray', vmin=0, vmax=1)
-    ax_valid.set_title('Valid Mask (GT ≤70m)', fontsize=12, fontweight='bold', pad=8)
+
+    if objwise_enabled and seg_mask is not None:
+        # Object-wise mode: show Object Mask (only dynamic objects from object_classes)
+        object_mask = np.zeros_like(seg_mask, dtype=np.uint8)
+
+        if object_classes is not None and class_names_dict is not None:
+            # Get class IDs for object classes
+            object_class_ids = []
+            for class_id, class_name in class_names_dict.items():
+                if class_name in object_classes:
+                    object_class_ids.append(class_id)
+
+            # Create object mask (white for objects, black for background/non-objects)
+            for class_id in object_class_ids:
+                object_mask |= (seg_mask == class_id).astype(np.uint8)
+        else:
+            # Fallback: use all non-zero classes
+            object_mask = (seg_mask > 0).astype(np.uint8)
+
+        object_ratio = object_mask.sum() / object_mask.size
+        ax_valid.imshow(object_mask, cmap='gray', vmin=0, vmax=1)
+        ax_valid.set_title(f'Object Mask\n{object_ratio*100:.1f}% ({object_mask.sum():,} pixels)',
+                          fontsize=12, fontweight='bold', pad=8)
+    else:
+        # Regular mode: show GT Valid Mask (valid=white, invalid=black)
+        valid_mask_vis = gt_valid.astype(np.uint8)
+        gt_valid_ratio = gt_valid.sum() / gt_valid.size
+        ax_valid.imshow(valid_mask_vis, cmap='gray', vmin=0, vmax=1)
+        ax_valid.set_title(f'Valid Mask (GT ≤70m)\n{gt_valid_ratio*100:.1f}% valid',
+                          fontsize=12, fontweight='bold', pad=8)
+
     ax_valid.axis('off')
 
     # Row 1, Col 1: Absolute Error Map

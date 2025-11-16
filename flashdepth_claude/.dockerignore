@@ -12,8 +12,8 @@ refer_test/
 # Exclude dataset directory (mounted via volume)
 Datasets/
 
-# Exclude mamba directory (large compiled files)
-mamba/
+# NOTE: mamba/ is needed during build for installing Mamba2 package
+# Don't exclude it here
 
 # Exclude outputs and visualizations
 outputs/

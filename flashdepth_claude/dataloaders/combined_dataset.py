@@ -75,8 +75,10 @@ class CombinedDataset(Dataset):
 
 
         for dataset_name in enable_dataset_flags:
-            logging.info(f"[DEBUG combined_dataset] Loading dataset: {dataset_name}, split={split}")
-            dataset = BaseDatasetPairs.create(dataset_name, root_dir, split, load_cache=cache_dir)
+            # waymo_seg only has 'val' split, no 'test' split
+            actual_split = 'val' if dataset_name == 'waymo_seg' and split == 'test' else split
+            logging.info(f"[DEBUG combined_dataset] Loading dataset: {dataset_name}, split={actual_split}")
+            dataset = BaseDatasetPairs.create(dataset_name, root_dir, actual_split, load_cache=cache_dir)
             self.pairslist[dataset_name] = dataset.pairs
             self.depth_read_list[dataset_name] = dataset.depth_read
             self.reshape_list[dataset_name] = dataset.reshape_list

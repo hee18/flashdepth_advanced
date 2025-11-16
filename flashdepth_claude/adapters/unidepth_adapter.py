@@ -27,48 +27,109 @@ class UniDepthAdapter(MethodAdapter):
 
         UniDepth automatically resizes inputs based on resolution_level and pixels_bounds
         """
-        from unidepth.models import UniDepthV1, UniDepthV2
+        from unidepth.models import UniDepthV1, UniDepthV2, UniDepthV2old
 
         model_name = f"unidepth-{self.version}-vit{self.variant}14"
 
-        # Check for local checkpoint first
+        # Check for local checkpoint
         repo_path = Path(__file__).parent.parent / 'refer_test'
-        local_ckpt_paths = [
-            repo_path / 'configs' / 'unidepth' / f'unidepth{self.version}_pytorch_model.bin',
-            repo_path / 'UniDepth' / 'checkpoints' / f'unidepth{self.version}_pytorch_model.bin',
-        ]
+        checkpoint_dir = repo_path / 'UniDepth' / 'checkpoints'
 
-        local_ckpt = None
-        for ckpt_path in local_ckpt_paths:
-            if ckpt_path.exists():
-                local_ckpt = ckpt_path
-                break
+        # Check for safetensors or bin file
+        local_safetensors = checkpoint_dir / f'unidepth{self.version}_model.safetensors'
+        local_bin = checkpoint_dir / f'unidepth{self.version}_pytorch_model.bin'
 
-        if local_ckpt:
+        if local_safetensors.exists() or local_bin.exists():
             # Load from local checkpoint
             print(f"Loading UniDepth model: {model_name} from local checkpoint")
-            print(f"Using local checkpoint: {local_ckpt}")
+            print(f"Using checkpoint directory: {checkpoint_dir}")
+
+            # Detect checkpoint version for v2 by checking level_embeds shape
+            use_old_v2 = False
+            if self.version == 'v2':
+                # Load checkpoint to check shape
+                import safetensors.torch as st
+                checkpoint_file = local_safetensors if local_safetensors.exists() else local_bin
+                try:
+                    state_dict = st.load_file(str(checkpoint_file))
+                    if 'pixel_decoder.level_embeds' in state_dict:
+                        level_embeds_shape = state_dict['pixel_decoder.level_embeds'].shape
+                        # Old version: [4, 512], New version: [1, 1, 4, 512]
+                        if len(level_embeds_shape) == 2:
+                            use_old_v2 = True
+                            print(f"Detected old V2 checkpoint (level_embeds shape: {level_embeds_shape})")
+                        else:
+                            print(f"Detected new V2 checkpoint (level_embeds shape: {level_embeds_shape})")
+                except Exception as e:
+                    print(f"Warning: Could not detect checkpoint version: {e}")
+                    print("Defaulting to new V2 format")
+
+            # Choose config based on detected version
+            if self.version == 'v2':
+                if use_old_v2:
+                    config_name = f'config_v2old_vit{self.variant}14.json'
+                else:
+                    config_name = f'config_{self.version}_vit{self.variant}14.json'
+            else:
+                config_name = f'config_{self.version}_vit{self.variant}14.json'
+
+            config_path = checkpoint_dir / config_name
+            if not config_path.exists():
+                raise FileNotFoundError(f"Config file not found: {config_path}")
+
+            import shutil
+            main_config = checkpoint_dir / 'config.json'
+            # Always overwrite config.json with the correct version-specific config
+            # This ensures the config matches the model version being loaded
+            shutil.copy2(config_path, main_config)
+            print(f"Copied {config_name} to config.json")
+
+            # Ensure model.safetensors exists (copy from version-specific file)
+            model_file = checkpoint_dir / 'model.safetensors'
+            if local_safetensors.exists():
+                if not model_file.exists() or model_file.stat().st_size != local_safetensors.stat().st_size:
+                    shutil.copy2(local_safetensors, model_file)
+                    print(f"Copied {local_safetensors.name} to model.safetensors")
+            elif local_bin.exists():
+                # If only .bin exists, copy it as pytorch_model.bin
+                model_bin = checkpoint_dir / 'pytorch_model.bin'
+                if not model_bin.exists():
+                    shutil.copy2(local_bin, model_bin)
+                    print(f"Copied {local_bin.name} to pytorch_model.bin")
 
             if self.version == 'v2':
-                self.model = UniDepthV2.from_pretrained(str(local_ckpt.parent))
+                # Use appropriate version based on checkpoint
+                if use_old_v2:
+                    print("Using UniDepthV2old for old checkpoint")
+                    self.model = UniDepthV2old.from_pretrained(str(checkpoint_dir))
+                else:
+                    print("Using UniDepthV2 for new checkpoint")
+                    self.model = UniDepthV2.from_pretrained(str(checkpoint_dir))
+                # Don't set resolution_level - use default adaptive bounds
                 # Set interpolation mode for better quality
                 self.model.interpolation_mode = "bilinear"
             else:
-                self.model = UniDepthV1.from_pretrained(str(local_ckpt.parent))
+                self.model = UniDepthV1.from_pretrained(str(checkpoint_dir))
         else:
             # Load from HuggingFace
             print(f"Loading UniDepth model: {model_name} from lpiccinelli/{model_name}")
             print(f"Local checkpoint not found. Will download from HuggingFace...")
-            print(f"To avoid downloading, place checkpoint in: {local_ckpt_paths[0]}")
 
             if self.version == 'v2':
+                # HuggingFace uses the new version
                 self.model = UniDepthV2.from_pretrained(f"lpiccinelli/{model_name}")
+                # Don't set resolution_level - use default adaptive bounds
                 # Set interpolation mode for better quality
                 self.model.interpolation_mode = "bilinear"
             else:
                 self.model = UniDepthV1.from_pretrained(f"lpiccinelli/{model_name}")
 
         self.model.eval()
+
+        # Enable FP16 for faster inference (optional, sacrifices minimal accuracy)
+        # Uncomment to enable:
+        # self.model.half()
+        # print("UniDepth running in FP16 mode for faster inference")
 
         print(f"UniDepth {self.version} ({self.variant}) model loaded successfully")
         return self.model
@@ -128,9 +189,9 @@ class UniDepthAdapter(MethodAdapter):
             ], dtype=torch.float32).unsqueeze(0)
             camera = Pinhole(K=K)
 
-        # For V1, camera should be K matrix directly
-        from unidepth.models import UniDepthV1
-        if isinstance(self.model, UniDepthV1):
+        # For V1 and V2old, camera should be K matrix directly
+        from unidepth.models import UniDepthV1, UniDepthV2old
+        if isinstance(self.model, (UniDepthV1, UniDepthV2old)):
             camera = camera.K.squeeze(0)
 
         # Move to device

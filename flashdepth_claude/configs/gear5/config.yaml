@@ -12,6 +12,9 @@ load: configs/flashdepth-l/iter_10001.pth  # FlashDepth-L pretrained weights (Vi
 canonical_focal_length: 1000.0  # Fixed canonical focal length for all resolutions
 use_canonical_space: true  # ENABLED - all training data normalized to canonical focal length
 
+# Loss configuration
+loss_type: log_l1  # Loss type: log_l1 (default), importance (importance-weighted)
+
 # ========== Gear5 Specific Settings ==========
 # Unified Architecture:
 #   - 2-layer CLS tokens [11, 23] for ViT-L or [5, 11] for ViT-S (averaged)
@@ -60,7 +63,12 @@ model:
   target_blocks: [11, 23]  # ViT-L: layers 11, 23 (for Phase 1)
   target_blocks_s: [5, 11]  # ViT-S: layers 5, 11 (for Phase 2 hybrid)
 
-  # Mamba configuration (frozen during Gear5 training)
+  # Gear5 Temporal Modeling Backend (NEW: Support Mamba2 option)
+  # NOTE: This controls ONLY the TemporalScalePredictor module!
+  # The original FlashDepth Mamba modules (below) are ALWAYS frozen during Gear5 training.
+  use_mamba_temporal: false  # false=GRU (fast for T<50), true=Mamba2 (better for T>100)
+
+  # FlashDepth Mamba configuration (FROZEN during Gear5 training)
   use_mamba: true
   mamba_type: "add"
   num_mamba_layers: 4
@@ -83,7 +91,7 @@ eval:
   metrics: true
   save_grid: true
   outfolder: "test_gear5"
-  test_datasets: [sintel]
+  test_datasets: [sintel, waymo_seg, eth3d, urbansyn, unreal4k]  # All test datasets (not used in training)
   test_dataset_resolution: 'base'
   random_input: null
   out_video: true

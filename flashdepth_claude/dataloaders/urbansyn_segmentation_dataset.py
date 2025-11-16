@@ -235,7 +235,8 @@ class UrbanSynSegmentationDataset(Dataset):
             'depth': depths,
             'segmentations': segmentations,
             'focal_lengths': focal_lengths,
-            'sequence_name': f'urbansyn_{frame_indices[0]:04d}'
+            'sequence_name': f'urbansyn_{frame_indices[0]:04d}',
+            'dataset_name': 'urbansyn'  # For intrinsics lookup
         }
 
 
@@ -257,6 +258,7 @@ def urbansyn_collate_fn(batch):
     return {
         'images': sample['image'].unsqueeze(0),  # (1, T, 3, H, W) - Changed to 'images' (plural)
         'depths': sample['depth'].unsqueeze(0),  # (1, T, H, W) - Changed to 'depths' (plural)
+        'dataset_name': sample['dataset_name'],  # For intrinsics lookup
         'segmentations': sample['segmentations'].unsqueeze(0),  # (1, T, H, W)
         'focal_lengths': sample['focal_lengths'].unsqueeze(0),  # (1, T)
         'sequence_name': sample['sequence_name']

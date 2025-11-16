@@ -19,6 +19,9 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 import logging
 
+# Import boundary metrics for F1 score computation
+from utils.eval_metrics.boundary_metrics import SI_boundary_F1
+
 logger = logging.getLogger(__name__)
 
 
@@ -50,11 +53,12 @@ class ObjectWiseMetrics:
         # ... (40 classes total, abbreviated for brevity)
     }
 
-    # VKITTI2 class IDs
+    # VKITTI2 class IDs (15 classes total)
+    # Source: https://www.changjiangcai.com/studynotes/2020-05-16-Virtual-KITTI-2-Dataset/
     VKITTI2_CLASSES = {
-        0: 'terrain', 1: 'tree', 2: 'vegetation', 3: 'building', 4: 'road',
-        5: 'guard_rail', 6: 'traffic_sign', 7: 'traffic_light', 8: 'pole',
-        9: 'misc', 10: 'truck', 11: 'car', 12: 'van', 255: 'ignore'
+        0: 'undefined', 1: 'terrain', 2: 'sky', 3: 'tree', 4: 'vegetation',
+        5: 'building', 6: 'road', 7: 'guard_rail', 8: 'traffic_sign',
+        9: 'traffic_light', 10: 'pole', 11: 'misc', 12: 'truck', 13: 'car', 14: 'van'
     }
 
     # Waymo Open Dataset class IDs (Semantic Segmentation v2.0)
@@ -123,16 +127,22 @@ class ObjectWiseMetrics:
     }
 
 
-    def __init__(self, dataset_type: str = 'kitti'):
+    def __init__(self, dataset_type: str = 'kitti', depth_mode: str = 'metric'):
         """
         Initialize object-wise metrics calculator.
 
         Args:
             dataset_type: Dataset type ('kitti', 'cityscapes', 'nyu', 'vkitti2', 'waymo', 'urbansyn')
                          Also accepts '_seg' variants (e.g., 'waymo_seg')
+            depth_mode: Depth type ('metric' or 'relative')
         """
-        # Normalize dataset type: remove _seg suffix
+        # Normalize dataset type: remove _seg suffix and handle aliases
         self.dataset_type = dataset_type.lower().replace('_seg', '')
+        self.depth_mode = depth_mode
+
+        # Handle dataset aliases
+        if self.dataset_type == 'vkitti':
+            self.dataset_type = 'vkitti2'  # VKITTI uses VKITTI2 class definitions
 
         if self.dataset_type == 'kitti':
             self.classes = self.KITTI_CLASSES
@@ -163,7 +173,8 @@ class ObjectWiseMetrics:
         pred_depth: np.ndarray,
         gt_depth: np.ndarray,
         seg_mask: np.ndarray,
-        min_pixels: int = 100
+        min_pixels: int = 100,
+        max_depth: float = 1000.0
     ) -> Dict[str, Dict[str, float]]:
         """
         Compute depth metrics for each segmentation class.
@@ -173,6 +184,7 @@ class ObjectWiseMetrics:
             gt_depth: Ground truth depth map (H, W)
             seg_mask: Segmentation mask (H, W) with class IDs
             min_pixels: Minimum pixels required to compute metrics for a class
+            max_depth: Maximum valid depth value (default: 1000m)
 
         Returns:
             Dictionary mapping class names to metrics dictionaries
@@ -193,11 +205,16 @@ class ObjectWiseMetrics:
             if class_name in ['ignore', 'unknown', 'undefined']:
                 continue
 
+            # IMPORTANT: Only compute metrics for object classes (dynamic, movable objects)
+            # Skip static/scene classes like sky, road, building, vegetation, etc.
+            if class_name not in self.object_classes:
+                continue
+
             # Create mask for this class
             class_mask = (seg_mask == class_id)
 
-            # Combine with valid depth mask
-            valid_mask = (gt_depth > 0) & (pred_depth > 0) & class_mask
+            # Combine with valid depth mask (filter invalid and out-of-range depths)
+            valid_mask = (gt_depth > 0) & (pred_depth > 0) & (pred_depth < max_depth) & class_mask
 
             # Skip if too few pixels
             num_pixels = np.sum(valid_mask)
@@ -208,8 +225,12 @@ class ObjectWiseMetrics:
             pred_valid = pred_depth[valid_mask]
             gt_valid = gt_depth[valid_mask]
 
-            # Compute metrics
-            metrics = self._compute_depth_metrics(pred_valid, gt_valid)
+            # Compute metrics (pass full maps for F1 computation in relative mode)
+            metrics = self._compute_depth_metrics(
+                pred_valid, gt_valid,
+                pred_full=pred_depth,
+                gt_full=gt_depth
+            )
             metrics['num_pixels'] = int(num_pixels)
 
             results[class_name] = metrics
@@ -219,14 +240,18 @@ class ObjectWiseMetrics:
     def _compute_depth_metrics(
         self,
         pred: np.ndarray,
-        gt: np.ndarray
+        gt: np.ndarray,
+        pred_full: np.ndarray = None,
+        gt_full: np.ndarray = None
     ) -> Dict[str, float]:
         """
         Compute standard depth estimation metrics.
 
         Args:
-            pred: Predicted depth values (N,)
-            gt: Ground truth depth values (N,)
+            pred: Predicted depth values (N,) - masked pixels only
+            gt: Ground truth depth values (N,) - masked pixels only
+            pred_full: Full predicted depth map (H, W) - for F1 computation
+            gt_full: Full ground truth depth map (H, W) - for F1 computation
 
         Returns:
             Dictionary of metrics
@@ -246,15 +271,31 @@ class ObjectWiseMetrics:
         a2 = np.mean(thresh < 1.25 ** 2)
         a3 = np.mean(thresh < 1.25 ** 3)
 
-        return {
-            'mae': float(mae),
-            'rmse': float(rmse),
+        # Compute boundary F1 (edge accuracy / depth discontinuity detection)
+        # Works for both metric and relative depth (scale-invariant)
+        if pred_full is not None and gt_full is not None:
+            try:
+                boundary_f1 = SI_boundary_F1(pred_full, gt_full, t_min=1.05, t_max=1.25, N=10)
+            except Exception as e:
+                logger.warning(f"Failed to compute boundary F1: {e}")
+                boundary_f1 = 0.0
+        else:
+            boundary_f1 = 0.0
+
+        # Order metrics: abs_rel, a1, a2, a3, fps, tae, f1, mae, rmse
+        # Note: fps and tae are not computed here, will be added later if needed
+        metrics = {
             'abs_rel': float(abs_rel),
-            'sq_rel': float(sq_rel),
             'a1': float(a1),
             'a2': float(a2),
-            'a3': float(a3)
+            'a3': float(a3),
+            'boundary_f1': float(boundary_f1),
+            'mae': float(mae),
+            'rmse': float(rmse),
+            'sq_rel': float(sq_rel)
         }
+
+        return metrics
 
     def aggregate_metrics(
         self,
@@ -369,13 +410,40 @@ class ObjectWiseMetrics:
             output_path: Output JSON path
             comparison: Optional model comparison results
         """
+        # Reorder metrics for each class: abs_rel, a1, a2, a3, fps, tae, f1, mae, rmse
+        metric_order = ['abs_rel', 'a1', 'a2', 'a3', 'fps', 'tae', 'boundary_f1', 'mae', 'rmse']
+
+        reordered_results = {}
+        for class_name, class_metrics in results.items():
+            reordered = {}
+            # Add metrics in the desired order
+            for key in metric_order:
+                if key in class_metrics:
+                    reordered[key] = class_metrics[key]
+            # Add any remaining metrics not in the order list
+            for key, value in class_metrics.items():
+                if key not in reordered:
+                    reordered[key] = value
+            reordered_results[class_name] = reordered
+
         output_data = {
             'dataset_type': self.dataset_type,
-            'per_class_metrics': results
+            'per_class_metrics': reordered_results
         }
 
         if comparison is not None:
-            output_data['model_comparison'] = comparison
+            # Also reorder comparison metrics if provided
+            reordered_comparison = {}
+            for class_name, class_metrics in comparison.items():
+                reordered = {}
+                for key in metric_order:
+                    if key in class_metrics:
+                        reordered[key] = class_metrics[key]
+                for key, value in class_metrics.items():
+                    if key not in reordered:
+                        reordered[key] = value
+                reordered_comparison[class_name] = reordered
+            output_data['model_comparison'] = reordered_comparison
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
         with open(output_path, 'w') as f:

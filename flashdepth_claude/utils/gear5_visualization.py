@@ -89,19 +89,19 @@ class Gear5Visualizer:
             input_img = np.clip(input_img, 0, 1)
 
             if gt_depth.ndim == 4:  # [B, T, H, W] or [B, 1, H, W]
-                gt_depth_frame = gt_depth[0, 0].cpu().numpy()  # [H, W]
+                gt_depth_frame = gt_depth[0, 0].float().cpu().numpy()  # [H, W]
             else:  # [B, H, W]
-                gt_depth_frame = gt_depth[0].cpu().numpy()  # [H, W]
+                gt_depth_frame = gt_depth[0].float().cpu().numpy()  # [H, W]
 
             if pred_depth.ndim == 4:  # [B, T, H, W] or [B, 1, H, W]
-                pred_depth_frame = pred_depth[0, 0].cpu().numpy()  # [H, W]
+                pred_depth_frame = pred_depth[0, 0].float().cpu().numpy()  # [H, W]
             else:  # [B, H, W]
-                pred_depth_frame = pred_depth[0].cpu().numpy()  # [H, W]
+                pred_depth_frame = pred_depth[0].float().cpu().numpy()  # [H, W]
 
             if importance_map.ndim == 4:  # [B, T, H, W] or [B, 1, H, W]
-                importance_frame = importance_map[0, 0].cpu().numpy()  # [H, W]
+                importance_frame = importance_map[0, 0].float().cpu().numpy()  # [H, W]
             else:  # [B, H, W]
-                importance_frame = importance_map[0].cpu().numpy()  # [H, W]
+                importance_frame = importance_map[0].float().cpu().numpy()  # [H, W]
 
             # Ensure all frames are 2D
             while gt_depth_frame.ndim > 2:
@@ -115,8 +115,8 @@ class Gear5Visualizer:
             # Check if canonical masks are provided (from train/test)
             if 'canonical_gt_valid' in model_outputs:
                 # Use pre-computed canonical masks (from training/test)
-                canonical_gt_valid = model_outputs['canonical_gt_valid'][0, 0].cpu().numpy()  # [H, W]
-                canonical_pred_valid = model_outputs['canonical_pred_valid'][0, 0].cpu().numpy()
+                canonical_gt_valid = model_outputs['canonical_gt_valid'][0, 0].bool().cpu().numpy()  # [H, W]
+                canonical_pred_valid = model_outputs['canonical_pred_valid'][0, 0].bool().cpu().numpy()
 
                 # Metrics: GT valid + Pred outlier filtering (Option 1)
                 # Filter out unreasonable predictions (NaN, Inf, >200m)
@@ -211,7 +211,7 @@ class Gear5Visualizer:
             # Check if we have valid pixels for metrics calculation
             has_valid_pixels = num_valid_metrics > 0
 
-            # Calculate importance statistics
+            # Calculate importance statistics from upsampled importance map
             imp_mean = importance_frame.mean()
             imp_std = importance_frame.std()
 
@@ -305,7 +305,7 @@ class Gear5Visualizer:
             ax4.axis('off')
             plt.colorbar(im4, ax=ax4, fraction=0.046, pad=0.04)
 
-            # Generate FG/BG masks from importance map (threshold at mean)
+            # Generate FG/BG masks from upsampled importance map (threshold at mean for smooth visualization)
             fg_mask_frame = (importance_frame >= imp_mean).astype(np.float32)
             bg_mask_frame = (importance_frame < imp_mean).astype(np.float32)
 
@@ -331,6 +331,7 @@ class Gear5Visualizer:
             fg_overlay = np.zeros((*fg_mask_upsampled.shape, 3))
             fg_overlay[..., 0] = fg_mask_upsampled  # Red channel
             ax5.imshow(fg_overlay, alpha=0.5)
+            # Compute fg_ratio from upsampled importance map
             fg_ratio = fg_mask_frame.mean() * 100
             ax5.set_title(f'FG Mask (Red)\n{fg_ratio:.1f}%', fontsize=14, fontweight='bold')
             ax5.axis('off')

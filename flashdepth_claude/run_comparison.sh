@@ -30,6 +30,8 @@ DEPTH_MODE="metric"
 INDOOR=false
 METRIC_MODE=false
 FRAME_INTERVAL=""
+ONLY_CLONE=true  # For VKITTI: only use 'clone' condition by default
+VISUALIZATION="true"  # Enable visualizations by default
 
 # Help function
 show_help() {
@@ -50,19 +52,21 @@ Methods:
 
 Options:
   --dataset <name>         Dataset name (default: waymo)
-                           Options: waymo, sintel, kitti, scannet, tartanair, bonn, nyu
-                           For object-wise: waymo_seg, urbansyn_seg
+                           Options: waymo, sintel, kitti, scannet, tartanair, bonn, nyu, vkitti
+                           For object-wise: waymo_seg, urbansyn_seg, vkitti_seg
   --version <v1|v2>        Method version (for metric3d, unidepth)
   --gpu <id>               GPU device ID (default: 0)
   --workers <n>            Number of data loading workers (default: 4)
   --vid-len <n>            Video sequence length (default: 50)
   --objwise                Enable object-wise evaluation
+  --only-clone <true|false> For VKITTI: use only 'clone' condition (default: true)
   --checkpoint <path>      Model checkpoint path
   --results-dir <path>     Results directory
   --depth-mode <mode>      Depth evaluation mode: metric or relative (default: metric)
   --indoor                 Use indoor checkpoint (for depthanythingv2 only)
   --metric                 Use metric mode (for vda only)
   --frame-interval <n>     Frame interval for sequence.png visualization
+  --visualization <true|false> Enable/disable visualizations (sequence.png, best_frame.png, etc.). Default: true
   --help                   Show this help message
 
 Examples:
@@ -116,6 +120,10 @@ while [[ $# -gt 0 ]]; do
             OBJWISE=true
             shift
             ;;
+        --only-clone)
+            ONLY_CLONE="$2"
+            shift 2
+            ;;
         --checkpoint)
             CHECKPOINT="$2"
             shift 2
@@ -138,6 +146,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --frame-interval)
             FRAME_INTERVAL="$2"
+            shift 2
+            ;;
+        --visualization)
+            VISUALIZATION="$2"
             shift 2
             ;;
         --help)
@@ -188,6 +200,9 @@ echo "GPU: $GPU_ID"
 echo "Workers: $WORKERS"
 echo "Video Length: $VID_LEN"
 echo "Object-wise: $OBJWISE"
+if [[ "$DATASET" == *"vkitti"* ]]; then
+    echo "Only Clone (VKITTI): $ONLY_CLONE"
+fi
 if [ "$INDOOR" = true ]; then
     echo "Indoor Mode: ENABLED"
 fi
@@ -200,6 +215,7 @@ fi
 if [ -n "$CHECKPOINT" ]; then
     echo "Checkpoint: $CHECKPOINT"
 fi
+echo "Visualization: $VISUALIZATION"
 echo "Results Dir: $RESULTS_DIR"
 echo "========================================"
 
@@ -230,6 +246,14 @@ if [ "$OBJWISE" = true ]; then
     CMD="$CMD --objwise"
 fi
 
+if [[ "$DATASET" == *"vkitti"* ]]; then
+    if [ "$ONLY_CLONE" = "true" ]; then
+        CMD="$CMD --only-clone true"
+    else
+        CMD="$CMD --only-clone false"
+    fi
+fi
+
 if [ "$INDOOR" = true ]; then
     CMD="$CMD --indoor"
 fi
@@ -245,6 +269,8 @@ fi
 if [ -n "$CHECKPOINT" ]; then
     CMD="$CMD --checkpoint $CHECKPOINT"
 fi
+
+CMD="$CMD --visualization $VISUALIZATION"
 
 # Get required conda environment
 case $METHOD in

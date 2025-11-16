@@ -1,907 +1,903 @@
-# FlashDepth Gear5: Two-Stage Global + Foreground Modulation for Metric Depth
+# GEAR5: Metric Depth Enhancement System
 
-**작성일**: 2025-11-10
-**최종 업데이트**: 2025-11-10
-**브랜치**: gear5
-**목적**: 2단계 학습을 통한 metric depth 정확도 향상 (Global Scale Predictor + Foreground-only Modulation)
+This document covers two distinct approaches for enhancing FlashDepth with metric depth capabilities:
+- **Gear5**: GRU-based temporal scale/shift prediction (original)
+- **Gear5 FiLM**: FiLM-style channel-wise feature modulation (variant)
 
-**학습 가능 파라미터**:
-- Phase 1 Step 1: **GSP (0.26M) + Mamba (4.3M) + output_conv (0.3M) = 4.86M / 340M (1.43%)**
-- Phase 1 Step 2: **FFM (2.9M) + Mamba (4.3M) + output_conv (0.3M) = 7.5M / 340M (2.21%)**
-
-## 주요 특징 ⭐⭐⭐⭐⭐
-
-### 1. 2단계 학습 전략
-
-**Step 1 (Global Scale Predictor)**:
-- Multi-layer CLS tokens → Global scale/shift 예측
-- ViT-L: [4, 11, 17, 23] 4개 레이어 사용
-- ViT-S: [2, 5, 8, 11] 4개 레이어 사용
-- 전역적 metric scale을 먼저 학습
-
-**Step 2 (Foreground-only Modulation)**:
-- Multi-layer attention weights → Foreground feature 추출
-- ViT-L: [11, 17] 중간 2개 레이어 사용
-- ViT-S: [5, 8] 중간 2개 레이어 사용
-- Global modulation 위에 FG-only modulation 추가
-- GSP는 frozen, FFM만 학습
-
-### 2. Two-Phase Training (518×518 → 2K Hybrid)
-
-**Phase 1 (518×518, ViT-L)**:
-```bash
-# Step 1: Global Scale Predictor 학습
-python train_gear5.py --config-path configs/gear5 step=1 load=configs/flashdepth-l/iter_10001.pth
-
-# Step 2: Foreground-only Modulation 학습 (GSP frozen)
-python train_gear5.py --config-path configs/gear5 step=2 gear_checkpoint=configs/gear5/checkpoint_step40000_step1.pth
-```
-
-**Phase 2 (2K, ViT-S Hybrid)**:
-```bash
-# Step 1: 2K resolution에서 GSP 재학습 (FFM 제외)
-python train_gear5.py --config-path configs/gear5/hybrid \
-  step=1 \
-  gear_checkpoint=configs/gear5/checkpoint_step40000_step2.pth \
-  load=configs/flashdepth/iter_43002.pth
-
-# Step 2: FFM 추가하여 전체 모델 학습
-python train_gear5.py --config-path configs/gear5/hybrid \
-  step=2 \
-  gear_checkpoint=configs/gear5/hybrid/checkpoint_step40000_step1.pth \
-  phase1_step2_checkpoint=configs/gear5/checkpoint_step40000_step2.pth
-```
-
-### 3. Gear5 vs Gear3 비교
-
-| 특징 | Gear3 | Gear5 |
-|-----|-------|-------|
-| **학습 전략** | Single-stage | Two-stage (GSP → FFM) |
-| **Multi-layer** | Step 2만 사용 | Step 1, 2 모두 사용 |
-| **CLS tokens** | 사용 안함 | Step 1에서 사용 (4-layer) |
-| **Attention layers** | Step 2: 4-layer | Step 2: 2-layer (중간만) |
-| **GSP** | Global feature 기반 | Multi-layer CLS 기반 |
-| **FFM** | 전체 feature 대상 | Foreground-only |
-| **학습 파라미터** | ~9.2M | Step1: 4.86M, Step2: 7.5M |
+Both share common components (CLS token extraction, importance map generation) but differ in their modulation strategies.
 
 ---
 
-## 목차
-
-1. [개요](#개요)
-2. [핵심 아이디어](#핵심-아이디어)
-3. [아키텍처 설계](#아키텍처-설계)
-4. [2단계 학습 전략](#2단계-학습-전략)
-5. [손실 함수](#손실-함수)
-6. [사용 방법](#사용-방법)
-7. [Dimension Flow](#dimension-flow)
-8. [Testing](#testing)
-9. [기대 효과](#기대-효과)
+## Table of Contents
+- [Architecture Overview](#architecture-overview)
+- [Gear5 (Original): GRU-Based Temporal Modulation](#gear5-original-gru-based-temporal-modulation)
+- [Gear5 FiLM: Channel-Wise Feature Modulation](#gear5-film-channel-wise-feature-modulation)
+- [Comparison](#comparison)
+- [Loss Functions](#loss-functions)
+- [Training & Testing](#training--testing)
+- [Configuration](#configuration)
 
 ---
 
-## 개요
+## Architecture Overview
 
-Gear5는 **2단계 학습 전략**을 통해 metric depth 추정 성능을 극대화합니다:
+Both Gear5 variants extend FlashDepth with metric depth prediction capabilities by:
+1. Extracting semantic features from multi-layer CLS tokens
+2. Generating importance maps from attention weights for loss weighting
+3. Applying learned transformations to enhance depth predictions
 
-1. **Step 1 (Global Scale Predictor)**: Multi-layer CLS tokens를 사용하여 전역적 scale/shift 예측
-2. **Step 2 (Foreground-only Modulation)**: Multi-layer attention weights로 foreground feature를 추출하고, FG-only modulation 적용
+**Key Shared Components**:
+- **Multi-layer CLS Token Extraction**: Layers [11, 23] for ViT-L, [5, 11] for ViT-S
+- **ImportanceMapGenerator**: CLS-to-patch attention → importance map for loss weighting
+- **Loss Functions**: Both support `log_l1` (standard) and `importance` (weighted) loss types
+- **Canonical Space**: All training/inference uses canonical focal length (500.0 for 518×518, configurable via `canonical_focal_length`; on/off via `use_canonical_space`)
 
-### Gear5의 핵심 설계 원칙
-
-1. **Multi-layer Feature Fusion**:
-   - Single layer 대신 multiple layers (4개 또는 2개)의 정보를 융합
-   - ViT의 계층적 특징을 활용하여 더 풍부한 semantic 정보 획득
-
-2. **Foreground-only Modulation**:
-   - Background는 global modulation만으로 충분
-   - Foreground만 추가 modulation → 효율적 파라미터 사용
-
-3. **Two-stage Learning**:
-   - Step 1: Global scale을 먼저 정확하게 학습
-   - Step 2: Global 위에 FG-specific refinement 추가
-
----
-
-## 핵심 아이디어
-
-### 1. Multi-layer Global Scale Predictor (Step 1)
-
-**기존 GSP의 한계**:
-- Single CLS token (last layer) 사용
-- 계층적 feature의 이점 활용 못함
-
-**Gear5 GSP**:
-```python
-# GlobalScalePredictorMultiLayer
-# Input: CLS tokens from 4 layers [4, 11, 17, 23] or [2, 5, 8, 11]
-# Output: scale (B,), shift (B,)
-
-# 1. Extract CLS tokens from multiple layers
-cls_tokens = [encoder_features[i][:, 0] for i in [0, 1, 2, 3]]  # 4 CLS tokens
-
-# 2. Uniform weight fusion (equal ratio)
-cls_fused = torch.stack(cls_tokens, dim=1).mean(dim=1)  # [B, embed_dim]
-
-# 3. Predict scale/shift
-scale = F.softplus(self.scale_head(cls_fused))  # [B] positive
-shift = self.shift_head(cls_fused)  # [B] real number
-```
-
-**장점**:
-- ✅ 4개 layer의 계층적 정보 활용
-- ✅ Uniform weight → 학습 안정성 ↑
-- ✅ 추가 파라미터 최소 (~0.26M)
-
-### 2. Multi-layer Foreground Feature Extraction (Step 2)
-
-**기존 attention-based FG mask의 한계**:
-- Last block attention만 사용 → 정보 제한적
-- FG/BG 구분이 명확하지 않을 수 있음
-
-**Gear5 FG Feature Extraction**:
-```python
-# ForegroundOnlyModulationHead
-# Input: Attention weights from [11, 17] or [5, 8]
-# Output: FG features (B, 256), importance map, FG mask
-
-# 1. Extract attention weights from middle 2 layers
-attn_weights_multi = [
-    model.pretrained.blocks[11].attn.attn_weights,
-    model.pretrained.blocks[17].attn.attn_weights
-]
-
-# 2. Multi-layer fusion (uniform weights)
-attn_fused = torch.stack(attn_weights_multi, dim=0).mean(dim=0)  # [B, H, N, N]
-
-# 3. CLS→patch attention for importance
-importance_map = process_attention_to_importance(attn_fused, patch_h, patch_w)
-
-# 4. FG mask generation (threshold-based)
-fg_mask = (importance_map > 0.5).float()  # [B, 1, H, W]
-
-# 5. FG patch tokens extraction (ViT의 patch tokens 사용)
-fg_patches = extract_foreground_patches(patch_tokens, fg_mask)  # [B, N_fg, C]
-
-# 6. FG feature pooling
-fg_features = fg_patches.mean(dim=1)  # [B, C]
-```
-
-**장점**:
-- ✅ 중간 2개 layer의 attention 융합 → 더 robust한 FG detection
-- ✅ ViT patch tokens 직접 사용 → 고품질 semantic feature
-- ✅ Binary FG mask → 명확한 FG/BG 구분
-
-### 3. Foreground-only Modulation
-
-**핵심 아이디어**: Background는 global modulation만으로 충분, Foreground만 추가 modulation
-
-```python
-# Step 1: Global modulation (전체 영역)
-dpt_global = dpt_features * scale.view(B,1,1,1) + shift.view(B,1,1,1)
-
-# Step 2: FG-only modulation (Foreground만)
-# 1. FG features → FG-specific γ_fg, β_fg 예측
-gamma_fg, beta_fg = self.fg_modulation_predictor(fg_features)  # [B, dpt_dim]
-
-# 2. Spatial broadcast + FG mask 적용
-gamma_fg_spatial = gamma_fg.view(B, -1, 1, 1) * fg_mask  # [B, C, H, W]
-beta_fg_spatial = beta_fg.view(B, -1, 1, 1) * fg_mask
-
-# 3. FG-only modulation on top of global
-dpt_fg_modulated = dpt_global + gamma_fg_spatial * dpt_global + beta_fg_spatial
-```
-
-**수식**:
-```
-Global:  F_global(x,y) = γ_global × F(x,y) + β_global
-FG-only: F_final(x,y) = F_global(x,y) + M_fg(x,y) × (γ_fg × F_global(x,y) + β_fg)
-```
-
-**장점**:
-- ✅ Background는 untouched → global만으로 처리
-- ✅ Foreground에만 집중 → 파라미터 효율 ↑
-- ✅ Residual connection → 학습 안정성 ↑
+**Key Differences**:
+| Component | Gear5 (Original) | Gear5 FiLM |
+|-----------|------------------|------------|
+| **Modulation Target** | Final relative depth map | DPT path_1 features (before Mamba) |
+| **Modulation Method** | GRU-based temporal scale/shift | Channel-wise FiLM (gamma/beta) |
+| **Temporal Modeling** | GRU inside head | Existing Mamba layers |
+| **Trainable Params** | ~132K (head only) | ~1.03M (head + Mamba + output_conv2) |
+| **Frozen Components** | Everything except Gear5Head | ViT + DPT + output_conv1 |
 
 ---
 
-## 아키텍처 설계
+## Gear5 (Original): GRU-Based Temporal Modulation
 
-### Overall Architecture
+### Architecture
+
+Gear5 applies **temporal scale and shift** to the final relative depth output using a GRU-based predictor.
 
 ```
-Video Frames [B, T, 3, H, W]
+Video Input [B, T, 3, H, W]
     ↓
-DINOv2 Encoder (frozen)
-    ├→ CLS tokens [Layer 4, 11, 17, 23] → Step 1 (GSP)
-    ├→ Attention weights [Layer 11, 17] → Step 2 (FFM)
-    └→ Patch tokens [Layer 23] → Step 2 (FG feature extraction)
+ViT Encoder (Frozen)
     ↓
-DPT Features (frozen): path_1 [B*T, dpt_dim, H/14, W/14]
+CLS Tokens [Layers 11, 23] → ImportanceMapGenerator → Importance Map
+    ↓                              ↓
+TemporalScalePredictor          Loss Weighting
     ↓
-═══════════════════════════════════════════════════════════
-Step 1: Global Scale Predictor (GSP)
-═══════════════════════════════════════════════════════════
-GlobalScalePredictorMultiLayer:
-    Input:  CLS tokens [4, 11, 17, 23] (4 layers)
-    Fusion: Uniform weights (equal ratio)
-    Output: scale [B], shift [B]
-
-Global Modulation:
-    path_1_global = path_1 * scale + shift
-
-    ↓ (if step == 1, return here)
-
-═══════════════════════════════════════════════════════════
-Step 2: Foreground-only Modulation (FFM)
-═══════════════════════════════════════════════════════════
-ForegroundOnlyModulationHead:
-    Input:
-        - Patch tokens [B*T, N, embed_dim]
-        - Attention weights from [11, 17] (2 layers)
-        - path_1_global [B*T, dpt_dim, H/14, W/14]
-
-    Process:
-        1. Multi-layer attention fusion → importance_map [B, 1, H, W]
-        2. Binary FG mask (threshold 0.5)
-        3. FG patch extraction → fg_features [B, 256]
-        4. FG modulation params: γ_fg, β_fg [B, dpt_dim]
-        5. Spatial broadcast + mask → FG-only modulation
-
-    Output: path_1_fg_modulated [B*T, dpt_dim, H/14, W/14]
-
-═══════════════════════════════════════════════════════════
-Temporal Modeling (Mamba) - Both Steps
-═══════════════════════════════════════════════════════════
-Mamba:
-    Input:  path_1_modulated (global or global+FG)
-    Output: path_1_temporal [B*T, dpt_dim, H/14, W/14]
-
-═══════════════════════════════════════════════════════════
-DPT Output Head (Trainable) - Both Steps
-═══════════════════════════════════════════════════════════
-output_conv1 → upsample to (H, W) → output_conv2
+Scale [B, T, 1, 1, 1], Shift [B, T, 1, 1, 1]
     ↓
-Metric Depth [B*T, 1, H, W]
+Relative Depth × Scale + Shift = Metric Depth
 ```
 
-### Module Details
+### Key Components
 
-#### 1. GlobalScalePredictorMultiLayer
+#### 1. ImportanceMapGenerator
+Generates spatial importance weights from CLS attention for loss weighting.
 
 ```python
-class GlobalScalePredictorMultiLayer(nn.Module):
+class ImportanceMapGenerator(nn.Module):
     """
-    Multi-layer CLS token fusion for global scale/shift prediction.
+    Extract CLS-to-patch attention from multiple layers (11, 23)
+    Average across layers → Reshape → Remove register token → Normalize [0,1]
+
+    Input: List of [B*T, num_heads, N+1, N+1] attention weights
+    Output: [B, T, patch_h, patch_w] importance map
+    """
+```
+
+**Pipeline**:
+1. Extract CLS-to-patch attention from each layer: `attn[:, :, 0, 1:]`
+2. Average over heads: `[B, num_heads, N] → [B, N]`
+3. Average across layers (11, 23)
+4. Reshape to spatial: `[B, patch_h, patch_w]`
+5. Remove register token (highest attention patch) via 3×3 inpainting
+6. Percentile normalization (1-99 percentile → [0, 1])
+
+#### 2. TemporalScalePredictor
+Predicts scale and shift parameters using a GRU for temporal consistency.
+
+```python
+class TemporalScalePredictor(nn.Module):
+    """
+    CLS token [B, T, 1024] → Linear → GRU → Linear → Scale/Shift
 
     Architecture:
-        4 CLS tokens → Uniform fusion → MLP → scale/shift
+        - Input projection: 1024 → 256
+        - Bi-directional GRU: hidden_dim=256, 2 layers
+        - Output projection: 512 (bidirectional) → 2 (scale, shift)
 
-    Parameters:
-        - embed_dim: DINOv2 embedding dimension (1024 for ViT-L, 384 for ViT-S)
-
-    Trainable params: ~0.26M
+    Trainable params: ~132K (only this module is trained)
     """
+```
+
+**Forward Flow**:
+```python
+cls_token: [B, T, 1024]  # Last layer CLS token (Layer 23)
+    ↓ Linear(1024 → 256)
+cls_features: [B, T, 256]
+    ↓ Bi-GRU(2 layers, 256 hidden)
+gru_output: [B, T, 512]  # 256 × 2 (bidirectional)
+    ↓ Linear(512 → 2)
+scale_shift: [B, T, 2]
+    ↓ Split
+scale: [B, T, 1, 1, 1] = exp(scale_raw)  # Ensures positive
+shift: [B, T, 1, 1, 1] = shift_raw        # Real number
+```
+
+**Temporal Processing**: GRU processes sequence bidirectionally, ensuring each frame's scale/shift considers past and future context.
+
+#### 3. Gear5Head (Main Module)
+
+```python
+class Gear5Head(nn.Module):
     def __init__(self, embed_dim=1024):
-        super().__init__()
-        self.scale_head = nn.Sequential(
-            nn.Linear(embed_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, 1)
-        )
-        self.shift_head = nn.Sequential(
-            nn.Linear(embed_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, 1)
-        )
+        self.temporal_scale_predictor = TemporalScalePredictor(embed_dim)
+        self.importance_map_generator = ImportanceMapGenerator(num_layers=2)
 
-    def forward(self, cls_tokens_list):
+    def forward(self, cls_tokens_multi_layer, attention_weights_list,
+                relative_depth, patch_h, patch_w):
         """
         Args:
-            cls_tokens_list: List of [B, embed_dim] CLS tokens from 4 layers
+            cls_tokens_multi_layer: List of [B, T, 1024] from [Layer 11, 23]
+            attention_weights_list: List of [B*T, heads, N+1, N+1] from [Layer 11, 23]
+            relative_depth: [B, T, 1, H, W] normalized depth
+            patch_h, patch_w: Spatial patch dimensions (e.g., 37×37 for 518×518)
 
         Returns:
-            scale: [B] positive values
-            shift: [B] real values
+            dict with:
+                - metric_depth: [B, T, 1, H, W]
+                - scale: [B, T, 1, 1, 1]
+                - shift: [B, T, 1, 1, 1]
+                - importance_map: [B, T, patch_h, patch_w]
         """
-        # Uniform weight fusion
-        cls_fused = torch.stack(cls_tokens_list, dim=1).mean(dim=1)  # [B, embed_dim]
+        # Use last layer CLS token for scale/shift prediction
+        cls_token = cls_tokens_multi_layer[-1]  # [B, T, 1024]
 
-        # Predict scale/shift
-        scale = F.softplus(self.scale_head(cls_fused).squeeze(-1))  # [B]
-        shift = self.shift_head(cls_fused).squeeze(-1)  # [B]
+        # Predict scale and shift
+        scale, shift = self.temporal_scale_predictor(cls_token)
 
-        return scale, shift
+        # Apply to relative depth
+        metric_depth = scale * relative_depth + shift
+
+        # Generate importance map for loss
+        importance_map = self.importance_map_generator(
+            attention_weights_list, patch_h, patch_w
+        )
+
+        return {
+            'metric_depth': metric_depth,
+            'scale': scale,
+            'shift': shift,
+            'importance_map': importance_map
+        }
 ```
 
-#### 2. ForegroundOnlyModulationHead
+### Dimension Flow
+
+```
+Input Video:        [B=2, T=5, C=3, H=518, W=518]
+                             ↓
+ViT Encoder (Frozen):
+  - Patch embedding:     [B*T=10, N=1369, embed=1024]
+  - Layer 11 output:     [B*T=10, N+1=1370, 1024]  (with CLS)
+  - Layer 23 output:     [B*T=10, N+1=1370, 1024]  (with CLS)
+
+CLS Token Extraction:
+  - Layer 11 CLS:        [B*T=10, 1024] → Reshape → [B=2, T=5, 1024]
+  - Layer 23 CLS:        [B*T=10, 1024] → Reshape → [B=2, T=5, 1024]
+  - cls_tokens_multi_layer = [[B, T, 1024], [B, T, 1024]]
+
+Attention Weights:
+  - Layer 11 attn:       [B*T=10, heads=16, N+1=1370, N+1=1370]
+  - Layer 23 attn:       [B*T=10, heads=16, N+1=1370, N+1=1370]
+
+TemporalScalePredictor:
+  cls_token (Layer 23):  [B=2, T=5, 1024]
+       ↓ Linear(1024→256)
+  cls_features:          [B=2, T=5, 256]
+       ↓ Bi-GRU(2 layers, hidden=256)
+  gru_output:            [B=2, T=5, 512]  # 256×2 bidirectional
+       ↓ Linear(512→2)
+  scale_shift:           [B=2, T=5, 2]
+       ↓ Split & Reshape
+  scale:                 [B=2, T=5, 1, 1, 1]
+  shift:                 [B=2, T=5, 1, 1, 1]
+
+ImportanceMapGenerator:
+  attention_weights_list: [[B*T=10, 16, 1370, 1370], [B*T=10, 16, 1370, 1370]]
+       ↓ Extract CLS-to-patch attn[:, :, 0, 1:]
+  cls_to_patch:          [B*T=10, 16, N=1369]
+       ↓ Mean over heads
+  cls_attention:         [B*T=10, N=1369]
+       ↓ Average layers 11, 23
+  cls_avg:               [B*T=10, N=1369]
+       ↓ Reshape to spatial
+  importance_map:        [B*T=10, 1, patch_h=37, patch_w=37]
+       ↓ Remove register token + normalize
+       ↓ Reshape temporal
+  importance_map:        [B=2, T=5, patch_h=37, patch_w=37]
+
+Metric Depth:
+  relative_depth:        [B=2, T=5, 1, H=518, W=518]
+  metric_depth:          scale × relative_depth + shift
+                         [B=2, T=5, 1, 518, 518]
+```
+
+### Parameter Count
+
+**Frozen Components** (~340M params):
+- ViT Encoder: ~304M
+- DPT: ~35M
+- Mamba: ~0.9M
+- output_conv: ~0.6K
+
+**Trainable Components** (~132K params):
+- TemporalScalePredictor:
+  - Input Linear: 1024×256 = 262K weights + 256 bias = 262,400
+  - Bi-GRU (2 layers): ~66K
+  - Output Linear: 512×2 = 1,024 + 2 bias = 1,026
+- ImportanceMapGenerator: 0 (no trainable params)
+- **Total trainable**: ~132K
+
+### Training Strategy
+
+**Freezing**:
+```python
+# Freeze entire FlashDepth model
+for param in model.pretrained.parameters():
+    param.requires_grad = False
+for param in model.depth_head.parameters():
+    param.requires_grad = False
+if model.use_mamba:
+    for param in model.mamba_temporal_modules.parameters():
+        param.requires_grad = False
+
+# Only train Gear5Head
+for param in model.gear5_head.parameters():
+    param.requires_grad = True
+```
+
+**Learning Rates**:
+- `gear5_lr`: 1.0e-4 (TemporalScalePredictor)
+- Weight decay: 1.0e-6
+
+**Loss**: Log L1 in inverse depth space (100/m) with optional importance weighting.
+
+---
+
+## Gear5 FiLM: Channel-Wise Feature Modulation
+
+### Architecture
+
+Gear5 FiLM applies **channel-wise FiLM modulation** to DPT features before Mamba temporal modeling.
+
+```
+Video Input [B, T, 3, H, W]
+    ↓
+ViT Encoder (Frozen)
+    ↓
+CLS Tokens [Layers 11, 23] → GlobalFeatureNetwork → ModulationNetwork
+    ↓                              ↓                      ↓
+DPT (Frozen)                  Global Feature         Gamma, Beta
+    ↓                              ↓                      ↓
+path_1 features          SimpleFeatureModulator (Channel-wise)
+    ↓
+Modulated path_1 → Mamba (Trainable) → output_conv2 (Trainable) → Metric Depth
+    ↓
+ImportanceMapGenerator → Importance Map (Loss Weighting)
+```
+
+### Key Components
+
+#### 1. ImportanceMapGenerator
+Identical to Gear5 - generates spatial importance weights from CLS attention.
+
+#### 2. GlobalFeatureNetwork
+Extracts global semantic features from CLS token.
 
 ```python
-class ForegroundOnlyModulationHead(nn.Module):
+class GlobalFeatureNetwork(nn.Module):
     """
-    Multi-layer attention fusion for foreground-only modulation.
+    CLS token → Global semantic feature
 
     Architecture:
-        Multi-layer attention → FG mask → FG features → FG modulation
+        - Linear(1024 → 512) → ReLU
+        - Linear(512 → 256) → ReLU
 
-    Parameters:
-        - embed_dim: 1024 (ViT-L) or 384 (ViT-S)
-        - dpt_dim: 256 (ViT-L) or 64 (ViT-S)
-
-    Trainable params: ~2.9M
+    Processes each frame independently, handles temporal dimension.
     """
-    def __init__(self, embed_dim=1024, dpt_dim=256):
-        super().__init__()
 
-        # FG feature aggregator
-        self.fg_feature_mlp = nn.Sequential(
-            nn.Linear(embed_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, 256)
-        )
-
-        # FG modulation predictor
-        self.fg_modulation_predictor = nn.Sequential(
-            nn.Linear(256, 256),
-            nn.ReLU(),
-            nn.Linear(256, dpt_dim * 2)  # γ_fg and β_fg
-        )
-
-    def forward(self, patch_tokens, attention_weights_multi_layer,
-                dpt_features_global, patch_h, patch_w):
+    def forward(self, cls_token):
         """
         Args:
-            patch_tokens: [B, N, embed_dim]
-            attention_weights_multi_layer: List of [B, H, N, N] (2 layers)
-            dpt_features_global: [B, dpt_dim, H, W]
+            cls_token: [B, T, 1024] from Layer 23
 
         Returns:
-            path_1_fg_modulated: [B, dpt_dim, H, W]
-            importance_map: [B, 1, H, W]
-            fg_features: [B, 256]
-            fg_mask: [B, 1, H, W]
+            global_feature: [B, T, 256]
         """
-        B = dpt_features_global.shape[0]
-
-        # 1. Multi-layer attention fusion
-        attn_fused = torch.stack(attention_weights_multi_layer, dim=0).mean(dim=0)
-
-        # 2. Importance map
-        importance_map = process_attention_to_importance(attn_fused, patch_h, patch_w)
-
-        # 3. FG mask (binary threshold)
-        fg_mask = (importance_map > 0.5).float()
-
-        # 4. Extract FG patch tokens
-        fg_patches = extract_foreground_patches(patch_tokens, fg_mask, patch_h, patch_w)
-
-        # 5. FG feature aggregation
-        fg_features_raw = self.fg_feature_mlp(fg_patches)  # [B, N_fg, 256]
-        fg_features = fg_features_raw.mean(dim=1)  # [B, 256] (average pooling)
-
-        # 6. Predict FG modulation parameters
-        fg_params = self.fg_modulation_predictor(fg_features)  # [B, dpt_dim*2]
-        gamma_fg = fg_params[:, :self.dpt_dim]  # [B, dpt_dim]
-        beta_fg = fg_params[:, self.dpt_dim:]   # [B, dpt_dim]
-
-        # 7. Spatial broadcast + FG mask
-        gamma_fg_spatial = gamma_fg.view(B, -1, 1, 1) * fg_mask
-        beta_fg_spatial = beta_fg.view(B, -1, 1, 1) * fg_mask
-
-        # 8. FG-only modulation (residual connection)
-        path_1_fg_modulated = dpt_features_global + \\
-            gamma_fg_spatial * dpt_features_global + beta_fg_spatial
-
-        return path_1_fg_modulated, importance_map, fg_features, fg_mask
 ```
 
----
-
-## 2단계 학습 전략
-
-### Phase 1 (518×518, ViT-L)
-
-#### Step 1: Global Scale Predictor 학습
-
-**목표**: Multi-layer CLS tokens로 전역 scale/shift 학습
-
-**Trainable**:
-- ✅ GlobalScalePredictorMultiLayer (~0.26M)
-- ✅ Mamba (~4.3M)
-- ✅ output_conv (~0.3M)
-
-**Frozen**:
-- ❌ DINOv2 encoder
-- ❌ DPT decoder
-
-**Config**:
-```yaml
-step: 1
-load: configs/flashdepth-l/iter_10001.pth
-dataset:
-  resolution: 'base'  # 518×518
-  train_datasets: [mvs-synth, dynamicreplica, tartanair, pointodyssey, spring]
-training:
-  batch_size: 20
-  iterations: 40001
-  gsp_lr: 1.0e-4
-  mamba_lr: 1.0e-4
-  output_lr: 1.0e-4
-```
-
-**Command**:
-```bash
-python train_gear5.py --config-path configs/gear5 \\
-  step=1 \\
-  load=configs/flashdepth-l/iter_10001.pth \\
-  dataset.data_root=/path/to/data
-```
-
-#### Step 2: Foreground-only Modulation 학습
-
-**목표**: FG-only modulation 추가 (GSP frozen)
-
-**Trainable**:
-- ✅ ForegroundOnlyModulationHead (~2.9M)
-- ✅ Mamba (~4.3M)
-- ✅ output_conv (~0.3M)
-
-**Frozen**:
-- ❌ DINOv2 encoder
-- ❌ DPT decoder
-- ❌ GlobalScalePredictorMultiLayer (Step 1에서 학습됨)
-
-**Config**:
-```yaml
-step: 2
-gear_checkpoint: configs/gear5/checkpoint_step40000_step1.pth  # Step 1 checkpoint
-training:
-  fg_mod_lr: 1.0e-4  # FG modulation LR
-  mamba_lr: 5.0e-5   # Lower for fine-tuning
-  output_lr: 5.0e-5
-```
-
-**Command**:
-```bash
-python train_gear5.py --config-path configs/gear5 \\
-  step=2 \\
-  gear_checkpoint=configs/gear5/checkpoint_step40000_step1.pth \\
-  dataset.data_root=/path/to/data
-```
-
-### Phase 2 (2K, ViT-S Hybrid)
-
-#### Step 1: 2K resolution에서 GSP 재학습 (FFM 제외)
-
-**목표**: 고해상도에서 GSP + Mamba + output 재학습
-
-**Checkpoint Loading**:
-1. Phase1 Step2 checkpoint에서 GSP + Mamba + output 로드 (FFM 제외)
-2. FlashDepth-hybrid에서 DINOv2 + DPT 덮어쓰기
-
-**Trainable**:
-- ✅ GlobalScalePredictorMultiLayer
-- ✅ Mamba
-- ✅ output_conv
-
-**Frozen**:
-- ❌ DINOv2 + DPT (FlashDepth-hybrid)
-
-**Config**:
-```yaml
-# configs/gear5/hybrid.yaml
-step: 1
-load: configs/flashdepth/iter_43002.pth  # FlashDepth-hybrid (DINOv2+DPT)
-gear_checkpoint: configs/gear5/checkpoint_step40000_step2.pth  # Phase1 Step2 (GSP+Mamba+output, NO FFM)
-model:
-  vit_size: 'vits'  # ViT-S for hybrid
-dataset:
-  resolution: '2k'
-  train_datasets: [mvs-synth, spring]
-training:
-  batch_size: 3
-  gradient_checkpointing: true
-hybrid_configs:
-  use_hybrid: true
-```
-
-**Command**:
-```bash
-python train_gear5.py --config-path configs/gear5/hybrid \\
-  step=1 \\
-  gear_checkpoint=configs/gear5/checkpoint_step40000_step2.pth \\
-  load=configs/flashdepth/iter_43002.pth \\
-  dataset.data_root=/path/to/data
-```
-
-#### Step 2: FFM 추가하여 전체 모델 학습
-
-**목표**: Phase2 Step1 base에 Phase1 Step2의 FFM 추가
-
-**Checkpoint Loading**:
-1. Phase2 Step1 checkpoint에서 base 로드
-2. Phase1 Step2 checkpoint에서 FFM만 추가 로드
-
-**Trainable**:
-- ✅ ForegroundOnlyModulationHead
-- ✅ Mamba
-- ✅ output_conv
-
-**Frozen**:
-- ❌ DINOv2 + DPT
-- ❌ GlobalScalePredictorMultiLayer
-
-**Config**:
-```yaml
-step: 2
-gear_checkpoint: configs/gear5/hybrid/checkpoint_step40000_step1.pth  # Phase2 Step1
-phase1_step2_checkpoint: configs/gear5/checkpoint_step40000_step2.pth  # Phase1 Step2 (for FFM)
-training:
-  fg_mod_lr: 1.0e-4
-  mamba_lr: 5.0e-5
-  output_lr: 5.0e-5
-```
-
-**Command**:
-```bash
-python train_gear5.py --config-path configs/gear5/hybrid \\
-  step=2 \\
-  gear_checkpoint=configs/gear5/hybrid/checkpoint_step40000_step1.pth \\
-  phase1_step2_checkpoint=configs/gear5/checkpoint_step40000_step2.pth \\
-  dataset.data_root=/path/to/data
-```
-
----
-
-## 손실 함수
-
-### Log L1 Loss (Main Loss)
+#### 3. ModulationNetwork
+Generates channel-wise gamma and beta for FiLM modulation.
 
 ```python
-# Inverse depth log L1 loss (같은 FlashDepth와 동일)
-loss = torch.abs(torch.log(pred_inverse + 1e-3) - torch.log(gt_inverse + 1e-3))
-loss = loss[valid_mask].mean()
+class ModulationNetwork(nn.Module):
+    """
+    Global feature → Gamma, Beta (channel-wise)
+
+    Architecture:
+        - Linear(256 → 512) → ReLU
+        - Linear(512 → 512)  # First 256: gamma, Last 256: beta
+
+    Each channel gets its own gamma/beta, applied uniformly across spatial locations.
+    """
+
+    def forward(self, global_feature):
+        """
+        Args:
+            global_feature: [B, T, 256]
+
+        Returns:
+            gamma: [B, T, 256]  # Channel-wise scaling
+            beta: [B, T, 256]   # Channel-wise shift
+        """
 ```
 
-**Valid Mask**:
-- GT valid: Canonical 70m 이내 (inverse depth > 100/70)
-- Pred outlier filtering: 200m 이내 (inverse depth > 100/200)
-- Final mask: GT valid AND Pred not outlier
+**Key Concept - Channel-wise Modulation**:
+- 256 DPT channels = 256 information types
+- Each channel gets its own gamma/beta pair
+- All spatial locations (H×W) within a channel share the same gamma/beta
+- Formula: `modulated[b,t,c,x,y] = gamma[b,t,c] ⊙ feature[b,t,c,x,y] + beta[b,t,c]`
 
-**Canonical Space**:
+#### 4. SimpleFeatureModulator
+Applies channel-wise FiLM modulation to DPT features.
+
 ```python
-# GT depth를 canonical space로 변환
-depth_canonical = depth_actual × (CANONICAL_FX / fx_actual)
-inverse_canonical = inverse_actual × (fx_actual / CANONICAL_FX)
+class SimpleFeatureModulator(nn.Module):
+    """
+    Apply FiLM-style modulation: feature * gamma + beta (channel-wise)
+    """
 
-# Training threshold
-MIN_INVERSE_DEPTH = 100.0 / 70.0  # Canonical 70m
+    def forward(self, features, gamma, beta):
+        """
+        Args:
+            features: [B*T, C=256, H, W] DPT path_1 features
+            gamma: [B, T, 256] channel-wise scaling
+            beta: [B, T, 256] channel-wise shift
+
+        Returns:
+            modulated_features: [B*T, 256, H, W]
+        """
+        # Reshape gamma/beta to [B*T, C, 1, 1]
+        gamma_expanded = gamma.view(B*T, C, 1, 1)
+        beta_expanded = beta.view(B*T, C, 1, 1)
+
+        # Apply channel-wise modulation
+        return gamma_expanded * features + beta_expanded
 ```
+
+#### 5. Gear5FilmHead (Main Module)
+
+```python
+class Gear5FilmHead(nn.Module):
+    def __init__(self, embed_dim=1024, dpt_dim=256):
+        self.global_feature_net = GlobalFeatureNetwork(embed_dim, feature_dim=256)
+        self.modulation_net = ModulationNetwork(feature_dim=256, dpt_dim=dpt_dim)
+        self.feature_modulator = SimpleFeatureModulator()
+        self.importance_map_generator = ImportanceMapGenerator(num_layers=2)
+
+    def forward(self, cls_tokens_multi_layer, attention_weights_list,
+                dpt_features, patch_h, patch_w):
+        """
+        Args:
+            cls_tokens_multi_layer: List of [B, T, 1024] from [Layer 11, 23]
+            attention_weights_list: List of [B*T, heads, N+1, N+1] from [Layer 11, 23]
+            dpt_features: List of 4× [B*T, 256, H, W] DPT layer features
+            patch_h, patch_w: Spatial patch dimensions
+
+        Returns:
+            dict with:
+                - path_1_modulated: [B*T, 256, H, W]
+                - gamma: [B, T, 256]
+                - beta: [B, T, 256]
+                - importance_map: [B, T, patch_h, patch_w]
+        """
+        # Use last layer CLS token (Layer 23)
+        cls_token = cls_tokens_multi_layer[-1]  # [B, T, 1024]
+
+        # Generate global semantic feature
+        global_feature = self.global_feature_net(cls_token)  # [B, T, 256]
+
+        # Get modulation parameters
+        gamma, beta = self.modulation_net(global_feature)  # [B, T, 256] each
+
+        # Modulate ONLY path_1 (last DPT layer features)
+        path_1 = dpt_features[-1]  # [B*T, 256, H, W]
+        path_1_modulated = self.feature_modulator(path_1, gamma, beta)
+
+        # Generate importance map
+        importance_map = self.importance_map_generator(
+            attention_weights_list, patch_h, patch_w
+        )  # [B, T, patch_h, patch_w]
+
+        return {
+            'path_1_modulated': path_1_modulated,
+            'gamma': gamma,
+            'beta': beta,
+            'importance_map': importance_map
+        }
+```
+
+### Dimension Flow
+
+```
+Input Video:        [B=2, T=5, C=3, H=518, W=518]
+                             ↓
+ViT Encoder (Frozen):
+  - Layer 11 CLS:        [B*T=10, 1024] → Reshape → [B=2, T=5, 1024]
+  - Layer 23 CLS:        [B*T=10, 1024] → Reshape → [B=2, T=5, 1024]
+
+DPT (Frozen):
+  - path_1 (Layer 23):   [B*T=10, C=256, H=65, W=65]
+  - path_2 (Layer 11):   [B*T=10, C=512, H=65, W=65]
+  - path_3 (Layer 5):    [B*T=10, C=256, H=65, W=65]
+  - path_4 (Layer 2):    [B*T=10, C=256, H=65, W=65]
+
+GlobalFeatureNetwork:
+  cls_token (Layer 23):  [B=2, T=5, 1024]
+       ↓ Reshape to [B*T=10, 1024]
+       ↓ Linear(1024→512) → ReLU
+       ↓ Linear(512→256) → ReLU
+  global_feature:        [B*T=10, 256]
+       ↓ Reshape to [B=2, T=5, 256]
+
+ModulationNetwork:
+  global_feature:        [B=2, T=5, 256]
+       ↓ Reshape to [B*T=10, 256]
+       ↓ Linear(256→512) → ReLU
+       ↓ Linear(512→512)
+  params:                [B*T=10, 512]
+       ↓ Split into [B*T=10, 256] each
+  gamma:                 [B*T=10, 256] → Reshape → [B=2, T=5, 256]
+  beta:                  [B*T=10, 256] → Reshape → [B=2, T=5, 256]
+
+SimpleFeatureModulator:
+  path_1:                [B*T=10, C=256, H=65, W=65]
+  gamma:                 [B=2, T=5, 256] → Reshape → [B*T=10, 256, 1, 1]
+  beta:                  [B=2, T=5, 256] → Reshape → [B*T=10, 256, 1, 1]
+       ↓ Broadcast to [B*T=10, 256, 65, 65]
+  path_1_modulated:      gamma * path_1 + beta
+                         [B*T=10, 256, 65, 65]
+
+Mamba Temporal Processing (Trainable):
+  path_1_modulated:      [B*T=10, 256, 65, 65]
+       ↓ Reshape to [B=2, T=5, 256, 65, 65]
+       ↓ Mamba layers (4 layers, d_state=256)
+  temporal_features:     [B=2, T=5, 256, 65, 65]
+       ↓ Flatten to [B*T=10, 256, 65, 65]
+
+DPT Refinement Head (Frozen output_conv1 + Trainable output_conv2):
+  temporal_features:     [B*T=10, 256, 65, 65]
+       ↓ Upsample + fusion
+  depth_pred:            [B*T=10, 1, 518, 518]
+       ↓ Reshape temporal
+  metric_depth:          [B=2, T=5, 1, 518, 518]
+
+ImportanceMapGenerator:
+  attention_weights:     [[B*T=10, 16, 1370, 1370], [B*T=10, 16, 1370, 1370]]
+       ↓ CLS attention extraction + averaging
+  importance_map:        [B=2, T=5, patch_h=37, patch_w=37]
+```
+
+### Parameter Count
+
+**Frozen Components** (~339M params):
+- ViT Encoder: ~304M
+- DPT: ~35M
+- output_conv1: ~0.3K
+
+**Trainable Components** (~1.03M params):
+- Gear5FilmHead:
+  - GlobalFeatureNetwork: (1024×512 + 512×256) + bias ≈ 656K
+  - ModulationNetwork: (256×512 + 512×512) + bias ≈ 394K
+  - SimpleFeatureModulator: 0 (no params)
+  - ImportanceMapGenerator: 0 (no params)
+  - **Subtotal**: ~132K (per actual module implementation)
+- Mamba modules: ~0.9M
+- output_conv2: ~0.6K
+- **Total trainable**: ~1.03M
+
+### Training Strategy
+
+**Freezing**:
+```python
+# Freeze ViT encoder
+for param in model.pretrained.parameters():
+    param.requires_grad = False
+
+# Freeze DPT (except output_conv2)
+for name, param in model.depth_head.named_parameters():
+    if 'output_conv2' not in name:
+        param.requires_grad = False
+    else:
+        param.requires_grad = True
+
+# Train Mamba
+if model.use_mamba:
+    for param in model.mamba_temporal_modules.parameters():
+        param.requires_grad = True
+
+# Train Gear5FilmHead
+for param in model.gear5_film_head.parameters():
+    param.requires_grad = True
+```
+
+**Learning Rates**:
+- `film_lr`: 1.0e-4 (Gear5FilmHead modules)
+- `mamba_lr`: 1.0e-5 (Mamba temporal modules)
+- `output_lr`: 1.0e-5 (output_conv2)
+- Weight decay: 1.0e-6
+
+**Loss**: Log L1 in inverse depth space (100/m) with optional importance weighting.
 
 ---
 
-## 사용 방법
+## Comparison
+
+### Side-by-Side Comparison
+
+| Feature | Gear5 (Original) | Gear5 FiLM |
+|---------|------------------|------------|
+| **Modulation Target** | Final relative depth map | DPT path_1 features |
+| **Modulation Timing** | After all processing | Before Mamba temporal modeling |
+| **Modulation Type** | Scalar scale/shift per frame | Channel-wise gamma/beta (256 channels) |
+| **Temporal Modeling** | GRU inside head (bidirectional) | Existing Mamba layers (4 layers) |
+| **CLS Token Usage** | Layer 23 only (for scale/shift) | Layer 23 only (for FiLM params) |
+| **Attention Usage** | Layers [11, 23] for importance map | Layers [11, 23] for importance map |
+| **Trainable Params** | ~132K (TemporalScalePredictor) | ~1.03M (head + Mamba + conv2) |
+| **Frozen Components** | Everything except Gear5Head | ViT + DPT + output_conv1 |
+| **Training Speed** | Faster (less trainable params) | Slower (more trainable params) |
+| **Modulation Granularity** | Coarse (1 scale + 1 shift per frame) | Fine (256 gamma + 256 beta per frame) |
+| **Loss Functions** | log_l1, importance | log_l1, importance |
+
+### When to Use Which?
+
+**Use Gear5 (Original)** when:
+- You want minimal trainable parameters (~132K)
+- You need faster training and inference
+- You want explicit temporal consistency via GRU
+- Simple global scale/shift is sufficient
+
+**Use Gear5 FiLM** when:
+- You want fine-grained channel-wise modulation
+- You can afford more trainable parameters (~1.03M)
+- You want to leverage and refine Mamba's temporal modeling
+- You want modulation integrated early in the pipeline
+
+---
+
+## Loss Functions
+
+Both Gear5 variants support two loss types: `log_l1` (default) and `importance` (weighted).
+
+### Log L1 Loss (Standard)
+
+```python
+def log_l1_loss(pred, target, valid_mask):
+    """
+    Log L1 loss in inverse depth space (100/m)
+
+    Formula: L = |log(100/pred) - log(100/target)|
+           = |log(target) - log(pred)|  (after simplification)
+
+    Args:
+        pred: [B*T, 1, H, W] predicted metric depth (meters)
+        target: [B*T, 1, H, W] ground truth metric depth (meters)
+        valid_mask: [B*T, 1, H, W] boolean mask (True = valid pixel)
+
+    Returns:
+        Scalar loss (mean over valid pixels)
+    """
+    pred_inv = 100.0 / (pred + 1e-8)
+    target_inv = 100.0 / (target + 1e-8)
+
+    loss = torch.abs(torch.log(pred_inv + 1e-8) - torch.log(target_inv + 1e-8))
+
+    return loss[valid_mask].mean()
+```
+
+**Usage**:
+```bash
+python train_gear5.py --config-path configs/gear5 +loss_type=log_l1
+```
+
+### Importance-Weighted Loss
+
+```python
+def importance_weighted_loss(pred, target, valid_mask, importance_map):
+    """
+    Importance-weighted Log L1 loss
+
+    Formula: L_weighted = L × (1 + fg_ratio × importance)
+
+    Where:
+        - L: Standard Log L1 loss per pixel
+        - importance: Spatial importance map from CLS attention [0, 1]
+        - fg_ratio: Fraction of high-attention pixels (importance > mean)
+        - Higher weights on semantically important regions
+
+    Args:
+        pred: [B*T, 1, H, W] predicted metric depth
+        target: [B*T, 1, H, W] ground truth metric depth
+        valid_mask: [B*T, 1, H, W] boolean mask
+        importance_map: [B, T, patch_h, patch_w] attention-based importance
+
+    Returns:
+        Scalar loss (mean over valid pixels)
+    """
+    # Compute base loss
+    pred_inv = 100.0 / (pred + 1e-8)
+    target_inv = 100.0 / (target + 1e-8)
+    loss = torch.abs(torch.log(pred_inv + 1e-8) - torch.log(target_inv + 1e-8))
+
+    # Resize importance map to match depth resolution
+    B, T, patch_h, patch_w = importance_map.shape
+    importance_resized = F.interpolate(
+        importance_map.view(B * T, 1, patch_h, patch_w),
+        size=(H, W), mode='bilinear', align_corners=True
+    )  # [B*T, 1, H, W]
+
+    importance_flat = importance_resized.flatten()
+
+    # Compute foreground ratio (pixels with importance > mean)
+    importance_threshold = importance_flat.mean()
+    fg_mask = (importance_flat > importance_threshold)
+    fg_ratio = fg_mask.float().mean()
+
+    # Apply importance weighting
+    weighted_loss = loss * (1.0 + fg_ratio * importance_flat.float())
+
+    return weighted_loss[valid_mask].mean()
+```
+
+**Usage**:
+```bash
+python train_gear5.py --config-path configs/gear5 +loss_type=importance
+```
+
+**Effect**: Higher loss weights on regions with high CLS attention (semantically important areas like objects), lower weights on background/less important regions.
+
+---
+
+## Training & Testing
 
 ### Training
 
-#### Phase 1
+#### Gear5 (Original)
+
+**Single GPU**:
+```bash
+CUDA_VISIBLE_DEVICES=1 python train_gear5.py \
+  --config-path configs/gear5 \
+  training.iterations=40001 \
+  dataset.data_root=/path/to/datasets \
+  +loss_type=log_l1
+```
+
+**Multi-GPU (DDP)**:
+```bash
+./train_gear5_ddp.sh \
+  --config-path configs/gear5 \
+  training.iterations=40001 \
+  dataset.data_root=/path/to/datasets \
+  +loss_type=importance
+```
+
+**Key Parameters**:
+- `load`: Path to FlashDepth-L checkpoint (configs/flashdepth-l/iter_10001.pth)
+- `training.batch_size`: 20 per GPU (effective 40 with 2 GPUs in DDP)
+- `training.gear5_lr`: 1.0e-4 (TemporalScalePredictor learning rate)
+- `training.iterations`: 40001 (with save_freq=5000, val_freq=1000)
+- `loss_type`: 'log_l1' or 'importance'
+
+#### Gear5 FiLM
+
+**Single GPU**:
+```bash
+CUDA_VISIBLE_DEVICES=1 python train_gear5_film.py \
+  --config-path configs/gear5_film \
+  training.iterations=40001 \
+  dataset.data_root=/path/to/datasets \
+  +loss_type=log_l1
+```
+
+**Multi-GPU (DDP)**:
+```bash
+./train_gear5_film_ddp.sh \
+  --config-path configs/gear5_film \
+  training.iterations=40001 \
+  dataset.data_root=/path/to/datasets \
+  +loss_type=importance
+```
+
+**Key Parameters**:
+- `load`: Path to FlashDepth-L checkpoint (configs/flashdepth-l/iter_10001.pth)
+- `training.batch_size`: 20 per GPU (effective 40 with 2 GPUs in DDP)
+- `training.film_lr`: 1.0e-4 (Gear5FilmHead learning rate)
+- `training.mamba_lr`: 1.0e-5 (Mamba temporal modules learning rate)
+- `training.output_lr`: 1.0e-5 (output_conv2 learning rate)
+- `training.iterations`: 40001
+- `loss_type`: 'log_l1' or 'importance'
+
+### Testing
+
+#### Gear5 (Original)
 
 ```bash
-# Step 1: GSP 학습
-python train_gear5.py --config-path configs/gear5 \\
-  step=1 \\
-  load=configs/flashdepth-l/iter_10001.pth \\
-  dataset.data_root=/home/cvlab/hsy/Datasets \\
-  training.wandb=true \\
-  training.wandb_name=gear5_phase1_step1
-
-# Step 2: FFM 학습
-python train_gear5.py --config-path configs/gear5 \\
-  step=2 \\
-  gear_checkpoint=configs/gear5/checkpoint_step40000_step1.pth \\
-  dataset.data_root=/home/cvlab/hsy/Datasets \\
-  training.wandb=true \\
-  training.wandb_name=gear5_phase1_step2
+CUDA_VISIBLE_DEVICES=1 python test_gear5.py \
+  --config-path configs/gear5 \
+  --checkpoint train_results/results_X/gear_5/phase_1/checkpoint_step40000.pth \
+  --results-dir test_results/gear5_results \
+  --gpu 1
 ```
 
-#### Phase 2
+#### Gear5 FiLM
 
 ```bash
-# Step 1: 2K에서 GSP 재학습 (FFM 제외)
-python train_gear5.py --config-path configs/gear5/hybrid \\
-  step=1 \\
-  gear_checkpoint=configs/gear5/checkpoint_step40000_step2.pth \\
-  load=configs/flashdepth/iter_43002.pth \\
-  dataset.data_root=/home/cvlab/hsy/Datasets \\
-  training.wandb=true \\
-  training.wandb_name=gear5_phase2_step1
-
-# Step 2: FFM 추가
-python train_gear5.py --config-path configs/gear5/hybrid \\
-  step=2 \\
-  gear_checkpoint=configs/gear5/hybrid/checkpoint_step40000_step1.pth \\
-  phase1_step2_checkpoint=configs/gear5/checkpoint_step40000_step2.pth \\
-  dataset.data_root=/home/cvlab/hsy/Datasets \\
-  training.wandb=true \\
-  training.wandb_name=gear5_phase2_step2
+CUDA_VISIBLE_DEVICES=1 python test_gear5_film.py \
+  --config-path configs/gear5_film \
+  --checkpoint train_results/results_X/gear_5_film/phase_1/checkpoint_step40000.pth \
+  --results-dir test_results/gear5_film_results \
+  --gpu 1
 ```
 
----
+**Output**:
+- Depth predictions (npy/png)
+- Visualization grids (input, prediction, GT)
+- Metrics JSON (per-sequence and averaged)
+- Gamma/beta visualizations (FiLM only)
+- Importance maps (if enabled)
 
-## Dimension Flow
+### Docker Commands
 
-### Step 1: Global Scale Predictor
-
-```
-Input: Video [B=2, T=5, 3, 518, 518]
-    ↓
-Flatten to [B*T=10, 3, 518, 518]
-    ↓
-DINOv2 Encoder (frozen):
-    intermediate_layer_idx = [4, 11, 17, 23]  # ViT-L
-    encoder_features: List of [B*T=10, N=1370, embed_dim=1024]
-        - Layer 4:  [10, 1370, 1024]
-        - Layer 11: [10, 1370, 1024]
-        - Layer 17: [10, 1370, 1024]
-        - Layer 23: [10, 1370, 1024]
-
-    CLS tokens extraction:
-        cls_tokens_list: List of [B*T=10, 1024]
-            - [10, 1024] × 4 layers
-    ↓
-GlobalScalePredictorMultiLayer:
-    Input:  cls_tokens_list (4 tensors of [10, 1024])
-    Fusion: torch.stack → [10, 4, 1024] → mean(dim=1) → [10, 1024]
-    Output:
-        scale: [10]  (positive)
-        shift: [10]  (real)
-    ↓
-DPT Features (frozen):
-    path_1: [10, 256, 37, 37]  (518/14 = 37)
-    ↓
-Global Modulation:
-    scale: [10] → [10, 1, 1, 1]
-    shift: [10] → [10, 1, 1, 1]
-    path_1_global = path_1 * scale + shift  # [10, 256, 37, 37]
-    ↓
-Mamba Temporal Modeling:
-    Input:  path_1_global [10, 256, 37, 37]
-    Reshape: [B=2, T=5, 256, 37, 37]
-    Mamba: Frame-by-frame processing
-    Output: path_1_temporal [10, 256, 37, 37]
-    ↓
-DPT Output Head (trainable):
-    output_conv1: [10, 256, 37, 37] → [10, 32, 37, 37]
-    upsample: → [10, 32, 518, 518]
-    output_conv2: → [10, 1, 518, 518]
-    ↓
-Metric Depth: [10, 1, 518, 518]
-```
-
-### Step 2: + Foreground-only Modulation
-
-```
-(... same as Step 1 until path_1_global ...)
-    ↓
-path_1_global: [10, 256, 37, 37]
-    ↓
-Multi-layer Attention Extraction:
-    target_blocks = [11, 17]  # Middle 2 layers
-    attention_weights:
-        - Layer 11: [10, num_heads=16, 1370, 1370]
-        - Layer 17: [10, 16, 1370, 1370]
-
-    Fusion: torch.stack → [2, 10, 16, 1370, 1370] → mean(dim=0) → [10, 16, 1370, 1370]
-    ↓
-Importance Map:
-    CLS→patch attention: [10, 16, 1370] → mean(heads) → [10, 1370]
-    Reshape: [10, 1, 37, 37]
-    Normalize: percentile(1-99) → [0, 1]
-    ↓
-FG Mask:
-    Binary threshold (0.5): [10, 1, 37, 37] → {0, 1}
-    ↓
-Patch Tokens Extraction:
-    patch_tokens: [10, 1370, 1024]  (from Layer 23)
-    Remove CLS: [10, 1369, 1024]
-    Apply FG mask → fg_patches: [10, N_fg, 1024]  (N_fg varies per sample)
-    ↓
-FG Feature Aggregation:
-    fg_feature_mlp: [10, N_fg, 1024] → [10, N_fg, 256]
-    Average pooling: → [10, 256]
-    ↓
-FG Modulation Prediction:
-    fg_modulation_predictor: [10, 256] → [10, 512]
-    Split: γ_fg [10, 256], β_fg [10, 256]
-    ↓
-Spatial Broadcast + Mask:
-    γ_fg: [10, 256] → [10, 256, 1, 1] * fg_mask → [10, 256, 37, 37]
-    β_fg: [10, 256] → [10, 256, 1, 1] * fg_mask → [10, 256, 37, 37]
-    ↓
-FG-only Modulation:
-    path_1_fg = path_1_global + γ_fg * path_1_global + β_fg
-    Result: [10, 256, 37, 37]
-    ↓
-(... same as Step 1: Mamba → output_conv → Metric Depth ...)
-```
-
----
-
-## Testing
-
-### Test 구성
-
-Gear5는 **4가지 테스트 스테이지** 지원:
-
-1. **Phase1 Step1**: 518×518, ViT-L, GSP only
-2. **Phase1 Step2**: 518×518, ViT-L, GSP + FFM
-3. **Phase2 Step1**: 2K, ViT-S Hybrid, GSP only
-4. **Phase2 Step2**: 2K, ViT-S Hybrid, GSP + FFM
-
-### Testing Commands
-
+**Build**:
 ```bash
-# Phase1 Step1
-python test_gear5.py --config-path configs/gear5 \\
-  step=1 \\
-  load=configs/gear5/checkpoint_step40000_step1.pth \\
-  dataset.data_root=/home/cvlab/hsy/Datasets \\
-  results_dir=test_results/phase1_step1
-
-# Phase1 Step2
-python test_gear5.py --config-path configs/gear5 \\
-  step=2 \\
-  load=configs/gear5/checkpoint_step40000_step2.pth \\
-  dataset.data_root=/home/cvlab/hsy/Datasets \\
-  results_dir=test_results/phase1_step2
-
-# Phase2 Step1 (Hybrid)
-python test_gear5.py --config-path configs/gear5/hybrid \\
-  step=1 \\
-  load=configs/gear5/hybrid/checkpoint_step40000_step1.pth \\
-  dataset.data_root=/home/cvlab/hsy/Datasets \\
-  results_dir=test_results/phase2_step1
-
-# Phase2 Step2 (Hybrid)
-python test_gear5.py --config-path configs/gear5/hybrid \\
-  step=2 \\
-  load=configs/gear5/hybrid/checkpoint_step40000_step2.pth \\
-  dataset.data_root=/home/cvlab/hsy/Datasets \\
-  results_dir=test_results/phase2_step2
+./run_docker.sh build
 ```
 
-### Sequence Normalization
-
-**중요**: Gear5의 sequence.png 및 gif 시각화는 **GT의 vmin/vmax를 Pred에도 적용**하여 일관된 비교 제공
-
-```python
-# GT의 percentile 계산
-gt_vmin = np.nanpercentile(gt_display, 2)
-gt_vmax = np.nanpercentile(gt_display, 98)
-
-# Pred도 GT의 range 사용 (NOT pred's own percentile!)
-axes[1, col].imshow(pred_display, cmap=cmap_pred, vmin=gt_vmin, vmax=gt_vmax)
-axes[2, col].imshow(gt_display, cmap=cmap_gt, vmin=gt_vmin, vmax=gt_vmax)
+**Training (Gear5)**:
+```bash
+./run_docker.sh train_gear5 \
+  --loss importance \
+  --batch-size 20 \
+  --workers 8 \
+  --gpu 1
 ```
 
-**장점**:
-- ✅ Pred와 GT의 색상 범위가 동일 → 직접 비교 가능
-- ✅ GT 기준 normalization → GT의 depth range에 맞춰 평가
+**Training (Gear5 FiLM)**:
+```bash
+./run_docker.sh train_gear5_film \
+  --loss log_l1 \
+  --batch-size 20 \
+  --workers 8 \
+  --gpu 1
+```
+
+**Testing**:
+```bash
+./run_docker.sh test_gear5 --gpu 1
+./run_docker.sh test_gear5_film --gpu 1
+```
 
 ---
 
-## 기대 효과
+## Configuration
 
-### 1. 정확도 향상
+### Gear5 Config Example (`configs/gear5/config.yaml`)
 
-**Multi-layer Fusion**:
-- 4개 layer의 CLS tokens 융합 → 더 풍부한 global context
-- 2개 layer의 attention weights 융합 → 더 robust한 FG detection
+```yaml
+# General settings
+config_dir: null
+inference: false
+load: configs/flashdepth-l/iter_10001.pth  # FlashDepth-L pretrained weights
 
-**Two-stage Learning**:
-- Step 1: Global scale을 먼저 정확하게 학습 → metric depth의 전반적 정확도 ↑
-- Step 2: FG-only refinement → 중요 영역(foreground)의 세밀한 개선
+# Canonical space settings
+canonical_focal_length: 500.0  # Fixed canonical focal length for 518×518 resolution (configurable)
+use_canonical_space: true  # Enable/disable canonicalization (on/off toggle)
 
-### 2. 효율성
+# Loss function selection
+# Options: 'log_l1' (default), 'importance' (importance-weighted)
+loss_type: "log_l1"
 
-**Foreground-only Modulation**:
-- Background는 global만으로 충분
-- Foreground에만 추가 modulation → 파라미터 효율 ↑
+# Dataset configuration
+dataset:
+  data_root: null
+  resolution: 'base'  # 518x518
+  video_length: 5
+  train_datasets: [mvs-synth, dynamicreplica, tartanair, pointodyssey, spring]
+  val_datasets: [sintel, waymo_seg]
 
-**파라미터 비교**:
-- Gear3: ~9.2M (전체 feature modulation)
-- Gear5 Step1: 4.86M (GSP + Mamba + output)
-- Gear5 Step2: 7.5M (+ FFM, but FG-only)
+# Training configuration
+training:
+  batch_size: 20  # Per GPU (effective 40 with 2 GPUs in DDP)
+  workers: 8
+  iterations: 40001
+  save_freq: 5000
+  val_freq: 1000
+  log_freq: 100
+  wandb: false
+  wandb_name: "gear5_phase1"
 
-### 3. 학습 안정성
+  # Learning rates
+  gear5_lr: 1.0e-4     # TemporalScalePredictor learning rate
+  weight_decay: 1.0e-6
 
-**Uniform Weight Fusion**:
-- Learnable weights 대신 uniform → 학습 안정성 ↑
-- Overfitting 위험 ↓
+# Model configuration
+model:
+  vit_size: "vitl"
+  patch_size: 14
+  attn_class: "MemEffAttention"
 
-**Residual Connection**:
-- FG-only modulation이 residual로 추가 → gradient flow 개선
+  # Gear5 attention layer selection (2-layer CLS tokens)
+  target_blocks: [11, 23]  # ViT-L: layers 11, 23
+  target_blocks_s: [5, 11]  # ViT-S: layers 5, 11 (for Phase 2 hybrid)
 
-### 4. 고해상도 대응
+  # Mamba configuration (frozen in Gear5)
+  use_mamba: true
+  mamba_type: "add"
+  num_mamba_layers: 4
+  downsample_mamba: [0.1]
+  mamba_pos_embed: null
+  mamba_in_dpt_layer: [1]
+  mamba_d_conv: 4
+  mamba_d_state: 256
 
-**Phase 2 (2K Hybrid)**:
-- ViT-S student + ViT-L teacher
-- 고해상도에서 효율적 학습
-- FlashDepth-hybrid의 이점 활용
+# Evaluation configuration
+eval:
+  compile: false
+  metrics: true
+  save_grid: true
+  outfolder: "test_gear5"
+  test_datasets: [sintel]
+  save_vis_map: true  # Save importance map visualizations
+```
 
----
+### Gear5 FiLM Config Example (`configs/gear5_film/config.yaml`)
 
-## 참고사항
+```yaml
+# (Similar structure to Gear5 config)
 
-### ViT-S vs ViT-L Target Blocks
+# Loss function selection (Gear5 FiLM style)
+loss_type: "log_l1"
 
-| Model | Step 1 (All) | Step 2 (Mid 2) |
-|-------|-------------|----------------|
-| **ViT-L** | [4, 11, 17, 23] | [11, 17] |
-| **ViT-S** | [2, 5, 8, 11] | [5, 8] |
+# Training configuration
+training:
+  batch_size: 20
+  workers: 8
+  iterations: 40001
+  save_freq: 5000
+  val_freq: 1000
 
-### Config Parameters
+  # Learning rates
+  film_lr: 1.0e-4     # FiLM modules learning rate
+  mamba_lr: 1.0e-5    # Mamba learning rate (lower than FiLM)
+  output_lr: 1.0e-5   # output_conv2 learning rate
+  weight_decay: 1.0e-6
 
-**Phase Detection**:
-- config_dir에 'hybrid' 포함 → Phase 2
-- 그 외 → Phase 1
-
-**ViT Size**:
-- Phase 1: config.model.vit_size 사용 (보통 'vitl')
-- Phase 2: 강제로 'vits' (hybrid)
-
-### Checkpoint 로딩 전략
-
-**Phase1 Step1**:
-- load: FlashDepth-L checkpoint (DINOv2 + DPT + Mamba + output)
-
-**Phase1 Step2**:
-- gear_checkpoint: Phase1 Step1 checkpoint (모든 파라미터)
-
-**Phase2 Step1**:
-- gear_checkpoint: Phase1 Step2 (GSP + Mamba + output만, FFM 제외)
-- load: FlashDepth-hybrid (DINOv2 + DPT 덮어쓰기)
-
-**Phase2 Step2**:
-- gear_checkpoint: Phase2 Step1 (base model)
-- phase1_step2_checkpoint: Phase1 Step2 (FFM만 추가)
-
----
-
-## 문제 해결
-
-### Training Issues
-
-1. **OOM (Out of Memory)**:
-   - Phase 2: gradient_checkpointing 활성화 필수
-   - batch_size 감소 (2K: 3 → 2)
-   - workers 감소 (8 → 4)
-
-2. **Loss가 떨어지지 않음**:
-   - Learning rate 확인 (Step 1: 1e-4, Step 2: 5e-5)
-   - Valid mask 확인 (canonical 70m 이내)
-   - Checkpoint 로딩 확인 (phase/step에 맞는지)
-
-3. **Attention weights 없음**:
-   - target_blocks가 올바르게 설정되었는지 확인
-   - store_attn_weights = True 확인
-
-### Testing Issues
-
-1. **Phase/Step detection 오류**:
-   - config_dir 확인 (hybrid 포함 여부)
-   - config.step 확인 (1 or 2)
-
-2. **Checkpoint 로딩 실패**:
-   - strict=False로 로딩 (hybrid는 key 불일치 가능)
-   - Missing/Unexpected keys 로그 확인
-
-3. **Visualization 색상 이상**:
-   - GT vmin/vmax 사용 확인
-   - Valid mask 확인 (70m 이내)
+# Model configuration
+model:
+  # (Same as Gear5)
+  use_mamba: true  # Trainable in Gear5 FiLM
+  # ... (Mamba configuration)
+```
 
 ---
 
-**작성**: Claude (Anthropic)
-**기반**: FlashDepth + Gear3
-**목적**: Two-stage learning for improved metric depth estimation
+## Summary
+
+**Gear5** provides lightweight, GRU-based temporal scale/shift prediction for metric depth, ideal for scenarios requiring minimal trainable parameters (~132K) and explicit temporal consistency.
+
+**Gear5 FiLM** offers fine-grained channel-wise feature modulation integrated early in the pipeline, suitable for scenarios where you can afford more trainable parameters (~1.03M) and want to leverage Mamba's temporal modeling capabilities.
+
+Both variants:
+- Support canonical space normalization (focal length = 500.0 for 518×518, configurable)
+- Generate importance maps for loss weighting
+- Support `log_l1` and `importance` loss types
+- Use multi-layer CLS tokens from DINOv2 [Layers 11, 23]
+- Trained on video datasets with metric depth ground truth
+
+Choose the variant that best fits your computational budget, modulation granularity needs, and training objectives.

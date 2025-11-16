@@ -39,21 +39,43 @@ class ComparisonDataset(Dataset):
     according to their own requirements.
     """
 
-    def __init__(self, dataset_name, data_root, split='test', video_length=50):
+    def __init__(self, dataset_name, data_root, split='test', video_length=50, chunk_size=None, objwise_enabled=False, only_clone=False):
         """
         Args:
             dataset_name: Name of dataset ('eth3d', 'kitti', 'sintel', etc.)
             data_root: Root directory containing datasets
             split: 'test' or 'val'
             video_length: Maximum sequence length
+            chunk_size: If set, load frames in chunks to reduce memory usage
+                       Useful for high-resolution datasets (e.g., 50 for 4K images)
+            objwise_enabled: If True, load segmentation masks for object-wise evaluation
+            only_clone: If True and dataset is VKITTI, only use 'clone' condition (5 sequences instead of 50)
         """
         self.dataset_name = dataset_name.lower()
         self.data_root = data_root
         self.split = split
         self.video_length = video_length
+        self.objwise_enabled = objwise_enabled
+        self.only_clone = only_clone
+
+        # Auto-set chunk_size for efficient memory usage
+        # Only enable chunking for extreme cases (very high resolution or very long sequences)
+        if chunk_size is None:
+            if dataset_name in ['eth3d', 'unrealstereo4k']:
+                # For 4K+ images, use smaller chunks
+                self.chunk_size = min(50, video_length)
+                logger.info(f"Auto-enabled chunked loading for {dataset_name}: chunk_size={self.chunk_size}")
+            else:
+                # Don't use chunking by default - let user specify if needed
+                self.chunk_size = None
+        else:
+            self.chunk_size = chunk_size
 
         # Load dataset-specific configuration
         self.dataset_path = os.path.join(data_root, self.dataset_name)
+
+        # Cache for intrinsics to avoid repeated file reads
+        self._intrinsics_cache = {}
 
         # Build sequence list
         self.sequences = self._build_sequences()
@@ -76,6 +98,8 @@ class ComparisonDataset(Dataset):
             return self._build_bonn_sequences()
         elif self.dataset_name == 'nyu':
             return self._build_nyu_sequences()
+        elif self.dataset_name == 'vkitti':
+            return self._build_vkitti_sequences()
         elif self.dataset_name == 'waymo_seg':
             return self._build_waymo_seg_sequences()
         elif self.dataset_name == 'unrealstereo4k':
@@ -89,9 +113,8 @@ class ComparisonDataset(Dataset):
         """Build ETH3D sequences
 
         Sequence selection (matching FlashDepth's eth3d_dataset.py):
-        - 'val' split: Exclude first 8 scenes (use remaining scenes for validation)
-        - 'test' split: Use last 5 scenes only
-        - Other: Use all scenes
+        - 'val' split: Use first 8 scenes only (filter out scenes[8:])
+        - 'test' split: Use all scenes (no filtering)
         """
         scenes_path = self.dataset_path
         sequences = []
@@ -105,17 +128,13 @@ class ComparisonDataset(Dataset):
 
         # Filter scenes based on split (matching FlashDepth)
         if self.split == 'val':
-            # Exclude first 8 scenes (use last N scenes for validation)
-            # This matches FlashDepth's validation split
-            scenes = all_scenes[8:]
-            logger.info(f"ETH3D val split: Using last {len(scenes)} scenes (excluding first 8)")
-        elif self.split == 'test':
-            # Use last 5 scenes for testing
-            scenes = all_scenes[-5:]
-            logger.info(f"ETH3D test split: Using last 5 scenes")
+            # FlashDepth filters out scenes[8:], so use first 8 scenes only
+            scenes = all_scenes[:8]
+            logger.info(f"ETH3D val split: Using first 8 scenes (for validation)")
         else:
+            # 'test' split or other: Use all scenes (no filtering)
             scenes = all_scenes
-            logger.info(f"ETH3D: Using all {len(scenes)} scenes")
+            logger.info(f"ETH3D {self.split} split: Using all {len(scenes)} scenes")
 
         for scene in scenes:
             scene_path = os.path.join(scenes_path, scene)
@@ -222,9 +241,59 @@ class ComparisonDataset(Dataset):
         return []
 
     def _build_nyu_sequences(self):
-        """Build NYU Depth V2 sequences (placeholder)"""
-        logger.warning("NYU dataset not yet implemented")
-        return []
+        """
+        Build NYU Depth V2 sequences
+
+        Expects preprocessed structure:
+        nyuv2_preprocessed/val/
+            seq_000/
+                0000/
+                    rgb.png
+                    depth.png
+                0001/...
+            seq_001/...
+        """
+        sequences = []
+        nyu_root = os.path.join(self.data_root, 'nyuv2_preprocessed', self.split)
+
+        if not os.path.exists(nyu_root):
+            logger.warning(f"NYU preprocessed root not found: {nyu_root}")
+            logger.warning("Please run: python scripts/preprocess_nyu.py")
+            return []
+
+        # Get all sequence directories
+        seq_dirs = sorted([d for d in os.listdir(nyu_root)
+                          if os.path.isdir(os.path.join(nyu_root, d)) and d.startswith('seq_')])
+
+        logger.info(f"NYU: Found {len(seq_dirs)} sequences")
+
+        for seq_name in seq_dirs:
+            seq_path = os.path.join(nyu_root, seq_name)
+
+            # Get all frame directories
+            frame_dirs = sorted([d for d in os.listdir(seq_path)
+                                if os.path.isdir(os.path.join(seq_path, d))],
+                               key=lambda x: int(x))
+
+            # Build sequence
+            sequence = []
+            for frame_dir in frame_dirs[:self.video_length]:
+                frame_path = os.path.join(seq_path, frame_dir)
+                rgb_path = os.path.join(frame_path, 'rgb.png')
+                depth_path = os.path.join(frame_path, 'depth.png')
+
+                if os.path.exists(rgb_path) and os.path.exists(depth_path):
+                    sequence.append({
+                        'image': rgb_path,
+                        'depth': depth_path,
+                        'scene_name': seq_name,
+                        'img_name': frame_dir
+                    })
+
+            if len(sequence) > 0:
+                sequences.append(sequence)
+
+        return sequences
 
     def _build_waymo_seg_sequences(self):
         """
@@ -289,6 +358,117 @@ class ComparisonDataset(Dataset):
             if len(sequence) > 0:
                 sequences.append(sequence)
 
+        return sequences
+
+    def _build_vkitti_sequences(self):
+        """
+        Build Virtual KITTI 2 sequences
+
+        Structure:
+        vkitti/
+            Scene01/
+                clone/
+                    frames/
+                        rgb/Camera_0/rgb_00000.jpg
+                        depth/Camera_0/depth_00000.png
+                        classSegmentation/Camera_0/classgt_00000.png
+                overcast/...
+                rain/...
+            Scene02/...
+        """
+        sequences = []
+        vkitti_root = os.path.join(self.data_root, 'vkitti')
+
+        if not os.path.exists(vkitti_root):
+            logger.warning(f"VKITTI root not found: {vkitti_root}")
+            return []
+
+        # Get all scene directories (Scene01, Scene02, ...)
+        scene_dirs = sorted([d for d in os.listdir(vkitti_root)
+                           if os.path.isdir(os.path.join(vkitti_root, d)) and d.startswith('Scene')])
+
+        logger.info(f"VKITTI: Found {len(scene_dirs)} scenes")
+
+        # Condition types in VKITTI2
+        all_conditions = ['clone', 'overcast', 'sunset', 'morning', 'rain', 'fog',
+                         '15-deg-left', '15-deg-right', '30-deg-left', '30-deg-right']
+
+        for scene_name in scene_dirs:
+            scene_path = os.path.join(vkitti_root, scene_name)
+
+            # Get available conditions for this scene
+            available_conditions = [c for c in all_conditions
+                                   if os.path.isdir(os.path.join(scene_path, c))]
+
+            # Filter by only_clone flag
+            if self.only_clone:
+                available_conditions = ['clone'] if 'clone' in available_conditions else []
+
+            for condition in available_conditions:
+                condition_path = os.path.join(scene_path, condition, 'frames')
+                rgb_dir = os.path.join(condition_path, 'rgb', 'Camera_0')
+                depth_dir = os.path.join(condition_path, 'depth', 'Camera_0')
+                seg_dir = os.path.join(condition_path, 'classSegmentation', 'Camera_0') if self.objwise_enabled else None
+
+                if not os.path.exists(rgb_dir) or not os.path.exists(depth_dir):
+                    continue
+
+                # Check if segmentation is available when required
+                if self.objwise_enabled:
+                    if os.path.exists(seg_dir):
+                        logger.info(f"[VKITTI DEBUG] Segmentation directory found: {seg_dir}")
+                    else:
+                        logger.warning(f"[VKITTI DEBUG] Object-wise enabled but no segmentation found: {seg_dir}")
+                        continue
+
+                # Get sorted RGB files
+                rgb_files = sorted([f for f in os.listdir(rgb_dir) if f.startswith('rgb_') and f.endswith('.jpg')])
+
+                # Build sequence
+                sequence = []
+                seg_count = 0
+                for rgb_file in rgb_files[:self.video_length]:
+                    # Extract frame number
+                    frame_num = int(rgb_file.split('_')[1].split('.')[0])
+                    depth_file = f'depth_{frame_num:05d}.png'
+                    seg_file = f'classgt_{frame_num:05d}.png' if self.objwise_enabled else None
+
+                    depth_path = os.path.join(depth_dir, depth_file)
+                    seg_path = os.path.join(seg_dir, seg_file) if self.objwise_enabled else None
+
+                    # Check if required files exist
+                    if not os.path.exists(depth_path):
+                        continue
+                    if self.objwise_enabled and not os.path.exists(seg_path):
+                        if seg_count == 0:  # Only log first missing file
+                            logger.warning(f"[VKITTI DEBUG] Segmentation file not found: {seg_path}")
+                        continue
+
+                    if self.objwise_enabled and os.path.exists(seg_path):
+                        seg_count += 1
+
+                    frame_info = {
+                        'image': os.path.join(rgb_dir, rgb_file),
+                        'depth': depth_path,
+                        'scene_name': f'{scene_name}_{condition}',
+                        'img_name': rgb_file,
+                        'condition': condition
+                    }
+
+                    if self.objwise_enabled:
+                        frame_info['segmentation'] = seg_path
+
+                    sequence.append(frame_info)
+
+                if len(sequence) > 0:
+                    if self.objwise_enabled:
+                        logger.info(f"[VKITTI DEBUG] Built sequence {scene_name}_{condition}: {len(sequence)} frames, {seg_count} with segmentation")
+                    sequences.append(sequence)
+
+        if self.only_clone:
+            logger.info(f"VKITTI: Created {len(sequences)} sequences (clone condition only)")
+        else:
+            logger.info(f"VKITTI: Created {len(sequences)} sequences (all conditions)")
         return sequences
 
     def _build_unrealstereo4k_sequences(self):
@@ -403,13 +583,30 @@ class ComparisonDataset(Dataset):
         """
         sequence = self.sequences[idx]
 
+        # Apply chunk_size to limit memory usage
+        if self.chunk_size and self.chunk_size < len(sequence):
+            max_frames = self.chunk_size
+            logger.info(f"Applying chunk_size: loading {max_frames}/{len(sequence)} frames from sequence {idx}")
+        else:
+            max_frames = len(sequence)
+
+        # Warning for large sequences
+        if max_frames > 200:
+            logger.warning(f"Loading large sequence with {max_frames} frames at high resolution. "
+                          f"This may take several minutes and require significant memory. "
+                          f"Consider using --vid-len 100 to reduce sequence length.")
+
         images = []
         depths = []
         intrinsics_list = []
+        segmentations = [] if self.objwise_enabled else None
 
-        # First pass: load all frames
+        # First pass: load frames (respecting chunk_size)
         loaded_frames = []
-        for frame in sequence:
+        for frame_idx, frame in enumerate(sequence[:max_frames]):
+            # Progress indicator for large sequences
+            if max_frames > 200 and frame_idx % 100 == 0:
+                logger.info(f"Loading sequence {idx}: {frame_idx}/{max_frames} frames...")
             try:
                 # Load image at ORIGINAL resolution
                 image = self._load_image(frame['image'])  # [3, H, W], 0-1 range
@@ -420,11 +617,20 @@ class ComparisonDataset(Dataset):
                 # Load intrinsics
                 intrinsics = self._load_intrinsics(frame)  # [4] - fx, fy, cx, cy
 
-                loaded_frames.append({
+                frame_data = {
                     'image': image,
                     'depth': depth,
                     'intrinsics': intrinsics
-                })
+                }
+
+                # Load segmentation if object-wise mode
+                if self.objwise_enabled and 'segmentation' in frame:
+                    seg = self._load_segmentation(frame['segmentation'])  # [H, W], class IDs
+                    frame_data['segmentation'] = seg
+                    if frame_idx == 0 and self.dataset_name == 'vkitti':  # Debug log for first frame only
+                        logger.info(f"[VKITTI DEBUG] Loaded segmentation for frame 0: shape={seg.shape}, unique_classes={len(torch.unique(seg))}")
+
+                loaded_frames.append(frame_data)
 
             except Exception as e:
                 logger.warning(f"Error loading frame: {e}")
@@ -444,6 +650,7 @@ class ComparisonDataset(Dataset):
             image = frame_data['image']
             depth = frame_data['depth']
             intrinsics = frame_data['intrinsics']
+            seg = frame_data.get('segmentation', None)
 
             img_H, img_W = image.shape[1:]
             depth_H, depth_W = depth.shape[0:]
@@ -479,6 +686,17 @@ class ComparisonDataset(Dataset):
                     mode='nearest'
                 ).squeeze(0).squeeze(0)  # [H, W]
 
+            # Resize segmentation if needed (use nearest for class labels)
+            if seg is not None:
+                seg_H, seg_W = seg.shape[0:]
+                if seg_H != target_H or seg_W != target_W:
+                    logger.debug(f"Resizing segmentation {i} from {seg_H}x{seg_W} to {target_H}x{target_W}")
+                    seg = F.interpolate(
+                        seg.unsqueeze(0).unsqueeze(0).float(),  # [1, 1, H, W]
+                        size=(target_H, target_W),
+                        mode='nearest'
+                    ).squeeze(0).squeeze(0).long()  # [H, W]
+
             # Update intrinsics
             intrinsics = torch.tensor([orig_fx, orig_fy, orig_cx, orig_cy])
 
@@ -486,17 +704,31 @@ class ComparisonDataset(Dataset):
             depths.append(depth)
             intrinsics_list.append(intrinsics)
 
+            if seg is not None:
+                segmentations.append(seg)
+
         # Extract dataset and scene information
         scene_name = sequence[0]['scene_name']
         dataset_scene = f"{self.dataset_name}/{scene_name}"
 
-        return {
+        batch = {
             'images': torch.stack(images),  # [T, 3, H, W]
             'depths': torch.stack(depths),  # [T, H, W]
             'intrinsics': torch.stack(intrinsics_list),  # [T, 4]
             'scene_name': scene_name,
             'dataset_name': dataset_scene  # e.g., 'eth3d/pipes'
         }
+
+        # Add segmentations if object-wise mode
+        if self.objwise_enabled and len(segmentations) > 0:
+            batch['segmentations'] = torch.stack(segmentations)  # [T, H, W]
+            if self.dataset_name == 'vkitti':
+                logger.info(f"[VKITTI DEBUG] Added segmentations to batch: shape={batch['segmentations'].shape}")
+        elif self.objwise_enabled and len(segmentations) == 0:
+            if self.dataset_name == 'vkitti':
+                logger.warning(f"[VKITTI DEBUG] Object-wise enabled but no segmentations loaded for sequence {idx}")
+
+        return batch
 
     def _load_image(self, path):
         """Load RGB image at original resolution"""
@@ -519,6 +751,10 @@ class ComparisonDataset(Dataset):
             return self._load_kitti_depth(path)
         elif self.dataset_name == 'sintel':
             return self._load_sintel_depth(path)
+        elif self.dataset_name == 'nyu':
+            return self._load_nyu_depth(path)
+        elif self.dataset_name == 'vkitti':
+            return self._load_vkitti_depth(path)
         elif self.dataset_name == 'waymo_seg':
             return self._load_waymo_depth(path, frame_info)
         elif self.dataset_name == 'unrealstereo4k':
@@ -548,8 +784,8 @@ class ComparisonDataset(Dataset):
         depth = depth.reshape((h, w))
 
         # Handle invalid values (infinity represents invalid depth)
-        invalid_mask = depth == np.inf
-        depth[invalid_mask] = 0
+        # Keep infinity as-is for proper masking in visualization
+        # infinity will be filtered by valid_mask (depth > 0 & depth < MAX_DEPTH)
 
         # ETH3D files already store normal depth in meters
         # No conversion needed - just return as-is
@@ -558,6 +794,113 @@ class ComparisonDataset(Dataset):
     def _load_kitti_depth(self, path):
         """Load KITTI depth (placeholder)"""
         raise NotImplementedError("KITTI depth loading not implemented")
+
+    def _load_nyu_depth(self, path):
+        """
+        Load NYU Depth V2 depth (uint16 PNG)
+
+        NYU preprocessed depth is stored as uint16 PNG in millimeters.
+        Convert to meters for metric depth evaluation.
+
+        Returns:
+            torch.Tensor: Depth in meters [H, W]
+        """
+        # Load uint16 depth in millimeters
+        depth_mm = cv2.imread(path, cv2.IMREAD_ANYDEPTH)
+
+        if depth_mm is None:
+            raise ValueError(f"Failed to load NYU depth from {path}")
+
+        # Convert millimeters to meters
+        depth_meters = depth_mm.astype(np.float32) / 1000.0
+
+        # Handle invalid values
+        invalid_mask = (depth_meters <= 0) | np.isinf(depth_meters) | np.isnan(depth_meters)
+        depth_meters[invalid_mask] = 0
+
+        return torch.from_numpy(depth_meters).float()  # [H, W] in meters
+
+    def _load_vkitti_depth(self, path):
+        """
+        Load VKITTI2 depth (uint16 PNG)
+
+        VKITTI2 stores depth as uint16 PNG in centimeters.
+        Convert to meters for metric depth evaluation.
+
+        Returns:
+            torch.Tensor: Depth in meters [H, W]
+        """
+        # Load uint16 depth in centimeters
+        depth_cm = cv2.imread(path, cv2.IMREAD_ANYDEPTH)
+
+        if depth_cm is None:
+            raise ValueError(f"Failed to load VKITTI depth from {path}")
+
+        # Convert centimeters to meters
+        depth_meters = depth_cm.astype(np.float32) / 100.0
+
+        # Handle invalid values
+        invalid_mask = (depth_meters <= 0) | np.isinf(depth_meters) | np.isnan(depth_meters)
+        depth_meters[invalid_mask] = 0
+
+        return torch.from_numpy(depth_meters).float()  # [H, W] in meters
+
+    def _load_segmentation(self, path):
+        """
+        Load segmentation mask (class IDs)
+
+        For VKITTI: classgt_XXXXX.png contains RGB color-coded segmentation
+        For other datasets: may contain direct class IDs
+
+        Returns:
+            torch.Tensor: Segmentation mask [H, W] with class IDs
+        """
+        # Load segmentation mask
+        seg = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+
+        if seg is None:
+            raise ValueError(f"Failed to load segmentation from {path}")
+
+        # VKITTI uses RGB color-coded segmentation
+        if self.dataset_name == 'vkitti' and len(seg.shape) == 3:
+            # RGB to class ID mapping for VKITTI
+            # Based on https://europe.naverlabs.com/research/computer-vision/proxy-virtual-worlds-vkitti-2/
+            seg_rgb = seg[:, :, ::-1]  # BGR to RGB
+
+            # Create class ID map
+            class_map = np.zeros((seg.shape[0], seg.shape[1]), dtype=np.int64)
+
+            # VKITTI2 RGB -> Class ID mapping
+            # Source: https://www.changjiangcai.com/studynotes/2020-05-16-Virtual-KITTI-2-Dataset/
+            rgb_to_class = {
+                (0, 0, 0): 0,           # undefined
+                (210, 0, 200): 1,       # terrain
+                (90, 200, 255): 2,      # sky
+                (0, 199, 0): 3,         # tree
+                (90, 240, 0): 4,        # vegetation
+                (140, 140, 140): 5,     # building
+                (100, 60, 100): 6,      # road
+                (250, 100, 255): 7,     # guard rail
+                (255, 255, 0): 8,       # traffic sign
+                (200, 200, 0): 9,       # traffic light
+                (255, 130, 0): 10,      # pole
+                (80, 80, 80): 11,       # misc
+                (160, 60, 60): 12,      # truck (OBJECT)
+                (255, 127, 80): 13,     # car (OBJECT)
+                (0, 139, 139): 14,      # van (OBJECT)
+            }
+
+            # Convert RGB to class ID
+            for rgb, class_id in rgb_to_class.items():
+                mask = (seg_rgb[:, :, 0] == rgb[0]) & \
+                       (seg_rgb[:, :, 1] == rgb[1]) & \
+                       (seg_rgb[:, :, 2] == rgb[2])
+                class_map[mask] = class_id
+
+            return torch.from_numpy(class_map).long()  # [H, W]
+        else:
+            # Direct class ID (single channel)
+            return torch.from_numpy(seg).long()  # [H, W]
 
     def _load_sintel_depth(self, path):
         """
@@ -691,6 +1034,18 @@ class ComparisonDataset(Dataset):
         """Load camera intrinsics"""
         if self.dataset_name == 'eth3d':
             return self._load_eth3d_intrinsics(frame_info)
+        elif self.dataset_name == 'nyu':
+            return self._load_nyu_intrinsics(frame_info)
+        elif self.dataset_name == 'vkitti':
+            return self._load_vkitti_intrinsics(frame_info)
+        elif self.dataset_name == 'unrealstereo4k':
+            return self._load_unrealstereo4k_intrinsics(frame_info)
+        elif self.dataset_name == 'urbansyn':
+            return self._load_urbansyn_intrinsics(frame_info)
+        elif self.dataset_name == 'sintel':
+            return self._load_sintel_intrinsics(frame_info)
+        elif self.dataset_name == 'waymo_seg':
+            return self._load_waymo_intrinsics(frame_info)
         else:
             # Default: estimate from image size
             # This is a fallback - actual intrinsics should be loaded
@@ -736,6 +1091,254 @@ class ComparisonDataset(Dataset):
             logger.warning(f"Error loading intrinsics: {e}")
             return torch.tensor([4251.0, 4251.0, 3024.0, 2016.0])
 
+    def _load_nyu_intrinsics(self, frame_info):
+        """
+        Load NYU Depth V2 camera intrinsics (hardcoded fixed values)
+
+        NYU Depth V2 uses fixed camera intrinsics for all frames:
+        - fx = 518.86
+        - fy = 519.47
+        - cx = 325.58
+        - cy = 253.74
+        - Resolution: 640×480
+
+        Returns:
+            torch.Tensor: [fx, fy, cx, cy]
+        """
+        return torch.tensor([518.86, 519.47, 325.58, 253.74])
+
+    def _load_vkitti_intrinsics(self, frame_info):
+        """
+        Load VKITTI2 camera intrinsics (hardcoded fixed values)
+
+        VKITTI2 uses fixed camera intrinsics for all scenes and conditions:
+        - fx = 725.0
+        - fy = 725.0
+        - cx = 620.5  (image_width - 1) / 2
+        - cy = 187.0  (image_height - 1) / 2
+        - Resolution: 1242×375
+
+        Returns:
+            torch.Tensor: [fx, fy, cx, cy]
+        """
+        return torch.tensor([725.0, 725.0, 620.5, 187.0])
+
+    def _load_unrealstereo4k_intrinsics(self, frame_info):
+        """
+        Load UnrealStereo4K camera intrinsics from Extrinsics file (with caching)
+
+        Format (line 1): fx skew cx 0 fy cy 0 0 1
+        This represents the K matrix in row-major order.
+
+        UnrealStereo4K resolution: 3840×2160 (4K)
+        Note: All frames in the same scene share the same intrinsics, so we cache by scene_name.
+        """
+        scene_name = frame_info['scene_name']
+
+        # Check cache first
+        cache_key = f"unreal_{scene_name}"
+        if cache_key in self._intrinsics_cache:
+            return self._intrinsics_cache[cache_key]
+
+        # Load from first frame's extrinsics (all frames in scene have same intrinsics)
+        extrinsics_dir = os.path.join(self.data_root, 'unrealstereo4k', scene_name, 'Extrinsics0')
+        extrinsics_file = os.path.join(extrinsics_dir, '00000.txt')
+
+        if not os.path.exists(extrinsics_file):
+            logger.warning(f"Extrinsics file not found: {extrinsics_file}")
+            # Default intrinsics for UnrealStereo4K (3840×2160)
+            intrinsics = torch.tensor([1920.0, 1920.0, 1920.0, 1080.0])
+            self._intrinsics_cache[cache_key] = intrinsics
+            return intrinsics
+
+        try:
+            with open(extrinsics_file, 'r') as f:
+                lines = f.readlines()
+                if len(lines) < 1:
+                    raise ValueError("Extrinsics file is empty")
+
+                # Parse first line: fx skew cx 0 fy cy 0 0 1
+                k_values = list(map(float, lines[0].split()))
+                if len(k_values) >= 9:
+                    fx = k_values[0]
+                    cx = k_values[2]
+                    fy = k_values[4]
+                    cy = k_values[5]
+
+                    intrinsics = torch.tensor([fx, fy, cx, cy])
+                    self._intrinsics_cache[cache_key] = intrinsics
+                    return intrinsics
+                else:
+                    raise ValueError(f"Invalid K matrix format: {len(k_values)} values")
+
+        except Exception as e:
+            logger.warning(f"Error loading UnrealStereo4K intrinsics: {e}")
+            intrinsics = torch.tensor([1920.0, 1920.0, 1920.0, 1080.0])
+            self._intrinsics_cache[cache_key] = intrinsics
+            return intrinsics
+
+    def _load_urbansyn_intrinsics(self, frame_info):
+        """
+        Load UrbanSyn camera intrinsics from camera_metadata.json (with caching)
+
+        UrbanSyn provides physical camera parameters:
+        - focalLength_mm: focal length in millimeters
+        - sensorWidth_mm: sensor width in millimeters
+        - sensorHeight_mm: sensor height in millimeters
+
+        We convert to pixel units using:
+        fx = focal_length_mm / sensor_width_mm * image_width
+        fy = focal_length_mm / sensor_height_mm * image_height
+
+        UrbanSyn resolution: 2048×1024
+        Note: All frames share the same intrinsics.
+        """
+        # Check cache first (all UrbanSyn frames have same intrinsics)
+        cache_key = "urbansyn"
+        if cache_key in self._intrinsics_cache:
+            return self._intrinsics_cache[cache_key]
+
+        metadata_file = os.path.join(self.data_root, 'urbansyn', 'camera_metadata.json')
+
+        if not os.path.exists(metadata_file):
+            logger.warning(f"Camera metadata not found: {metadata_file}")
+            # Default intrinsics for UrbanSyn (2048×1024)
+            intrinsics = torch.tensor([1731.0, 1731.0, 1024.0, 512.0])
+            self._intrinsics_cache[cache_key] = intrinsics
+            return intrinsics
+
+        try:
+            import json
+            with open(metadata_file, 'r') as f:
+                metadata = json.load(f)
+
+            # Extract camera parameters
+            camera_params = metadata['parameters'][0]['Camera']
+            focal_length_mm = camera_params['focalLength_mm']
+            sensor_width_mm = camera_params['sensorWidth_mm']
+            sensor_height_mm = camera_params['sensorHeight_mm']
+
+            # UrbanSyn resolution
+            image_width = 2048
+            image_height = 1024
+
+            # Convert to pixel units
+            fx = focal_length_mm / sensor_width_mm * image_width
+            fy = focal_length_mm / sensor_height_mm * image_height
+            cx = image_width / 2.0
+            cy = image_height / 2.0
+
+            intrinsics = torch.tensor([fx, fy, cx, cy])
+            self._intrinsics_cache[cache_key] = intrinsics
+            return intrinsics
+
+        except Exception as e:
+            logger.warning(f"Error loading UrbanSyn intrinsics: {e}")
+            intrinsics = torch.tensor([1731.0, 1731.0, 1024.0, 512.0])
+            self._intrinsics_cache[cache_key] = intrinsics
+            return intrinsics
+
+    def _load_sintel_intrinsics(self, frame_info):
+        """
+        Load Sintel camera intrinsics from .cam file
+
+        Sintel provides per-frame intrinsics in cam_data/training/camdata_left/*.cam files.
+        Binary format:
+          - TAG_FLOAT (float32): validation value (202021.25)
+          - Intrinsic matrix M: 9 float64 values (3×3) for original 1024×436 resolution
+          - Extrinsic matrix N: 12 float64 values (3×4) [not used]
+
+        Sintel resolution: 1024×436
+        """
+        TAG_FLOAT = 202021.25
+
+        img_path = frame_info['image']
+        cam_path = img_path.replace('images/training/clean', 'cam_data/training/camdata_left').replace('.png', '.cam')
+
+        # Cache by frame path
+        cache_key = f"sintel_{cam_path}"
+        if cache_key in self._intrinsics_cache:
+            return self._intrinsics_cache[cache_key]
+
+        if not os.path.exists(cam_path):
+            logger.warning(f"Sintel camera file not found: {cam_path}")
+            # Fallback: typical Sintel intrinsics (1024×436)
+            intrinsics = torch.tensor([920.0, 920.0, 512.0, 218.0])
+            self._intrinsics_cache[cache_key] = intrinsics
+            return intrinsics
+
+        try:
+            with open(cam_path, 'rb') as f:
+                # Read TAG_FLOAT validation value (float32)
+                tag_val = np.fromfile(f, dtype=np.float32, count=1)[0]
+                if abs(tag_val - TAG_FLOAT) > 0.01:
+                    raise ValueError(f"Unexpected tag: {tag_val} (expected {TAG_FLOAT})")
+
+                # Read intrinsic matrix M (9 float64 values, reshape to 3×3)
+                M = np.fromfile(f, dtype=np.float64, count=9).reshape(3, 3)
+                fx = float(M[0, 0])
+                fy = float(M[1, 1])
+                cx = float(M[0, 2])
+                cy = float(M[1, 2])
+
+                intrinsics = torch.tensor([fx, fy, cx, cy])
+                self._intrinsics_cache[cache_key] = intrinsics
+                return intrinsics
+
+        except Exception as e:
+            logger.warning(f"Error reading Sintel camera from {cam_path}: {e}")
+            # Fallback
+            intrinsics = torch.tensor([920.0, 920.0, 512.0, 218.0])
+            self._intrinsics_cache[cache_key] = intrinsics
+            return intrinsics
+
+    def _load_waymo_intrinsics(self, frame_info):
+        """
+        Load Waymo camera intrinsics from intrinsics.npy file
+
+        Waymo stores intrinsics per sequence (not per frame) in:
+        waymo_seg/{split}/{sequence_name}/FRONT/intrinsics.npy
+
+        Format: [fx, fy, cx, cy] - numpy array of shape (4,)
+        Original Waymo resolution: 1920×1280
+        """
+        scene_name = frame_info['scene_name']
+
+        # Cache by scene (all frames in scene share intrinsics)
+        cache_key = f"waymo_{scene_name}"
+        if cache_key in self._intrinsics_cache:
+            return self._intrinsics_cache[cache_key]
+
+        # Build path to intrinsics file
+        intrinsics_file = os.path.join(
+            self.data_root, 'waymo_seg', self.split, scene_name, 'FRONT', 'intrinsics.npy'
+        )
+
+        if not os.path.exists(intrinsics_file):
+            logger.warning(f"Waymo intrinsics file not found: {intrinsics_file}")
+            # Fallback: typical Waymo intrinsics (1920×1280)
+            intrinsics = torch.tensor([2060.0, 2060.0, 960.0, 640.0])
+            self._intrinsics_cache[cache_key] = intrinsics
+            return intrinsics
+
+        try:
+            # Load numpy array [fx, fy, cx, cy]
+            K = np.load(intrinsics_file)
+            if K.shape != (4,):
+                raise ValueError(f"Expected shape (4,), got {K.shape}")
+
+            fx, fy, cx, cy = K
+            intrinsics = torch.tensor([float(fx), float(fy), float(cx), float(cy)])
+            self._intrinsics_cache[cache_key] = intrinsics
+            return intrinsics
+
+        except Exception as e:
+            logger.warning(f"Error loading Waymo intrinsics from {intrinsics_file}: {e}")
+            # Fallback
+            intrinsics = torch.tensor([2060.0, 2060.0, 960.0, 640.0])
+            self._intrinsics_cache[cache_key] = intrinsics
+            return intrinsics
+
 
 def comparison_collate_fn(batch):
     """
@@ -758,10 +1361,16 @@ def comparison_collate_fn(batch):
     item = batch[0]
 
     # Add batch dimension
-    return {
+    result = {
         'images': item['images'].unsqueeze(0),  # [1, T, 3, H, W]
         'depths': item['depths'].unsqueeze(0),  # [1, T, H, W]
         'intrinsics': item['intrinsics'].unsqueeze(0),  # [1, T, 4]
         'scene_name': item['scene_name'],
         'dataset_name': item['dataset_name']  # e.g., 'eth3d/pipes'
     }
+
+    # Add segmentations if available (for object-wise evaluation)
+    if 'segmentations' in item:
+        result['segmentations'] = item['segmentations'].unsqueeze(0)  # [1, T, H, W]
+
+    return result

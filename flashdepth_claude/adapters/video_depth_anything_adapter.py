@@ -98,9 +98,16 @@ class VideoDepthAnythingAdapter(MethodAdapter):
             PrepareForNet(),
         ])
 
-        # Convert to numpy for transform (expects HWC format)
-        image_np = image[0].cpu().numpy()  # [3, H, W]
+        # Optimize: Convert to uint8 on GPU first (4x smaller transfer)
+        # For large images (e.g., ETH3D 6205x4135), this is much faster
+        image_uint8 = (image[0] * 255.0).to(torch.uint8)  # [3, H, W] on GPU
+
+        # Transfer to CPU (uint8 is 4x smaller than float32)
+        image_np = image_uint8.cpu().numpy()  # [3, H, W]
         image_np = image_np.transpose(1, 2, 0)  # [H, W, 3]
+
+        # Convert back to float for transform (expects 0-255 range)
+        image_np = image_np.astype(np.float32)
 
         # Apply transform
         transformed = transform({'image': image_np})['image']  # [3, H', W']

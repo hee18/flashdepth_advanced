@@ -78,6 +78,10 @@ show_usage() {
     echo "  --whole-seq-test BOOL    Use all sequences in dataset (true) or first 8 sequences only (false, default: false)"
     echo "  --canon BOOL         Use canonical focal length normalization (default: true)"
     echo "  --loss TYPE          Set loss type for Gear5: log_l1 (default), importance (importance-weighted)"
+    echo "  --visualization BOOL Enable/disable visualizations (sequence.png, best_frame.png, etc.). Default: true"
+    echo "  --wandb BOOL         Enable/disable WandB logging (default: true)"
+    echo "  --wandb-name NAME    Set WandB experiment name (default: auto-generated)"
+    echo "  --mamba              Use Mamba2 instead of GRU for Gear5 TemporalScalePredictor (default: false/GRU)"
     echo ""
     echo "Note: Regularization losses are deprecated. Importance map now uses raw DINOv2 attention (frozen)."
     echo ""
@@ -139,6 +143,10 @@ NO_VIDEO="false"  # Skip video (GIF/MP4) generation for faster testing
 WHOLE_SEQ_TEST="false"  # Use all sequences in dataset (true) or first 8 sequences only (false, default)
 USE_CANONICAL="true"  # Use canonical focal length normalization (default: true)
 LOSS_TYPE="log_l1"  # Loss type for Gear5 training: log_l1 (default), importance (importance-weighted)
+VISUALIZATION="true"  # Enable visualizations by default (sequence.png, best_frame.png, etc.)
+WANDB="true"  # Enable WandB logging by default
+WANDB_NAME=""  # WandB experiment name (empty = auto-generated)
+MAMBA="false"  # Use Mamba2 for Gear5 TemporalScalePredictor (false=GRU, true=Mamba2)
 
 # Parse arguments
 USER_BATCH_SIZE=""  # Track if user explicitly set batch size
@@ -232,6 +240,22 @@ while [[ $# -gt 0 ]]; do
         --loss)
             LOSS_TYPE="$2"
             shift 2
+            ;;
+        --visualization)
+            VISUALIZATION="$2"
+            shift 2
+            ;;
+        --wandb)
+            WANDB="$2"
+            shift 2
+            ;;
+        --wandb-name)
+            WANDB_NAME="$2"
+            shift 2
+            ;;
+        --mamba)
+            MAMBA="true"
+            shift
             ;;
         -h|--help)
             show_usage
@@ -339,8 +363,14 @@ case $COMMAND in
             training.batch_size=$BATCH_SIZE \
             training.workers=$WORKERS \
             training.iterations=$TOTAL_ITERS \
+            training.wandb=$WANDB \
             use_canonical_space=$USE_CANONICAL \
             +results_dir=$RESULTS_DIR"
+
+        # Add wandb name if specified
+        if [ -n "$WANDB_NAME" ]; then
+            DOCKER_CMD="$DOCKER_CMD training.wandb_name=$WANDB_NAME"
+        fi
 
         # Add nuScenes flag if enabled
         if [ "$NUSCENES" = "true" ]; then
@@ -399,6 +429,7 @@ case $COMMAND in
             -e GLOO_SOCKET_IFNAME=eth0 \
             -e NCCL_SOCKET_IFNAME=eth0 \
             -e NCCL_P2P_DISABLE=1 \
+            -e WANDB_API_KEY=${WANDB_API_KEY:-} \
             flashdepth torchrun \
             --standalone \
             --nproc_per_node=2 \
@@ -410,8 +441,14 @@ case $COMMAND in
             training.workers=$ACTUAL_WORKERS \
             training.iterations=$TOTAL_ITERS \
             training.measure_fps=$MEASURE_FPS \
+            training.wandb=$WANDB \
             use_canonical_space=$USE_CANONICAL \
             +results_dir=$RESULTS_DIR"
+
+        # Add wandb name if specified
+        if [ -n "$WANDB_NAME" ]; then
+            DOCKER_CMD="$DOCKER_CMD training.wandb_name=$WANDB_NAME"
+        fi
 
         # Add nuScenes flag if enabled
         if [ "$NUSCENES" = "true" ]; then
@@ -461,8 +498,14 @@ case $COMMAND in
             training.batch_size=$BATCH_SIZE \
             training.workers=$WORKERS \
             training.iterations=$TOTAL_ITERS \
+            training.wandb=$WANDB \
             use_canonical_space=$USE_CANONICAL \
             +results_dir=$RESULTS_DIR"
+
+        # Add wandb name if specified
+        if [ -n "$WANDB_NAME" ]; then
+            DOCKER_CMD="$DOCKER_CMD training.wandb_name=$WANDB_NAME"
+        fi
 
         # Add nuScenes flag if enabled
         if [ "$NUSCENES" = "true" ]; then
@@ -521,6 +564,7 @@ case $COMMAND in
             -e GLOO_SOCKET_IFNAME=eth0 \
             -e NCCL_SOCKET_IFNAME=eth0 \
             -e NCCL_P2P_DISABLE=1 \
+            -e WANDB_API_KEY=${WANDB_API_KEY:-} \
             flashdepth torchrun \
             --standalone \
             --nproc_per_node=2 \
@@ -532,8 +576,14 @@ case $COMMAND in
             training.workers=$ACTUAL_WORKERS \
             training.iterations=$TOTAL_ITERS \
             training.measure_fps=$MEASURE_FPS \
+            training.wandb=$WANDB \
             use_canonical_space=$USE_CANONICAL \
             +results_dir=$RESULTS_DIR"
+
+        # Add wandb name if specified
+        if [ -n "$WANDB_NAME" ]; then
+            DOCKER_CMD="$DOCKER_CMD training.wandb_name=$WANDB_NAME"
+        fi
 
         # Add nuScenes flag if enabled
         if [ "$NUSCENES" = "true" ]; then
@@ -605,8 +655,14 @@ case $COMMAND in
             training.batch_size=$BATCH_SIZE \
             training.workers=$WORKERS \
             training.iterations=$TOTAL_ITERS \
+            training.wandb=$WANDB \
             use_canonical_space=$USE_CANONICAL \
             +results_dir=$RESULTS_DIR"
+
+        # Add wandb name if specified
+        if [ -n "$WANDB_NAME" ]; then
+            DOCKER_CMD="$DOCKER_CMD training.wandb_name=$WANDB_NAME"
+        fi
 
         # Add nuScenes flag if enabled
         if [ "$NUSCENES" = "true" ]; then
@@ -687,6 +743,7 @@ case $COMMAND in
             -e GLOO_SOCKET_IFNAME=eth0 \
             -e NCCL_SOCKET_IFNAME=eth0 \
             -e NCCL_P2P_DISABLE=1 \
+            -e WANDB_API_KEY=${WANDB_API_KEY:-} \
             flashdepth torchrun \
             --standalone \
             --nproc_per_node=2 \
@@ -698,8 +755,14 @@ case $COMMAND in
             training.workers=$ACTUAL_WORKERS \
             training.iterations=$TOTAL_ITERS \
             training.measure_fps=$MEASURE_FPS \
+            training.wandb=$WANDB \
             use_canonical_space=$USE_CANONICAL \
             +results_dir=$RESULTS_DIR"
+
+        # Add wandb name if specified
+        if [ -n "$WANDB_NAME" ]; then
+            DOCKER_CMD="$DOCKER_CMD training.wandb_name=$WANDB_NAME"
+        fi
 
         # Add nuScenes flag if enabled
         if [ "$NUSCENES" = "true" ]; then
@@ -760,6 +823,9 @@ case $COMMAND in
         # Add frame interval and video length options
         TEST_CMD="$TEST_CMD +frame_interval=$FRAME_INTERVAL +vid_len=$VID_LEN +whole_seq_test=$WHOLE_SEQ_TEST"
 
+        # Add visualization flag
+        TEST_CMD="$TEST_CMD +visualization=$VISUALIZATION"
+
         # Add single sequence path if specified
         if [ -n "$SINGLE_SEQUENCE" ]; then
             TEST_CMD="$TEST_CMD +single_sequence=$SINGLE_SEQUENCE"
@@ -810,6 +876,9 @@ case $COMMAND in
         # Add frame interval and video length options
         TEST_CMD="$TEST_CMD +frame_interval=$FRAME_INTERVAL +vid_len=$VID_LEN +whole_seq_test=$WHOLE_SEQ_TEST"
 
+        # Add visualization flag
+        TEST_CMD="$TEST_CMD +visualization=$VISUALIZATION"
+
         # Add single sequence path if specified
         if [ -n "$SINGLE_SEQUENCE" ]; then
             TEST_CMD="$TEST_CMD +single_sequence=$SINGLE_SEQUENCE"
@@ -859,6 +928,9 @@ case $COMMAND in
 
         # Add frame interval and video length options
         TEST_CMD="$TEST_CMD +frame_interval=$FRAME_INTERVAL +vid_len=$VID_LEN +whole_seq_test=$WHOLE_SEQ_TEST"
+
+        # Add visualization flag
+        TEST_CMD="$TEST_CMD +visualization=$VISUALIZATION"
 
         # Add video generation control
         if [ "$NO_VIDEO" == "true" ]; then
@@ -968,20 +1040,28 @@ case $COMMAND in
         echo "  - Results directory: $RESULTS_DIR"
         echo "  - FlashDepth checkpoint: $FLASHDEPTH_CHECKPOINT"
         echo "  - Loss type: $LOSS_TYPE"
+        echo "  - Temporal backend: $([ "$MAMBA" = "true" ] && echo "Mamba2" || echo "GRU")"
         echo ""
 
         # Build train_gear5 command
-        DOCKER_CMD="CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm flashdepth python train_gear5.py \
+        DOCKER_CMD="CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm -e WANDB_API_KEY=${WANDB_API_KEY:-} flashdepth python train_gear5.py \
             --config-path configs/gear5 \
             --config-name config \
             dataset.data_root=/data/datasets \
             training.batch_size=$BATCH_SIZE \
             training.workers=$WORKERS \
             training.iterations=$TOTAL_ITERS \
+            training.wandb=$WANDB \
+            model.use_mamba_temporal=$MAMBA \
             +config_variant=$CONFIG_VARIANT \
             use_canonical_space=$USE_CANONICAL \
-            +loss_type=$LOSS_TYPE \
+            loss_type=$LOSS_TYPE \
             +results_dir=$RESULTS_DIR"
+
+        # Add wandb name if specified
+        if [ -n "$WANDB_NAME" ]; then
+            DOCKER_CMD="$DOCKER_CMD training.wandb_name=$WANDB_NAME"
+        fi
 
         # Add FlashDepth checkpoint (ViT + DPT pretrained weights)
         if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
@@ -1027,12 +1107,15 @@ case $COMMAND in
         echo "  - FPS measurement: $MEASURE_FPS"
         echo "  - FlashDepth checkpoint: $FLASHDEPTH_CHECKPOINT"
         echo "  - Loss type: $LOSS_TYPE"
+        echo "  - Temporal backend: $([ "$MAMBA" = "true" ] && echo "Mamba2" || echo "GRU")"
         echo ""
 
         DOCKER_CMD="CUDA_VISIBLE_DEVICES=0,1 docker compose run --rm \
             -e GLOO_SOCKET_IFNAME=eth0 \
             -e NCCL_SOCKET_IFNAME=eth0 \
             -e NCCL_P2P_DISABLE=1 \
+            -e WANDB_API_KEY=${WANDB_API_KEY:-} \
+            -e WANDB_API_KEY=\${WANDB_API_KEY:-} \
             flashdepth torchrun \
             --standalone \
             --nproc_per_node=2 \
@@ -1044,10 +1127,17 @@ case $COMMAND in
             training.workers=$ACTUAL_WORKERS \
             training.iterations=$TOTAL_ITERS \
             training.measure_fps=$MEASURE_FPS \
+            training.wandb=$WANDB \
+            model.use_mamba_temporal=$MAMBA \
             +config_variant=$CONFIG_VARIANT \
             use_canonical_space=$USE_CANONICAL \
-            +loss_type=$LOSS_TYPE \
+            loss_type=$LOSS_TYPE \
             +results_dir=$RESULTS_DIR"
+
+        # Add wandb name if specified
+        if [ -n "$WANDB_NAME" ]; then
+            DOCKER_CMD="$DOCKER_CMD training.wandb_name=$WANDB_NAME"
+        fi
 
         # Add FlashDepth checkpoint (ViT + DPT pretrained weights)
         if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
@@ -1065,6 +1155,11 @@ case $COMMAND in
         echo "  - GPU: $GPU_ID"
         echo "  - Results directory: $RESULTS_DIR"
         echo "  - Checkpoint: $FLASHDEPTH_CHECKPOINT"
+        if [ -n "$OBJWISE_DATASET" ]; then
+            echo "  - Dataset: $OBJWISE_DATASET"
+        else
+            echo "  - Dataset: Using config defaults (all test datasets)"
+        fi
         echo ""
 
         # Build test_gear5 command
@@ -1075,7 +1170,13 @@ case $COMMAND in
             +results_dir=$RESULTS_DIR \
             +gpu=$GPU_ID \
             +vid_len=$VID_LEN \
-            +frame_interval=$FRAME_INTERVAL"
+            +frame_interval=$FRAME_INTERVAL \
+            +visualization=$VISUALIZATION"
+
+        # Add dataset override if specified
+        if [ -n "$OBJWISE_DATASET" ]; then
+            TEST_CMD="$TEST_CMD eval.test_datasets=[$OBJWISE_DATASET]"
+        fi
 
         # Add checkpoint
         if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
@@ -1130,16 +1231,22 @@ case $COMMAND in
         echo ""
 
         # Build train_gear5_film command
-        DOCKER_CMD="CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm flashdepth python train_gear5_film.py \
+        DOCKER_CMD="CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm -e WANDB_API_KEY=${WANDB_API_KEY:-} flashdepth python train_gear5_film.py \
             --config-path configs/gear5_film \
             --config-name config \
             dataset.data_root=/data/datasets \
             training.batch_size=$BATCH_SIZE \
             training.workers=$WORKERS \
             training.iterations=$TOTAL_ITERS \
+            training.wandb=$WANDB \
             use_canonical_space=$USE_CANONICAL \
-            +loss_type=$LOSS_TYPE \
+            loss_type=$LOSS_TYPE \
             +results_dir=$RESULTS_DIR"
+
+        # Add wandb name if specified
+        if [ -n "$WANDB_NAME" ]; then
+            DOCKER_CMD="$DOCKER_CMD training.wandb_name=$WANDB_NAME"
+        fi
 
         # Add FlashDepth checkpoint (ViT + DPT + Mamba pretrained weights)
         if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
@@ -1171,6 +1278,7 @@ case $COMMAND in
             -e GLOO_SOCKET_IFNAME=eth0 \
             -e NCCL_SOCKET_IFNAME=eth0 \
             -e NCCL_P2P_DISABLE=1 \
+            -e WANDB_API_KEY=${WANDB_API_KEY:-} \
             flashdepth torchrun \
             --standalone \
             --nproc_per_node=2 \
@@ -1182,9 +1290,15 @@ case $COMMAND in
             training.workers=$ACTUAL_WORKERS \
             training.iterations=$TOTAL_ITERS \
             training.measure_fps=$MEASURE_FPS \
+            training.wandb=$WANDB \
             use_canonical_space=$USE_CANONICAL \
-            +loss_type=$LOSS_TYPE \
+            loss_type=$LOSS_TYPE \
             +results_dir=$RESULTS_DIR"
+
+        # Add wandb name if specified
+        if [ -n "$WANDB_NAME" ]; then
+            DOCKER_CMD="$DOCKER_CMD training.wandb_name=$WANDB_NAME"
+        fi
 
         # Add FlashDepth checkpoint (ViT + DPT + Mamba pretrained weights)
         if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
@@ -1202,6 +1316,11 @@ case $COMMAND in
         echo "  - GPU: $GPU_ID"
         echo "  - Results directory: $RESULTS_DIR"
         echo "  - Checkpoint: $FLASHDEPTH_CHECKPOINT"
+        if [ -n "$OBJWISE_DATASET" ]; then
+            echo "  - Dataset: $OBJWISE_DATASET"
+        else
+            echo "  - Dataset: Using config defaults (all test datasets)"
+        fi
         echo ""
 
         # Build test_gear5_film command
@@ -1212,7 +1331,13 @@ case $COMMAND in
             +results_dir=$RESULTS_DIR \
             +gpu=$GPU_ID \
             +vid_len=$VID_LEN \
-            +frame_interval=$FRAME_INTERVAL"
+            +frame_interval=$FRAME_INTERVAL \
+            +visualization=$VISUALIZATION"
+
+        # Add dataset override if specified
+        if [ -n "$OBJWISE_DATASET" ]; then
+            TEST_CMD="$TEST_CMD eval.test_datasets=[$OBJWISE_DATASET]"
+        fi
 
         # Add checkpoint
         if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then

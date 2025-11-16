@@ -93,21 +93,21 @@ class Gear4Visualizer:
             input_img = np.clip(input_img, 0, 1)
 
             if gt_depth.ndim == 4:  # [B, T, H, W] or [B, 1, H, W]
-                gt_depth_frame = gt_depth[0, 0].cpu().numpy()  # [H, W]
+                gt_depth_frame = gt_depth[0, 0].float().cpu().numpy()  # [H, W]
             else:  # [B, H, W]
-                gt_depth_frame = gt_depth[0].cpu().numpy()  # [H, W]
+                gt_depth_frame = gt_depth[0].float().cpu().numpy()  # [H, W]
 
             if pred_depth.ndim == 4:  # [B, T, H, W] or [B, 1, H, W]
-                pred_depth_frame = pred_depth[0, 0].cpu().numpy()  # [H, W]
+                pred_depth_frame = pred_depth[0, 0].float().cpu().numpy()  # [H, W]
             else:  # [B, H, W]
-                pred_depth_frame = pred_depth[0].cpu().numpy()  # [H, W]
+                pred_depth_frame = pred_depth[0].float().cpu().numpy()  # [H, W]
 
             # Importance map is optional (None in Step 1)
             if importance_map is not None:
                 if importance_map.ndim == 4:  # [B, T, H, W] or [B, 1, H, W]
-                    importance_frame = importance_map[0, 0].cpu().numpy()  # [H, W]
+                    importance_frame = importance_map[0, 0].float().cpu().numpy()  # [H, W]
                 else:  # [B, H, W]
-                    importance_frame = importance_map[0].cpu().numpy()  # [H, W]
+                    importance_frame = importance_map[0].float().cpu().numpy()  # [H, W]
             else:
                 importance_frame = None
 
@@ -116,9 +116,9 @@ class Gear4Visualizer:
                 if not hasattr(fg_mask, 'cpu'):
                     fg_mask = torch.from_numpy(fg_mask) if isinstance(fg_mask, np.ndarray) else fg_mask
                 if fg_mask.ndim == 4:
-                    fg_mask_frame = fg_mask[0, 0].cpu().numpy()
+                    fg_mask_frame = fg_mask[0, 0].float().cpu().numpy()
                 else:
-                    fg_mask_frame = fg_mask[0].cpu().numpy()
+                    fg_mask_frame = fg_mask[0].float().cpu().numpy()
             else:
                 fg_mask_frame = None
 
@@ -126,9 +126,9 @@ class Gear4Visualizer:
                 if not hasattr(bg_mask, 'cpu'):
                     bg_mask = torch.from_numpy(bg_mask) if isinstance(bg_mask, np.ndarray) else bg_mask
                 if bg_mask.ndim == 4:
-                    bg_mask_frame = bg_mask[0, 0].cpu().numpy()
+                    bg_mask_frame = bg_mask[0, 0].float().cpu().numpy()
                 else:
-                    bg_mask_frame = bg_mask[0].cpu().numpy()
+                    bg_mask_frame = bg_mask[0].float().cpu().numpy()
             else:
                 bg_mask_frame = None
 
@@ -153,8 +153,8 @@ class Gear4Visualizer:
             # Check if canonical masks are provided (from train/test)
             if 'canonical_gt_valid' in model_outputs:
                 # Use pre-computed canonical masks (from training/test)
-                canonical_gt_valid = model_outputs['canonical_gt_valid'][0, 0].cpu().numpy()  # [H, W]
-                canonical_pred_valid = model_outputs['canonical_pred_valid'][0, 0].cpu().numpy()
+                canonical_gt_valid = model_outputs['canonical_gt_valid'][0, 0].bool().cpu().numpy()  # [H, W]
+                canonical_pred_valid = model_outputs['canonical_pred_valid'][0, 0].bool().cpu().numpy()
 
                 # Metrics: GT valid + Pred outlier filtering (Option 1)
                 # Filter out unreasonable predictions (NaN, Inf, >200m)
@@ -285,43 +285,31 @@ class Gear4Visualizer:
             # 2. Ground Truth Depth (with sparse depth handling - IDENTICAL to Gear3)
             ax2 = fig.add_subplot(gs[0, 1])
 
-            # Use inpainting ONLY for sparse datasets (waymo, nuscenes)
+            # Simplified sparse/dense GT visualization (matching test_gear* approach)
+            # Show valid pixels with colormap, invalid pixels as black
+            gt_display = np.where(valid_mask_gt_vis, gt_depth_frame, np.nan)  # Invalid = NaN (will be black)
+
+            if valid_mask_gt_vis.sum() > 0:
+                # Compute vmin/vmax from valid pixels only
+                vmin = np.nanpercentile(gt_display, 2)
+                vmax = np.nanpercentile(gt_display, 98)
+            else:
+                vmin, vmax = 0, 1
+
+            # Create colormap with NaN handling (NaN = black)
+            cmap_gt = plt.cm.plasma_r.copy()
+            cmap_gt.set_bad(color='black')  # NaN pixels = black
+
+            # Apply colormap
+            im2 = ax2.imshow(gt_display, cmap=cmap_gt, vmin=vmin, vmax=vmax)  # plasma_r: near=bright, far=dark
+
+            # Title based on dataset type
             is_sparse_dataset = dataset_name in self.SPARSE_DATASETS if dataset_name else False
-
             if is_sparse_dataset:
-                # Sparse depth: show valid pixels only (no inpainting)
-                _, gt_dense_vis, gt_info = create_sparse_depth_vis_no_inpaint(
-                    gt_depth_frame, valid_mask_gt_vis, colormap='plasma_r', percentile_range=(2, 98)
-                )
-
-                # Limit colorbar to canonical 70m if canonical space is enabled
-                vmin, vmax = gt_info['vmin'], gt_info['vmax']
-                use_canonical = config.get('use_canonical_space', False) if config is not None else False
-                if use_canonical:
-                    vmax = min(vmax, 70.0)  # Cap at canonical 70m
-
-                # Create custom colormap with NaN handling
-                cmap_gt = plt.cm.plasma_r.copy()
-                cmap_gt.set_bad(color='black')  # NaN pixels = black
-
-                # Re-normalize GT display with capped vmax
-                gt_display_capped = np.where(valid_mask_gt_vis, gt_depth_frame, np.nan)
-                im2 = ax2.imshow(gt_display_capped, cmap=cmap_gt, vmin=vmin, vmax=vmax)
-
                 valid_ratio_gt_vis = valid_mask_gt_vis.sum() / valid_mask_gt_vis.size
                 ax2.set_title(f'GT Depth (Sparse)\n{valid_ratio_gt_vis*100:.1f}% valid',
                              fontsize=14, fontweight='bold')
             else:
-                # Dense depth: use standard visualization (invalid pixels = black)
-                gt_display = np.where(valid_mask_gt_vis, gt_depth_frame, np.nan)  # Invalid = NaN (will be black)
-                if valid_mask_gt_vis.sum() > 0:
-                    vmin = np.nanpercentile(gt_display, 2)
-                    vmax = np.nanpercentile(gt_display, 98)
-                else:
-                    vmin, vmax = 0, 1
-                cmap = plt.cm.plasma_r.copy()
-                cmap.set_bad(color='black')  # NaN pixels = black
-                im2 = ax2.imshow(gt_display, cmap=cmap, vmin=vmin, vmax=vmax)  # plasma_r: near=bright, far=dark
                 ax2.set_title('Ground Truth Depth (m)', fontsize=14, fontweight='bold')
 
             ax2.axis('off')

@@ -50,15 +50,15 @@ from utils.gear5_film_visualization import Gear5FilmVisualizer
 
 def get_canonical_focal_length(config):
     """
-    Get canonical focal length (fixed at 500.0 for all resolutions).
+    Get canonical focal length from config.
 
     Args:
         config: Configuration dict
 
     Returns:
-        float: Canonical focal length (always 500.0)
+        float: Canonical focal length (default 500.0 for 518×518 resolution)
     """
-    return 500.0
+    return config.get('canonical_focal_length', 500.0)
 
 # Setup logging
 logging.basicConfig(
@@ -100,6 +100,10 @@ class Gear5FilmTester:
         # Object-wise evaluation configuration
         self.object_wise_enabled = config.get('object_wise', {}).get('enabled', False)
         self.object_wise_dataset = config.get('object_wise', {}).get('dataset', 'waymo')
+
+        # Visualization control (master flag, default=True)
+        self.enable_visualization = config.get('visualization', True)
+        logger.info(f"Visualization: {'ENABLED' if self.enable_visualization else 'DISABLED (only JSON results)'}")
 
         # Frame interval for visualization (only applies to sequence.png, not video)
         self.frame_interval = None
@@ -322,9 +326,10 @@ class Gear5FilmTester:
 
                 test_dataset = UrbanSynSegmentationDataset(
                     data_root=urbansyn_data_root,
-                    split='val',
+                    split='test',
                     video_length=video_length,
-                    resolution=resolution
+                    resolution=resolution,
+                    max_frames=1000
                 )
                 test_loader = DataLoader(
                     test_dataset,
@@ -354,7 +359,7 @@ class Gear5FilmTester:
                 root_dir=self.config.dataset.data_root,
                 enable_dataset_flags=test_datasets,
                 resolution=resolution,
-                split='val',
+                split='test',
                 video_length=video_length
             )
 
@@ -378,7 +383,7 @@ class Gear5FilmTester:
             root_dir=self.config.dataset.data_root,
             enable_dataset_flags=test_datasets,
             resolution=resolution,
-            split='val',
+            split='test',
             video_length=video_length
         )
 
@@ -418,12 +423,40 @@ class Gear5FilmTester:
 
         # Compute average metrics
         if len(all_metrics) > 0:
-            avg_metrics = {}
+            avg_metrics_raw = {}
             for key in all_metrics[0].keys():
                 if key == 'object_wise':
                     continue
                 values = [m[key] for m in all_metrics]
-                avg_metrics[key] = np.mean(values)
+                avg_metrics_raw[key] = np.mean(values)
+
+            # Reorder metrics: abs_rel, a1, a2, a3, fps, tae, f1, mae, rmse
+            metric_order = ['abs_rel', 'a1', 'a2', 'a3', 'fps', 'tae', 'boundary_f1', 'mae', 'rmse']
+            avg_metrics = {}
+            for key in metric_order:
+                if key in avg_metrics_raw:
+                    avg_metrics[key] = avg_metrics_raw[key]
+            # Add any remaining metrics not in the order list
+            for key, value in avg_metrics_raw.items():
+                if key not in avg_metrics:
+                    avg_metrics[key] = value
+
+            # Reorder per-sequence results
+            reordered_metrics = []
+            for result in all_metrics:
+                reordered = {}
+                # First add sequence_id if it exists
+                if 'sequence_id' in result:
+                    reordered['sequence_id'] = result['sequence_id']
+                # Then add metrics in the desired order
+                for key in metric_order:
+                    if key in result:
+                        reordered[key] = result[key]
+                # Add any remaining keys
+                for key, value in result.items():
+                    if key not in reordered:
+                        reordered[key] = value
+                reordered_metrics.append(reordered)
 
             logger.info("=" * 80)
             logger.info("AVERAGE METRICS")
@@ -435,7 +468,7 @@ class Gear5FilmTester:
             results_path = self.save_dir / "test_results.json"
             with open(results_path, 'w') as f:
                 json.dump({
-                    'per_sequence': all_metrics,
+                    'per_sequence': reordered_metrics,
                     'average': avg_metrics
                 }, f, indent=2)
             logger.info(f"Saved results to {results_path}")
@@ -474,7 +507,13 @@ class Gear5FilmTester:
                 images = images.unsqueeze(0)  # [1, T, 3, H, W]
         else:
             images = batch['image'].to(self.device)  # [1, T, 3, H, W]
-        gt_depth = batch['depth'].to(self.device)  # [1, T, H, W] or [T, H, W]
+
+        # Handle both 'depths' (WaymoSegmentationDataset objwise) and 'depth' (CombinedDataset)
+        if 'depths' in batch:
+            gt_depth = batch['depths'].to(self.device)  # [1, T, H, W] - objwise mode
+        else:
+            gt_depth = batch['depth'].to(self.device)  # [1, T, H, W] or [T, H, W]
+
         focal_lengths = batch['focal_lengths'].to(self.device)  # [1, T]
 
         # Get actual space valid mask if available
@@ -859,7 +898,7 @@ class Gear5FilmTester:
         valid_mask = (gt_depth_metric > 0)  # [T, 1, H, W]
 
         # Visualize
-        if self.config.eval.get('save_grid', True):
+        if self.enable_visualization and self.config.eval.get('save_grid', True):
             self._visualize_sequence(
                 images[0], pred_depths, gt_depth_metric,
                 valid_mask, sequence_id, metrics, fps, focal_lengths[0],
@@ -867,7 +906,7 @@ class Gear5FilmTester:
             )
 
         # Save video
-        if self.config.eval.get('out_video', True):
+        if self.enable_visualization and self.config.eval.get('out_video', True):
             save_video_util(
                 images[0], pred_depths, gt_depth_metric, valid_mask, sequence_id,
                 save_dir=self.save_dir,
@@ -875,7 +914,7 @@ class Gear5FilmTester:
             )
 
         # Save best frame visualizations
-        if len(frame_metrics) > 0:
+        if self.enable_visualization and len(frame_metrics) > 0:
             logger.info(f"Best frame for sequence {sequence_id}: Frame {best_frame_idx} (AbsRel={best_frame_abs_rel:.4f})")
 
             # Gear5 FiLM doesn't use layer fusion weights

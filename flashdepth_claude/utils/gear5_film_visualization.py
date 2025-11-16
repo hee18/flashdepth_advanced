@@ -16,11 +16,6 @@ from .sparse_depth_visualization import create_sparse_depth_vis_no_inpaint
 class Gear5FilmVisualizer:
     """
     Visualization utilities for Gear5 FiLM training
-
-    Visualizes FiLM-style channel-wise modulation (gamma/beta) instead of
-    scale/shift/importance map from original Gear5.
-
-    Gamma and Beta are [T, C] tensors where C=256 (DPT channel dimension).
     """
 
     # Sparse depth datasets that need inpainting for visualization
@@ -41,20 +36,21 @@ class Gear5FilmVisualizer:
 
         Layout (4 rows × 3 columns):
         Row 1: Input, GT Depth, Pred Depth
-        Row 2: Gamma Map (channel mean), Beta Map (channel mean), Gamma/Beta Stats
-        Row 3: Valid Mask, Error Map, Metrics & Training Info
-        Row 4: Depth Distribution (colspan=2), Gamma/Beta Channel Distribution (colspan=1)
+        Row 2: Importance Map, FG Mask (from importance), BG Mask (from importance)
+        Row 3: Valid Mask, Error Map, Metrics & Training Info (with scale/shift)
+        Row 4: Depth Distribution (colspan=2), Importance Distribution (colspan=1)
 
         Args:
-            sample_batch: Validation batch (images, gt_depth, dataset_idx, fx_ratio, resize_ratio)
-            model_outputs: Dictionary with 'pred_depth', 'gamma', 'beta'
+            sample_batch: Validation batch (images, gt_depth, dataset_idx)
+            model_outputs: Dictionary with 'pred_depth', 'importance_map', 'scale', 'shift'
             step: Training step number
             save_name: Optional custom save name
             prefix: Prefix for the visualization
             fps: Forward pass FPS (optional)
             loss_dict: Dictionary with loss values (optional)
+                - 'depth_loss': Importance-weighted Log L1 loss value
+                - 'val_loss': Validation loss value
             dataset_name: Name of the dataset (for sparse depth detection)
-            config: Configuration object (optional)
 
         Returns:
             fig: Matplotlib figure object
@@ -68,8 +64,9 @@ class Gear5FilmVisualizer:
 
             images, gt_depth, dataset_idx, fx_ratio, resize_ratio = sample_batch
             pred_depth = model_outputs['pred_depth']
-            gamma = model_outputs['gamma']  # [B, T, C] or [B, C]
-            beta = model_outputs['beta']    # [B, T, C] or [B, C]
+            importance_map = model_outputs['importance_map']
+            gamma = model_outputs.get('gamma', None)
+            beta = model_outputs.get('beta', None)
 
             # Debug shapes
             if not hasattr(images, 'cpu'):
@@ -78,10 +75,8 @@ class Gear5FilmVisualizer:
                 gt_depth = torch.from_numpy(gt_depth) if isinstance(gt_depth, np.ndarray) else gt_depth
             if not hasattr(pred_depth, 'cpu'):
                 pred_depth = torch.from_numpy(pred_depth) if isinstance(pred_depth, np.ndarray) else pred_depth
-            if not hasattr(gamma, 'cpu'):
-                gamma = torch.from_numpy(gamma) if isinstance(gamma, np.ndarray) else gamma
-            if not hasattr(beta, 'cpu'):
-                beta = torch.from_numpy(beta) if isinstance(beta, np.ndarray) else beta
+            if not hasattr(importance_map, 'cpu'):
+                importance_map = torch.from_numpy(importance_map) if isinstance(importance_map, np.ndarray) else importance_map
 
             # Use first batch and first frame for visualization
             # Handle both [B, T, ...] and [B, ...] formats
@@ -91,54 +86,59 @@ class Gear5FilmVisualizer:
                 input_img = images[0].float().cpu().numpy().transpose(1, 2, 0)  # [H, W, 3]
 
             # Min-Max normalization (FlashDepth original method)
+            # This automatically stretches contrast without manual denormalization
             input_img = (input_img - input_img.min()) / (input_img.max() - input_img.min() + 1e-8)
             input_img = np.clip(input_img, 0, 1)
 
             if gt_depth.ndim == 4:  # [B, T, H, W] or [B, 1, H, W]
-                gt_depth_frame = gt_depth[0, 0].cpu().numpy()  # [H, W]
+                gt_depth_frame = gt_depth[0, 0].float().cpu().numpy()  # [H, W]
             else:  # [B, H, W]
-                gt_depth_frame = gt_depth[0].cpu().numpy()  # [H, W]
+                gt_depth_frame = gt_depth[0].float().cpu().numpy()  # [H, W]
 
             if pred_depth.ndim == 4:  # [B, T, H, W] or [B, 1, H, W]
-                pred_depth_frame = pred_depth[0, 0].cpu().numpy()  # [H, W]
+                pred_depth_frame = pred_depth[0, 0].float().cpu().numpy()  # [H, W]
             else:  # [B, H, W]
-                pred_depth_frame = pred_depth[0].cpu().numpy()  # [H, W]
+                pred_depth_frame = pred_depth[0].float().cpu().numpy()  # [H, W]
 
-            # Extract gamma/beta for first batch and first frame
-            if gamma.ndim == 3:  # [B, T, C]
-                gamma_frame = gamma[0, 0].cpu().numpy()  # [C]
-            else:  # [B, C]
-                gamma_frame = gamma[0].cpu().numpy()  # [C]
-
-            if beta.ndim == 3:  # [B, T, C]
-                beta_frame = beta[0, 0].cpu().numpy()  # [C]
-            else:  # [B, C]
-                beta_frame = beta[0].cpu().numpy()  # [C]
+            if importance_map.ndim == 4:  # [B, T, H, W] or [B, 1, H, W]
+                importance_frame = importance_map[0, 0].float().cpu().numpy()  # [H, W]
+            else:  # [B, H, W]
+                importance_frame = importance_map[0].float().cpu().numpy()  # [H, W]
 
             # Ensure all frames are 2D
             while gt_depth_frame.ndim > 2:
                 gt_depth_frame = gt_depth_frame[0]
             while pred_depth_frame.ndim > 2:
                 pred_depth_frame = pred_depth_frame[0]
+            while importance_frame.ndim > 2:
+                importance_frame = importance_frame[0]
 
             # Create valid masks based on canonical space (70m threshold)
+            # Check if canonical masks are provided (from train/test)
             if 'canonical_gt_valid' in model_outputs:
-                canonical_gt_valid = model_outputs['canonical_gt_valid'][0, 0].cpu().numpy()  # [H, W]
-                canonical_pred_valid = model_outputs['canonical_pred_valid'][0, 0].cpu().numpy()
+                # Use pre-computed canonical masks (from training/test)
+                canonical_gt_valid = model_outputs['canonical_gt_valid'][0, 0].bool().cpu().numpy()  # [H, W]
+                canonical_pred_valid = model_outputs['canonical_pred_valid'][0, 0].bool().cpu().numpy()
 
+                # Metrics: GT valid + Pred outlier filtering (Option 1)
+                # Filter out unreasonable predictions (NaN, Inf, >200m)
                 MAX_DEPTH_OUTLIER = 200.0
                 pred_outlier_mask = (pred_depth_frame > 0) & (pred_depth_frame < MAX_DEPTH_OUTLIER)
                 valid_mask_metrics = canonical_gt_valid & pred_outlier_mask
+
+                # Visualization: GT uses GT valid
                 valid_mask_gt_vis = canonical_gt_valid
 
-                # Check if dataset is sparse
+                # Check if dataset is sparse (< 50% valid GT pixels)
                 gt_exists = (gt_depth_frame > 0)
                 gt_density = gt_exists.sum() / gt_exists.size
                 is_sparse = gt_density < 0.5
 
                 if is_sparse:
-                    valid_pixels_per_row = gt_exists.sum(axis=1)
-                    min_valid_pixels_threshold = 10
+                    # Sparse dataset (waymo_seg): Apply height mask + fill sparse gaps
+                    # 1. Find valid scan height range from GT
+                    valid_pixels_per_row = gt_exists.sum(axis=1)  # [H]
+                    min_valid_pixels_threshold = 10  # At least 10 GT pixels per row
                     valid_rows = valid_pixels_per_row >= min_valid_pixels_threshold
                     valid_row_indices = np.where(valid_rows)[0]
 
@@ -150,14 +150,19 @@ class Gear5FilmVisualizer:
                     else:
                         height_mask = np.ones_like(gt_depth_frame, dtype=bool)
 
+                    # 2. GT missing mask (sparse LiDAR gaps)
                     gt_missing = ~gt_exists
+
+                    # 3. Final: Within height AND (GT valid OR (GT missing AND Pred valid))
                     valid_mask_pred_vis = height_mask & (canonical_gt_valid | (gt_missing & canonical_pred_valid))
                 else:
+                    # Dense dataset (sintel): Just use GT valid mask
                     valid_mask_pred_vis = canonical_gt_valid
 
+                # Valid Mask visualization: GT valid only (shows actual evaluation region)
                 valid_mask_vis = canonical_gt_valid
             else:
-                # Backward compatibility
+                # Backward compatibility: compute masks here if not provided
                 MAX_DEPTH = 70.0
                 MAX_DEPTH_OUTLIER = 200.0
                 gt_valid = (gt_depth_frame > 0) & (gt_depth_frame < MAX_DEPTH)
@@ -166,11 +171,13 @@ class Gear5FilmVisualizer:
                 valid_mask_metrics = gt_valid & pred_outlier_mask
                 valid_mask_gt_vis = gt_valid
 
+                # Check if dataset is sparse
                 gt_exists = (gt_depth_frame > 0)
                 gt_density = gt_exists.sum() / gt_exists.size
                 is_sparse = gt_density < 0.5
 
                 if is_sparse:
+                    # Sparse: height mask + fill sparse gaps
                     valid_pixels_per_row = gt_exists.sum(axis=1)
                     min_valid_pixels_threshold = 10
                     valid_rows = valid_pixels_per_row >= min_valid_pixels_threshold
@@ -187,28 +194,28 @@ class Gear5FilmVisualizer:
                     gt_missing = ~gt_exists
                     valid_mask_pred_vis = height_mask & (gt_valid | (gt_missing & pred_valid))
                 else:
+                    # Dense: just use GT valid mask
                     valid_mask_pred_vis = gt_valid
 
                 valid_mask_vis = gt_valid
 
-            # Create figure with subplots - 4 rows × 3 columns
+            # Create figure with subplots - NEW LAYOUT: 4 rows × 3 columns
             fig = plt.figure(figsize=(15, 16))
             gs = GridSpec(4, 3, figure=fig, hspace=0.3, wspace=0.3)
 
-            # Calculate valid ratio and error
+            # Calculate valid ratio and error BEFORE visualization
             num_valid_metrics = valid_mask_metrics.sum()
             valid_ratio_metrics = num_valid_metrics / valid_mask_metrics.size
             valid_ratio_vis = valid_mask_vis.sum() / valid_mask_vis.size
             abs_error = np.abs(pred_depth_frame - gt_depth_frame)
-            abs_error_masked = np.where(valid_mask_metrics, abs_error, np.nan)
+            abs_error_masked = np.where(valid_mask_metrics, abs_error, np.nan)  # Metrics use 70m threshold
 
+            # Check if we have valid pixels for metrics calculation
             has_valid_pixels = num_valid_metrics > 0
 
-            # Calculate gamma/beta statistics
-            gamma_mean = gamma_frame.mean()
-            gamma_std = gamma_frame.std()
-            beta_mean = beta_frame.mean()
-            beta_std = beta_frame.std()
+            # Calculate importance statistics from upsampled importance map
+            imp_mean = importance_frame.mean()
+            imp_std = importance_frame.std()
 
             # ==================== Row 1: Input, GT, Pred ====================
 
@@ -218,119 +225,121 @@ class Gear5FilmVisualizer:
             ax1.set_title('Input Image', fontsize=14, fontweight='bold')
             ax1.axis('off')
 
-            # 2. Ground Truth Depth
+            # 2. Ground Truth Depth (with sparse depth handling)
             ax2 = fig.add_subplot(gs[0, 1])
+
+            # Simplified sparse/dense GT visualization (matching test_gear* approach)
+            # Show valid pixels with colormap, invalid pixels as black
+            gt_display = np.where(valid_mask_gt_vis, gt_depth_frame, np.nan)  # Invalid = NaN (will be black)
+
+            if valid_mask_gt_vis.sum() > 0:
+                # Compute vmin/vmax from valid pixels only
+                vmin = np.nanpercentile(gt_display, 2)
+                vmax = np.nanpercentile(gt_display, 98)
+            else:
+                vmin, vmax = 0, 1
+
+            # Create colormap with NaN handling (NaN = black)
+            cmap_gt = plt.cm.plasma_r.copy()
+            cmap_gt.set_bad(color='black')  # NaN pixels = black
+
+            # Apply colormap
+            im2 = ax2.imshow(gt_display, cmap=cmap_gt, vmin=vmin, vmax=vmax)  # plasma_r: near=bright, far=dark
+
+            # Title based on dataset type
             is_sparse_dataset = dataset_name in self.SPARSE_DATASETS if dataset_name else False
-
             if is_sparse_dataset:
-                _, gt_dense_vis, gt_info = create_sparse_depth_vis_no_inpaint(
-                    gt_depth_frame, valid_mask_gt_vis, colormap='plasma_r', percentile_range=(2, 98)
-                )
-
-                vmin, vmax = gt_info['vmin'], gt_info['vmax']
-                use_canonical = config.get('use_canonical_space', False) if config is not None else False
-                if use_canonical:
-                    vmax = min(vmax, 70.0)
-
-                cmap_gt = plt.cm.plasma_r.copy()
-                cmap_gt.set_bad(color='black')
-                gt_display_capped = np.where(valid_mask_gt_vis, gt_depth_frame, np.nan)
-                im2 = ax2.imshow(gt_display_capped, cmap=cmap_gt, vmin=vmin, vmax=vmax)
-
                 valid_ratio_gt_vis = valid_mask_gt_vis.sum() / valid_mask_gt_vis.size
                 ax2.set_title(f'GT Depth (Sparse)\n{valid_ratio_gt_vis*100:.1f}% valid',
                              fontsize=14, fontweight='bold')
             else:
-                gt_display = np.where(valid_mask_gt_vis, gt_depth_frame, np.nan)
-                if valid_mask_gt_vis.sum() > 0:
-                    vmin = np.nanpercentile(gt_display, 2)
-                    vmax = np.nanpercentile(gt_display, 98)
-                else:
-                    vmin, vmax = 0, 1
-                cmap = plt.cm.plasma_r.copy()
-                cmap.set_bad(color='black')
-                im2 = ax2.imshow(gt_display, cmap=cmap, vmin=vmin, vmax=vmax)
                 ax2.set_title('Ground Truth Depth (m)', fontsize=14, fontweight='bold')
 
             ax2.axis('off')
             plt.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
 
-            # 3. Predicted Metric Depth
+            # 3. Predicted Metric Depth (with sparse depth handling)
             ax3 = fig.add_subplot(gs[0, 2])
-            pred_display = np.where(valid_mask_pred_vis, pred_depth_frame, np.nan)
+
+            # Apply valid_mask_pred_vis to pred visualization (both sparse and dense)
+            pred_display = np.where(valid_mask_pred_vis, pred_depth_frame, np.nan)  # Invalid = NaN (will be black)
             cmap_pred = plt.cm.plasma_r.copy()
-            cmap_pred.set_bad(color='black')
-            im3 = ax3.imshow(pred_display, cmap=cmap_pred, vmin=vmin, vmax=vmax)
+            cmap_pred.set_bad(color='black')  # NaN pixels = black
+            im3 = ax3.imshow(pred_display, cmap=cmap_pred, vmin=vmin, vmax=vmax)  # plasma_r: near=bright, far=dark
 
             if is_sparse_dataset:
                 mae_str = f'{np.nanmean(abs_error_masked):.3f}m' if has_valid_pixels else 'N/A'
-                ax3.set_title(f'Pred Depth\nMAE: {mae_str}', fontsize=14, fontweight='bold')
+                ax3.set_title(f'Pred Depth\nMAE: {mae_str}',
+                             fontsize=14, fontweight='bold')
             else:
                 ax3.set_title('Predicted Metric Depth (m)', fontsize=14, fontweight='bold')
 
             ax3.axis('off')
             plt.colorbar(im3, ax=ax3, fraction=0.046, pad=0.04)
 
-            # ==================== Row 2: Gamma, Beta, Stats ====================
+            # ==================== Row 2: Importance, FG, BG ====================
 
-            # 4. Gamma Channel Mean (Bar chart)
+            # 4. Importance Map (upsampled with bilinear for smooth visualization)
             ax4 = fig.add_subplot(gs[1, 0])
-            channel_indices = np.arange(len(gamma_frame))
-            ax4.bar(channel_indices, gamma_frame, color='red', alpha=0.7, width=1.0)
-            ax4.axhline(gamma_mean, color='blue', linestyle='--', linewidth=2, label=f'Mean: {gamma_mean:.3f}')
-            ax4.set_xlabel('Channel Index', fontsize=10)
-            ax4.set_ylabel('Gamma Value', fontsize=10)
-            ax4.set_title(f'Gamma (Channel-wise)\nmean={gamma_mean:.3f}, std={gamma_std:.3f}',
+            # Upsample importance map to image resolution
+            img_h, img_w = input_img.shape[:2]
+            importance_upsampled = F.interpolate(
+                torch.from_numpy(importance_frame).unsqueeze(0).unsqueeze(0),
+                size=(img_h, img_w),
+                mode='bilinear',
+                align_corners=True
+            ).squeeze().numpy()
+            im4 = ax4.imshow(importance_upsampled, cmap='jet', vmin=0, vmax=1)
+            ax4.set_title(f'Importance Map\nmean={imp_mean:.3f}, std={imp_std:.3f}',
                          fontsize=14, fontweight='bold')
-            ax4.legend(fontsize=9)
-            ax4.grid(True, alpha=0.3)
+            ax4.axis('off')
+            plt.colorbar(im4, ax=ax4, fraction=0.046, pad=0.04)
 
-            # 5. Beta Channel Mean (Bar chart)
+            # Generate FG/BG masks from upsampled importance map (threshold at mean for smooth visualization)
+            fg_mask_frame = (importance_frame >= imp_mean).astype(np.float32)
+            bg_mask_frame = (importance_frame < imp_mean).astype(np.float32)
+
+            # Upsample FG/BG masks to match input image resolution (bilinear for smoother visualization)
+            fg_mask_upsampled = F.interpolate(
+                torch.from_numpy(fg_mask_frame).unsqueeze(0).unsqueeze(0),
+                size=(img_h, img_w),
+                mode='bilinear',
+                align_corners=True
+            ).squeeze().numpy()
+
+            bg_mask_upsampled = F.interpolate(
+                torch.from_numpy(bg_mask_frame).unsqueeze(0).unsqueeze(0),
+                size=(img_h, img_w),
+                mode='bilinear',
+                align_corners=True
+            ).squeeze().numpy()
+
+            # 5. FG Mask (visualize_attention_weights.py style)
             ax5 = fig.add_subplot(gs[1, 1])
-            ax5.bar(channel_indices, beta_frame, color='blue', alpha=0.7, width=1.0)
-            ax5.axhline(beta_mean, color='red', linestyle='--', linewidth=2, label=f'Mean: {beta_mean:.3f}')
-            ax5.set_xlabel('Channel Index', fontsize=10)
-            ax5.set_ylabel('Beta Value', fontsize=10)
-            ax5.set_title(f'Beta (Channel-wise)\nmean={beta_mean:.3f}, std={beta_std:.3f}',
-                         fontsize=14, fontweight='bold')
-            ax5.legend(fontsize=9)
-            ax5.grid(True, alpha=0.3)
+            ax5.imshow(input_img)
+            # Create FG overlay (Red channel only)
+            fg_overlay = np.zeros((*fg_mask_upsampled.shape, 3))
+            fg_overlay[..., 0] = fg_mask_upsampled  # Red channel
+            ax5.imshow(fg_overlay, alpha=0.5)
+            # Compute fg_ratio from upsampled importance map
+            fg_ratio = fg_mask_frame.mean() * 100
+            ax5.set_title(f'FG Mask (Red)\n{fg_ratio:.1f}%', fontsize=14, fontweight='bold')
+            ax5.axis('off')
 
-            # 6. Gamma/Beta Statistics Summary
+            # 6. BG Mask (visualize_attention_weights.py style)
             ax6 = fig.add_subplot(gs[1, 2])
-            y_pos = 0.95
-
-            # Gamma stats
-            ax6.text(0.05, y_pos, 'Gamma Statistics', fontsize=12, fontweight='bold',
-                    transform=ax6.transAxes, bbox=dict(boxstyle="round", facecolor='lightcoral'))
-            y_pos -= 0.12
-            ax6.text(0.05, y_pos, f'Mean: {gamma_mean:.3f}', fontsize=10, transform=ax6.transAxes)
-            y_pos -= 0.08
-            ax6.text(0.05, y_pos, f'Std: {gamma_std:.3f}', fontsize=10, transform=ax6.transAxes)
-            y_pos -= 0.08
-            ax6.text(0.05, y_pos, f'Min: {gamma_frame.min():.3f}', fontsize=10, transform=ax6.transAxes)
-            y_pos -= 0.08
-            ax6.text(0.05, y_pos, f'Max: {gamma_frame.max():.3f}', fontsize=10, transform=ax6.transAxes)
-            y_pos -= 0.15
-
-            # Beta stats
-            ax6.text(0.05, y_pos, 'Beta Statistics', fontsize=12, fontweight='bold',
-                    transform=ax6.transAxes, bbox=dict(boxstyle="round", facecolor='lightblue'))
-            y_pos -= 0.12
-            ax6.text(0.05, y_pos, f'Mean: {beta_mean:.3f}', fontsize=10, transform=ax6.transAxes)
-            y_pos -= 0.08
-            ax6.text(0.05, y_pos, f'Std: {beta_std:.3f}', fontsize=10, transform=ax6.transAxes)
-            y_pos -= 0.08
-            ax6.text(0.05, y_pos, f'Min: {beta_frame.min():.3f}', fontsize=10, transform=ax6.transAxes)
-            y_pos -= 0.08
-            ax6.text(0.05, y_pos, f'Max: {beta_frame.max():.3f}', fontsize=10, transform=ax6.transAxes)
-
-            ax6.set_title('FiLM Modulation Stats', fontsize=14, fontweight='bold')
+            ax6.imshow(input_img)
+            # Create BG overlay (Blue channel only)
+            bg_overlay = np.zeros((*bg_mask_upsampled.shape, 3))
+            bg_overlay[..., 2] = bg_mask_upsampled  # Blue channel
+            ax6.imshow(bg_overlay, alpha=0.5)
+            bg_ratio = bg_mask_frame.mean() * 100
+            ax6.set_title(f'BG Mask (Blue)\n{bg_ratio:.1f}%', fontsize=14, fontweight='bold')
             ax6.axis('off')
 
             # ==================== Row 3: Valid Mask, Error, Metrics & Training Info ====================
 
-            # 7. Valid Mask
+            # 7. Valid Mask (GT valid only, shows actual evaluation region)
             ax7 = fig.add_subplot(gs[2, 0])
             ax7.imshow(valid_mask_vis.astype(np.uint8), cmap='gray', vmin=0, vmax=1)
             valid_ratio_pct = (valid_mask_vis.sum() / valid_mask_vis.size) * 100
@@ -346,17 +355,19 @@ class Gear5FilmVisualizer:
                              fontsize=14, fontweight='bold')
                 plt.colorbar(im8, ax=ax8, fraction=0.046, pad=0.04)
             else:
+                # No valid pixels - show placeholder
                 ax8.text(0.5, 0.5, 'No Valid Pixels\n(All depths > 70m or invalid)',
                         ha='center', va='center', transform=ax8.transAxes,
                         fontsize=12, color='red', fontweight='bold')
                 ax8.set_title('Absolute Error (m)\nN/A', fontsize=14, fontweight='bold')
             ax8.axis('off')
 
-            # 9. Depth Metrics & Training Info
+            # 9. Depth Metrics & Training Info (COMBINED)
             ax9 = fig.add_subplot(gs[2, 2])
+
             y_pos = 0.95
 
-            # Dataset + Step info
+            # Dataset + Step info (merged, wheat box)
             if isinstance(dataset_idx, str):
                 dataset_str = dataset_idx
             elif isinstance(dataset_idx, (list, tuple)):
@@ -369,12 +380,50 @@ class Gear5FilmVisualizer:
                     transform=ax9.transAxes, bbox=dict(boxstyle="round", facecolor='wheat'))
             y_pos -= 0.10
 
-            # Canonicalization ratios
+            # Gamma/Beta info (Gear5 FiLM specific, wheat box)
+            if 'gamma' in model_outputs and 'beta' in model_outputs:
+                gamma = model_outputs['gamma']
+                beta = model_outputs['beta']
+
+                # Extract mean values (handle [B, T, C] or [B, C] format)
+                if torch.is_tensor(gamma):
+                    if gamma.ndim == 3:  # [B, T, C]
+                        gamma_mean = gamma[0, 0].mean().item()
+                    elif gamma.ndim == 2:  # [B, C]
+                        gamma_mean = gamma[0].mean().item()
+                    else:
+                        gamma_mean = gamma.mean().item()
+                else:
+                    gamma_mean = float(gamma)
+
+                if torch.is_tensor(beta):
+                    if beta.ndim == 3:  # [B, T, C]
+                        beta_mean = beta[0, 0].mean().item()
+                    elif beta.ndim == 2:  # [B, C]
+                        beta_mean = beta[0].mean().item()
+                    else:
+                        beta_mean = beta.mean().item()
+                else:
+                    beta_mean = float(beta)
+
+                ax9.text(0.05, y_pos, f'gamma_mean: {gamma_mean:.3f}, beta_mean: {beta_mean:.3f}',
+                        fontsize=10, transform=ax9.transAxes,
+                        bbox=dict(boxstyle="round", facecolor='wheat'))
+                y_pos -= 0.10
+
+            # Metric3D canonicalization ratios + FG_ratio (wheat box)
             if fx_ratio is not None and resize_ratio is not None:
+                # Extract ratios (from Metric3D canonicalization)
                 fx_ratio_value = fx_ratio[0, 0].item() if fx_ratio.ndim >= 2 else fx_ratio[0].item()
                 resize_ratio_value = resize_ratio[0, 0].item() if resize_ratio.ndim >= 2 else resize_ratio[0].item()
 
-                ax9.text(0.05, y_pos, f'fx_ratio: {fx_ratio_value:.3f} | resize_ratio: {resize_ratio_value:.3f}',
+                # Compute FG_ratio from importance map (same logic as train_gear5.py)
+                importance_flat = importance_frame.flatten()
+                importance_threshold = importance_flat.mean()
+                fg_mask = (importance_flat > importance_threshold)
+                fg_ratio_computed = fg_mask.astype(np.float32).mean()
+
+                ax9.text(0.05, y_pos, f'fx_ratio: {fx_ratio_value:.3f} | resize_ratio: {resize_ratio_value:.3f} | FG_ratio: {fg_ratio_computed:.3f}',
                         fontsize=10, transform=ax9.transAxes,
                         bbox=dict(boxstyle="round", facecolor='wheat'))
                 y_pos -= 0.10
@@ -416,20 +465,40 @@ class Gear5FilmVisualizer:
 
             # Loss values if available
             if loss_dict is not None:
+                # Validation loss (for validation visualization)
                 if 'val_loss' in loss_dict:
                     ax9.text(0.05, y_pos, f'Val Loss: {loss_dict["val_loss"]:.4f}', fontsize=9,
                             transform=ax9.transAxes, bbox=dict(boxstyle="round", facecolor='lightcoral'))
                     y_pos -= 0.08
 
+                # Depth loss (for training visualization)
                 if 'depth_loss' in loss_dict:
                     ax9.text(0.05, y_pos, f'Log L1: {loss_dict["depth_loss"]:.4f}', fontsize=9,
                             transform=ax9.transAxes, bbox=dict(boxstyle="round", facecolor='lightcoral'))
                     y_pos -= 0.08
 
+                # Variance loss (if enabled)
+                if 'depth_variance_loss' in loss_dict and loss_dict['depth_variance_loss'] > 0:
+                    ax9.text(0.05, y_pos, f'Var: {loss_dict["depth_variance_loss"]:.4f}', fontsize=9,
+                            transform=ax9.transAxes, bbox=dict(boxstyle="round", facecolor='lightyellow'))
+                    y_pos -= 0.08
+
+                # Edge-aware loss (if enabled)
+                if 'edge_aware_loss' in loss_dict and loss_dict['edge_aware_loss'] > 0:
+                    ax9.text(0.05, y_pos, f'Edge: {loss_dict["edge_aware_loss"]:.4f}', fontsize=9,
+                            transform=ax9.transAxes, bbox=dict(boxstyle="round", facecolor='lightblue'))
+                    y_pos -= 0.08
+
+                # Contrastive FG/BG loss (if enabled)
+                if 'contrastive_fgbg_loss' in loss_dict and loss_dict['contrastive_fgbg_loss'] > 0:
+                    ax9.text(0.05, y_pos, f'Contrast: {loss_dict["contrastive_fgbg_loss"]:.4f}', fontsize=9,
+                            transform=ax9.transAxes, bbox=dict(boxstyle="round", facecolor='lightgreen'))
+                    y_pos -= 0.08
+
             ax9.set_title('Depth Metrics & Training Info', fontsize=14, fontweight='bold')
             ax9.axis('off')
 
-            # ==================== Row 4: Depth Distribution, Gamma/Beta Distribution ====================
+            # ==================== Row 4: Depth Distribution, Importance Distribution ====================
 
             # 10. Depth Distribution Histogram
             ax10 = fig.add_subplot(gs[3, :2])
@@ -450,18 +519,29 @@ class Gear5FilmVisualizer:
                 ax10.legend(fontsize=12)
                 ax10.grid(True, alpha=0.3)
 
-            # 11. Gamma/Beta Channel Distribution
+            # 11. Importance Distribution
             ax11 = fig.add_subplot(gs[3, 2])
-            ax11.hist(gamma_frame, bins=30, alpha=0.6, label=f'Gamma (μ={gamma_mean:.2f})',
-                     color='red', density=True)
-            ax11.hist(beta_frame, bins=30, alpha=0.6, label=f'Beta (μ={beta_mean:.2f})',
-                     color='blue', density=True)
-            ax11.axvline(gamma_mean, color='red', linestyle='--', linewidth=2)
-            ax11.axvline(beta_mean, color='blue', linestyle='--', linewidth=2)
-            ax11.set_xlabel('Modulation Value', fontsize=12)
+            importance_flat = importance_frame.flatten()
+
+            # Handle case where all values are identical (std=0)
+            if imp_std < 1e-6:
+                # Just show a vertical line at the constant value
+                ax11.axvline(imp_mean, color='purple', linestyle='-', linewidth=3,
+                            label=f'Constant: {imp_mean:.3f}')
+                ax11.set_xlim(max(0, imp_mean - 0.1), min(1, imp_mean + 0.1))
+                ax11.text(0.5, 0.5, f'All pixels = {imp_mean:.3f}\n(std = {imp_std:.6f})',
+                         ha='center', va='center', transform=ax11.transAxes,
+                         fontsize=14, bbox=dict(boxstyle='round', facecolor='yellow', alpha=0.5))
+            else:
+                # Normal histogram
+                ax11.hist(importance_flat, bins=50, alpha=0.7, color='purple', density=True)
+                ax11.axvline(imp_mean, color='red', linestyle='--', linewidth=2,
+                            label=f'Mean: {imp_mean:.3f}')
+
+            ax11.set_xlabel('Importance Value', fontsize=12)
             ax11.set_ylabel('Density', fontsize=12)
-            ax11.set_title('Gamma/Beta Distribution', fontsize=14, fontweight='bold')
-            ax11.legend(fontsize=10)
+            ax11.set_title('Importance Map Distribution', fontsize=14, fontweight='bold')
+            ax11.legend(fontsize=12)
             ax11.grid(True, alpha=0.3)
 
             # Save figure

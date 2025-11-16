@@ -37,7 +37,7 @@ class DepthAnythingV2Adapter(MethodAdapter):
 
         # Choose checkpoint and max_depth based on indoor/outdoor
         if checkpoint_path is None:
-            base_path = Path(__file__).parent.parent / 'refer_test' / 'configs' / 'depthanythingv2'
+            base_path = Path(__file__).parent.parent / 'refer_test' / 'Depth-Anything-V2' / 'checkpoints'
             if self.indoor:
                 checkpoint_path = str(base_path / 'depth_anything_v2_metric_hypersim_vitl.pth')
                 max_depth = 10.0  # Indoor: 10 meters
@@ -74,11 +74,13 @@ class DepthAnythingV2Adapter(MethodAdapter):
         Returns:
             depth: torch.Tensor [1, H, W] - Metric depth in meters
         """
-        # Convert torch tensor to numpy array (BGR format expected by DA-V2)
-        # Input is [1, 3, H, W] in RGB, need to convert to HWC BGR numpy
-        image_np = image[0].cpu().numpy()  # [3, H, W]
+        # Optimize: Convert to uint8 on GPU, then transfer to CPU
+        # For large images (e.g., ETH3D 6205x4135), this is much faster
+        image_uint8 = (image[0] * 255.0).to(torch.uint8)  # [3, H, W] on GPU
+
+        # Transfer to CPU (uint8 is 4x smaller than float32)
+        image_np = image_uint8.cpu().numpy()  # [3, H, W]
         image_np = image_np.transpose(1, 2, 0)  # [H, W, 3]
-        image_np = (image_np * 255).astype(np.uint8)  # 0-1 -> 0-255
         image_np = image_np[:, :, ::-1]  # RGB -> BGR
 
         # Run inference (returns numpy array in meters)

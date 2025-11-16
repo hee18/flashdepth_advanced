@@ -36,7 +36,6 @@ class DepthCrafterAdapter(MethodAdapter):
         # Check for local UNet checkpoint
         repo_path = Path(__file__).parent.parent / 'refer_test'
         local_unet_paths = [
-            repo_path / 'configs' / 'depthcrafter' / 'depthcrafter_diffusion_pytorch_model.safetensors',
             repo_path / 'DepthCrafter' / 'checkpoints' / 'depthcrafter_diffusion_pytorch_model.safetensors',
         ]
 
@@ -48,7 +47,7 @@ class DepthCrafterAdapter(MethodAdapter):
 
         # Check for local SVD pipeline
         local_svd_paths = [
-            repo_path / 'configs' / 'depthcrafter' / 'stable-video-diffusion',
+            repo_path / 'DepthCrafter' / 'checkpoints' / 'stable-video-diffusion',
             repo_path / 'stable-video-diffusion-img2vid-xt',
         ]
 
@@ -132,14 +131,10 @@ class DepthCrafterAdapter(MethodAdapter):
         Note: DepthCrafter is designed for video sequences. For single frame,
         we process it as a 1-frame video, which may not utilize temporal features.
         """
-        # Convert to numpy for DepthCrafter
-        image_np = image[0].cpu().numpy()  # [3, H, W]
-        image_np = image_np.transpose(1, 2, 0)  # [H, W, 3]
-        image_np = (image_np * 255).astype(np.uint8)  # 0-1 -> 0-255
+        # Get original size
+        H_orig, W_orig = image.shape[2:]
 
-        H_orig, W_orig = image_np.shape[:2]
-
-        # Resize while keeping aspect ratio
+        # Resize while keeping aspect ratio (do on GPU first for large images)
         scale = min(self.max_res / H_orig, self.max_res / W_orig)
         if scale < 1.0:
             new_H = int(H_orig * scale)
@@ -147,8 +142,25 @@ class DepthCrafterAdapter(MethodAdapter):
             # Ensure dimensions are divisible by 64 (required by diffusion model)
             new_H = (new_H // 64) * 64
             new_W = (new_W // 64) * 64
-            import cv2
-            image_np = cv2.resize(image_np, (new_W, new_H), interpolation=cv2.INTER_LINEAR)
+
+            # Resize on GPU using PyTorch (much faster for large images like ETH3D)
+            import torch.nn.functional as F
+            image_resized = F.interpolate(
+                image,  # [1, 3, H, W]
+                size=(new_H, new_W),
+                mode='bilinear',
+                align_corners=False
+            )  # [1, 3, new_H, new_W]
+        else:
+            image_resized = image
+
+        # Optimize: Convert to uint8 on GPU first (4x smaller transfer)
+        # For large images (e.g., ETH3D 6205x4135), this is much faster
+        image_uint8 = (image_resized[0] * 255.0).to(torch.uint8)  # [3, H, W] on GPU
+
+        # Transfer to CPU (uint8 is 4x smaller than float32)
+        image_np = image_uint8.cpu().numpy()  # [3, H, W]
+        image_np = image_np.transpose(1, 2, 0)  # [H, W, 3]
 
         # Convert to frames format (add temporal dimension)
         frames = np.expand_dims(image_np, axis=0)  # [1, H, W, 3]
