@@ -53,12 +53,12 @@ class ObjectWiseMetrics:
         # ... (40 classes total, abbreviated for brevity)
     }
 
-    # VKITTI2 class IDs (15 classes total)
-    # Source: https://www.changjiangcai.com/studynotes/2020-05-16-Virtual-KITTI-2-Dataset/
+    # VKITTI2 class IDs (15 classes, 0-14)
+    # Source: VKITTI2 colors.txt (official homepage)
     VKITTI2_CLASSES = {
-        0: 'undefined', 1: 'terrain', 2: 'sky', 3: 'tree', 4: 'vegetation',
-        5: 'building', 6: 'road', 7: 'guard_rail', 8: 'traffic_sign',
-        9: 'traffic_light', 10: 'pole', 11: 'misc', 12: 'truck', 13: 'car', 14: 'van'
+        0: 'terrain', 1: 'sky', 2: 'tree', 3: 'vegetation', 4: 'building',
+        5: 'road', 6: 'guard_rail', 7: 'traffic_sign', 8: 'traffic_light',
+        9: 'pole', 10: 'misc', 11: 'truck', 12: 'car', 13: 'van', 14: 'undefined'
     }
 
     # Waymo Open Dataset class IDs (Semantic Segmentation v2.0)

@@ -686,7 +686,11 @@ class Gear5Trainer:
 
             # Training step
             loss_dict = self.train_step(batch, step)
-            
+
+            # Skip if no valid pixels in batch
+            if loss_dict is None:
+                continue
+
             # Get learning rates
             lr_gear5 = self.optimizer.param_groups[0]['lr']
             lr_mamba = self.optimizer.param_groups[1]['lr']
@@ -1048,21 +1052,31 @@ class Gear5Trainer:
 
         # Compute loss (outside autocast for numerical stability and gradient flow)
         with torch.amp.autocast('cuda', enabled=False):
-            # Canonical space validation masks (70m threshold)
-            MIN_INVERSE_DEPTH = 100.0 / 70.0  # 1.43 (100/m)
-            canonical_gt_valid = (gt_depth_inverse_100 > MIN_INVERSE_DEPTH)
+            # Training valid mask: GT > 0 + actual valid masks (no 70m threshold in training, like Gear2)
+            # Test uses 70m threshold in test_gear5.py for canonical space evaluation
+            gt_valid = (gt_depth_inverse_100 > 0)
 
             # Combine with actual valid masks from dataloader
             # actual_valid_masks: [B, T, H, W], need to add channel dim to match gt_depth: [B, T, 1, H, W]
-            canonical_gt_valid = canonical_gt_valid & actual_valid_masks.unsqueeze(2)
+            gt_valid = gt_valid & actual_valid_masks.unsqueeze(2)
 
             # Flatten for loss computation
             pred_depth_flat = pred_metric_inverse.float().flatten()
             gt_depth_flat = gt_depth_inverse_100.float().flatten()
-            valid_mask = canonical_gt_valid.flatten()
+            valid_mask = gt_valid.flatten()
+
+            # Check if we have valid pixels (avoid division by zero)
+            if valid_mask.sum() == 0:
+                self.logger.warning("No valid pixels in batch! Skipping this step.")
+                return None
+
+            # Clamp to positive values BEFORE log to prevent NaN from log(negative) or log(0)
+            # This is critical: shift can be negative, making some predictions negative
+            epsilon = 1e-8
+            pred_depth_flat = torch.clamp(pred_depth_flat, min=epsilon)
+            gt_depth_flat = torch.clamp(gt_depth_flat, min=epsilon)
 
             # Log L1 Loss (inverse depth space)
-            epsilon = 1e-8
             loss = torch.abs(
                 torch.log(pred_depth_flat + epsilon) -
                 torch.log(gt_depth_flat + epsilon)
@@ -1297,8 +1311,8 @@ class Gear5Trainer:
                 pred_depth_flat = pred_depth_inverse.flatten()
                 gt_depth_flat = gt_depth_inverse_flat.flatten()
 
-                # Valid mask: GT valid + Pred positive (no 70m restriction in validation, like original FlashDepth)
-                valid_mask = (gt_depth_flat >= 0) & (pred_depth_flat > 0)
+                # Valid mask: GT valid (>0) + Pred positive (no threshold in validation, like Gear2)
+                valid_mask = (gt_depth_flat > 0) & (pred_depth_flat > 0)
 
                 # Save masks for visualization
                 canonical_gt_valid = (gt_depth_inverse_flat > 0).cpu()  # [B*T, 1, H_gt, W_gt] - GT valid pixels

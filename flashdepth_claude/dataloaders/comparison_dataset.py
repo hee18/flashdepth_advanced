@@ -39,7 +39,7 @@ class ComparisonDataset(Dataset):
     according to their own requirements.
     """
 
-    def __init__(self, dataset_name, data_root, split='test', video_length=50, chunk_size=None, objwise_enabled=False, only_clone=False):
+    def __init__(self, dataset_name, data_root, split='test', video_length=50, chunk_size=None, objwise_enabled=False, only_clone=False, unrealstereo4k_seq=None):
         """
         Args:
             dataset_name: Name of dataset ('eth3d', 'kitti', 'sintel', etc.)
@@ -50,9 +50,11 @@ class ComparisonDataset(Dataset):
                        Useful for high-resolution datasets (e.g., 50 for 4K images)
             objwise_enabled: If True, load segmentation masks for object-wise evaluation
             only_clone: If True and dataset is VKITTI, only use 'clone' condition (5 sequences instead of 50)
+            unrealstereo4k_seq: If set, only use this sequence number (0-8) for UnrealStereo4K
         """
         self.dataset_name = dataset_name.lower()
         self.data_root = data_root
+        self.unrealstereo4k_seq = unrealstereo4k_seq
         self.split = split
         self.video_length = video_length
         self.objwise_enabled = objwise_enabled
@@ -474,6 +476,8 @@ class ComparisonDataset(Dataset):
     def _build_unrealstereo4k_sequences(self):
         """
         Build UnrealStereo4K sequences
+
+        If unrealstereo4k_seq is specified, only load that sequence number (0-8).
         """
         sequences = []
         unreal_root = os.path.join(self.data_root, 'unrealstereo4k')
@@ -486,7 +490,15 @@ class ComparisonDataset(Dataset):
         all_scenes = sorted([s for s in os.listdir(unreal_root)
                            if os.path.isdir(os.path.join(unreal_root, s))])
 
-        logger.info(f"UnrealStereo4K: Using all {len(all_scenes)} scenes")
+        # Filter by sequence number if specified
+        if self.unrealstereo4k_seq is not None:
+            if self.unrealstereo4k_seq < 0 or self.unrealstereo4k_seq >= len(all_scenes):
+                logger.error(f"UnrealStereo4K seq {self.unrealstereo4k_seq} out of range (0-{len(all_scenes)-1})")
+                return []
+            all_scenes = [all_scenes[self.unrealstereo4k_seq]]
+            logger.info(f"UnrealStereo4K: Using sequence {self.unrealstereo4k_seq} only: {all_scenes[0]}")
+        else:
+            logger.info(f"UnrealStereo4K: Using all {len(all_scenes)} scenes")
 
         for scene in all_scenes:
             scene_path = os.path.join(unreal_root, scene)
@@ -871,23 +883,24 @@ class ComparisonDataset(Dataset):
             class_map = np.zeros((seg.shape[0], seg.shape[1]), dtype=np.int64)
 
             # VKITTI2 RGB -> Class ID mapping
-            # Source: https://www.changjiangcai.com/studynotes/2020-05-16-Virtual-KITTI-2-Dataset/
+            # Source: VKITTI2 colors.txt (official homepage)
+            # https://europe.naverlabs.com/research/computer-vision/proxy-virtual-worlds-vkitti-2/
             rgb_to_class = {
-                (0, 0, 0): 0,           # undefined
-                (210, 0, 200): 1,       # terrain
-                (90, 200, 255): 2,      # sky
-                (0, 199, 0): 3,         # tree
-                (90, 240, 0): 4,        # vegetation
-                (140, 140, 140): 5,     # building
-                (100, 60, 100): 6,      # road
-                (250, 100, 255): 7,     # guard rail
-                (255, 255, 0): 8,       # traffic sign
-                (200, 200, 0): 9,       # traffic light
-                (255, 130, 0): 10,      # pole
-                (80, 80, 80): 11,       # misc
-                (160, 60, 60): 12,      # truck (OBJECT)
-                (255, 127, 80): 13,     # car (OBJECT)
-                (0, 139, 139): 14,      # van (OBJECT)
+                (210, 0, 200): 0,       # Terrain
+                (90, 200, 255): 1,      # Sky
+                (0, 199, 0): 2,         # Tree
+                (90, 240, 0): 3,        # Vegetation
+                (140, 140, 140): 4,     # Building
+                (100, 60, 100): 5,      # Road
+                (250, 100, 255): 6,     # GuardRail
+                (255, 255, 0): 7,       # TrafficSign
+                (200, 200, 0): 8,       # TrafficLight
+                (255, 130, 0): 9,       # Pole
+                (80, 80, 80): 10,       # Misc
+                (160, 60, 60): 11,      # Truck (OBJECT)
+                (255, 127, 80): 12,     # Car (OBJECT)
+                (0, 139, 139): 13,      # Van (OBJECT)
+                (0, 0, 0): 14,          # Undefined
             }
 
             # Convert RGB to class ID

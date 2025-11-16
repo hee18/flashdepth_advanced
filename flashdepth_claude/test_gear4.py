@@ -95,7 +95,8 @@ class Gear4Tester:
         logger.info(f"Visualization: {'ENABLED' if self.enable_visualization else 'DISABLED (only JSON results)'}")
 
         # Frame interval for visualization (only applies to sequence.png, not video)
-        self.frame_interval = None
+        # Can be overridden via command line: frame_interval=X
+        self.frame_interval = self.config.get('frame_interval', None)
 
         if self.object_wise_enabled:
             logger.info(f"Object-wise evaluation ENABLED for dataset: {self.object_wise_dataset}")
@@ -748,7 +749,7 @@ class Gear4Tester:
         torch.cuda.empty_cache()
 
         # FPS measurement (like original FlashDepth)
-        warmup_frames = min(5, T)  # Warmup frames to skip initial overhead
+        warmup_frames = min(10, T)  # Warmup frames to skip initial overhead
         start_time = None  # Will start timing after warmup
 
         # Initialize Mamba sequence for actual test (critical for temporal processing!)

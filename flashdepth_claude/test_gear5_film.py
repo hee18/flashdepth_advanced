@@ -106,7 +106,8 @@ class Gear5FilmTester:
         logger.info(f"Visualization: {'ENABLED' if self.enable_visualization else 'DISABLED (only JSON results)'}")
 
         # Frame interval for visualization (only applies to sequence.png, not video)
-        self.frame_interval = None
+        # Can be overridden via command line: frame_interval=X
+        self.frame_interval = self.config.get('frame_interval', None)
 
         if self.object_wise_enabled:
             logger.info(f"Object-wise evaluation ENABLED for dataset: {self.object_wise_dataset}")
@@ -654,7 +655,7 @@ class Gear5FilmTester:
         torch.cuda.empty_cache()
 
         # FPS measurement
-        warmup_frames = min(5, T)
+        warmup_frames = min(10, T)
         start_time = None
 
         # Initialize Mamba sequence for actual test

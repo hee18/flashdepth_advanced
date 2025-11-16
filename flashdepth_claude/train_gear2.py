@@ -945,8 +945,8 @@ class Gear2Trainer:
         # GT valid: Only compute loss where GT is valid (no depth restriction like FlashDepth and train_gear5)
         # Pred outlier: Filter out extreme predictions (>200m outliers)
 
-        # Valid mask: GT valid + Pred positive (no 70m or 200m restriction in training, like original FlashDepth)
-        valid_mask = (gt_depth_inverse_flat >= 0) & (pred_depth_inverse_flat > 0)
+        # Valid mask: GT valid (>0) + Pred positive (no threshold in training)
+        valid_mask = (gt_depth_inverse_flat > 0) & (pred_depth_inverse_flat > 0)
 
         if valid_mask.sum() == 0:
             self.logger.error("No valid GT & Pred pixels in batch!")

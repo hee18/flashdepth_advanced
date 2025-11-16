@@ -685,6 +685,10 @@ class Gear5FilmTrainer:
             # Training step
             loss_dict = self.train_step(batch)
 
+            # Skip if no valid pixels in batch
+            if loss_dict is None:
+                continue
+
             # Get learning rates
             lr_film = self.optimizer.param_groups[0]['lr']
             lr_mamba = self.optimizer.param_groups[1]['lr']
@@ -995,21 +999,26 @@ class Gear5FilmTrainer:
         pred_depth_flat = pred_depth_inverse_100.flatten()
         gt_depth_flat = gt_depth_inverse_flat.flatten()
 
-        # Valid mask: GT valid + Pred positive
-        valid_mask = (gt_depth_flat >= 0) & (pred_depth_flat > 0)
+        # Valid mask: GT valid (>0) + Pred positive (no threshold, like Gear2)
+        valid_mask = (gt_depth_flat > 0) & (pred_depth_flat > 0)
 
         if valid_mask.sum() == 0:
-            self.logger.error("No valid GT pixels in batch!")
-            return {'loss': 0.0}
+            self.logger.warning("No valid pixels in batch! Skipping this step.")
+            return None
 
         # Compute loss based on loss_type (Gear5 style)
         with torch.amp.autocast('cuda', enabled=False):
             epsilon = 1e-3
+
+            # Clamp to positive values BEFORE log to prevent NaN from log(negative) or log(0)
+            pred_depth_flat = torch.clamp(pred_depth_flat.float(), min=epsilon)
+            gt_depth_flat = torch.clamp(gt_depth_flat.float(), min=epsilon)
+
             # pred_depth_flat and gt_depth_flat are already inverse depth (100/m)
             # Compute log L1 loss directly in inverse depth space
             loss = torch.abs(
-                torch.log(pred_depth_flat.float() + epsilon) -
-                torch.log(gt_depth_flat.float() + epsilon)
+                torch.log(pred_depth_flat + epsilon) -
+                torch.log(gt_depth_flat + epsilon)
             )
 
             if self.loss_type == 'importance':
@@ -1218,7 +1227,8 @@ class Gear5FilmTrainer:
                 pred_depth_flat = pred_depth_inverse.flatten()
                 gt_depth_flat = gt_depth_inverse_flat.flatten()
 
-                valid_mask = (gt_depth_flat >= 0) & (pred_depth_flat > 0)
+                # Valid mask: GT valid (>0) + Pred positive (no threshold in validation, like Gear2)
+                valid_mask = (gt_depth_flat > 0) & (pred_depth_flat > 0)
 
                 # Save masks for visualization
                 canonical_gt_valid = (gt_depth_inverse_flat > 0).cpu()

@@ -45,17 +45,26 @@ class LogL1Loss(nn.Module):
             if len(pred_valid) == 0:
                 return torch.tensor(0.0, device=pred_inverse.device)
 
+            # Clamp to positive values to prevent NaN from log(negative) or log(0)
+            # Critical: shift in Gear5 can be negative, making predictions negative
+            epsilon = 1e-8
+            pred_valid = torch.clamp(pred_valid, min=epsilon)
+            gt_valid = torch.clamp(gt_valid, min=epsilon)
+
             # Log L1 loss on valid pixels only
             loss = F.l1_loss(
-                torch.log(pred_valid + 1e-8),
-                torch.log(gt_valid + 1e-8),
+                torch.log(pred_valid + epsilon),
+                torch.log(gt_valid + epsilon),
                 reduction='mean'
             )
         else:
             # Fallback: compute on all pixels
+            epsilon = 1e-8
+            pred_clamped = torch.clamp(pred_inverse, min=epsilon)
+            gt_clamped = torch.clamp(gt_inverse, min=epsilon)
             loss = F.l1_loss(
-                torch.log(pred_inverse + 1e-8),
-                torch.log(gt_inverse + 1e-8),
+                torch.log(pred_clamped + epsilon),
+                torch.log(gt_clamped + epsilon),
                 reduction='mean'
             )
 

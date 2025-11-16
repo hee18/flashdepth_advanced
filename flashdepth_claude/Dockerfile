@@ -37,13 +37,19 @@ RUN pip install packaging wheel
 RUN pip install ninja
 
 # Install xformers from source for CUDA 12.4 compatibility
-RUN MAX_JOBS=4 pip install -v -U git+https://github.com/facebookresearch/xformers.git@v0.0.27 --no-build-isolation
+# Ensure CUDA is available during build
+RUN nvcc --version && \
+    TORCH_CUDA_ARCH_LIST="7.0;7.5;8.0;8.6;8.9;9.0" \
+    FORCE_CUDA=1 \
+    MAX_JOBS=4 \
+    pip install -v -U git+https://github.com/facebookresearch/xformers.git@v0.0.27 --no-build-isolation
 
 # Install flash-attention
 RUN pip install flash-attn --no-build-isolation
 
 # Install causal-conv1d (required for Mamba2)
-RUN pip install causal-conv1d>=1.4.0 --no-build-isolation
+# Pin to specific version for compatibility with mamba-ssm
+RUN pip install causal-conv1d==1.4.0 --no-build-isolation
 
 # Install local Mamba package
 WORKDIR /app/mamba

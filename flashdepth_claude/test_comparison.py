@@ -257,13 +257,17 @@ class ComparisonTester:
             # Get only_clone flag for VKITTI
             only_clone = self.config.get('only_clone', False) if dataset_name == 'vkitti' else False
 
+            # Get unrealstereo4k_seq if specified
+            unrealstereo4k_seq = self.config.get('unrealstereo4k_seq', None) if dataset_name == 'unrealstereo4k' else None
+
             dataset = ComparisonDataset(
                 dataset_name=dataset_name,
                 data_root=data_root,
                 split=split,
                 video_length=video_length,
                 objwise_enabled=self.object_wise_enabled,
-                only_clone=only_clone
+                only_clone=only_clone,
+                unrealstereo4k_seq=unrealstereo4k_seq
             )
             collate_fn = comparison_collate_fn
 
@@ -353,20 +357,17 @@ class ComparisonTester:
         assert B == 1, "Batch size must be 1 for testing"
 
         # Process GT depth
-        # ComparisonDataset: depths are already in meters
-        # WaymoSegmentationDataset/UrbanSynSegmentationDataset: depths are inverse depth (1/m), need conversion
-        # CombinedDataset: depths are inverse depth (1/m), need conversion
+        # --objwise flag determines dataset type:
+        # - objwise=True → SegmentationDataset (WaymoSeg/UrbanSynSeg/VKITTISeg) → inverse depth (1/m)
+        # - objwise=False → ComparisonDataset → metric depth (m)
 
-        # Check if this is segmentation dataset (waymo_seg, urbansyn_seg)
-        is_segmentation_dataset = 'segmentations' in batch
-
-        if 'images' in batch and not is_segmentation_dataset:
+        if self.object_wise_enabled:
+            # SegmentationDataset - convert from inverse depth to metric
+            gt_depth_processed = 1.0 / (gt_depths + 1e-8)  # [1, T, H, W] inverse → meters
+            gt_depth_processed = gt_depth_processed.unsqueeze(2)  # [1, T, 1, H, W]
+        else:
             # ComparisonDataset - already in meters
             gt_depth_processed = gt_depths.unsqueeze(2)  # [1, T, 1, H, W]
-        else:
-            # Segmentation datasets or CombinedDataset - convert from inverse depth
-            gt_depth_processed = 1.0 / (gt_depths + 1e-8)  # [1, T, H, W] -> meters
-            gt_depth_processed = gt_depth_processed.unsqueeze(2)  # [1, T, 1, H, W]
 
         # Get focal lengths (for models that need them)
         if intrinsics is not None:
@@ -901,8 +902,21 @@ def main():
                        help='Frame interval for sequence.png visualization')
     parser.add_argument('--visualization', type=str, default='true', choices=['true', 'false'],
                        help='Enable/disable visualizations (sequence.png, best_frame.png, etc.). Default: true')
+    parser.add_argument('--seq', type=int, default=None,
+                       help='Sequence number for UnrealStereo4K (0-8). Required for unrealstereo4k dataset.')
 
     args = parser.parse_args()
+
+    # Check UnrealStereo4K --seq requirement
+    if args.dataset.lower() == 'unrealstereo4k':
+        if args.seq is None:
+            logger.error("❌ UnrealStereo4K requires --seq option (0-8)")
+            logger.error("   Example: --dataset unrealstereo4k --seq 0")
+            sys.exit(1)
+        if args.seq < 0 or args.seq > 8:
+            logger.error(f"❌ UnrealStereo4K --seq must be between 0 and 8, got {args.seq}")
+            sys.exit(1)
+        logger.info(f"UnrealStereo4K: Testing sequence {args.seq} only")
 
     # Build method name with version
     method_name = args.method
@@ -930,7 +944,8 @@ def main():
         'metric': args.metric,
         'frame_interval': args.frame_interval,
         'only_clone': (args.only_clone == 'true'),  # Convert string to bool
-        'visualization': (args.visualization == 'true')  # Convert string to bool
+        'visualization': (args.visualization == 'true'),  # Convert string to bool
+        'unrealstereo4k_seq': args.seq  # Sequence number for UnrealStereo4K (None for other datasets)
     }
 
     # Import and create adapter

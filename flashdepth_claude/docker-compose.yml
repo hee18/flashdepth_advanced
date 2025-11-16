@@ -3,7 +3,7 @@ version: '3.8'
 services:
   flashdepth:
     build: .
-    image: flashdepth:old
+    image: flashdepth:latest
     container_name: flashdepth_training
     runtime: nvidia
     environment:

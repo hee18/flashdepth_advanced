@@ -94,6 +94,10 @@ class Gear2Tester:
         self.enable_visualization = config.get('visualization', True)
         logger.info(f"Visualization: {'ENABLED' if self.enable_visualization else 'DISABLED (only JSON results)'}")
 
+        # Frame interval for visualization (only applies to sequence.png, not video)
+        # Can be overridden via command line: frame_interval=X
+        self.frame_interval = self.config.get('frame_interval', None)
+
         if self.object_wise_enabled:
             logger.info(f"Object-wise evaluation ENABLED for dataset: {self.object_wise_dataset}")
             self.object_wise_metrics = ObjectWiseMetrics(dataset_type=self.object_wise_dataset)
@@ -187,7 +191,18 @@ class Gear2Tester:
             if self.object_wise_dataset == 'waymo':
                 # WaymoSegmentationDataset expects data_root to be waymo_seg directory
                 waymo_data_root = str(Path(data_root) / 'waymo_seg')
-                
+
+                # For waymo_seg in objwise mode: use 20 frames (0-19 with annotation)
+                # Override video_length and frame_interval if not explicitly set
+                if 'vid_len' not in self.config:
+                    video_length = 20
+                    logger.info(f"Auto-setting video_length=20 for waymo_seg objwise mode (frames with annotation)")
+
+                # Set frame_interval to 2 for waymo_seg objwise (show every 2nd frame in sequence.png)
+                if self.frame_interval is None:
+                    self.frame_interval = 2
+                    logger.info(f"Auto-setting frame_interval=2 for waymo_seg objwise mode")
+
                 test_dataset = WaymoSegmentationDataset(
                     data_root=waymo_data_root,
                     split='val',
@@ -689,7 +704,7 @@ class Gear2Tester:
         torch.cuda.empty_cache()
 
         # FPS measurement (논문 방법: 데이터가 GPU에 미리 로드된 상태에서 순수 inference 시간만 측정)
-        warmup_frames = min(5, T)  # Warmup frames to skip initial overhead
+        warmup_frames = min(10, T)  # Warmup frames to skip initial overhead
         start_time = None  # Will start timing after warmup
 
         # Initialize Mamba sequence for actual test (critical for temporal processing!)
@@ -1030,7 +1045,14 @@ class Gear2Tester:
         """
         T = images.shape[0]
         frames_to_show = min(10, T)  # Show up to 10 frames
-        interval = max(1, T // frames_to_show)
+
+        # Use frame_interval if set (for waymo_seg objwise), otherwise auto-calculate
+        if self.frame_interval is not None:
+            interval = self.frame_interval
+            logger.info(f"Using frame_interval={interval} for sequence.png visualization")
+        else:
+            interval = max(1, T // frames_to_show)
+
         frame_indices = list(range(0, T, interval))[:frames_to_show]
 
         # Create figure with actual number of frames (not frames_to_show)

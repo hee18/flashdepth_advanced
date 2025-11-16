@@ -930,7 +930,7 @@ class Gear3Trainer:
         # Pred outlier: Filter out extreme predictions (>200m outliers)
 
         # Valid mask: GT valid + Pred positive (no 70m or 200m restriction in training, like original FlashDepth)
-        valid_mask = (gt_depth_inverse_flat >= 0) & (pred_depth_inverse_flat > 0)
+        valid_mask = (gt_depth_inverse_flat > 0) & (pred_depth_inverse_flat > 0)
 
         if valid_mask.sum() == 0:
             self.logger.error("No valid GT & Pred pixels in batch!")

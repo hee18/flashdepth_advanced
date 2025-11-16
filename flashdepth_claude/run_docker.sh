@@ -124,7 +124,7 @@ show_usage() {
 COMMAND=""
 BATCH_SIZE=3
 WORKERS=8      # Optimized for 96 CPU cores, prevents I/O bottleneck
-TOTAL_ITERS=40001
+TOTAL_ITERS=60001
 GPU_ID=0
 RESULTS_DIR="train_results/results_1"
 FLASHDEPTH_CHECKPOINT="configs/flashdepth-l/iter_10001.pth"
@@ -402,7 +402,7 @@ case $COMMAND in
             fi
 
             # Reduce iterations for Hybrid (same as Stage 1)
-            TOTAL_ITERS=40001
+            TOTAL_ITERS=60001
             echo "  NOTE: Iterations set to $TOTAL_ITERS for Hybrid training"
         else
             # Stage 1 (L/S): 518x518 resolution - can use more workers and larger batch
@@ -537,7 +537,7 @@ case $COMMAND in
             fi
 
             # Iterations for Hybrid (same as Stage 1)
-            TOTAL_ITERS=40001
+            TOTAL_ITERS=60001
             echo "  NOTE: Iterations set to $TOTAL_ITERS for Hybrid training"
         else
             # Stage 1 (L/S): 518x518 resolution - can use more workers and larger batch
@@ -715,7 +715,7 @@ case $COMMAND in
             fi
 
             # Iterations for Hybrid (same as Stage 1)
-            TOTAL_ITERS=40001
+            TOTAL_ITERS=60001
             echo "  NOTE: Iterations set to $TOTAL_ITERS for Hybrid training"
         else
             # Stage 1 (L/S): 518x518 resolution - can use more workers and larger batch
