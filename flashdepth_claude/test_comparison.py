@@ -239,7 +239,8 @@ class ComparisonTester:
                     data_root=data_root,
                     split='test',
                     video_length=video_length,
-                    only_clone=only_clone
+                    only_clone=only_clone,
+                    use_sliding_window=False  # One sequence per scene
                 )
                 collate_fn = vkitti_collate_fn
                 logger.info(f"Object-wise dataset: vkitti_seg (only_clone={only_clone})")

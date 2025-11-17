@@ -38,6 +38,7 @@ from dataloaders.combined_dataset import CombinedDataset
 from dataloaders.waymo_segmentation_dataset import WaymoSegmentationDataset, collate_fn as waymo_collate_fn
 from dataloaders.urbansyn_dataset import UrbanSynDepth
 from dataloaders.urbansyn_segmentation_dataset import UrbanSynSegmentationDataset, urbansyn_collate_fn
+from dataloaders.vkitti_segmentation_dataset import VKITTISegmentationDataset, collate_fn as vkitti_collate_fn
 from utils.metric_depth_metrics import MetricDepthMetrics, format_metrics
 from utils.object_wise_evaluation import ObjectWiseMetrics
 from utils.object_wise_visualization import create_object_wise_grid
@@ -337,6 +338,17 @@ class Gear5Tester:
                     max_frames=1000
                 )
                 collate_fn = urbansyn_collate_fn
+            elif self.object_wise_dataset == 'vkitti':
+                only_clone = self.config.get('only_clone', True)
+                test_dataset = VKITTISegmentationDataset(
+                    data_root=data_root,
+                    split='test',
+                    video_length=video_length,
+                    only_clone=only_clone,
+                    use_sliding_window=False  # One sequence per scene
+                )
+                collate_fn = vkitti_collate_fn
+                logger.info(f"Object-wise dataset: vkitti_seg (only_clone={only_clone})")
             else:
                 raise ValueError(f"Unknown object-wise dataset: {self.object_wise_dataset}")
 
@@ -752,6 +764,12 @@ class Gear5Tester:
         B, T = images.shape[:2]
         assert B == 1, "Batch size must be 1 for testing"
 
+        # Extract dataset name for conditional saving
+        dataset_name = batch.get('dataset_name', ['unknown'])[0]
+        if isinstance(dataset_name, (list, tuple)):
+            dataset_name = dataset_name[0]
+        dataset_name = dataset_name.lower() if isinstance(dataset_name, str) else 'unknown'
+
         # Dataloader gives inverse depth (1/m) already in canonical space (fx=500), scale to 100/m
         gt_depth_inverse_100 = gt_depth * 100.0  # [1, T, 1, H, W] in canonical 100/m
 
@@ -994,11 +1012,19 @@ class Gear5Tester:
                 end_time = time.time()
 
             # List append for visualization (outside FPS measurement)
-            pred_depths.append(pred_depth_metric)
+            # Move to CPU immediately to prevent GPU memory accumulation (OOM fix)
+            pred_depths.append(pred_depth_metric.cpu())
             # Save upsampled importance_map (already smooth, no need to interpolate again in visualization)
-            importance_maps.append(importance_map_resized[0])  # [1, H, W] at image resolution
+            importance_maps.append(importance_map_resized[0].cpu())  # [1, H, W] at image resolution
             scales_list.append(scale[0].cpu())  # [1]
             shifts_list.append(shift[0].cpu())  # [1]
+
+            # Release intermediate tensors to prevent GPU memory accumulation
+            # Critical for long sequences (e.g., urbansyn 1000 frames)
+            del encoder_features, cls_tokens_list, cls_tokens_averaged, cls_tokens
+            del attention_weights_list, dpt_features, path_1, path_1_temporal
+            del relative_depth, gear5_outputs, scale, shift
+            del importance_map, importance_map_resized, pred_depth_inverse_100, pred_depth_metric
 
         # Calculate FPS (like original FlashDepth: exclude warmup frames)
         if start_time is not None:
@@ -1011,25 +1037,27 @@ class Gear5Tester:
             fps = 0
             logger.warning(f"Too few frames ({T}) for FPS measurement (need > {warmup_frames})")
 
-        # Stack predictions
-        pred_depths = torch.stack(pred_depths, dim=0)  # [T, 1, H, W] in meters
-        importance_maps = torch.stack(importance_maps, dim=0)  # [T, 1, H, W]
-        scales = torch.stack(scales_list, dim=0)  # [T, 1]
-        shifts = torch.stack(shifts_list, dim=0)  # [T, 1]
+        # Stack predictions (already on CPU from loop)
+        pred_depths = torch.stack(pred_depths, dim=0)  # [T, 1, H, W] in meters (CPU)
+        importance_maps = torch.stack(importance_maps, dim=0)  # [T, 1, H, W] (CPU)
+        scales = torch.stack(scales_list, dim=0)  # [T, 1] (CPU)
+        shifts = torch.stack(shifts_list, dim=0)  # [T, 1] (CPU)
 
         # Convert GT to metric depth for visualization
         # GT is in canonical space (fx=500), de-canonicalize to actual space for visualization
-        gt_depth_canonical = 100.0 / (gt_depth_inverse_100[0] + 1e-8)  # [T, 1, H, W] in canonical meters
+        # Move to CPU first to avoid OOM for long sequences (urbansyn 1000 frames)
+        gt_depth_inverse_100_cpu = gt_depth_inverse_100[0].cpu()  # [T, 1, H, W] to CPU
+        gt_depth_canonical = 100.0 / (gt_depth_inverse_100_cpu + 1e-8)  # [T, 1, H, W] in canonical meters (CPU)
 
         # De-canonicalize: depth_actual = depth_canonical × (fx_actual / fx_canonical)
         # This converts from canonical space (fx=500) back to actual space for visualization
-        de_canonical_ratio = fx_actual_tensor[0] / CANONICAL_FX  # [T]
-        gt_depth_metric = gt_depth_canonical * de_canonical_ratio.view(T, 1, 1, 1)  # [T, 1, H, W] in actual meters
+        de_canonical_ratio = fx_actual_tensor[0].cpu() / CANONICAL_FX  # [T] (CPU)
+        gt_depth_metric = gt_depth_canonical * de_canonical_ratio.view(T, 1, 1, 1)  # [T, 1, H, W] in actual meters (CPU)
 
-        # Compute metrics (both pred and GT are now in meters)
-        # Move to CPU and compute per-frame metrics (like test_metric_head.py)
-        pred_depths_cpu = pred_depths.cpu()
-        gt_depth_metric_cpu = gt_depth_metric.cpu()
+        # Compute metrics (both pred and GT are now in meters on CPU)
+        # Already on CPU, no need to call .cpu() again
+        pred_depths_cpu = pred_depths
+        gt_depth_metric_cpu = gt_depth_metric
 
         frame_metrics = []
         for t in range(pred_depths.shape[0]):
@@ -1157,8 +1185,13 @@ class Gear5Tester:
 
                 # Aggregate across all frames
                 class_metrics = self.object_wise_metrics.aggregate_metrics(per_frame_class_metrics)
-                metrics['object_wise'] = class_metrics
-                logger.info(f"Computed object-wise metrics for {len(class_metrics)} classes across {T_seg} frames")
+
+                # Skip object-wise saving for urbansyn (to save disk space)
+                if dataset_name == 'urbansyn':
+                    logger.info(f"Skipping object-wise metrics save for urbansyn (long sequence dataset)")
+                else:
+                    metrics['object_wise'] = class_metrics
+                    logger.info(f"Computed object-wise metrics for {len(class_metrics)} classes across {T_seg} frames")
 
             except Exception as e:
                 logger.error(f"Error computing object-wise metrics: {e}")
@@ -1168,8 +1201,8 @@ class Gear5Tester:
                 seg_masks_np = None
                 per_frame_class_metrics = []
 
-        # Recreate valid_mask on GPU for visualization
-        valid_mask = (gt_depth_metric > 0)  # [T, 1, H, W] on GPU
+        # Recreate valid_mask for visualization (on CPU)
+        valid_mask = (gt_depth_metric > 0)  # [T, 1, H, W] on CPU
 
         # Visualize
         if self.enable_visualization and self.config.eval.get('save_grid', True):
@@ -1180,7 +1213,10 @@ class Gear5Tester:
 
         # Save video (GIF or MP4)
         # Note: frame_interval is NOT applied to video - use all frames
-        if self.enable_visualization and self.config.eval.get('out_video', True):
+        # Skip video for long sequences (urbansyn, unreal4k) to save time and disk space
+        skip_video_datasets = ['urbansyn', 'unreal4k']
+        should_save_video = dataset_name not in skip_video_datasets
+        if self.enable_visualization and self.config.eval.get('out_video', True) and should_save_video:
             # Use original model resolution for images (following FlashDepth approach)
             # save_gifs_as_grid/save_grid_to_mp4 will handle downsampling to save_res
             save_video_util(
@@ -1188,6 +1224,8 @@ class Gear5Tester:
                 save_dir=self.save_dir,
                 config=self.config
             )
+        elif not should_save_video:
+            logger.info(f"Skipping video save for {dataset_name} (long sequence dataset)")
 
         # Save best frame visualizations
         if self.enable_visualization and len(frame_metrics) > 0:

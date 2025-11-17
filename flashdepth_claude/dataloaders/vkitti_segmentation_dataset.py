@@ -61,7 +61,8 @@ class VKITTISegmentationDataset(Dataset):
         video_length: int = 50,
         resolution: int = 518,
         max_depth: float = 80.0,
-        only_clone: bool = True
+        only_clone: bool = True,
+        use_sliding_window: bool = False
     ):
         """
         Initialize VKITTI2 dataset.
@@ -73,13 +74,15 @@ class VKITTISegmentationDataset(Dataset):
             resolution: Target resolution ('base', '2k', or int for square)
             max_depth: Maximum depth value (meters)
             only_clone: If True, only use 'clone' condition; else use all conditions
+            use_sliding_window: If True, create multiple overlapping sequences; else one sequence per scene
         """
         self.data_root = Path(data_root)
         self.split = split
         self.video_length = video_length
         self.only_clone = only_clone
+        self.use_sliding_window = use_sliding_window
 
-        logger.info(f"VKITTISegmentationDataset initialized with video_length={video_length}, only_clone={only_clone}")
+        logger.info(f"VKITTISegmentationDataset initialized with video_length={video_length}, only_clone={only_clone}, use_sliding_window={use_sliding_window}")
 
         # Handle resolution like CombinedDataset (preserves aspect ratio)
         # Original VKITTI2 is 1242×375 (3.312 ratio)
@@ -173,14 +176,19 @@ class VKITTISegmentationDataset(Dataset):
                     logger.warning(f"Sequence {scene_name}/{condition} has only {len(frame_indices)} valid frames (< 5), skipping")
                     continue
 
-                # Create sliding window sequences
+                # Create sequences
                 if len(frame_indices) <= self.video_length:
                     # Single sequence with all frames
                     sequences.append((scene_dir, condition, frame_indices))
                 else:
-                    # Multiple sequences with sliding window
-                    for start_idx in range(0, len(frame_indices) - self.video_length + 1, self.video_length // 2):
-                        seq_frame_indices = frame_indices[start_idx:start_idx + self.video_length]
+                    if self.use_sliding_window:
+                        # Multiple sequences with sliding window (overlapping)
+                        for start_idx in range(0, len(frame_indices) - self.video_length + 1, self.video_length // 2):
+                            seq_frame_indices = frame_indices[start_idx:start_idx + self.video_length]
+                            sequences.append((scene_dir, condition, seq_frame_indices))
+                    else:
+                        # Single sequence: only use first video_length frames
+                        seq_frame_indices = frame_indices[:self.video_length]
                         sequences.append((scene_dir, condition, seq_frame_indices))
 
         return sequences
