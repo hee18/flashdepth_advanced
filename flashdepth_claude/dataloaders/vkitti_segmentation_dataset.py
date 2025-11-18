@@ -37,21 +37,25 @@ class VKITTISegmentationDataset(Dataset):
     Virtual KITTI 2 Dataset with depth and semantic segmentation for object-wise evaluation.
     """
 
-    # VKITTI2 semantic class mapping (13 classes)
+    # VKITTI2 semantic class mapping (15 classes, 0-14)
+    # Based on VKITTI2 official colors.txt from homepage
+    # https://europe.naverlabs.com/research/computer-vision/proxy-virtual-worlds-vkitti-2/
     SEMANTIC_CLASSES = {
         0: 'Terrain',
-        1: 'Tree',
-        2: 'Vegetation',
-        3: 'Building',
-        4: 'Road',
-        5: 'GuardRail',
-        6: 'TrafficSign',
-        7: 'TrafficLight',
-        8: 'Pole',
-        9: 'Misc',
-        10: 'Truck',
-        11: 'Car',
-        12: 'Van'
+        1: 'Sky',
+        2: 'Tree',
+        3: 'Vegetation',
+        4: 'Building',
+        5: 'Road',
+        6: 'GuardRail',
+        7: 'TrafficSign',
+        8: 'TrafficLight',
+        9: 'Pole',
+        10: 'Misc',
+        11: 'Truck',
+        12: 'Car',
+        13: 'Van',
+        14: 'Undefined'
     }
 
     def __init__(
@@ -71,7 +75,7 @@ class VKITTISegmentationDataset(Dataset):
             data_root: Root directory (expects vkitti/ subdirectory)
             split: Dataset split ('test' or 'train')
             video_length: Number of consecutive frames per sequence
-            resolution: Target resolution ('base', '2k', or int for square)
+            resolution: Target resolution ('base', '2k', int for square, or None for original 1242×375)
             max_depth: Maximum depth value (meters)
             only_clone: If True, only use 'clone' condition; else use all conditions
             use_sliding_window: If True, create multiple overlapping sequences; else one sequence per scene
@@ -86,11 +90,15 @@ class VKITTISegmentationDataset(Dataset):
 
         # Handle resolution like CombinedDataset (preserves aspect ratio)
         # Original VKITTI2 is 1242×375 (3.312 ratio)
-        if isinstance(resolution, str):
+        # User specified: 1246×378 for base and 2k (3.296 ratio, 14x divisible)
+        if resolution is None:
+            # Use original resolution for test_comparison.py
+            self.resolution = (1242, 375)  # Original resolution
+        elif isinstance(resolution, str):
             if resolution == 'base':
-                self.resolution = (1712, 518)  # (width, height) - 3.306 ratio
+                self.resolution = (1246, 378)  # (width, height) - 3.296 ratio, 14x divisible
             elif resolution == '2k':
-                self.resolution = (4224, 1276)  # (width, height) - 3.309 ratio
+                self.resolution = (1246, 378)  # (width, height) - 3.296 ratio, 14x divisible
             else:
                 # Try to parse as int
                 self.resolution = int(resolution)
@@ -264,16 +272,51 @@ class VKITTISegmentationDataset(Dataset):
                 # Convert centimeters to meters
                 depth_meters = depth_cm.astype(np.float32) / 100.0
 
-                # Load segmentation
+                # Load segmentation (RGB color-coded)
                 seg_path = seg_dir / f'classgt_{frame_num:05d}.png'
-                seg = cv2.imread(str(seg_path), cv2.IMREAD_GRAYSCALE)
-                if seg is None:
+                seg_rgb = cv2.imread(str(seg_path), cv2.IMREAD_COLOR)
+                if seg_rgb is None:
                     raise ValueError(f"Failed to load segmentation from {seg_path}")
+
+                # Convert RGB color-coded segmentation to class IDs
+                # VKITTI uses BGR format from cv2, convert to RGB
+                seg_rgb = seg_rgb[:, :, ::-1]  # BGR to RGB
+
+                # Create class ID map
+                class_map = np.zeros((seg_rgb.shape[0], seg_rgb.shape[1]), dtype=np.int32)
+
+                # VKITTI2 RGB → Class ID mapping
+                # Source: VKITTI2 colors.txt (official homepage)
+                # https://europe.naverlabs.com/research/computer-vision/proxy-virtual-worlds-vkitti-2/
+                rgb_to_class = {
+                    (210, 0, 200): 0,       # Terrain
+                    (90, 200, 255): 1,      # Sky
+                    (0, 199, 0): 2,         # Tree
+                    (90, 240, 0): 3,        # Vegetation
+                    (140, 140, 140): 4,     # Building
+                    (100, 60, 100): 5,      # Road
+                    (250, 100, 255): 6,     # GuardRail
+                    (255, 255, 0): 7,       # TrafficSign
+                    (200, 200, 0): 8,       # TrafficLight
+                    (255, 130, 0): 9,       # Pole
+                    (80, 80, 80): 10,       # Misc
+                    (160, 60, 60): 11,      # Truck (OBJECT)
+                    (255, 127, 80): 12,     # Car (OBJECT)
+                    (0, 139, 139): 13,      # Van (OBJECT)
+                    (0, 0, 0): 14,          # Undefined
+                }
+
+                # Convert RGB to class ID
+                for rgb_key, class_id in rgb_to_class.items():
+                    mask = (seg_rgb[:, :, 0] == rgb_key[0]) & \
+                           (seg_rgb[:, :, 1] == rgb_key[1]) & \
+                           (seg_rgb[:, :, 2] == rgb_key[2])
+                    class_map[mask] = class_id
 
                 # Resize to target resolution
                 rgb_resized = rgb.resize((self.width, self.height), Image.BILINEAR)
                 depth_resized = cv2.resize(depth_meters, (self.width, self.height), interpolation=cv2.INTER_NEAREST)
-                seg_resized = cv2.resize(seg, (self.width, self.height), interpolation=cv2.INTER_NEAREST)
+                seg_resized = cv2.resize(class_map, (self.width, self.height), interpolation=cv2.INTER_NEAREST)
 
                 # Convert metric depth to inverse depth (1/m) to match WaymoSegmentationDataset/UrbanSynSegmentationDataset
                 # This ensures test_comparison.py can handle all segmentation datasets uniformly
@@ -304,8 +347,9 @@ class VKITTISegmentationDataset(Dataset):
                 'images': images,
                 'depth': depths,
                 'segmentations': segmentations,
-                'focal_lengths': focal_lengths,
-                'sequence_name': sequence_name
+                'focal_lengths_actual': focal_lengths,  # Match CombinedDataset naming
+                'sequence_name': sequence_name,
+                'dataset_name': 'vkitti'  # For intrinsics lookup
             }
 
         except Exception as e:
@@ -329,6 +373,7 @@ def collate_fn(batch):
         'images': torch.stack([item['images'] for item in batch]),  # [B, T, 3, H, W]
         'depth': torch.stack([item['depth'] for item in batch]),  # [B, T, H, W]
         'segmentations': torch.stack([item['segmentations'] for item in batch]),  # [B, T, H, W]
-        'focal_lengths': torch.stack([item['focal_lengths'] for item in batch]),  # [B, T]
-        'sequence_name': [item['sequence_name'] for item in batch]  # List of strings
+        'focal_lengths_actual': torch.stack([item['focal_lengths_actual'] for item in batch]),  # [B, T] - Match CombinedDataset naming
+        'sequence_name': [item['sequence_name'] for item in batch],  # List of strings
+        'dataset_name': [item['dataset_name'] for item in batch]  # List of dataset names
     }

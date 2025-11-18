@@ -23,6 +23,7 @@ services:
     stdin_open: true
     tty: true
     shm_size: '16gb'  # Generous allocation (host has 252GB available)
+    ipc: host  # Use host IPC namespace to avoid shared memory limitations
     deploy:
       resources:
         reservations:
@@ -71,6 +72,7 @@ services:
     stdin_open: true
     tty: true
     shm_size: '16gb'
+    ipc: host  # Use host IPC namespace to avoid shared memory limitations
     deploy:
       resources:
         reservations:

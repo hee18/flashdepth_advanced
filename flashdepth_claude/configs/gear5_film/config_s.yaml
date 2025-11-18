@@ -1,16 +1,15 @@
-# Gear5 FiLM Hybrid Configuration - Phase 2: High Resolution (2K)
-# Hybrid Model: ViT-S student + ViT-L teacher with cross-attention
-# Architecture: Frozen Hybrid Encoder/DPT + Trainable Gear5FilmHead + Trainable Mamba + Trainable output_conv2
-# Resolution: 2K (aspect ratio preserved, e.g., 1022×434 for Sintel, 1918×1274 for Waymo)
+# Gear5 FiLM Configuration - ViT-S variant
+# Single-Stage: FiLM modulates DPT features before Mamba using 2-layer CLS tokens
+# Architecture: Frozen Encoder/DPT + Trainable Gear5FilmHead + Trainable Mamba + Trainable output_conv2
+# Modulation: Channel-wise gamma/beta applied to DPT path_1 features before temporal modeling
 
 # General settings
 config_dir: null # overwrite by --config-path
 inference: false
-load: configs/flashdepth/iter_43002.pth  # FlashDepth-S Hybrid checkpoint (ViT + DPT only)
-gear_checkpoint: null  # Phase 1-S checkpoint path (Gear5FilmHead + Mamba + output_conv2) - SET THIS!
+load: configs/flashdepth-s/iter_14001.pth  # FlashDepth-S pretrained weights (ViT + DPT + Mamba + output_conv)
 
 # Canonical space settings
-canonical_focal_length: 500.0  # Fixed canonical focal length (same as Phase 1)
+canonical_focal_length: 500.0  # Fixed canonical focal length for all resolutions (518x518)
 use_canonical_space: true  # ENABLED - all training data normalized to canonical focal length
 
 # Loss function selection (Gear5 style)
@@ -18,37 +17,36 @@ use_canonical_space: true  # ENABLED - all training data normalized to canonical
 # Can be changed via CLI: +loss_type=importance
 loss_type: "log_l1"
 
-# ========== Gear5 FiLM Phase 2 Hybrid Settings ==========
-# FiLM Architecture (Phase 2):
-#   - 2-layer CLS tokens [5, 11] for ViT-S hybrid (student encoder)
+# ========== Gear5 FiLM Specific Settings ==========
+# FiLM Architecture:
+#   - 2-layer CLS tokens [11, 23] for ViT-L (averaged, following Gear5 pattern)
 #   - GlobalFeatureNetwork: CLS tokens → global semantic features
 #   - ModulationNetwork: global features → channel-wise gamma/beta
 #   - SimpleFeatureModulator: Applies gamma/beta to DPT path_1 features
 #   - Modulated features then go through Mamba temporal modeling
-# Frozen: Hybrid ViT encoder (ViT-S + ViT-L + Cross Attn), DPT, output_conv1
+# Frozen: ViT encoder (~304M params), DPT (~35M params), output_conv1
 # Trainable: Gear5FilmHead (~132K params), Mamba (~0.9M params), output_conv2 (~0.6K params)
 
 # Dataset configuration
 dataset:
   data_root: null # change data path
-  resolution: '2k'  # 2K resolution (Phase 2)
+  resolution: 'base'  # 518x518
   video_length: 5
-  train_datasets: [mvs-synth, spring]  # Phase 2: high-quality datasets only
+  train_datasets: [mvs-synth, dynamicreplica, tartanair, pointodyssey, spring]
   val_datasets: [sintel, waymo_seg]
 
 # Training configuration
 training:
-  batch_size: 8   # Per GPU (reduced for 2K, effective 16 with 2 GPUs in DDP)
+  batch_size: 20  # Per GPU (effective 40 with 2 GPUs in DDP)
   workers: 8      # Optimized for 96 CPU cores
   iterations: 40001
   save_freq: 5000
   val_freq: 1000  # Validation every 1k steps
   log_freq: 100
   wandb: false
-  wandb_name: "gear5_film_phase2_hybrid"
-  gradient_checkpointing: true  # CRITICAL for 2K resolution memory management
+  wandb_name: "gear5_film_s_phase1"
 
-  # Learning rates (same as Phase 1)
+  # Learning rates
   # Gear5FilmHead + Mamba + output_conv2 are trainable
   film_lr: 1.0e-4     # FiLM modules learning rate
   mamba_lr: 1.0e-5    # Mamba learning rate (lower than FiLM)
@@ -61,14 +59,14 @@ training:
 
 # Model configuration
 model:
-  # ViT configuration (ViT-S for hybrid)
-  vit_size: "vits"  # Phase 2 uses ViT-S hybrid (embed_dim=384, dpt_dim=64)
+  # ViT configuration
+  vit_size: "vits"
   patch_size: 14
   attn_class: "MemEffAttention"
 
-  # Gear5 FiLM attention layer selection (2-layer CLS tokens for ViT-S)
-  target_blocks: [11, 23]  # ViT-L: layers 11, 23 (not used in Phase 2)
-  target_blocks_s: [5, 11]  # ViT-S: layers 5, 11 (used in Phase 2 hybrid)
+  # Gear5 FiLM attention layer selection (2-layer CLS tokens)
+  target_blocks: [5, 11]  # ViT-S: layers 5, 11
+  target_blocks_s: [5, 11]  # ViT-S: layers 5, 11 (for Phase 2 hybrid)
 
   # Mamba configuration (trainable in Gear5 FiLM)
   use_mamba: true
@@ -83,23 +81,22 @@ model:
   use_transformer_rnn: false
   use_xlstm: false
 
-# Hybrid model configuration (Phase 2)
+# Hybrid model (not used in Phase 1)
 hybrid_configs:
-  use_hybrid: true  # Enable hybrid model (ViT-S student + ViT-L teacher)
-  # Hybrid-specific settings (add more if needed from original flashdepth config)
+  use_hybrid: false
 
 # Evaluation configuration
 eval:
   compile: false
   metrics: true
   save_grid: true
-  outfolder: "test_gear5_film_hybrid"
+  outfolder: "test_gear5_film"
   test_datasets: [sintel, waymo_seg, eth3d, urbansyn, unreal4k]  # All test datasets (not used in training)
-  test_dataset_resolution: '2k'
+  test_dataset_resolution: 'base'
   random_input: null
   out_video: true
   out_mp4: false
-  save_res: 1024  # Higher resolution output
+  save_res: 518
   video_fps: 24
   gif_duration: 110
   save_depth_npy: false

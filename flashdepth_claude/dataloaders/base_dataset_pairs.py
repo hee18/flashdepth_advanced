@@ -47,9 +47,11 @@ class BaseDatasetPairs(Dataset):
             from .unreal4k_dataset import Unreal4kDepth as DepthDataset
         elif dataset_name.lower() == 'nuscenes':
             from .nuscenes_dataset import NuScenesDepth as DepthDataset
-
+        elif dataset_name.lower() == 'vkitti':
+            from .vkitti_dataset import VKITTIDepth as DepthDataset
         else:
             raise ValueError(f"Unknown dataset: {dataset_name}")
+
         return DepthDataset(root_dir=root_dir, split=split, load_cache=load_cache)
         
 

@@ -35,26 +35,38 @@ class WaymoSegmentationDataset(Dataset):
     """
 
     # Waymo semantic class mapping (v2.0)
+    # Reference: https://github.com/waymo-research/waymo-open-dataset/blob/master/src/waymo_open_dataset/protos/segmentation.proto
     SEMANTIC_CLASSES = {
         0: 'undefined',
-        1: 'vehicle',
-        2: 'pedestrian',
-        3: 'sign',
-        4: 'cyclist',
-        5: 'traffic_light',
-        6: 'pole',
-        7: 'construction_cone',
-        8: 'bicycle',
-        9: 'motorcycle',
-        10: 'building',
-        11: 'vegetation',
-        12: 'tree_trunk',
-        13: 'curb',
-        14: 'road',
-        15: 'lane_marker',
-        16: 'other_ground',
-        17: 'walkable',
-        18: 'sidewalk'
+        1: 'car',
+        2: 'truck',
+        3: 'bus',
+        4: 'other_vehicle',
+        5: 'motorcyclist',
+        6: 'bicyclist',
+        7: 'pedestrian',
+        8: 'sign',
+        9: 'traffic_light',
+        10: 'pole',
+        11: 'construction_cone',
+        12: 'bicycle',
+        13: 'motorcycle',
+        14: 'building',
+        15: 'vegetation',
+        16: 'tree_trunk',
+        17: 'curb',
+        18: 'road',
+        19: 'lane_marker',
+        20: 'other_ground',
+        21: 'walkable',
+        22: 'sidewalk',
+        # Extended classes (found in data)
+        23: 'unknown_23',
+        24: 'unknown_24',
+        25: 'unknown_25',
+        26: 'unknown_26',
+        27: 'unknown_27',
+        28: 'unknown_28'
     }
 
     def __init__(
@@ -74,7 +86,7 @@ class WaymoSegmentationDataset(Dataset):
             data_root: Root directory (expects waymo_seg/)
             split: Dataset split ('val')
             video_length: Number of consecutive frames per sequence
-            resolution: Target resolution ('base', '2k', or int for square)
+            resolution: Target resolution ('base', '2k', int for square, or None for original 1920×1280)
             max_depth: Maximum depth value (meters)
             camera_name: Camera to use ('FRONT', 'FRONT_LEFT', etc.)
             objwise_mode: If True, only use frames 0-19 with segmentation annotation
@@ -89,7 +101,10 @@ class WaymoSegmentationDataset(Dataset):
 
         # Handle resolution like CombinedDataset (preserves aspect ratio)
         # Original Waymo is 1920×1280 (1.5 ratio)
-        if isinstance(resolution, str):
+        if resolution is None:
+            # Use original resolution for test_comparison.py
+            self.resolution = (1920, 1280)  # Original resolution
+        elif isinstance(resolution, str):
             if resolution == 'base':
                 self.resolution = (784, 518)  # (width, height) - 1.514 ratio
             elif resolution == '2k':
@@ -480,7 +495,7 @@ class WaymoSegmentationDataset(Dataset):
                 'images': images,
                 'depth': depths,
                 'segmentations': segmentations,  # Changed to plural - per-frame
-                'focal_lengths': focal_lengths_tensor,  # Focal lengths for each frame
+                'focal_lengths_actual': focal_lengths_tensor,  # Focal lengths for each frame (match CombinedDataset naming)
                 'sequence_name': sequence_name,
                 'frame_indices': valid_frame_indices,  # Actual frame numbers
                 'dataset_name': 'waymo_seg'  # For intrinsics lookup
@@ -509,7 +524,7 @@ def collate_fn(batch):
         'depths': torch.stack([item['depth'] for item in batch]),  # Changed to 'depths' (plural)
         'dataset_name': [item['dataset_name'] for item in batch],  # List of dataset names
         'segmentations': torch.stack([item['segmentations'] for item in batch]),  # Per-frame segmentations
-        'focal_lengths': torch.stack([item['focal_lengths'] for item in batch]),  # Focal lengths per frame
+        'focal_lengths_actual': torch.stack([item['focal_lengths_actual'] for item in batch]),  # Match CombinedDataset naming
         'sequence_name': [item['sequence_name'] for item in batch],
         'frame_indices': [item['frame_indices'] for item in batch]  # Actual frame numbers
     }

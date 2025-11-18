@@ -55,6 +55,8 @@ class ObjectWiseMetrics:
 
     # VKITTI2 class IDs (15 classes, 0-14)
     # Source: VKITTI2 colors.txt (official homepage)
+    # https://europe.naverlabs.com/research/computer-vision/proxy-virtual-worlds-vkitti-2/
+    # Matches VKITTISegmentationDataset.SEMANTIC_CLASSES
     VKITTI2_CLASSES = {
         0: 'terrain', 1: 'sky', 2: 'tree', 3: 'vegetation', 4: 'building',
         5: 'road', 6: 'guard_rail', 7: 'traffic_sign', 8: 'traffic_light',
@@ -63,26 +65,39 @@ class ObjectWiseMetrics:
 
     # Waymo Open Dataset class IDs (Semantic Segmentation v2.0)
     # Based on Waymo Open Dataset 2.0 semantic segmentation labels
+    # Reference: https://github.com/waymo-research/waymo-open-dataset/blob/master/src/waymo_open_dataset/protos/segmentation.proto
     WAYMO_CLASSES = {
         0: 'undefined',
-        1: 'vehicle',
-        2: 'pedestrian',
-        3: 'sign',
-        4: 'cyclist',
-        5: 'traffic_light',
-        6: 'pole',
-        7: 'construction_cone',
-        8: 'bicycle',
-        9: 'motorcycle',
-        10: 'building',
-        11: 'vegetation',
-        12: 'tree_trunk',
-        13: 'curb',
-        14: 'road',
-        15: 'lane_marker',
-        16: 'other_ground',
-        17: 'walkable',
-        18: 'sidewalk',
+        1: 'car',                 # TYPE_CAR
+        2: 'truck',               # TYPE_TRUCK
+        3: 'bus',                 # TYPE_BUS
+        4: 'other_vehicle',       # TYPE_OTHER_VEHICLE
+        5: 'motorcyclist',        # TYPE_MOTORCYCLIST
+        6: 'bicyclist',           # TYPE_BICYCLIST
+        7: 'pedestrian',          # TYPE_PEDESTRIAN
+        8: 'sign',                # TYPE_SIGN
+        9: 'traffic_light',       # TYPE_TRAFFIC_LIGHT
+        10: 'pole',               # TYPE_POLE
+        11: 'construction_cone',  # TYPE_CONSTRUCTION_CONE
+        12: 'bicycle',            # TYPE_BICYCLE
+        13: 'motorcycle',         # TYPE_MOTORCYCLE
+        14: 'building',           # TYPE_BUILDING
+        15: 'vegetation',         # TYPE_VEGETATION
+        16: 'tree_trunk',         # TYPE_TREE_TRUNK
+        17: 'curb',               # TYPE_CURB
+        18: 'road',               # TYPE_ROAD
+        19: 'lane_marker',        # TYPE_LANE_MARKER
+        20: 'other_ground',       # TYPE_OTHER_GROUND
+        21: 'walkable',           # TYPE_WALKABLE
+        22: 'sidewalk',           # TYPE_SIDEWALK
+        # Extended classes (found in preprocessed data but not in official proto)
+        # These may be artifacts from panoptic->semantic conversion or dataset version differences
+        23: 'unknown_23',
+        24: 'unknown_24',
+        25: 'unknown_25',
+        26: 'unknown_26',
+        27: 'unknown_27',
+        28: 'unknown_28',
         255: 'ignore'
     }
 
@@ -118,7 +133,10 @@ class ObjectWiseMetrics:
     }
 
     WAYMO_OBJECT_CLASSES = {
-        'vehicle', 'pedestrian', 'cyclist', 'bicycle', 'motorcycle'
+        # Dynamic/movable objects only (exclude static scene elements)
+        'car', 'truck', 'bus', 'other_vehicle',           # Vehicles
+        'motorcyclist', 'bicyclist', 'pedestrian',        # People
+        'bicycle', 'motorcycle'                            # Two-wheelers
     }
 
     URBANSYN_OBJECT_CLASSES = {

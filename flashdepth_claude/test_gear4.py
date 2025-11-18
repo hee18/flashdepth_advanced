@@ -260,6 +260,7 @@ class Gear4Tester:
                     data_root=data_root,
                     split='test',
                     video_length=video_length,
+                    resolution=resolution,
                     only_clone=only_clone,
                     use_sliding_window=False  # One sequence per scene
                 )
@@ -362,6 +363,8 @@ class Gear4Tester:
                             self.resolution = (924, 518)
                         elif dataset_name in ['tartanair']:
                             self.resolution = (518, 518)
+                        elif dataset_name in ['vkitti']:
+                            self.resolution = (1246, 378)  # 3.296 ratio, near original, 14x divisible
                         else:
                             # Default fallback for unknown datasets
                             logger.warning(f"Unknown dataset '{dataset_name}' in path, using default 518x518")
@@ -377,6 +380,8 @@ class Gear4Tester:
                             self.resolution = (2044, 1022)
                         elif dataset_name in ['unreal4k']:
                             self.resolution = (2044, 1148)
+                        elif dataset_name in ['vkitti']:
+                            self.resolution = (1246, 378)  # 3.296 ratio, near original, 14x divisible
                         else:
                             # Default fallback for unknown datasets
                             logger.warning(f"Unknown dataset '{dataset_name}' in path, using default 1918x1078")
@@ -497,7 +502,16 @@ class Gear4Tester:
                     'resize_ratio': torch.stack(resize_ratios, dim=0),  # NEW: total resize ratio
                     'dataset_name': names
                 }
-            else:  # Old format (backwards compatibility)
+            elif len(batch[0]) == 5:  # Old format with actual_valid_mask (backwards compatibility)
+                images, depths, focal_lengths, actual_valid_masks, names = zip(*batch)
+                return {
+                    'image': torch.stack(images, dim=0),
+                    'depth': torch.stack(depths, dim=0),
+                    'focal_lengths': torch.stack(focal_lengths, dim=0),
+                    'actual_valid_mask': torch.stack(actual_valid_masks, dim=0),
+                    'dataset_name': names
+                }
+            else:  # Older format without actual_valid_mask (for backwards compatibility)
                 images, depths, focal_lengths, names = zip(*batch)
                 return {
                     'image': torch.stack(images, dim=0),
@@ -512,6 +526,9 @@ class Gear4Tester:
             result = batch[0]  # Batch size is 1
             if 'images' in result:
                 result['image'] = result.pop('images')  # Rename 'images' -> 'image'
+            # Add 'focal_lengths' key for compatibility (SegmentationDataset uses metric depth, no canonical transform)
+            if 'focal_lengths_actual' in result and 'focal_lengths' not in result:
+                result['focal_lengths'] = result['focal_lengths_actual']
             return result
 
         # Use default collate for dict items (training split)
@@ -681,7 +698,7 @@ class Gear4Tester:
         assert B == 1, "Batch size must be 1 for testing"
 
         # Extract dataset name for conditional saving
-        dataset_name = batch.get('dataset_name', ['unknown'])[0]
+        dataset_name = batch.get('dataset_name', 'unknown')
         if isinstance(dataset_name, (list, tuple)):
             dataset_name = dataset_name[0]
         dataset_name = dataset_name.lower() if isinstance(dataset_name, str) else 'unknown'
@@ -702,11 +719,11 @@ class Gear4Tester:
             MIN_INVERSE_CANONICAL = 100.0 / 70.0
             canonical_gt_valid = (gt_depth_inverse_100 > MIN_INVERSE_CANONICAL)  # [1, T, 1, H, W]
 
-        # Storage for predictions
-        pred_depths = []
-        importance_maps = []
-        fg_mask_list = []
-        bg_mask_list = []
+        # Storage for predictions (keep on GPU during FPS measurement)
+        pred_depths_gpu = []
+        importance_maps_gpu = []
+        fg_mask_gpu = []
+        bg_mask_gpu = []
 
         # Best frame tracking
         best_frame_idx = 0
@@ -767,7 +784,11 @@ class Gear4Tester:
         torch.cuda.empty_cache()
 
         # FPS measurement (like original FlashDepth)
-        warmup_frames = min(10, T)  # Warmup frames to skip initial overhead
+        # ETH3D uses fewer warmup frames due to high resolution
+        if dataset_name == 'eth3d':
+            warmup_frames = min(5, T)
+        else:
+            warmup_frames = min(10, T)
         start_time = None  # Will start timing after warmup
 
         # Initialize Mamba sequence for actual test (critical for temporal processing!)
@@ -864,13 +885,20 @@ class Gear4Tester:
                 torch.cuda.synchronize()
                 end_time = time.time()
 
-            # List append for visualization (outside FPS measurement)
-            # Move to CPU immediately to prevent GPU memory accumulation (OOM fix)
-            pred_depths.append(pred_depth_metric.cpu())
-            # Save upsampled importance_map (already smooth, no need to interpolate again in visualization)
-            importance_maps.append(importance_map_resized[0].cpu())  # [1, H, W] at image resolution
-            fg_mask_list.append(fg_mask[0].cpu())
-            bg_mask_list.append(bg_mask[0].cpu())
+            # List append for visualization
+            # Move to CPU only for warmup frames and after FPS measurement ends to exclude .cpu() overhead from FPS
+            if start_time is None or t >= T - 1:
+                # Warmup frames or last frame: transfer to CPU immediately
+                pred_depths_gpu.append(pred_depth_metric.cpu())
+                importance_maps_gpu.append(importance_map_resized[0].cpu())
+                fg_mask_gpu.append(fg_mask[0].cpu())
+                bg_mask_gpu.append(bg_mask[0].cpu())
+            else:
+                # During FPS measurement: keep on GPU
+                pred_depths_gpu.append(pred_depth_metric)
+                importance_maps_gpu.append(importance_map_resized[0])
+                fg_mask_gpu.append(fg_mask[0])
+                bg_mask_gpu.append(bg_mask[0])
 
             # Release intermediate tensors to prevent GPU memory accumulation
             # Critical for long sequences (e.g., urbansyn 1000 frames)
@@ -889,11 +917,15 @@ class Gear4Tester:
             fps = 0
             logger.warning(f"Too few frames ({T}) for FPS measurement (need > {warmup_frames})")
 
-        # Stack predictions
-        pred_depths = torch.stack(pred_depths, dim=0)  # [T, 1, H, W] in meters (CPU)
-        importance_maps = torch.stack(importance_maps, dim=0)  # [T, 1, patch_h, patch_w] (CPU)
-        fg_mask_all = torch.stack(fg_mask_list, dim=0)  # [T, 1, patch_h, patch_w] (CPU)
-        bg_mask_all = torch.stack(bg_mask_list, dim=0)  # [T, 1, patch_h, patch_w] (CPU)
+        # Stack predictions (mix of CPU and GPU tensors - move remaining GPU tensors to CPU)
+        pred_depths = torch.stack([p.cpu() if p.is_cuda else p for p in pred_depths_gpu], dim=0)  # [T, 1, H, W] in meters (CPU)
+        importance_maps = torch.stack([i.cpu() if i.is_cuda else i for i in importance_maps_gpu], dim=0)  # [T, 1, patch_h, patch_w] (CPU)
+        fg_mask_all = torch.stack([f.cpu() if f.is_cuda else f for f in fg_mask_gpu], dim=0)  # [T, 1, patch_h, patch_w] (CPU)
+        bg_mask_all = torch.stack([b.cpu() if b.is_cuda else b for b in bg_mask_gpu], dim=0)  # [T, 1, patch_h, patch_w] (CPU)
+
+        # Clear GPU memory
+        del pred_depths_gpu, importance_maps_gpu, fg_mask_gpu, bg_mask_gpu
+        torch.cuda.empty_cache()
 
         # Convert GT to metric depth for evaluation
         # GT is in canonical space (fx=500), de-canonicalize to actual space (like test_gear5)
@@ -1091,7 +1123,7 @@ class Gear4Tester:
                     logger.info(f"gear4_head has multi_layer_fusion: {hasattr(self.model.gear4_head, 'multi_layer_fusion')}")
                     if hasattr(self.model.gear4_head, 'multi_layer_fusion'):
                         fusion_weights = self.model.gear4_head.multi_layer_fusion.fusion_weights
-                        layer_weights = torch.softmax(fusion_weights, dim=0).detach().cpu().numpy()
+                        layer_weights = torch.softmax(fusion_weights, dim=0).detach().cpu().float().numpy()
                         logger.info(f"Successfully extracted layer_weights: {layer_weights}")
                     else:
                         logger.warning(f"gear4_head does not have multi_layer_fusion attribute")
@@ -1139,7 +1171,8 @@ class Gear4Tester:
                 layer_weights,  # Add layer weights
                 frame_metrics[best_frame_idx] if best_frame_idx < len(frame_metrics) else None,  # Add frame metrics (includes boundary_f1)
                 fx_ratio[0, best_frame_idx].item() if fx_ratio is not None else None,  # NEW: Metric3D fx_ratio
-                resize_ratio[0, best_frame_idx].item() if resize_ratio is not None else None  # NEW: Metric3D resize_ratio
+                resize_ratio[0, best_frame_idx].item() if resize_ratio is not None else None,  # NEW: Metric3D resize_ratio
+                dataset_name=dataset_name
             )
 
         return metrics
@@ -1171,7 +1204,7 @@ class Gear4Tester:
 
         for col, t in enumerate(frame_indices):
             # Row 0: Image (denormalize ImageNet normalization)
-            img = images[t].permute(1, 2, 0).cpu().numpy()
+            img = images[t].permute(1, 2, 0).cpu().float().numpy()
             # Min-Max normalization (FlashDepth original method)
             img = (img - img.min()) / (img.max() - img.min() + 1e-8)
             img = np.clip(img, 0, 1)
@@ -1182,8 +1215,8 @@ class Gear4Tester:
 
             # Row 1: Predicted metric depth (invalid pixels = black)
             MAX_DEPTH = 70.0
-            pred = pred_depths[t, 0].cpu().numpy()
-            gt = gt_depths[t, 0].cpu().numpy()
+            pred = pred_depths[t, 0].cpu().float().numpy()
+            gt = gt_depths[t, 0].cpu().float().numpy()
 
             # Check if dataset is sparse (< 50% valid GT pixels)
             gt_exists = (gt > 0)
@@ -1234,7 +1267,7 @@ class Gear4Tester:
             axes[1, col].axis('off')
 
             # Row 2: GT metric depth (invalid pixels = black)
-            gt = gt_depths[t, 0].cpu().numpy()
+            gt = gt_depths[t, 0].cpu().float().numpy()
             gt_valid = (gt > 0) & (gt < MAX_DEPTH)  # Only <70m
             gt_display = np.where(gt_valid, gt, np.nan)  # Invalid = NaN
             if gt_valid.sum() > 0:
@@ -1250,7 +1283,7 @@ class Gear4Tester:
 
             # Row 3: Importance map (already upsampled to image resolution in test_sequence)
             importance_resized = importance_maps[t]  # [1, H, W] already at image resolution
-            importance_display = importance_resized.squeeze().cpu().numpy()  # [H, W]
+            importance_display = importance_resized.squeeze().cpu().float().numpy()  # [H, W]
             axes[3, col].imshow(importance_display, cmap='jet', vmin=0, vmax=1)
             axes[3, col].set_title(f'Importance')
             axes[3, col].axis('off')
@@ -1304,7 +1337,7 @@ class Gear4Tester:
     def _save_best_frame_visualizations(self, image, pred_depth, gt_depth, importance_map,
                                         fg_mask, bg_mask, sequence_id, frame_idx, abs_rel, fps=None,
                                         seg_mask=None, class_metrics=None, layer_weights=None, frame_metrics=None,
-                                        fx_ratio=None, resize_ratio=None):
+                                        fx_ratio=None, resize_ratio=None, dataset_name='unknown'):
         """
         Save best frame visualization matching train_gear4 layout
 
@@ -1517,21 +1550,42 @@ class Gear4Tester:
             logger.info(f"[VISUALIZATION] seg_mask min: {seg_mask.min()}, max: {seg_mask.max()}")
             logger.info(f"[VISUALIZATION] seg_mask > 0 count: {(seg_mask > 0).sum()}")
 
-            # Waymo object class IDs (dynamic objects + important static objects)
-            # Based on WAYMO_OBJECT_CLASSES in utils/object_wise_evaluation.py
-            waymo_object_class_ids = [1, 2, 3, 4, 5, 6, 7, 8, 9]
-            # 1: vehicle, 2: pedestrian, 3: sign, 4: cyclist, 5: traffic_light,
-            # 6: pole, 7: construction_cone, 8: bicycle, 9: motorcycle
+            # Dataset-specific object class IDs
+            # Determine by dataset name instead of seg_max
+            if 'waymo' in dataset_name:
+                # Waymo object class IDs (dynamic objects + important static objects)
+                # Based on WAYMO_OBJECT_CLASSES in utils/object_wise_evaluation.py
+                object_class_ids = [1, 2, 3, 4, 5, 6, 7, 8, 9]
+                # 1: vehicle, 2: pedestrian, 3: sign, 4: cyclist, 5: traffic_light,
+                # 6: pole, 7: construction_cone, 8: bicycle, 9: motorcycle
+                dataset_type = 'Waymo'
+            elif 'vkitti' in dataset_name:
+                # VKITTI2 object class IDs (only vehicles)
+                # Based on VKITTI2_OBJECT_CLASSES in utils/object_wise_evaluation.py
+                object_class_ids = [11, 12, 13]
+                # 11: truck, 12: car, 13: van
+                dataset_type = 'VKITTI2'
+            elif 'urbansyn' in dataset_name:
+                # UrbanSyn object class IDs (dynamic objects)
+                # Based on URBANSYN_OBJECT_CLASSES in utils/object_wise_evaluation.py
+                object_class_ids = [11, 12, 13, 14, 15, 16, 17, 18]
+                # 11: person, 12: rider, 13: car, 14: truck, 15: bus, 16: motorcycle, 17: bicycle, 18: train
+                dataset_type = 'UrbanSyn'
+            else:
+                # Unknown dataset: use all non-zero values
+                object_class_ids = list(np.unique(seg_mask[seg_mask > 0]))
+                dataset_type = 'Unknown'
+                logger.warning(f"Unknown dataset '{dataset_name}', using all non-zero seg values: {object_class_ids}")
 
             # Create object mask: include dynamic objects and important static objects
             object_mask = np.zeros_like(seg_mask, dtype=np.uint8)
-            for class_id in waymo_object_class_ids:
+            for class_id in object_class_ids:
                 object_mask |= (seg_mask == class_id).astype(np.uint8)
 
             ax7.imshow(object_mask, cmap='gray', vmin=0, vmax=1, interpolation='nearest')
             object_ratio = object_mask.sum() / object_mask.size
             # Count only object classes present in this frame
-            num_object_classes = len([cid for cid in waymo_object_class_ids if (seg_mask == cid).any()])
+            num_object_classes = len([cid for cid in object_class_ids if (seg_mask == cid).any()])
 
             logger.info(f"[VISUALIZATION] object_mask sum: {object_mask.sum()}, ratio: {object_ratio*100:.1f}%, num_object_classes: {num_object_classes}")
 
@@ -1721,9 +1775,25 @@ def main(config: DictConfig):
     # Override config for testing
     config.inference = True
 
+    # Check for objwise mode set in __main__ block
+    if getattr(main, '_objwise_mode', False):
+        OmegaConf.update(config, 'object_wise.enabled', True, merge=False)
+
     tester = Gear4Tester(config)
     tester.test()
 
 
 if __name__ == "__main__":
+    import sys
+
+    # Handle --objwise flag BEFORE Hydra processes arguments
+    # This prevents "unrecognized arguments" error
+    objwise_mode = False
+    if '--objwise' in sys.argv:
+        objwise_mode = True
+        sys.argv = [arg for arg in sys.argv if arg != '--objwise']
+
+    # Store objwise_mode as function attribute so main() can access it
+    main._objwise_mode = objwise_mode
+
     main()

@@ -201,9 +201,13 @@ class ComparisonTester:
 
         logger.info(f"Setting up test loader for dataset: {dataset_name}")
 
-        # Object-wise datasets
-        if dataset_name.endswith('_seg'):
-            base_dataset_name = dataset_name.replace('_seg', '')
+        # Remove _seg suffix if present (for unified naming)
+        base_dataset_name = dataset_name.replace('_seg', '') if dataset_name.endswith('_seg') else dataset_name
+
+        # Dataset selection based on --objwise flag
+        # --objwise: Use SegmentationDataset (inverse depth)
+        # No flag: Use ComparisonDataset (metric depth)
+        if self.object_wise_enabled:
             if base_dataset_name == 'waymo':
                 # WaymoSegmentationDataset expects data_root to be waymo_seg directory
                 waymo_data_root = str(Path(data_root) / 'waymo_seg')
@@ -217,6 +221,7 @@ class ComparisonTester:
                     data_root=waymo_data_root,
                     split='val',
                     video_length=video_length,
+                    resolution=None,  # Use original 1920×1280 for comparison
                     objwise_mode=objwise_mode
                 )
                 collate_fn = waymo_collate_fn
@@ -229,50 +234,58 @@ class ComparisonTester:
                     data_root=data_root,
                     split='test',
                     video_length=video_length,
+                    resolution=None,  # Use original 2048×1024 for comparison
                     max_frames=1000
                 )
                 collate_fn = urbansyn_collate_fn
-                logger.info(f"Object-wise dataset: urbansyn_seg")
+                logger.info(f"Object-wise dataset: urbansyn (UrbanSynSegmentationDataset, inverse depth)")
             elif base_dataset_name == 'vkitti':
                 only_clone = self.config.get('only_clone', True)
                 dataset = VKITTISegmentationDataset(
                     data_root=data_root,
                     split='test',
                     video_length=video_length,
+                    resolution=None,  # Use original 1242×375 for comparison
                     only_clone=only_clone,
                     use_sliding_window=False  # One sequence per scene
                 )
                 collate_fn = vkitti_collate_fn
-                logger.info(f"Object-wise dataset: vkitti_seg (only_clone={only_clone})")
+                logger.info(f"Object-wise dataset: vkitti (VKITTISegmentationDataset, inverse depth, only_clone={only_clone})")
             else:
-                raise ValueError(f"Unknown segmentation dataset: {dataset_name}")
+                raise ValueError(f"Unknown segmentation dataset for --objwise: {base_dataset_name}. "
+                                f"Supported: waymo, urbansyn, vkitti")
         else:
-            # Standard datasets - use ComparisonDataset for fair comparison
+            # Standard evaluation - use ComparisonDataset (metric depth)
             # ComparisonDataset provides ORIGINAL resolution images
             # Match FlashDepth original inference behavior (split='test' for comprehensive testing)
-            # waymo: uses 'val' split (hardcoded directory path in dataset implementation)
+            # waymo_seg: uses 'val' split (hardcoded directory path in dataset implementation)
             # others: use 'test' split (all scenes)
-            if dataset_name == 'waymo':
+
+            # Determine split based on base dataset name
+            if base_dataset_name == 'waymo':
                 split = 'val'
             else:
                 split = 'test'
 
             # Get only_clone flag for VKITTI
-            only_clone = self.config.get('only_clone', False) if dataset_name == 'vkitti' else False
+            only_clone = self.config.get('only_clone', False) if base_dataset_name == 'vkitti' else False
 
             # Get unrealstereo4k_seq if specified
-            unrealstereo4k_seq = self.config.get('unrealstereo4k_seq', None) if dataset_name == 'unrealstereo4k' else None
+            unrealstereo4k_seq = self.config.get('unrealstereo4k_seq', None) if base_dataset_name == 'unrealstereo4k' else None
 
+            # Use base_dataset_name (with _seg removed) for ComparisonDataset
+            # ComparisonDataset will look for waymo_seg, vkitti, urbansyn directories
             dataset = ComparisonDataset(
-                dataset_name=dataset_name,
+                dataset_name=base_dataset_name if base_dataset_name != 'waymo' else 'waymo_seg',
                 data_root=data_root,
                 split=split,
                 video_length=video_length,
-                objwise_enabled=self.object_wise_enabled,
+                objwise_enabled=False,  # Not using object-wise mode
                 only_clone=only_clone,
                 unrealstereo4k_seq=unrealstereo4k_seq
             )
             collate_fn = comparison_collate_fn
+            logger.info(f"Standard dataset: {base_dataset_name} (ComparisonDataset, metric depth)")
 
         # For high resolution datasets, use num_workers=0 to avoid OOM and slow worker processes
         num_workers = self.config.get('workers', 4)
@@ -376,7 +389,8 @@ class ComparisonTester:
         if intrinsics is not None:
             focal_lengths = intrinsics[:, :, 0]  # [1, T] - fx values
         else:
-            focal_lengths = batch.get('focal_lengths', None)
+            # Try focal_lengths_actual first (SegmentationDataset), then focal_lengths (legacy)
+            focal_lengths = batch.get('focal_lengths_actual', batch.get('focal_lengths', None))
             if focal_lengths is not None:
                 focal_lengths = focal_lengths.to(self.device)
 

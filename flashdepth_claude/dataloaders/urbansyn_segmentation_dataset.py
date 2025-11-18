@@ -61,7 +61,7 @@ class UrbanSynSegmentationDataset(Dataset):
             data_root: Root directory (expects urbansyn/)
             split: Dataset split ('test', 'train', 'val')
             video_length: Number of consecutive frames per sequence
-            resolution: Target resolution ('base', '2k', or int for square)
+            resolution: Target resolution ('base', '2k', int for square, or None for original 2048×1024)
             max_frames: Maximum number of frames to use (UrbanSyn has 1000 total)
         """
         self.data_root = Path(data_root) / 'urbansyn'
@@ -73,7 +73,10 @@ class UrbanSynSegmentationDataset(Dataset):
 
         # Handle resolution like CombinedDataset (preserves aspect ratio)
         # Original UrbanSyn is 2048×1024 (2.0 ratio)
-        if isinstance(resolution, str):
+        if resolution is None:
+            # Use original resolution for test_comparison.py
+            self.resolution = (2048, 1024)  # Original resolution
+        elif isinstance(resolution, str):
             if resolution == 'base':
                 self.resolution = (1036, 518)  # (width, height) - 2.0 ratio
             elif resolution == '2k':
@@ -258,8 +261,8 @@ def urbansyn_collate_fn(batch):
     return {
         'images': sample['image'].unsqueeze(0),  # (1, T, 3, H, W) - Changed to 'images' (plural)
         'depths': sample['depth'].unsqueeze(0),  # (1, T, H, W) - Changed to 'depths' (plural)
-        'dataset_name': sample['dataset_name'],  # For intrinsics lookup
+        'dataset_name': [sample['dataset_name']],  # List for consistency with other datasets
         'segmentations': sample['segmentations'].unsqueeze(0),  # (1, T, H, W)
-        'focal_lengths': sample['focal_lengths'].unsqueeze(0),  # (1, T)
-        'sequence_name': sample['sequence_name']
+        'focal_lengths_actual': sample['focal_lengths'].unsqueeze(0),  # (1, T) - Match CombinedDataset naming
+        'sequence_name': [sample['sequence_name']]  # List for consistency
     }

@@ -111,6 +111,10 @@ show_usage() {
     echo "  $0 test_gear4_objwise --dataset waymo_seg --config-variant l --gpu 2  # Gear4 object-wise"
     echo "  $0 test_gear5_objwise --dataset waymo_seg --gpu 0  # Gear5 object-wise evaluation"
     echo "  $0 test_gear5_objwise --dataset urbansyn --gpu 1  # Gear5 object-wise evaluation on UrbanSyn"
+    echo "  $0 train_gear5 --gpu 0  # Gear5 training with GRU (default)"
+    echo "  $0 train_gear5 --mamba --gpu 0  # Gear5 training with Mamba2 for temporal modeling"
+    echo "  $0 test_gear5 --gpu 0  # Test Gear5 with GRU"
+    echo "  $0 test_gear5 --mamba --gpu 0  # Test Gear5 with Mamba2"
     echo "  $0 train_gear2_ddp --config-variant hybrid --gear-checkpoint train_results/gear2_s/best.pth  # Hybrid training with Gear-S weights"
     echo "  $0 test_original_flashdepth --gpu 0  # Test original FlashDepth (ViT-L)"
     echo "  DATASET=waymo $0 test_original_flashdepth --gpu 1  # Test on Waymo dataset"
@@ -212,6 +216,10 @@ while [[ $# -gt 0 ]]; do
         --dataset)
             OBJWISE_DATASET="$2"
             shift 2
+            ;;
+        --objwise)
+            OBJWISE_FLAG="true"
+            shift
             ;;
         --resolution)
             RESOLUTION="$2"
@@ -790,12 +798,16 @@ case $COMMAND in
 
         echo "Starting Gear2 testing - Ablation Study..."
         echo "Configuration:"
-        echo "  - Config variant: $CONFIG_VARIANT"
-        echo "  - GPU: $GPU_ID"
-        echo "  - Results directory: $RESULTS_DIR"
         echo "  - Video length: $VID_LEN"
         echo "  - Frame interval: $FRAME_INTERVAL"
+        echo "  - GPU: $GPU_ID"
+        echo "  - Results directory: $RESULTS_DIR"
         echo "  - Checkpoint: $FLASHDEPTH_CHECKPOINT"
+        echo "  - Config variant: $CONFIG_VARIANT"
+        echo "  - Workers: $WORKERS"
+        if [ "$OBJWISE_FLAG" == "true" ]; then
+            echo "  - Object-wise evaluation: ENABLED"
+        fi
         if [ -n "$OBJWISE_DATASET" ]; then
             echo "  - Dataset: $OBJWISE_DATASET"
         fi
@@ -805,11 +817,19 @@ case $COMMAND in
         echo ""
 
         # Build test_gear2 command with config variant
-        TEST_CMD="python test_gear2.py --config-path configs/gear2 --config-name config_$CONFIG_VARIANT dataset.data_root=/data/datasets +results_dir=$RESULTS_DIR +gpu=$GPU_ID"
+        TEST_CMD="python test_gear2.py --config-path configs/gear2 --config-name config_$CONFIG_VARIANT dataset.data_root=/data/datasets training.workers=$WORKERS +results_dir=$RESULTS_DIR +gpu=$GPU_ID"
+
+        # Add --objwise flag if requested
+        if [ "$OBJWISE_FLAG" == "true" ]; then
+            TEST_CMD="$TEST_CMD --objwise"
+        fi
 
         # Override dataset if specified
         if [ -n "$OBJWISE_DATASET" ]; then
             TEST_CMD="$TEST_CMD eval.test_datasets=[$OBJWISE_DATASET]"
+            # Remove _seg suffix for object_wise.dataset config
+            OBJWISE_DATASET_BASE="${OBJWISE_DATASET/_seg/}"
+            TEST_CMD="$TEST_CMD object_wise.dataset=$OBJWISE_DATASET_BASE"
         fi
 
         # Add resolution override
@@ -843,12 +863,16 @@ case $COMMAND in
 
         echo "Starting Gear3 testing..."
         echo "Configuration:"
-        echo "  - Config variant: $CONFIG_VARIANT"
-        echo "  - GPU: $GPU_ID"
-        echo "  - Results directory: $RESULTS_DIR"
         echo "  - Video length: $VID_LEN"
         echo "  - Frame interval: $FRAME_INTERVAL"
+        echo "  - GPU: $GPU_ID"
+        echo "  - Results directory: $RESULTS_DIR"
         echo "  - Checkpoint: $FLASHDEPTH_CHECKPOINT"
+        echo "  - Config variant: $CONFIG_VARIANT"
+        echo "  - Workers: $WORKERS"
+        if [ "$OBJWISE_FLAG" == "true" ]; then
+            echo "  - Object-wise evaluation: ENABLED"
+        fi
         if [ -n "$OBJWISE_DATASET" ]; then
             echo "  - Dataset: $OBJWISE_DATASET"
         fi
@@ -858,11 +882,19 @@ case $COMMAND in
         echo ""
 
         # Build test_gear3 command with config variant
-        TEST_CMD="python test_gear3.py --config-path configs/gear3 --config-name config_$CONFIG_VARIANT dataset.data_root=/data/datasets +results_dir=$RESULTS_DIR +gpu=$GPU_ID"
+        TEST_CMD="python test_gear3.py --config-path configs/gear3 --config-name config_$CONFIG_VARIANT dataset.data_root=/data/datasets training.workers=$WORKERS +results_dir=$RESULTS_DIR +gpu=$GPU_ID"
+
+        # Add --objwise flag if requested
+        if [ "$OBJWISE_FLAG" == "true" ]; then
+            TEST_CMD="$TEST_CMD --objwise"
+        fi
 
         # Override dataset if specified
         if [ -n "$OBJWISE_DATASET" ]; then
             TEST_CMD="$TEST_CMD eval.test_datasets=[$OBJWISE_DATASET]"
+            # Remove _seg suffix for object_wise.dataset config
+            OBJWISE_DATASET_BASE="${OBJWISE_DATASET/_seg/}"
+            TEST_CMD="$TEST_CMD object_wise.dataset=$OBJWISE_DATASET_BASE"
         fi
 
         # Add resolution override
@@ -896,12 +928,16 @@ case $COMMAND in
 
         echo "Starting Gear4 testing - Enhanced FG/BG Separation..."
         echo "Configuration:"
-        echo "  - Config variant: $CONFIG_VARIANT"
-        echo "  - GPU: $GPU_ID"
-        echo "  - Results directory: $RESULTS_DIR"
         echo "  - Video length: $VID_LEN"
         echo "  - Frame interval: $FRAME_INTERVAL"
+        echo "  - GPU: $GPU_ID"
+        echo "  - Results directory: $RESULTS_DIR"
         echo "  - Checkpoint: $FLASHDEPTH_CHECKPOINT"
+        echo "  - Config variant: $CONFIG_VARIANT"
+        echo "  - Workers: $WORKERS"
+        if [ "$OBJWISE_FLAG" == "true" ]; then
+            echo "  - Object-wise evaluation: ENABLED"
+        fi
         if [ -n "$OBJWISE_DATASET" ]; then
             echo "  - Dataset: $OBJWISE_DATASET"
         fi
@@ -911,11 +947,19 @@ case $COMMAND in
         echo ""
 
         # Build test_gear4 command with config variant
-        TEST_CMD="python test_gear4.py --config-path configs/gear4 --config-name config_$CONFIG_VARIANT dataset.data_root=/data/datasets +results_dir=$RESULTS_DIR +gpu=$GPU_ID"
+        TEST_CMD="python test_gear4.py --config-path configs/gear4 --config-name config_$CONFIG_VARIANT dataset.data_root=/data/datasets training.workers=$WORKERS +results_dir=$RESULTS_DIR +gpu=$GPU_ID"
+
+        # Add --objwise flag if requested
+        if [ "$OBJWISE_FLAG" == "true" ]; then
+            TEST_CMD="$TEST_CMD --objwise"
+        fi
 
         # Override dataset if specified
         if [ -n "$OBJWISE_DATASET" ]; then
             TEST_CMD="$TEST_CMD eval.test_datasets=[$OBJWISE_DATASET]"
+            # Remove _seg suffix for object_wise.dataset config
+            OBJWISE_DATASET_BASE="${OBJWISE_DATASET/_seg/}"
+            TEST_CMD="$TEST_CMD object_wise.dataset=$OBJWISE_DATASET_BASE"
         fi
 
         # Add resolution override
@@ -960,100 +1004,76 @@ case $COMMAND in
         ;;
 
     test_gear2_objwise)
-        # Object-wise evaluation for Gear2
-        OBJWISE_DATASET=${OBJWISE_DATASET:-waymo_seg}  # Default to waymo_seg
-
-        echo "Starting Gear2 Object-Wise Evaluation..."
-        echo "Configuration:"
-        echo "  - Config variant: $CONFIG_VARIANT"
-        echo "  - Dataset: $OBJWISE_DATASET"
-        echo "  - GPU: $GPU_ID"
-        echo "  - Results directory: $RESULTS_DIR"
-        echo "  - Video length: $VID_LEN"
-        echo "  - Checkpoint: $FLASHDEPTH_CHECKPOINT"
+        # DEPRECATED: Use test_gear2 --objwise instead
+        echo "⚠️  WARNING: 'test_gear2_objwise' is deprecated!"
+        echo "   Please use: ./run_docker.sh test_gear2 --objwise --dataset $OBJWISE_DATASET"
+        echo ""
+        echo "Redirecting to new command format..."
         echo ""
 
-        # Build command with object-wise options
-        TEST_CMD="python test_gear2.py --config-path configs/gear2 --config-name config_$CONFIG_VARIANT dataset.data_root=/data/datasets eval.test_datasets=[$OBJWISE_DATASET] +results_dir=$RESULTS_DIR +gpu=$GPU_ID object_wise.enabled=true object_wise.dataset=${OBJWISE_DATASET/_seg/} +vid_len=$VID_LEN"
+        # Redirect to new format
+        OBJWISE_FLAG="true"
+        OBJWISE_DATASET=${OBJWISE_DATASET:-waymo_seg}
 
-        if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
-            TEST_CMD="$TEST_CMD load=$FLASHDEPTH_CHECKPOINT"
-        fi
-
-        CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm flashdepth $TEST_CMD
+        # Call test_gear2 with objwise flag
+        exec "$0" test_gear2 --objwise --dataset "$OBJWISE_DATASET" "${@:2}"
         ;;
 
     test_gear3_objwise)
-        # Object-wise evaluation for Gear3
-        OBJWISE_DATASET=${OBJWISE_DATASET:-waymo_seg}  # Default to waymo_seg
-
-        echo "Starting Gear3 Object-Wise Evaluation..."
-        echo "Configuration:"
-        echo "  - Config variant: $CONFIG_VARIANT"
-        echo "  - Dataset: $OBJWISE_DATASET"
-        echo "  - GPU: $GPU_ID"
-        echo "  - Results directory: $RESULTS_DIR"
-        echo "  - Video length: $VID_LEN"
-        echo "  - Checkpoint: $FLASHDEPTH_CHECKPOINT"
+        # DEPRECATED: Use test_gear3 --objwise instead
+        echo "⚠️  WARNING: 'test_gear3_objwise' is deprecated!"
+        echo "   Please use: ./run_docker.sh test_gear3 --objwise --dataset $OBJWISE_DATASET"
+        echo ""
+        echo "Redirecting to new command format..."
         echo ""
 
-        # Build command with object-wise options
-        TEST_CMD="python test_gear3.py --config-path configs/gear3 --config-name config_$CONFIG_VARIANT dataset.data_root=/data/datasets eval.test_datasets=[$OBJWISE_DATASET] +results_dir=$RESULTS_DIR +gpu=$GPU_ID object_wise.enabled=true object_wise.dataset=${OBJWISE_DATASET/_seg/} +vid_len=$VID_LEN"
+        # Redirect to new format
+        OBJWISE_FLAG="true"
+        OBJWISE_DATASET=${OBJWISE_DATASET:-waymo_seg}
 
-        if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
-            TEST_CMD="$TEST_CMD load=$FLASHDEPTH_CHECKPOINT"
-        fi
-
-        CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm flashdepth $TEST_CMD
+        # Call test_gear3 with objwise flag
+        exec "$0" test_gear3 --objwise --dataset "$OBJWISE_DATASET" "${@:2}"
         ;;
 
     test_gear4_objwise)
-        # Object-wise evaluation for Gear4
-        OBJWISE_DATASET=${OBJWISE_DATASET:-waymo_seg}  # Default to waymo_seg
-
-        echo "Starting Gear4 Object-Wise Evaluation..."
-        echo "Configuration:"
-        echo "  - Config variant: $CONFIG_VARIANT"
-        echo "  - Dataset: $OBJWISE_DATASET"
-        echo "  - GPU: $GPU_ID"
-        echo "  - Results directory: $RESULTS_DIR"
-        echo "  - Video length: $VID_LEN"
-        echo "  - Checkpoint: $FLASHDEPTH_CHECKPOINT"
+        # DEPRECATED: Use test_gear4 --objwise instead
+        echo "⚠️  WARNING: 'test_gear4_objwise' is deprecated!"
+        echo "   Please use: ./run_docker.sh test_gear4 --objwise --dataset $OBJWISE_DATASET"
+        echo ""
+        echo "Redirecting to new command format..."
         echo ""
 
-        # Build command with object-wise options
-        TEST_CMD="python test_gear4.py --config-path configs/gear4 --config-name config_$CONFIG_VARIANT dataset.data_root=/data/datasets eval.test_datasets=[$OBJWISE_DATASET] +results_dir=$RESULTS_DIR +gpu=$GPU_ID object_wise.enabled=true object_wise.dataset=${OBJWISE_DATASET/_seg/} +vid_len=$VID_LEN +whole_test=$WHOLE_TEST"
+        # Redirect to new format
+        OBJWISE_FLAG="true"
+        OBJWISE_DATASET=${OBJWISE_DATASET:-waymo_seg}
 
-        if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
-            TEST_CMD="$TEST_CMD load=$FLASHDEPTH_CHECKPOINT"
-        fi
-
-        CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm flashdepth $TEST_CMD
+        # Call test_gear4 with objwise flag
+        exec "$0" test_gear4 --objwise --dataset "$OBJWISE_DATASET" "${@:2}"
         ;;
 
     train_gear5)
         echo "Starting Gear5 training..."
         echo "Configuration:"
+        echo "  - Config variant: $CONFIG_VARIANT"
+        echo "  - Config file: configs/gear5/config_$CONFIG_VARIANT.yaml"
         echo "  - Batch size: $BATCH_SIZE"
         echo "  - Workers: $WORKERS"
         echo "  - GPU: $GPU_ID"
         echo "  - Results directory: $RESULTS_DIR"
-        echo "  - FlashDepth checkpoint: $FLASHDEPTH_CHECKPOINT"
         echo "  - Loss type: $LOSS_TYPE"
         echo "  - Temporal backend: $([ "$MAMBA" = "true" ] && echo "Mamba2" || echo "GRU")"
         echo ""
 
-        # Build train_gear5 command
+        # Build train_gear5 command with config variant
         DOCKER_CMD="CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm -e WANDB_API_KEY=${WANDB_API_KEY:-} flashdepth python train_gear5.py \
             --config-path configs/gear5 \
-            --config-name config \
+            --config-name config_$CONFIG_VARIANT \
             dataset.data_root=/data/datasets \
             training.batch_size=$BATCH_SIZE \
             training.workers=$WORKERS \
             training.iterations=$TOTAL_ITERS \
             training.wandb=$WANDB \
             model.use_mamba_temporal=$MAMBA \
-            +config_variant=$CONFIG_VARIANT \
             use_canonical_space=$USE_CANONICAL \
             loss_type=$LOSS_TYPE \
             +results_dir=$RESULTS_DIR"
@@ -1061,11 +1081,6 @@ case $COMMAND in
         # Add wandb name if specified
         if [ -n "$WANDB_NAME" ]; then
             DOCKER_CMD="$DOCKER_CMD training.wandb_name=$WANDB_NAME"
-        fi
-
-        # Add FlashDepth checkpoint (ViT + DPT pretrained weights)
-        if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
-            DOCKER_CMD="$DOCKER_CMD load=$FLASHDEPTH_CHECKPOINT"
         fi
 
         eval $DOCKER_CMD
@@ -1097,6 +1112,7 @@ case $COMMAND in
         echo "Starting Gear5 training (Multi-GPU: 0,1)..."
         echo "Configuration:"
         echo "  - Config variant: $CONFIG_VARIANT"
+        echo "  - Config file: configs/gear5/config_$CONFIG_VARIANT.yaml"
         echo "  - Resolution: $RES_NAME"
         echo "  - Batch size per GPU: $BATCH_SIZE"
         echo "  - Effective batch size: $((BATCH_SIZE * 2))"
@@ -1105,7 +1121,6 @@ case $COMMAND in
         echo "  - GPUs: 0,1"
         echo "  - Results directory: $RESULTS_DIR"
         echo "  - FPS measurement: $MEASURE_FPS"
-        echo "  - FlashDepth checkpoint: $FLASHDEPTH_CHECKPOINT"
         echo "  - Loss type: $LOSS_TYPE"
         echo "  - Temporal backend: $([ "$MAMBA" = "true" ] && echo "Mamba2" || echo "GRU")"
         echo ""
@@ -1121,7 +1136,7 @@ case $COMMAND in
             --nproc_per_node=2 \
             train_gear5.py \
             --config-path configs/gear5 \
-            --config-name config \
+            --config-name config_$CONFIG_VARIANT \
             dataset.data_root=/data/datasets \
             training.batch_size=$BATCH_SIZE \
             training.workers=$ACTUAL_WORKERS \
@@ -1129,7 +1144,6 @@ case $COMMAND in
             training.measure_fps=$MEASURE_FPS \
             training.wandb=$WANDB \
             model.use_mamba_temporal=$MAMBA \
-            +config_variant=$CONFIG_VARIANT \
             use_canonical_space=$USE_CANONICAL \
             loss_type=$LOSS_TYPE \
             +results_dir=$RESULTS_DIR"
@@ -1137,11 +1151,6 @@ case $COMMAND in
         # Add wandb name if specified
         if [ -n "$WANDB_NAME" ]; then
             DOCKER_CMD="$DOCKER_CMD training.wandb_name=$WANDB_NAME"
-        fi
-
-        # Add FlashDepth checkpoint (ViT + DPT pretrained weights)
-        if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
-            DOCKER_CMD="$DOCKER_CMD load=$FLASHDEPTH_CHECKPOINT"
         fi
 
         eval $DOCKER_CMD
@@ -1155,6 +1164,12 @@ case $COMMAND in
         echo "  - GPU: $GPU_ID"
         echo "  - Results directory: $RESULTS_DIR"
         echo "  - Checkpoint: $FLASHDEPTH_CHECKPOINT"
+        echo "  - Config variant: $CONFIG_VARIANT"
+        echo "  - Workers: $WORKERS"
+        echo "  - Temporal backend: $([ "$MAMBA" = "true" ] && echo "Mamba2" || echo "GRU")"
+        if [ "$OBJWISE_FLAG" == "true" ]; then
+            echo "  - Object-wise evaluation: ENABLED"
+        fi
         if [ -n "$OBJWISE_DATASET" ]; then
             echo "  - Dataset: $OBJWISE_DATASET"
         else
@@ -1167,16 +1182,29 @@ case $COMMAND in
             --config-path configs/gear5 \
             --config-name config \
             dataset.data_root=/data/datasets \
+            model.use_mamba_temporal=$MAMBA \
+            training.workers=$WORKERS \
             +results_dir=$RESULTS_DIR \
             +gpu=$GPU_ID \
             +vid_len=$VID_LEN \
             +frame_interval=$FRAME_INTERVAL \
             +visualization=$VISUALIZATION"
 
+        # Add --objwise flag if requested
+        if [ "$OBJWISE_FLAG" == "true" ]; then
+            TEST_CMD="$TEST_CMD --objwise"
+        fi
+
         # Add dataset override if specified
         if [ -n "$OBJWISE_DATASET" ]; then
             TEST_CMD="$TEST_CMD eval.test_datasets=[$OBJWISE_DATASET]"
+            # Remove _seg suffix for object_wise.dataset config
+            OBJWISE_DATASET_BASE="${OBJWISE_DATASET/_seg/}"
+            TEST_CMD="$TEST_CMD object_wise.dataset=$OBJWISE_DATASET_BASE"
         fi
+
+        # Add resolution override
+        TEST_CMD="$TEST_CMD +resolution=$RESOLUTION"
 
         # Add checkpoint
         if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
@@ -1187,53 +1215,48 @@ case $COMMAND in
         ;;
 
     test_gear5_objwise)
-        # Object-wise evaluation for Gear5
-        OBJWISE_DATASET=${OBJWISE_DATASET:-waymo_seg}  # Default to waymo_seg
-
-        echo "Starting Gear5 Object-Wise Evaluation..."
-        echo "Configuration:"
-        echo "  - Dataset: $OBJWISE_DATASET"
-        echo "  - GPU: $GPU_ID"
-        echo "  - Results directory: $RESULTS_DIR"
-        echo "  - Video length: $VID_LEN"
-        echo "  - Checkpoint: $FLASHDEPTH_CHECKPOINT"
+        # DEPRECATED: Use test_gear5 --objwise instead
+        echo "⚠️  WARNING: 'test_gear5_objwise' is deprecated!"
+        echo "   Please use: ./run_docker.sh test_gear5 --objwise --dataset $OBJWISE_DATASET"
+        echo ""
+        echo "Redirecting to new command format..."
         echo ""
 
-        # Build command with object-wise options
-        TEST_CMD="python test_gear5.py \
-            --config-path configs/gear5 \
-            --config-name config \
-            dataset.data_root=/data/datasets \
-            eval.test_datasets=[$OBJWISE_DATASET] \
-            +results_dir=$RESULTS_DIR \
-            +gpu=$GPU_ID \
-            object_wise.enabled=true \
-            object_wise.dataset=${OBJWISE_DATASET/_seg/} \
-            +vid_len=$VID_LEN \
-            +whole_seq_test=$WHOLE_TEST"
+        # Redirect to new format
+        OBJWISE_FLAG="true"
+        OBJWISE_DATASET=${OBJWISE_DATASET:-waymo_seg}
 
-        if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
-            TEST_CMD="$TEST_CMD load=$FLASHDEPTH_CHECKPOINT"
-        fi
-
-        CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm flashdepth $TEST_CMD
+        # Call test_gear5 with objwise flag
+        exec "$0" test_gear5 --objwise --dataset "$OBJWISE_DATASET" "${@:2}"
         ;;
 
     train_gear5_film)
+        # Auto-set FlashDepth checkpoint based on CONFIG_VARIANT if not explicitly specified
+        if [ "$FLASHDEPTH_CHECKPOINT" = "configs/flashdepth-l/iter_10001.pth" ]; then
+            if [ "$CONFIG_VARIANT" = "s" ]; then
+                FLASHDEPTH_CHECKPOINT="configs/flashdepth-s/iter_10001.pth"
+            elif [ "$CONFIG_VARIANT" = "l" ]; then
+                FLASHDEPTH_CHECKPOINT="configs/flashdepth-l/iter_10001.pth"
+            elif [ "$CONFIG_VARIANT" = "hybrid" ]; then
+                FLASHDEPTH_CHECKPOINT="configs/flashdepth-s/iter_10001.pth"
+            fi
+        fi
+
         echo "Starting Gear5 FiLM training..."
         echo "Configuration:"
+        echo "  - Config variant: $CONFIG_VARIANT"
+        echo "  - Config file: configs/gear5_film/config_$CONFIG_VARIANT.yaml"
         echo "  - Batch size: $BATCH_SIZE"
         echo "  - Workers: $WORKERS"
         echo "  - GPU: $GPU_ID"
         echo "  - Results directory: $RESULTS_DIR"
-        echo "  - FlashDepth checkpoint: $FLASHDEPTH_CHECKPOINT"
         echo "  - Loss type: $LOSS_TYPE"
         echo ""
 
-        # Build train_gear5_film command
+        # Build train_gear5_film command with config variant
         DOCKER_CMD="CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm -e WANDB_API_KEY=${WANDB_API_KEY:-} flashdepth python train_gear5_film.py \
             --config-path configs/gear5_film \
-            --config-name config \
+            --config-name config_$CONFIG_VARIANT \
             dataset.data_root=/data/datasets \
             training.batch_size=$BATCH_SIZE \
             training.workers=$WORKERS \
@@ -1248,11 +1271,6 @@ case $COMMAND in
             DOCKER_CMD="$DOCKER_CMD training.wandb_name=$WANDB_NAME"
         fi
 
-        # Add FlashDepth checkpoint (ViT + DPT + Mamba pretrained weights)
-        if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
-            DOCKER_CMD="$DOCKER_CMD load=$FLASHDEPTH_CHECKPOINT"
-        fi
-
         eval $DOCKER_CMD
         ;;
 
@@ -1263,6 +1281,8 @@ case $COMMAND in
 
         echo "Starting Gear5 FiLM training (Multi-GPU: 0,1)..."
         echo "Configuration:"
+        echo "  - Config variant: $CONFIG_VARIANT"
+        echo "  - Config file: configs/gear5_film/config_$CONFIG_VARIANT.yaml"
         echo "  - Batch size per GPU: $BATCH_SIZE"
         echo "  - Effective batch size: $((BATCH_SIZE * 2))"
         echo "  - Workers per GPU: $ACTUAL_WORKERS"
@@ -1270,7 +1290,6 @@ case $COMMAND in
         echo "  - GPUs: 0,1"
         echo "  - Results directory: $RESULTS_DIR"
         echo "  - FPS measurement: $MEASURE_FPS"
-        echo "  - FlashDepth checkpoint: $FLASHDEPTH_CHECKPOINT"
         echo "  - Loss type: $LOSS_TYPE"
         echo ""
 
@@ -1284,7 +1303,7 @@ case $COMMAND in
             --nproc_per_node=2 \
             train_gear5_film.py \
             --config-path configs/gear5_film \
-            --config-name config \
+            --config-name config_$CONFIG_VARIANT \
             dataset.data_root=/data/datasets \
             training.batch_size=$BATCH_SIZE \
             training.workers=$ACTUAL_WORKERS \
@@ -1300,11 +1319,6 @@ case $COMMAND in
             DOCKER_CMD="$DOCKER_CMD training.wandb_name=$WANDB_NAME"
         fi
 
-        # Add FlashDepth checkpoint (ViT + DPT + Mamba pretrained weights)
-        if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
-            DOCKER_CMD="$DOCKER_CMD load=$FLASHDEPTH_CHECKPOINT"
-        fi
-
         eval $DOCKER_CMD
         ;;
 
@@ -1316,6 +1330,11 @@ case $COMMAND in
         echo "  - GPU: $GPU_ID"
         echo "  - Results directory: $RESULTS_DIR"
         echo "  - Checkpoint: $FLASHDEPTH_CHECKPOINT"
+        echo "  - Config variant: $CONFIG_VARIANT"
+        echo "  - Workers: $WORKERS"
+        if [ "$OBJWISE_FLAG" == "true" ]; then
+            echo "  - Object-wise evaluation: ENABLED"
+        fi
         if [ -n "$OBJWISE_DATASET" ]; then
             echo "  - Dataset: $OBJWISE_DATASET"
         else
@@ -1328,16 +1347,28 @@ case $COMMAND in
             --config-path configs/gear5_film \
             --config-name config \
             dataset.data_root=/data/datasets \
+            training.workers=$WORKERS \
             +results_dir=$RESULTS_DIR \
             +gpu=$GPU_ID \
             +vid_len=$VID_LEN \
             +frame_interval=$FRAME_INTERVAL \
             +visualization=$VISUALIZATION"
 
+        # Add --objwise flag if requested
+        if [ "$OBJWISE_FLAG" == "true" ]; then
+            TEST_CMD="$TEST_CMD --objwise"
+        fi
+
         # Add dataset override if specified
         if [ -n "$OBJWISE_DATASET" ]; then
             TEST_CMD="$TEST_CMD eval.test_datasets=[$OBJWISE_DATASET]"
+            # Remove _seg suffix for object_wise.dataset config
+            OBJWISE_DATASET_BASE="${OBJWISE_DATASET/_seg/}"
+            TEST_CMD="$TEST_CMD object_wise.dataset=$OBJWISE_DATASET_BASE"
         fi
+
+        # Add resolution override
+        TEST_CMD="$TEST_CMD +resolution=$RESOLUTION"
 
         # Add checkpoint
         if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then

@@ -147,10 +147,18 @@ class Gear5Tester:
         # Add Gear5 metric head (unified single-stage)
         embed_dim = 1024 if model.encoder == 'vitl' else 384
 
+        # Get use_mamba_temporal from config (matches train_gear5.py)
+        use_mamba_temporal = self.config.model.get('use_mamba_temporal', False)
+        if use_mamba_temporal:
+            logger.info("TemporalScalePredictor: Using Mamba2 for temporal modeling")
+        else:
+            logger.info("TemporalScalePredictor: Using GRU for temporal modeling")
+
         model.gear5_metric_head = Gear5MetricHead(
             embed_dim=embed_dim,
             feature_dim=256,
-            hidden_dim=128
+            hidden_dim=128,
+            use_mamba=use_mamba_temporal  # Support Mamba2 option
         )
 
         # Enable attention weights storage for 2 layers (unified)
@@ -344,6 +352,7 @@ class Gear5Tester:
                     data_root=data_root,
                     split='test',
                     video_length=video_length,
+                    resolution=resolution,
                     only_clone=only_clone,
                     use_sliding_window=False  # One sequence per scene
                 )
@@ -446,6 +455,8 @@ class Gear5Tester:
                             self.resolution = (924, 518)
                         elif dataset_name in ['tartanair']:
                             self.resolution = (518, 518)
+                        elif dataset_name in ['vkitti']:
+                            self.resolution = (1246, 378)  # 3.296 ratio, near original, 14x divisible
                         else:
                             # Default fallback for unknown datasets
                             logger.warning(f"Unknown dataset '{dataset_name}' in path, using default 518x518")
@@ -461,6 +472,8 @@ class Gear5Tester:
                             self.resolution = (2044, 1022)
                         elif dataset_name in ['unreal4k']:
                             self.resolution = (2044, 1148)
+                        elif dataset_name in ['vkitti']:
+                            self.resolution = (1246, 378)  # 3.296 ratio, near original, 14x divisible
                         else:
                             # Default fallback for unknown datasets
                             logger.warning(f"Unknown dataset '{dataset_name}' in path, using default 1918x1078")
@@ -605,6 +618,9 @@ class Gear5Tester:
             result = batch[0]  # Batch size is 1
             if 'images' in result:
                 result['image'] = result.pop('images')  # Rename 'images' -> 'image'
+            # Add 'focal_lengths' key for compatibility (SegmentationDataset uses metric depth, no canonical transform)
+            if 'focal_lengths_actual' in result and 'focal_lengths' not in result:
+                result['focal_lengths'] = result['focal_lengths_actual']
             return result
 
         # Use default collate for dict items (training split)
@@ -700,7 +716,12 @@ class Gear5Tester:
             logger.info(f"Best sequence saved to {best_seq_path}")
 
             # Aggregate and save object-wise metrics
+            logger.info(f"DEBUG: object_wise_enabled={self.object_wise_enabled}, all_object_wise_metrics count={len(all_object_wise_metrics)}")
+            if self.object_wise_enabled and len(all_object_wise_metrics) == 0:
+                logger.warning(f"DEBUG: No object-wise metrics collected! Check if 'segmentations' key exists in batches.")
+
             if self.object_wise_enabled and all_object_wise_metrics:
+                logger.info(f"DEBUG: Aggregating {len(all_object_wise_metrics)} object-wise metrics across sequences...")
                 logger.info("\n" + "="*80)
                 logger.info("OBJECT-WISE EVALUATION RESULTS")
                 logger.info("="*80)
@@ -717,6 +738,7 @@ class Gear5Tester:
                     aggregated_class_metrics,
                     object_wise_path
                 )
+                logger.info(f"DEBUG: Saved object_wise_results.json to {object_wise_path}")
 
         else:
             logger.warning("No metrics computed!")
@@ -738,13 +760,23 @@ class Gear5Tester:
         else:
             images = batch['image'].to(self.device)  # [1, T, 3, H, W]
 
+        # Extract dataset name first for logging
+        dataset_name = batch.get('dataset_name', 'unknown')
+        if isinstance(dataset_name, (list, tuple)):
+            dataset_name = dataset_name[0]
+        dataset_name = dataset_name.lower() if isinstance(dataset_name, str) else 'unknown'
+
         # Handle both 'depths' (WaymoSegmentationDataset objwise) and 'depth' (CombinedDataset)
         if 'depths' in batch:
             gt_depth = batch['depths'].to(self.device)  # [1, T, H, W] - objwise mode
         else:
             gt_depth = batch['depth'].to(self.device)  # [1, T, H, W] or [T, H, W] - val split
 
-        focal_lengths = batch['focal_lengths'].to(self.device)  # [1, T], all 500.0 (canonical)
+        # Handle both focal_lengths and focal_lengths_actual (CombinedDataset uses focal_lengths_actual)
+        if 'focal_lengths_actual' in batch:
+            focal_lengths = batch['focal_lengths_actual'].to(self.device)  # [1, T] or [T]
+        else:
+            focal_lengths = batch['focal_lengths'].to(self.device)  # [1, T], all 500.0 (canonical)
 
         # Get actual space valid mask if available (from updated CombinedDataset)
         if 'actual_valid_mask' in batch:
@@ -763,12 +795,6 @@ class Gear5Tester:
 
         B, T = images.shape[:2]
         assert B == 1, "Batch size must be 1 for testing"
-
-        # Extract dataset name for conditional saving
-        dataset_name = batch.get('dataset_name', ['unknown'])[0]
-        if isinstance(dataset_name, (list, tuple)):
-            dataset_name = dataset_name[0]
-        dataset_name = dataset_name.lower() if isinstance(dataset_name, str) else 'unknown'
 
         # Dataloader gives inverse depth (1/m) already in canonical space (fx=500), scale to 100/m
         gt_depth_inverse_100 = gt_depth * 100.0  # [1, T, 1, H, W] in canonical 100/m
@@ -793,7 +819,7 @@ class Gear5Tester:
             fx_actual_first = fx_actual_tensor[0, 0].item()
         else:
             # Fallback: Use dataset-wide typical_fx (less accurate for per-frame datasets)
-            dataset_name = batch.get('dataset_name', ['unknown'])[0]
+            dataset_name = batch.get('dataset_name', 'unknown')
             if isinstance(dataset_name, (list, tuple)):
                 dataset_name = dataset_name[0]
             fx_actual_first = self._get_actual_focal_length(dataset_name, images.shape)
@@ -826,12 +852,12 @@ class Gear5Tester:
             MIN_INVERSE_CANONICAL = 100.0 / 70.0
             canonical_gt_valid = (gt_depth_inverse_100 > MIN_INVERSE_CANONICAL)  # [1, T, 1, H, W]
 
-        # Storage for predictions
-        pred_depths = []
-        importance_maps = []
-        scales_list = []
-        shifts_list = []
-        canonical_pred_valid_all = []  # Store canonical pred masks
+        # Storage for predictions (keep on GPU during FPS measurement to avoid .cpu() overhead)
+        pred_depths_gpu = []
+        importance_maps_gpu = []
+        scales_gpu = []
+        shifts_gpu = []
+        canonical_pred_valid_gpu = []  # Store canonical pred masks (on GPU)
 
         # Best frame tracking
         best_frame_idx = 0
@@ -902,7 +928,12 @@ class Gear5Tester:
         torch.cuda.empty_cache()
 
         # FPS measurement (like original FlashDepth)
-        warmup_frames = min(10, T)  # Warmup frames to skip initial overhead
+        # ETH3D: shorter sequences (30 frames) → use 5 warmup frames
+        # Other datasets: longer sequences → use 10 warmup frames
+        if dataset_name == 'eth3d':
+            warmup_frames = min(5, T)
+        else:
+            warmup_frames = min(10, T)
         start_time = None  # Will start timing after warmup
 
         # Initialize Mamba sequence for actual test (critical for temporal processing!)
@@ -983,7 +1014,6 @@ class Gear5Tester:
                 # Save canonical pred mask (before de-canonicalization!)
                 MIN_INVERSE_CANONICAL = 100.0 / 70.0
                 canonical_pred_valid_t = (pred_depth_inverse_100 > MIN_INVERSE_CANONICAL)  # [1, 1, H, W]
-                canonical_pred_valid_all.append(canonical_pred_valid_t.cpu())
 
                 # De-canonicalization: convert from canonical space to actual space (inverse depth)
                 # pred_inverse_actual = pred_inverse_canonical * (CANONICAL_FX / fx_actual)
@@ -1011,13 +1041,22 @@ class Gear5Tester:
                 torch.cuda.synchronize()
                 end_time = time.time()
 
-            # List append for visualization (outside FPS measurement)
-            # Move to CPU immediately to prevent GPU memory accumulation (OOM fix)
-            pred_depths.append(pred_depth_metric.cpu())
-            # Save upsampled importance_map (already smooth, no need to interpolate again in visualization)
-            importance_maps.append(importance_map_resized[0].cpu())  # [1, H, W] at image resolution
-            scales_list.append(scale[0].cpu())  # [1]
-            shifts_list.append(shift[0].cpu())  # [1]
+            # List append: Keep on GPU during FPS measurement, move to CPU after
+            # This prevents .cpu() overhead from affecting FPS while avoiding OOM on long sequences
+            if start_time is None or t >= T - 1:
+                # FPS measurement ended or not started - move to CPU immediately
+                pred_depths_gpu.append(pred_depth_metric.cpu())
+                importance_maps_gpu.append(importance_map_resized[0].cpu())
+                scales_gpu.append(scale[0].cpu())
+                shifts_gpu.append(shift[0].cpu())
+                canonical_pred_valid_gpu.append(canonical_pred_valid_t.cpu())
+            else:
+                # FPS measurement in progress - keep on GPU
+                pred_depths_gpu.append(pred_depth_metric)
+                importance_maps_gpu.append(importance_map_resized[0])
+                scales_gpu.append(scale[0])
+                shifts_gpu.append(shift[0])
+                canonical_pred_valid_gpu.append(canonical_pred_valid_t)
 
             # Release intermediate tensors to prevent GPU memory accumulation
             # Critical for long sequences (e.g., urbansyn 1000 frames)
@@ -1037,11 +1076,16 @@ class Gear5Tester:
             fps = 0
             logger.warning(f"Too few frames ({T}) for FPS measurement (need > {warmup_frames})")
 
-        # Stack predictions (already on CPU from loop)
-        pred_depths = torch.stack(pred_depths, dim=0)  # [T, 1, H, W] in meters (CPU)
-        importance_maps = torch.stack(importance_maps, dim=0)  # [T, 1, H, W] (CPU)
-        scales = torch.stack(scales_list, dim=0)  # [T, 1] (CPU)
-        shifts = torch.stack(shifts_list, dim=0)  # [T, 1] (CPU)
+        # Stack predictions (mix of CPU and GPU tensors - move remaining GPU tensors to CPU)
+        pred_depths = torch.stack([p.cpu() if p.is_cuda else p for p in pred_depths_gpu], dim=0)  # [T, 1, H, W] in meters
+        importance_maps = torch.stack([im.cpu() if im.is_cuda else im for im in importance_maps_gpu], dim=0)  # [T, 1, H, W]
+        scales = torch.stack([s.cpu() if s.is_cuda else s for s in scales_gpu], dim=0)  # [T, 1]
+        shifts = torch.stack([s.cpu() if s.is_cuda else s for s in shifts_gpu], dim=0)  # [T, 1]
+        canonical_pred_valid_all = [cpv.cpu() if cpv.is_cuda else cpv for cpv in canonical_pred_valid_gpu]  # Mixed CPU/GPU
+
+        # Clear memory
+        del pred_depths_gpu, importance_maps_gpu, scales_gpu, shifts_gpu, canonical_pred_valid_gpu
+        torch.cuda.empty_cache()
 
         # Convert GT to metric depth for visualization
         # GT is in canonical space (fx=500), de-canonicalize to actual space for visualization
@@ -1146,6 +1190,12 @@ class Gear5Tester:
         seg_masks_np = None  # Will store per-frame segmentations
         per_frame_class_metrics = []  # Per-frame metrics
 
+        if self.object_wise_enabled:
+            logger.info(f"DEBUG: object_wise_enabled=True, checking for segmentations in batch...")
+            logger.info(f"DEBUG: Batch keys: {batch.keys()}")
+            if 'segmentations' not in batch:
+                logger.warning(f"DEBUG: 'segmentations' key NOT FOUND in batch! Cannot compute object-wise metrics.")
+
         if self.object_wise_enabled and 'segmentations' in batch:
             try:
                 # Get per-frame segmentations
@@ -1156,6 +1206,14 @@ class Gear5Tester:
 
                 # Convert to numpy
                 seg_masks_np = seg_masks.cpu().numpy() if isinstance(seg_masks, torch.Tensor) else seg_masks
+
+                # Debug: Log unique class IDs in first frame
+                if sequence_id == 0:
+                    unique_classes = np.unique(seg_masks_np[0])
+                    logger.info(f"DEBUG: Unique class IDs in first frame: {unique_classes}")
+                    if self.object_wise_metrics:
+                        class_names = [self.object_wise_metrics.classes.get(c, f'unknown_{c}') for c in unique_classes]
+                        logger.info(f"DEBUG: Class names: {class_names}")
 
                 # Compute metrics for each frame
                 for t in range(T_seg):
@@ -1231,9 +1289,11 @@ class Gear5Tester:
         if self.enable_visualization and len(frame_metrics) > 0:
             logger.info(f"Best frame for sequence {sequence_id}: Frame {best_frame_idx} (AbsRel={best_frame_abs_rel:.4f})")
 
-            # Gear5 doesn't use multi-layer fusion weights (GRU-based, not layer fusion)
+            # Gear5 doesn't use multi-layer fusion weights (single temporal backend: GRU or Mamba2)
             layer_weights = None
-            logger.info(f"Gear5 uses GRU-based temporal modeling (no layer fusion weights)")
+            use_mamba = self.config.model.get('use_mamba_temporal', False)
+            temporal_backend = "Mamba2" if use_mamba else "GRU"
+            logger.info(f"Gear5 uses {temporal_backend}-based temporal modeling (no layer fusion weights)")
 
             # Get segmentation and actual frame number for best frame
             if self.object_wise_enabled and seg_masks_np is not None:
@@ -1277,7 +1337,8 @@ class Gear5Tester:
                 seg_mask_for_viz,  # Add segmentation mask (only if matches best_frame)
                 class_metrics_for_viz,  # Add class metrics
                 layer_weights,  # Add layer weights
-                frame_metrics[best_frame_idx] if best_frame_idx < len(frame_metrics) else None  # Add frame metrics (includes boundary_f1)
+                frame_metrics[best_frame_idx] if best_frame_idx < len(frame_metrics) else None,  # Add frame metrics (includes boundary_f1)
+                dataset_name  # Add dataset name for object class mapping
             )
 
         return metrics
@@ -1309,7 +1370,8 @@ class Gear5Tester:
 
         for col, t in enumerate(frame_indices):
             # Row 0: Image (denormalize ImageNet normalization)
-            img = images[t].permute(1, 2, 0).cpu().numpy()
+            # Convert BFloat16 to Float32 before numpy conversion
+            img = images[t].permute(1, 2, 0).cpu().float().numpy()
             # Min-Max normalization (FlashDepth original method)
             img = (img - img.min()) / (img.max() - img.min() + 1e-8)
             img = np.clip(img, 0, 1)
@@ -1320,8 +1382,9 @@ class Gear5Tester:
 
             # Row 1: Predicted metric depth (invalid pixels = black)
             MAX_DEPTH = 70.0
-            pred = pred_depths[t, 0].cpu().numpy()
-            gt = gt_depths[t, 0].cpu().numpy()
+            # Convert BFloat16 to Float32 before numpy conversion
+            pred = pred_depths[t, 0].cpu().float().numpy()
+            gt = gt_depths[t, 0].cpu().float().numpy()
 
             # Check if dataset is sparse (< 50% valid GT pixels)
             gt_exists = (gt > 0)
@@ -1332,7 +1395,7 @@ class Gear5Tester:
             gt_valid = (gt > 0) & (gt < MAX_DEPTH)
 
             if is_sparse:
-                # Sparse dataset (waymo_seg): Apply height mask + fill sparse gaps
+                # Sparse dataset (waymo_seg): Show pred dense, GT sparse
                 # 1. Find valid scan height range from GT
                 valid_pixels_per_row = gt_exists.sum(axis=1)  # [H]
                 min_valid_pixels_threshold = 10  # At least 10 GT pixels per row
@@ -1347,21 +1410,19 @@ class Gear5Tester:
                 else:
                     height_mask = np.ones_like(gt, dtype=bool)
 
-                # 2. GT missing mask (sparse LiDAR gaps)
-                gt_missing = ~gt_exists
-
-                # 3. Pred valid mask (canonical 70m)
+                # 2. Pred valid mask (canonical 70m) - DENSE
                 pred_valid_depth = (pred > 0) & (pred < MAX_DEPTH)
 
-                # 4. Final: Within height AND (GT valid OR (GT missing AND Pred valid))
-                pred_show_mask = height_mask & (gt_valid | (gt_missing & pred_valid_depth))
+                # 3. Show pred DENSE (all valid pixels within height range)
+                pred_show_mask = height_mask & pred_valid_depth  # Dense prediction
             else:
                 # Dense dataset (sintel): Just use GT valid mask
                 pred_show_mask = gt_valid
 
             # Row 2: GT metric depth (invalid pixels = black)
             # IMPORTANT: Compute GT's vmin/vmax FIRST, then use for both Pred and GT
-            gt = gt_depths[t, 0].cpu().numpy()
+            # Convert BFloat16 to Float32 before numpy conversion
+            gt = gt_depths[t, 0].cpu().float().numpy()
             gt_valid = (gt > 0) & (gt < MAX_DEPTH)  # Only <70m
             gt_display = np.where(gt_valid, gt, np.nan)  # Invalid = NaN
 
@@ -1389,7 +1450,8 @@ class Gear5Tester:
 
             # Row 3: Importance map (already upsampled to image resolution in test_sequence)
             importance_resized = importance_maps[t]  # [1, H, W] already at image resolution
-            importance_display = importance_resized.squeeze().cpu().numpy()  # [H, W]
+            # Convert BFloat16 to Float32 before numpy conversion
+            importance_display = importance_resized.squeeze().cpu().float().numpy()  # [H, W]
             axes[3, col].imshow(importance_display, cmap='jet', vmin=0, vmax=1)
             axes[3, col].set_title(f'Importance')
             axes[3, col].axis('off')
@@ -1442,7 +1504,7 @@ class Gear5Tester:
 
     def _save_best_frame_visualizations(self, image, gt_depth, model_outputs,
                                         sequence_id, frame_idx, abs_rel, fps=None,
-                                        seg_mask=None, class_metrics=None, layer_weights=None, frame_metrics=None):
+                                        seg_mask=None, class_metrics=None, layer_weights=None, frame_metrics=None, dataset_name='unknown'):
         """
         Save best frame visualization for Gear5 unified model
 
@@ -1519,16 +1581,13 @@ class Gear5Tester:
             else:
                 height_mask = np.ones_like(gt_depth, dtype=bool)
 
-            # 2. GT missing mask (sparse LiDAR gaps)
-            gt_missing = ~gt_exists
-
-            # 3. Pred valid mask (canonical 70m)
+            # 2. Pred valid mask (canonical 70m) - DENSE
             pred_valid_depth = (pred_depth > 0) & (pred_depth < MAX_DEPTH)
 
-            # 4. Final: Within height AND (GT valid OR (GT missing AND Pred valid))
-            pred_show_mask = height_mask & (gt_valid_mask | (gt_missing & pred_valid_depth))
+            # 3. Show pred DENSE (all valid pixels within height range)
+            pred_show_mask = height_mask & pred_valid_depth  # Dense prediction
 
-            # 5. Error mask (both GT and Pred valid)
+            # 4. Error mask (both GT and Pred valid)
             error_valid_mask = gt_valid_mask & pred_valid_depth
         else:
             # Dense dataset (sintel): Just use GT valid mask
@@ -1660,25 +1719,47 @@ class Gear5Tester:
             logger.info(f"[VISUALIZATION] seg_mask min: {seg_mask.min()}, max: {seg_mask.max()}")
             logger.info(f"[VISUALIZATION] seg_mask > 0 count: {(seg_mask > 0).sum()}")
 
-            # Waymo object class IDs (dynamic objects + important static objects)
-            # Based on WAYMO_OBJECT_CLASSES in utils/object_wise_evaluation.py
-            waymo_object_class_ids = [1, 2, 3, 4, 5, 6, 7, 8, 9]
-            # 1: vehicle, 2: pedestrian, 3: sign, 4: cyclist, 5: traffic_light,
-            # 6: pole, 7: construction_cone, 8: bicycle, 9: motorcycle
+            # Dataset-specific object class IDs
+            # Based on WAYMO_OBJECT_CLASSES, URBANSYN_OBJECT_CLASSES, VKITTI2_OBJECT_CLASSES
+            # in utils/object_wise_evaluation.py
 
-            # Create object mask: include dynamic objects and important static objects
+            # Determine object class IDs by dataset name
+            if 'waymo' in dataset_name:
+                # Waymo: class IDs 1-9
+                object_class_ids = [1, 2, 3, 4, 5, 6, 7, 8, 9]
+                # 1: vehicle, 2: pedestrian, 3: sign, 4: cyclist, 5: traffic_light,
+                # 6: pole, 7: construction_cone, 8: bicycle, 9: motorcycle
+                dataset_type = 'Waymo'
+            elif 'vkitti' in dataset_name:
+                # VKITTI2: class IDs 11-13 (truck, car, van)
+                object_class_ids = [11, 12, 13]
+                # 11: truck, 12: car, 13: van
+                dataset_type = 'VKITTI2'
+            elif 'urbansyn' in dataset_name:
+                # UrbanSyn: Cityscapes format, class IDs 11-18
+                object_class_ids = [11, 12, 13, 14, 15, 16, 17, 18]
+                # 11: person, 12: rider, 13: car, 14: truck, 15: bus,
+                # 16: train, 17: motorcycle, 18: bicycle
+                dataset_type = 'UrbanSyn'
+            else:
+                # Unknown dataset: use all classes from segmentation
+                logger.warning(f"Unknown dataset '{dataset_name}' for object class mapping, using all non-zero classes")
+                object_class_ids = list(np.unique(seg_mask[seg_mask > 0]))
+                dataset_type = 'Unknown'
+
+            # Create object mask: include dynamic objects
             object_mask = np.zeros_like(seg_mask, dtype=np.uint8)
-            for class_id in waymo_object_class_ids:
+            for class_id in object_class_ids:
                 object_mask |= (seg_mask == class_id).astype(np.uint8)
 
             ax7.imshow(object_mask, cmap='gray', vmin=0, vmax=1, interpolation='nearest')
             object_ratio = object_mask.sum() / object_mask.size
             # Count only object classes present in this frame
-            num_object_classes = len([cid for cid in waymo_object_class_ids if (seg_mask == cid).any()])
+            num_object_classes = len([cid for cid in object_class_ids if (seg_mask == cid).any()])
 
             logger.info(f"[VISUALIZATION] object_mask sum: {object_mask.sum()}, ratio: {object_ratio*100:.1f}%, num_object_classes: {num_object_classes}")
 
-            ax7.set_title(f'Object Mask\n{object_ratio*100:.1f}% ({object_mask.sum():,} pixels)\n{num_object_classes} object classes',
+            ax7.set_title(f'Object Mask ({dataset_type})\n{object_ratio*100:.1f}% ({object_mask.sum():,} pixels)\n{num_object_classes} object classes',
                          fontsize=14, fontweight='bold')
             ax7.axis('off')
 
@@ -1712,17 +1793,19 @@ class Gear5Tester:
                 bbox=dict(boxstyle="round", facecolor='wheat'))
         y_pos -= 0.10
 
-        # Original focal length + FG_ratio (wheat box)
-        # Note: In test mode, we use fx_actual from intrinsics (computed at sequence level)
-        # Get fx_actual from batch metadata
-        dataset_name = 'unknown'  # Will be retrieved from batch if available
-        # For now, use the focal_lengths from dataloader (canonical 500.0) as placeholder
-        # In actual testing, fx_actual is already computed at sequence level
-        fx_value = 500.0  # Canonical fx (test mode doesn't have easy access to fx_actual here)
+        # fx_ratio, resize_ratio, and FG_ratio (like train, wheat box)
+        fx_ratio_val = model_outputs.get('fx_ratio')
+        resize_ratio_val = model_outputs.get('resize_ratio')
         fg_ratio_computed = fg_ratio  # Already computed above from fg_mask_binary.mean() * 100
-        ax9.text(0.05, y_pos, f'original_fx: {fx_value:.1f} | FG_ratio: {fg_ratio_computed:.1f}',
-                fontsize=10, transform=ax9.transAxes,
-                bbox=dict(boxstyle="round", facecolor='wheat'))
+
+        if fx_ratio_val is not None and resize_ratio_val is not None:
+            ax9.text(0.05, y_pos, f'fx_ratio: {fx_ratio_val:.3f} | resize_ratio: {resize_ratio_val:.3f} | FG_ratio: {fg_ratio_computed:.1f}%',
+                    fontsize=10, transform=ax9.transAxes,
+                    bbox=dict(boxstyle="round", facecolor='wheat'))
+        else:
+            ax9.text(0.05, y_pos, f'FG_ratio: {fg_ratio_computed:.1f}%',
+                    fontsize=10, transform=ax9.transAxes,
+                    bbox=dict(boxstyle="round", facecolor='wheat'))
         y_pos -= 0.10
 
         # FPS if available
@@ -1874,9 +1957,26 @@ def main(config: DictConfig):
     # Override config for testing
     config.inference = True
 
+    # Enable object-wise evaluation if --objwise flag was passed
+    # (flag is removed from sys.argv in __main__ block before Hydra processes it)
+    if getattr(main, '_objwise_mode', False):
+        OmegaConf.update(config, 'object_wise.enabled', True, merge=False)
+
     tester = Gear5Tester(config)
     tester.test()
 
 
 if __name__ == "__main__":
+    import sys
+
+    # Handle --objwise flag BEFORE Hydra processes arguments
+    # This prevents "unrecognized arguments" error
+    objwise_mode = False
+    if '--objwise' in sys.argv:
+        objwise_mode = True
+        sys.argv = [arg for arg in sys.argv if arg != '--objwise']
+
+    # Store objwise_mode as function attribute so main() can access it
+    main._objwise_mode = objwise_mode
+
     main()

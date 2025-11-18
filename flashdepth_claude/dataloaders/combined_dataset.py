@@ -113,6 +113,8 @@ class CombinedDataset(Dataset):
                         self.reshape_list[dataset]['resolution'] = (1036,518)
                     elif dataset in ['unreal4k']:
                         self.reshape_list[dataset]['resolution'] = (924,518)
+                    elif dataset in ['vkitti']:
+                        self.reshape_list[dataset]['resolution'] = (1246, 378)  # 3.296 ratio, near original, 14x divisible
 
 
         elif resolution == '2k':
@@ -125,13 +127,15 @@ class CombinedDataset(Dataset):
                 for dataset in self.reshape_list:
                     self.reshape_list[dataset]['crop_type'] = None
                     if dataset in ['eth3d', 'waymo', 'waymo_seg']:
-                        self.reshape_list[dataset]['resolution'] = (1918,1274) 
+                        self.reshape_list[dataset]['resolution'] = (1918,1274)
                     if dataset in ['sintel']:
                         self.reshape_list[dataset]['resolution'] = (1022,434)
                     if dataset in ['urbansyn']:
                         self.reshape_list[dataset]['resolution'] = (2044,1022)
                     if dataset in ['unreal4k']:
-                        self.reshape_list[dataset]['resolution'] = (2044,1148) 
+                        self.reshape_list[dataset]['resolution'] = (2044,1148)
+                    if dataset in ['vkitti']:
+                        self.reshape_list[dataset]['resolution'] = (1246, 378)  # 3.296 ratio, near original, 14x divisible 
 
         else:
             raise ValueError(f"Resolution should be 'base' or '2k' for training")

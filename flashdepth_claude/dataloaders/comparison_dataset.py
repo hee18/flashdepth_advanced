@@ -995,28 +995,27 @@ class ComparisonDataset(Dataset):
         """
         Load UnrealStereo4K depth (.npy file)
 
-        UnrealStereo4K stores disparity/inverse depth (1/m) in .npy format.
-        Convert to normal depth (m) for comparison.
+        UnrealStereo4K stores METRIC DEPTH (m) in .npy format.
+        Despite variable names suggesting "disparity" in some places, the actual
+        data is already in meters and should NOT be inverted.
+
+        Confirmed by data analysis: median values 20-250m are reasonable metric depths,
+        while 1/x conversion would give unrealistic sub-centimeter values.
         """
-        # Load inverse depth or disparity
-        inverse_depth = np.load(path)
+        # Load metric depth (already in meters)
+        depth_meters = np.load(path)
 
         # Handle invalid values
         invalid_mask = np.logical_or.reduce((
-            np.isinf(inverse_depth),
-            np.isnan(inverse_depth),
-            inverse_depth <= 0
+            np.isinf(depth_meters),
+            np.isnan(depth_meters),
+            depth_meters <= 0
         ))
 
-        # Convert inverse depth to normal depth
-        depth = np.zeros_like(inverse_depth)
-        valid_mask = ~invalid_mask
-        depth[valid_mask] = 1.0 / inverse_depth[valid_mask]  # (1/m) → (m)
-
         # Set invalid to 0
-        depth[invalid_mask] = 0
+        depth_meters[invalid_mask] = 0
 
-        return torch.from_numpy(depth).float()  # [H, W] in meters
+        return torch.from_numpy(depth_meters).float()  # [H, W] in meters
 
     def _load_urbansyn_depth(self, path):
         """

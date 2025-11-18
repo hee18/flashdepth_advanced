@@ -52,29 +52,53 @@ class Unreal4kDepth(BaseDatasetPairs):
     def get_depth_name(self, img_name):
         return img_name.replace('.png', '.npy')
 
-    def depth_read(self, path, return_torch=False, **kwargs):
-        # unrealstereo4k provides disparity maps, would need to use baseline and focal length to get depth for training,
-        # but for evaluation we align the scale so it doesn't matter
-        inverse_depth = np.load(path)
+    def depth_read(self, path, is_inverse=False, return_torch=False, **kwargs):
+        """
+        Read depth from UnrealStereo4K.
 
+        UnrealStereo4K stores METRIC DEPTH (m) in .npy files, NOT disparity.
+        For training, we need to convert to inverse depth.
+
+        Args:
+            path: Path to .npy depth file
+            is_inverse: If True, convert metric depth to inverse depth (1/m)
+            return_torch: If True, return torch.Tensor
+
+        Returns:
+            Inverse depth (1/m) if is_inverse=True, else metric depth (m)
+        """
+        # Load metric depth (already in meters)
+        depth_meters = np.load(path)
+
+        # Handle invalid values
         invalid_mask = np.logical_or.reduce((
-            np.isinf(inverse_depth),
-            np.isnan(inverse_depth),
-            inverse_depth < 0
+            np.isinf(depth_meters),
+            np.isnan(depth_meters),
+            depth_meters <= 0
         ))
 
         if invalid_mask.any():
             logging.info(f"Found invalid values in {path}: "
-                        f"inf: {np.isinf(inverse_depth).sum()}, "
-                        f"nan: {np.isnan(inverse_depth).sum()}, "
-                        f"<0: {(inverse_depth < 0).sum()}")
+                        f"inf: {np.isinf(depth_meters).sum()}, "
+                        f"nan: {np.isnan(depth_meters).sum()}, "
+                        f"<=0: {(depth_meters <= 0).sum()}")
 
-        inverse_depth[invalid_mask] = -1
+        if is_inverse:
+            # Convert metric depth to inverse depth for training
+            inverse_depth = np.zeros_like(depth_meters)
+            valid_mask = ~invalid_mask
+            inverse_depth[valid_mask] = 1.0 / depth_meters[valid_mask]
+            inverse_depth[invalid_mask] = -1
+            result = inverse_depth
+        else:
+            # Return metric depth as-is
+            depth_meters[invalid_mask] = -1
+            result = depth_meters
 
         if return_torch:
-            inverse_depth = torch.from_numpy(inverse_depth).float()
+            result = torch.from_numpy(result).float()
 
-        return inverse_depth
+        return result
 
     def get_focal_length(self, pair, image_shape):
         """
