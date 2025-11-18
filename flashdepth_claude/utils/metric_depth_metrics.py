@@ -79,7 +79,8 @@ class MetricDepthMetrics:
 
     @staticmethod
     def compute_metric_depth_metrics(pred: torch.Tensor, gt: torch.Tensor,
-                                   valid_mask: Optional[torch.Tensor] = None) -> Dict[str, float]:
+                                   valid_mask: Optional[torch.Tensor] = None,
+                                   skip_boundary_f1: bool = False) -> Dict[str, float]:
         """
         Compute metrics for metric depth estimation (absolute depth values matter)
 
@@ -87,6 +88,7 @@ class MetricDepthMetrics:
             pred: Predicted depth in meters [H, W] or [N, H, W]
             gt: Ground truth depth in meters [H, W] or [N, H, W]
             valid_mask: Valid pixels mask [H, W] or [N, H, W]
+            skip_boundary_f1: Skip boundary F1 computation (for high-res datasets like ETH3D)
 
         Returns:
             Dictionary of metrics
@@ -108,7 +110,7 @@ class MetricDepthMetrics:
 
         # Absolute Relative Error
         abs_rel = torch.mean(torch.abs(pred_valid - gt_valid) / gt_valid)
-        
+
         # Squared Relative Error
         sq_rel = torch.mean(((pred_valid - gt_valid) ** 2) / gt_valid)
 
@@ -133,17 +135,21 @@ class MetricDepthMetrics:
         log_mae = torch.mean(torch.abs(pred_log - gt_log))
 
         # Boundary F1 score (edge accuracy / depth discontinuity detection)
-        # Convert to numpy for boundary_metrics computation
-        pred_np = pred.cpu().numpy() if isinstance(pred, torch.Tensor) else pred
-        gt_np = gt.cpu().numpy() if isinstance(gt, torch.Tensor) else gt
-
-        # Compute scale-invariant boundary F1 score
-        # (weighted average across thresholds from 5% to 25% depth changes)
-        try:
-            boundary_f1 = SI_boundary_F1(pred_np, gt_np, t_min=1.05, t_max=1.25, N=10)
-        except Exception as e:
-            # Fallback if computation fails
+        # Skip for high-resolution datasets (too slow)
+        if skip_boundary_f1:
             boundary_f1 = 0.0
+        else:
+            # Convert to numpy for boundary_metrics computation
+            pred_np = pred.cpu().numpy() if isinstance(pred, torch.Tensor) else pred
+            gt_np = gt.cpu().numpy() if isinstance(gt, torch.Tensor) else gt
+
+            # Compute scale-invariant boundary F1 score
+            # (weighted average across thresholds from 5% to 25% depth changes)
+            try:
+                boundary_f1 = SI_boundary_F1(pred_np, gt_np, t_min=1.05, t_max=1.25, N=10)
+            except Exception as e:
+                # Fallback if computation fails
+                boundary_f1 = 0.0
 
         return {
             "mae": mae.item(),
@@ -419,7 +425,8 @@ class RelativeDepthMetrics:
 
     @staticmethod
     def compute_relative_depth_metrics(pred: torch.Tensor, gt: torch.Tensor,
-                                       valid_mask: Optional[torch.Tensor] = None) -> Dict[str, float]:
+                                       valid_mask: Optional[torch.Tensor] = None,
+                                       skip_boundary_f1: bool = False) -> Dict[str, float]:
         """
         Compute metrics for relative depth estimation
 
@@ -431,10 +438,11 @@ class RelativeDepthMetrics:
             pred: Predicted relative depth [H, W] or [N, H, W]
             gt: Ground truth depth [H, W] or [N, H, W]
             valid_mask: Valid pixels mask [H, W] or [N, H, W]
+            skip_boundary_f1: Skip boundary F1 computation (for high-res datasets like ETH3D)
 
         Returns:
             Dictionary containing:
-            - boundary_f1: Scale-invariant boundary F1 score
+            - boundary_f1: Scale-invariant boundary F1 score (0.0 if skipped)
             - abs_rel_si: Scale-invariant absolute relative error
             - a1: Scale-invariant δ1 threshold accuracy
         """
@@ -446,15 +454,18 @@ class RelativeDepthMetrics:
             pred, gt, valid_mask
         )
 
-        # Convert to numpy for boundary F1 computation
-        pred_np = pred.cpu().numpy() if isinstance(pred, torch.Tensor) else pred
-        gt_np = gt.cpu().numpy() if isinstance(gt, torch.Tensor) else gt
-
-        # Compute scale-invariant boundary F1 score
-        try:
-            boundary_f1 = SI_boundary_F1(pred_np, gt_np, t_min=1.05, t_max=1.25, N=10)
-        except Exception as e:
+        # Compute scale-invariant boundary F1 score (skip for high-res datasets)
+        if skip_boundary_f1:
             boundary_f1 = 0.0
+        else:
+            # Convert to numpy for boundary F1 computation
+            pred_np = pred.cpu().numpy() if isinstance(pred, torch.Tensor) else pred
+            gt_np = gt.cpu().numpy() if isinstance(gt, torch.Tensor) else gt
+
+            try:
+                boundary_f1 = SI_boundary_F1(pred_np, gt_np, t_min=1.05, t_max=1.25, N=10)
+            except Exception as e:
+                boundary_f1 = 0.0
 
         return {
             "boundary_f1": float(boundary_f1),

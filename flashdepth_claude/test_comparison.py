@@ -525,16 +525,20 @@ class ComparisonTester:
                 if valid_mask.sum() > 0:
                     # Compute metrics based on depth mode
                     if self.depth_mode == 'metric':
+                        # Skip boundary F1 for ETH3D (too slow at 6048x4032 resolution)
+                        skip_f1 = (self.config.get('dataset', '') == 'eth3d')
                         frame_metric = self.metrics.compute_metric_depth_metrics(
-                            pred_frame, gt_frame, valid_mask
+                            pred_frame, gt_frame, valid_mask, skip_boundary_f1=skip_f1
                         )
                         # Track best frame (lowest AbsRel for metric)
                         if frame_metric['abs_rel'] < best_frame_abs_rel:
                             best_frame_abs_rel = frame_metric['abs_rel']
                             best_frame_idx = t
                     else:  # relative
+                        # Skip boundary F1 for ETH3D (too slow at 6048x4032 resolution)
+                        skip_f1 = (self.config.get('dataset', '') == 'eth3d')
                         frame_metric = self.relative_metrics.compute_relative_depth_metrics(
-                            pred_frame, gt_frame, valid_mask
+                            pred_frame, gt_frame, valid_mask, skip_boundary_f1=skip_f1
                         )
                         # Track best frame (highest F1 for relative)
                         if frame_metric['boundary_f1'] > best_frame_f1:
@@ -826,11 +830,19 @@ class ComparisonTester:
                     reordered[key] = value
             reordered_results.append(reordered)
 
+        # Get processing resolution from adapter
+        processing_resolution = self.adapter.processing_resolution
+        if isinstance(processing_resolution, tuple):
+            proc_res_str = f"{processing_resolution[0]}×{processing_resolution[1]}"
+        else:
+            proc_res_str = str(processing_resolution)
+
         # Save test results
         test_results = {
             'method': self.method_name,
             'dataset': self.config.get('dataset', 'waymo'),
             'num_sequences': len(self.all_results),
+            'processing_resolution': proc_res_str,
             'metrics': avg_metrics
         }
 
@@ -842,6 +854,7 @@ class ComparisonTester:
         logger.info(f"  Method: {self.method_name}")
         logger.info(f"  Dataset: {test_results['dataset']}")
         logger.info(f"  Sequences: {test_results['num_sequences']}")
+        logger.info(f"  Processing Resolution: {proc_res_str}")
         logger.info(f"  MAE: {avg_metrics.get('mae', 0):.4f}")
         logger.info(f"  RMSE: {avg_metrics.get('rmse', 0):.4f}")
         logger.info(f"  AbsRel: {avg_metrics.get('abs_rel', 0):.4f}")

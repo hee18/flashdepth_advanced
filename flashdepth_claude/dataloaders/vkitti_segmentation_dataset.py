@@ -58,6 +58,10 @@ class VKITTISegmentationDataset(Dataset):
         14: 'Undefined'
     }
 
+    # Define scene splits. Test set includes all 5 scenes to match user expectation.
+    TRAIN_SCENES = ['Scene01', 'Scene02', 'Scene18', 'Scene06', 'Scene20']
+    TEST_SCENES = ['Scene01', 'Scene02', 'Scene06', 'Scene18', 'Scene20']
+
     def __init__(
         self,
         data_root: str,
@@ -136,10 +140,21 @@ class VKITTISegmentationDataset(Dataset):
         sequences = []
 
         # Get all scene directories (Scene01, Scene02, ...)
-        scene_dirs = sorted([d for d in self.vkitti_root.iterdir()
+        all_scene_dirs = sorted([d for d in self.vkitti_root.iterdir()
                             if d.is_dir() and d.name.startswith('Scene')])
 
-        logger.info(f"Found {len(scene_dirs)} scenes in VKITTI2")
+        # Filter scenes based on the split
+        if self.split == 'train':
+            scenes_to_use = self.TRAIN_SCENES
+        elif self.split == 'test':
+            scenes_to_use = self.TEST_SCENES
+        else: # Fallback to all scenes if split is not train/test
+            scenes_to_use = [d.name for d in all_scene_dirs]
+        
+        scene_dirs = [d for d in all_scene_dirs if d.name in scenes_to_use]
+
+
+        logger.info(f"Found {len(scene_dirs)} scenes in VKITTI2 for split '{self.split}': {[d.name for d in scene_dirs]}")
 
         # Condition types in VKITTI2
         if self.only_clone:

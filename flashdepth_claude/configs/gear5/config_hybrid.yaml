@@ -1,32 +1,35 @@
 # Gear5 Hybrid Configuration - Phase 2 (2K Resolution with ViT-S)
-# Step 1: Global Scale & Shift Prediction from multi-layer CLS tokens (2K, ViT-S)
-# Step 2: Foreground-only modulation on globally-modulated features (2K, ViT-S)
+# Unified Single-Stage Training: Temporal Scale Prediction
 #
 # Architecture:
 # - DINOv2 ViT-S + ViT-L Hybrid Fusion (from FlashDepth-hybrid)
-# - DPT with Mamba temporal modeling
-# - Gear5 Metric Head: GSP (Step 1) + FFM (Step 2)
+# - DPT with Mamba temporal modeling (frozen)
+# - Gear5 Metric Head: 2-layer CLS tokens + GRU/Mamba2 temporal modeling
 #
 # Training pipeline:
-# Phase2 Step1: Load GSP+Mamba+output from Phase1 Step2, overwrite DINOv2+DPT from FlashDepth-hybrid
-# Phase2 Step2: Load from Phase2 Step1, add FFM from Phase1 Step2
+# Phase 2: Load Gear5 Phase 1 checkpoint (Gear5MetricHead + Mamba + output_conv)
+#          Overwrite ViT + DPT with FlashDepth-hybrid checkpoint
+# Freezing: ViT + DPT + Mamba + output_conv
+# Trainable: Only Gear5MetricHead (~132K params)
 
 # General settings
 config_dir: null # overwrite by --config-path
 inference: false
 load: configs/flashdepth/iter_43002.pth  # FlashDepth-hybrid checkpoint (DINOv2 ViT-L+S + DPT)
-gear_checkpoint: null  # Phase1 Step2 checkpoint (for Phase2 Step1) or Phase2 Step1 checkpoint (for Phase2 Step2)
-phase1_step2_checkpoint: null  # Phase1 Step2 checkpoint (for loading FFM in Phase2 Step2)
-step: 1  # Training step (1 or 2)
+gear_checkpoint: null  # Phase 1 Gear5 checkpoint (for Phase 2)
 
 # Canonical space settings
-canonical_focal_length: 1000.0  # Fixed canonical focal length for all resolutions
+canonical_focal_length: 500.0  # Fixed canonical focal length for all resolutions
 use_canonical_space: true  # ENABLED - all training data normalized to canonical focal length
 
+# Loss configuration
+loss_type: log_l1  # Loss type: log_l1 (default), importance (importance-weighted)
+
 # ========== Gear5 Specific Settings ==========
-# Step 1: Uses multi-layer CLS tokens [2, 5, 8, 11] (ViT-S) for global GSP
-# Step 2: Uses multi-layer attention [2, 5, 8, 11] (ViT-S) for FG mask generation
-# No separation_method config needed (hardcoded to multi_layer architecture)
+# Unified Single-Stage:
+# - Uses 2-layer CLS tokens: [5, 11] for ViT-S or [11, 23] for ViT-L
+# - GRU/Mamba2 temporal modeling for scale/shift prediction
+# - Attention-based importance map from 2 layers
 
 # Dataset configuration (2K resolution)
 dataset:
@@ -46,15 +49,10 @@ training:
   log_freq: 100
   gradient_checkpointing: true  # CRITICAL for 2K resolution (saves ~50% memory)
   wandb: false
-  wandb_name: "gear5_hybrid_step1"  # Update to gear5_hybrid_step2 for Step 2
+  wandb_name: "gear5_hybrid"
 
-  # Learning rates (step-specific, similar to Phase 1 but can be adjusted)
-  # Step 1: GSP (1e-4) + Mamba (1e-4) + Final (1e-4)
-  # Step 2: FG modulation (1e-4) + Mamba (5e-5, lower) + Final (5e-5)
-  gsp_lr: 1.0e-4      # Step 1: Global GSP learning rate
-  fg_mod_lr: 1.0e-4   # Step 2: FG modulation learning rate
-  mamba_lr: 1.0e-4    # Step 1: Mamba LR; Step 2: 5e-5 (lower for fine-tuning)
-  output_lr: 1.0e-4   # Step 1: Output head LR; Step 2: 5e-5
+  # Learning rate (unified single-stage)
+  gear3_lr: 1.0e-4    # Gear5MetricHead learning rate (same for all trainable params)
   weight_decay: 1.0e-6
 
   # FPS measurement
@@ -68,7 +66,16 @@ model:
   patch_size: 14
   attn_class: "MemEffAttention"
 
-  # Mamba configuration
+  # Gear5 2-layer architecture (for CLS tokens and attention weights)
+  # ViT-S: [5, 11], ViT-L: [11, 23]
+  target_blocks: [5, 11]  # 2-layer blocks for ViT-S
+
+  # Gear5 Temporal Modeling Backend (NEW: Support Mamba2 option)
+  # NOTE: This controls ONLY the TemporalScalePredictor module!
+  # The original FlashDepth Mamba modules (below) are ALWAYS frozen during Gear5 training.
+  use_mamba_temporal: false  # false=GRU (fast for T<50), true=Mamba2 (better for T>100)
+
+  # FlashDepth Mamba configuration (FROZEN during Gear5 training)
   use_mamba: true
   mamba_type: "add"
   num_mamba_layers: 4

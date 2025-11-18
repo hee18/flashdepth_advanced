@@ -87,6 +87,11 @@ class DepthAnythingV2Adapter(MethodAdapter):
         with torch.no_grad():
             depth_np = self.model.infer_image(image_np, self.input_size)  # [H, W]
 
+        # Record processing resolution on first inference
+        if self.processing_resolution is None:
+            self.processing_resolution = (self.input_size, self.input_size)
+            print(f"[DepthAnythingV2] Processing resolution: {self.input_size}×{self.input_size}")
+
         # Convert back to torch tensor
         depth = torch.from_numpy(depth_np).unsqueeze(0)  # [1, H, W]
 

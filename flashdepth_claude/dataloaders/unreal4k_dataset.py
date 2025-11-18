@@ -104,38 +104,11 @@ class Unreal4kDepth(BaseDatasetPairs):
         """
         Get focal length for UnrealStereo4K dataset.
 
-        UnrealStereo4K has intrinsics in Extrinsics0/*.txt files (first line).
-        Format (line 1): fx skew cx 0 fy cy 0 0 1
-        All scenes use the same intrinsics: fx=1920 for 3840x2160 resolution.
-
-        Args:
-            pair (dict): Data pair containing scene name
-            image_shape (tuple): (H, W) image shape AFTER resizing
-
-        Returns:
-            float: Focal length in pixels for current image shape
+        UnrealStereo4K has fixed intrinsics: fx=1920 for 3840x2160 resolution.
+        This method returns the focal length scaled to the current image_shape.
         """
-        # Try to read intrinsics from Extrinsics file
-        scene_name = pair['scene']
-        img_path = pair['rgb_path']
-        img_name = os.path.basename(img_path)
-        frame_idx = int(os.path.splitext(img_name)[0])
-
-        extrinsics_dir = os.path.join(self.root_dir, scene_name, 'Extrinsics0')
-        extrinsics_file = os.path.join(extrinsics_dir, f'{frame_idx:05d}.txt')
-
-        original_fx = 1920.0  # Default fallback
+        original_fx = 1920.0
         original_width = 3840
-
-        if os.path.exists(extrinsics_file):
-            try:
-                with open(extrinsics_file, 'r') as f:
-                    # Parse first line: fx skew cx 0 fy cy 0 0 1
-                    k_values = list(map(float, f.readline().split()))
-                    if len(k_values) >= 9:
-                        original_fx = k_values[0]  # fx from K matrix
-            except Exception as e:
-                logging.warning(f"Could not read intrinsics from {extrinsics_file}: {e}")
 
         # Scale to current image width
         current_width = image_shape[1]

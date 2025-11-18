@@ -72,6 +72,11 @@ class ZoeDepthAdapter(MethodAdapter):
         if depth.dim() == 4:
             depth = depth.squeeze(1)  # [1, 1, H, W] -> [1, H, W]
 
+        # Record processing resolution on first inference (ZoeDepth internal)
+        if self.processing_resolution is None:
+            self.processing_resolution = "model-internal"
+            print(f"[ZoeDepth] Processing resolution: model-internal (unknown)")
+
         # Verify and resize if needed
         # Note: ZoeDepth may internally resize, so we ensure output matches input
         if depth.shape[1] != orig_H or depth.shape[2] != orig_W:

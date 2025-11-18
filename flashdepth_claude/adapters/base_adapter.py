@@ -14,6 +14,7 @@ class MethodAdapter(ABC):
     def __init__(self):
         self.model = None
         self.device = None
+        self.processing_resolution = None  # Will be set on first inference: (H, W)
 
     @abstractmethod
     def load_model(self, checkpoint_path=None):

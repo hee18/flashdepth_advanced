@@ -154,6 +154,11 @@ class DepthCrafterAdapter(MethodAdapter):
             image_resized = image.squeeze(0)
             new_H, new_W = H_orig, W_orig
 
+        # Record processing resolution on first inference
+        if self.processing_resolution is None:
+            self.processing_resolution = (new_H, new_W)
+            print(f"[DepthCrafter] Processing resolution: {new_H}×{new_W} (max {self.max_res}, aspect-preserved)")
+
         # Convert to [T, H, W, 3] numpy format
         image_uint8 = (image_resized * 255.0).to(torch.uint8)
         frames_np = image_uint8.cpu().numpy().transpose(0, 2, 3, 1)

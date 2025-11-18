@@ -210,6 +210,22 @@ class UniDepthAdapter(MethodAdapter):
         # Extract depth (already in meters, already resized back to original resolution)
         depth = predictions["depth"].squeeze()  # [H, W]
 
+        # Record processing resolution on first inference (from internal features)
+        if self.processing_resolution is None:
+            # UniDepth processes adaptively, record from depth_features shape
+            if "depth_features" in predictions and predictions["depth_features"] is not None:
+                feat_shape = predictions["depth_features"].shape[-2:]
+                self.processing_resolution = (feat_shape[0], feat_shape[1])
+                print(f"[UniDepth-{self.version}] Processing resolution: ~{feat_shape[0]}×{feat_shape[1]} (adaptive)")
+            else:
+                # Fallback: estimate from config
+                if self.version == 'v1':
+                    self.processing_resolution = (image.shape[2], image.shape[3])  # v1 uses original
+                    print(f"[UniDepth-v1] Processing resolution: {image.shape[2]}×{image.shape[3]} (original)")
+                else:
+                    self.processing_resolution = "adaptive (200k-600k pixels)"
+                    print(f"[UniDepth-v2] Processing resolution: adaptive (200k-600k pixels)")
+
         # Add batch dimension
         depth = depth.unsqueeze(0)  # [1, H, W]
 

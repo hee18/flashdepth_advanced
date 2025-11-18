@@ -47,14 +47,21 @@ class VKITTIDepth(BaseDatasetPairs):
 
     def get_filter_scenes(self, split):
         """Filter scenes based on split"""
+        
+        # The user wants to test on all 5 scenes. The previous logic was inverted,
+        # causing test scenes to be filtered out.
+        # For split='test', we now return an empty list to prevent any filtering.
+        if split == 'test':
+            return []
+
         all_scenes = self.get_all_scenes(self.root_dir)
 
-        # VKITTI2 has 5 scenes: Scene01-Scene06 (Scene03 doesn't exist)
-        # Use Scene01, Scene02 for val; Scene06, Scene18, Scene20 for test
+        # For completeness, also fixing the inverted 'val' split logic.
+        # This will now correctly return only 'Scene01' and 'Scene02' for validation.
         if split == 'val':
-            return [s for s in all_scenes if any(x in s for x in ['Scene01', 'Scene02'])]
-        elif split == 'test':
-            return [s for s in all_scenes if any(x in s for x in ['Scene06', 'Scene18', 'Scene20'])]
+            val_scenes = ['Scene01', 'Scene02']
+            return [s for s in all_scenes if not any(x in s for x in val_scenes)]
+            
         return []
 
     def get_all_scenes(self, scenes_path):

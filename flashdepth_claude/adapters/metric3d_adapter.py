@@ -190,6 +190,11 @@ class Metric3DAdapter(MethodAdapter):
         std = torch.tensor([58.395, 57.12, 57.375], device=self.device).float().view(1, 3, 1, 1)
         rgb = torch.div((rgb_torch - mean), std)
 
+        # Record processing resolution on first inference
+        if self.processing_resolution is None:
+            self.processing_resolution = (self.input_size[0], self.input_size[1])
+            print(f"[Metric3D] Processing resolution: {self.input_size[0]}×{self.input_size[1]} (padded)")
+
         # Inference
         with torch.no_grad():
             pred_depth, confidence, output_dict = self.model.inference({'input': rgb})

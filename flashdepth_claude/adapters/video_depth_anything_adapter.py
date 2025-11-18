@@ -27,6 +27,12 @@ class VideoDepthAnythingAdapter(MethodAdapter):
 
     def load_model(self, checkpoint_path=None):
         """Load Video-Depth-Anything model"""
+        # Ensure utils path is available before importing
+        vda_path = Path(__file__).parent.parent / 'refer_test' / 'Video-Depth-Anything'
+        utils_path = vda_path / 'utils'
+        if str(utils_path.parent) not in sys.path:
+            sys.path.insert(0, str(utils_path.parent))
+
         from video_depth_anything.video_depth import VideoDepthAnything
 
         # Model configuration for ViT-L
@@ -146,6 +152,12 @@ class VideoDepthAnythingAdapter(MethodAdapter):
 
         # Stack into sequence [B, T, 3, H', W']
         processed = torch.cat(processed_frames, dim=0).unsqueeze(0)  # [1, T, 3, H', W']
+
+        # Record processing resolution on first inference
+        if self.processing_resolution is None:
+            proc_H, proc_W = processed.shape[-2:]
+            self.processing_resolution = (proc_H, proc_W)
+            print(f"[Video-Depth-Anything] Processing resolution: {proc_H}×{proc_W} (adaptive, aspect-ratio preserved)")
 
         if self.device is not None:
             processed = processed.to(self.device)

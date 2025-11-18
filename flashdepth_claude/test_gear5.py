@@ -646,6 +646,19 @@ class Gear5Tester:
                 if self.object_wise_enabled and 'object_wise' in metrics:
                     all_object_wise_metrics.append(metrics['object_wise'])
 
+                # Save per-sequence metrics and clear cache to prevent OOM
+                seq_results_path = self.save_dir / f"sequence_{sequence_id:04d}_metrics.json"
+                with open(seq_results_path, 'w') as f:
+                    # Filter out non-serializable items like nested dicts for this summary file
+                    json_metrics = {k: v for k, v in metrics.items() if not isinstance(v, dict)}
+                    json.dump(json_metrics, f, indent=2)
+                logger.info(f"Saved metrics for sequence {sequence_id} to {seq_results_path}")
+
+                # Clear GPU cache to prevent memory accumulation between sequences
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    logger.info(f"Cleared GPU cache after processing sequence {sequence_id}")
+
                 sequence_id += 1
 
             except Exception as e:
@@ -768,9 +781,9 @@ class Gear5Tester:
 
         # Handle both 'depths' (WaymoSegmentationDataset objwise) and 'depth' (CombinedDataset)
         if 'depths' in batch:
-            gt_depth = batch['depths'].to(self.device)  # [1, T, H, W] - objwise mode
+            gt_depth = batch['depths']  # [1, T, H, W] - objwise mode
         else:
-            gt_depth = batch['depth'].to(self.device)  # [1, T, H, W] or [T, H, W] - val split
+            gt_depth = batch['depth']  # [1, T, H, W] or [T, H, W] - val split
 
         # Handle both focal_lengths and focal_lengths_actual (CombinedDataset uses focal_lengths_actual)
         if 'focal_lengths_actual' in batch:
@@ -1090,7 +1103,7 @@ class Gear5Tester:
         # Convert GT to metric depth for visualization
         # GT is in canonical space (fx=500), de-canonicalize to actual space for visualization
         # Move to CPU first to avoid OOM for long sequences (urbansyn 1000 frames)
-        gt_depth_inverse_100_cpu = gt_depth_inverse_100[0].cpu()  # [T, 1, H, W] to CPU
+        gt_depth_inverse_100_cpu = gt_depth_inverse_100[0]  # [T, 1, H, W] to CPU
         gt_depth_canonical = 100.0 / (gt_depth_inverse_100_cpu + 1e-8)  # [T, 1, H, W] in canonical meters (CPU)
 
         # De-canonicalize: depth_actual = depth_canonical × (fx_actual / fx_canonical)

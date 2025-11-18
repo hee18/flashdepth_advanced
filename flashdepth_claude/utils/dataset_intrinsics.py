@@ -28,6 +28,18 @@ DATASET_INTRINSICS = {
         'notes': 'V1 uses 640×480, V2 uses 640×640. Both have fx=fy=320.'
     },
 
+    'unreal4k': {
+        'type': 'fixed',
+        'fx': 1920.0,
+        'fy': 1920.0,
+        'cx': 1920.0,
+        'cy': 1080.0,
+        'resolution': (3840, 2160),
+        'fov_deg': 90.0,
+        'source': 'UnrealStereo4K dataset extrinsics files',
+        'notes': 'All scenes use the same intrinsics: fx=1920 for 3840x2160 resolution.'
+    },
+
     'spring': {
         'type': 'per_frame',
         'file_pattern': 'cam_data/intrinsics.txt',

@@ -165,6 +165,11 @@ class DepthProAdapter(MethodAdapter):
         # Extract depth (already in meters)
         depth = prediction["depth"]  # [H, W]
 
+        # Record processing resolution on first inference
+        if self.processing_resolution is None:
+            self.processing_resolution = (1536, 1536)
+            print(f"[DepthPro] Processing resolution: 1536×1536")
+
         # Add batch dimension
         depth = depth.unsqueeze(0)  # [1, H, W]
 

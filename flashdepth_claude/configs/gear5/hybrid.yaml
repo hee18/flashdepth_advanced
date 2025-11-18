@@ -20,7 +20,7 @@ phase1_step2_checkpoint: null  # Phase1 Step2 checkpoint (for loading FFM in Pha
 step: 1  # Training step (1 or 2)
 
 # Canonical space settings
-canonical_focal_length: 1000.0  # Fixed canonical focal length for all resolutions
+canonical_focal_length: 500.0  # Fixed canonical focal length for all resolutions
 use_canonical_space: true  # ENABLED - all training data normalized to canonical focal length
 
 # ========== Gear5 Specific Settings ==========

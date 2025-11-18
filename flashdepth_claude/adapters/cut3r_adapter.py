@@ -119,6 +119,11 @@ class CUT3RAdapter(MethodAdapter):
                 if img.max() > 1.0:
                     img = img / 255.0
 
+                # Record processing resolution on first inference
+                if self.processing_resolution is None:
+                    self.processing_resolution = (self.size, self.size)
+                    print(f"[CUT3R] Processing resolution: {self.size}×{self.size}")
+
                 # Resize to model input size
                 img_resized = cv2.resize(img, (self.size, self.size))
 
