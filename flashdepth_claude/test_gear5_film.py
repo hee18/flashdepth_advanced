@@ -304,12 +304,27 @@ class Gear5FilmTester:
                     self.frame_interval = 2
                     logger.info(f"Auto-setting frame_interval=2 for waymo_seg objwise visualization")
 
+                # whole_seq_test controls which sequences to use:
+                # - False (default): Use 'val' split which applies same filtering as WaymoDepth (first 8 scenes only)
+                # - True: Use all sequences without filtering
+                # objwise_mode=True: Only load frames 0-19 with segmentation annotation
                 test_dataset = WaymoSegmentationDataset(
                     data_root=waymo_data_root,
                     split='val',
                     video_length=video_length,
-                    resolution=resolution
+                    resolution=resolution,
+                    camera_name='FRONT',
+                    objwise_mode=True  # Only use frames with segmentation annotation (0-19)
                 )
+
+                if whole_seq_test:
+                    # Reload all sequences without filtering
+                    test_dataset.sequences = test_dataset._load_sequences_unfiltered()
+                    logger.info(f"Using all sequences (whole_seq_test=True): {len(test_dataset.sequences)} sequences")
+                else:
+                    # Already loaded with validation filtering (first 8 scenes only)
+                    logger.info(f"Using validation subset (whole_seq_test=False): {len(test_dataset.sequences)} sequences (first 8 scenes, same as training val)")
+
                 test_loader = DataLoader(
                     test_dataset,
                     batch_size=1,

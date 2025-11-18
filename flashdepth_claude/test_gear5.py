@@ -1244,12 +1244,9 @@ class Gear5Tester:
                 # Aggregate across all frames
                 class_metrics = self.object_wise_metrics.aggregate_metrics(per_frame_class_metrics)
 
-                # Skip object-wise saving for urbansyn (to save disk space)
-                if dataset_name == 'urbansyn':
-                    logger.info(f"Skipping object-wise metrics save for urbansyn (long sequence dataset)")
-                else:
-                    metrics['object_wise'] = class_metrics
-                    logger.info(f"Computed object-wise metrics for {len(class_metrics)} classes across {T_seg} frames")
+                # Store object-wise metrics for final aggregation
+                metrics['object_wise'] = class_metrics
+                logger.info(f"Computed and stored object-wise metrics for {len(class_metrics)} classes across {T_seg} frames for dataset '{dataset_name}'")
 
             except Exception as e:
                 logger.error(f"Error computing object-wise metrics: {e}")
