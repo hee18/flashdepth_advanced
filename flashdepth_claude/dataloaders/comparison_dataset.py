@@ -39,7 +39,7 @@ class ComparisonDataset(Dataset):
     according to their own requirements.
     """
 
-    def __init__(self, dataset_name, data_root, split='test', video_length=50, chunk_size=None, objwise_enabled=False, only_clone=False, unrealstereo4k_seq=None):
+    def __init__(self, dataset_name, data_root, split='test', video_length=50, chunk_size=None, objwise_enabled=False, only_clone=False, unrealstereo4k_seq_list=None, unrealstereo4k_seq=None):
         """
         Args:
             dataset_name: Name of dataset ('eth3d', 'kitti', 'sintel', etc.)
@@ -50,28 +50,40 @@ class ComparisonDataset(Dataset):
                        Useful for high-resolution datasets (e.g., 50 for 4K images)
             objwise_enabled: If True, load segmentation masks for object-wise evaluation
             only_clone: If True and dataset is VKITTI, only use 'clone' condition (5 sequences instead of 50)
-            unrealstereo4k_seq: If set, only use this sequence number (0-8) for UnrealStereo4K
+            unrealstereo4k_seq_list: If set, only use these sequence numbers (list of 0-8) for UnrealStereo4K
+            unrealstereo4k_seq: (deprecated, use unrealstereo4k_seq_list) Single sequence number for backward compatibility
         """
-        self.dataset_name = dataset_name.lower()
+        # Handle dataset name aliases
+        dataset_name_lower = dataset_name.lower()
+        if dataset_name_lower in ['unreal4k', 'unreal']:
+            dataset_name_lower = 'unrealstereo4k'
+
+        self.dataset_name = dataset_name_lower
         self.data_root = data_root
-        self.unrealstereo4k_seq = unrealstereo4k_seq
+
+        # Handle backward compatibility: convert single seq to list
+        if unrealstereo4k_seq_list is not None:
+            self.unrealstereo4k_seq_list = unrealstereo4k_seq_list
+        elif unrealstereo4k_seq is not None:
+            self.unrealstereo4k_seq_list = [unrealstereo4k_seq]
+        else:
+            self.unrealstereo4k_seq_list = None
+
         self.split = split
         self.video_length = video_length
         self.objwise_enabled = objwise_enabled
         self.only_clone = only_clone
 
         # Auto-set chunk_size for efficient memory usage
-        # Only enable chunking for extreme cases (very high resolution or very long sequences)
+        # DISABLED: chunk_size limits total frames loaded, which breaks video models
+        # Instead, we rely on:
+        # 1. video_length to limit sequence length (user-specified via --vid-len)
+        # 2. num_workers=0 for high-res datasets to avoid OOM from parallel loading
+        # 3. GPU memory management (empty_cache after each sequence)
         if chunk_size is None:
-            if dataset_name in ['eth3d', 'unrealstereo4k']:
-                # For 4K+ images, use smaller chunks
-                self.chunk_size = min(50, video_length)
-                logger.info(f"Auto-enabled chunked loading for {dataset_name}: chunk_size={self.chunk_size}")
-            else:
-                # Don't use chunking by default - let user specify if needed
-                self.chunk_size = None
+            self.chunk_size = None  # Disabled by default
         else:
-            self.chunk_size = chunk_size
+            self.chunk_size = chunk_size  # Allow user override if needed
 
         # Load dataset-specific configuration
         self.dataset_path = os.path.join(data_root, self.dataset_name)
@@ -477,7 +489,7 @@ class ComparisonDataset(Dataset):
         """
         Build UnrealStereo4K sequences
 
-        If unrealstereo4k_seq is specified, only load that sequence number (0-8).
+        If unrealstereo4k_seq_list is specified, only load those sequence numbers (0-8).
         """
         sequences = []
         unreal_root = os.path.join(self.data_root, 'unrealstereo4k')
@@ -490,13 +502,21 @@ class ComparisonDataset(Dataset):
         all_scenes = sorted([s for s in os.listdir(unreal_root)
                            if os.path.isdir(os.path.join(unreal_root, s))])
 
-        # Filter by sequence number if specified
-        if self.unrealstereo4k_seq is not None:
-            if self.unrealstereo4k_seq < 0 or self.unrealstereo4k_seq >= len(all_scenes):
-                logger.error(f"UnrealStereo4K seq {self.unrealstereo4k_seq} out of range (0-{len(all_scenes)-1})")
+        # Filter by sequence numbers if specified
+        if self.unrealstereo4k_seq_list is not None:
+            selected_scenes = []
+            for seq_idx in self.unrealstereo4k_seq_list:
+                if seq_idx < 0 or seq_idx >= len(all_scenes):
+                    logger.error(f"UnrealStereo4K seq {seq_idx} out of range (0-{len(all_scenes)-1})")
+                    continue
+                selected_scenes.append(all_scenes[seq_idx])
+
+            if len(selected_scenes) == 0:
+                logger.error(f"No valid sequences in seq_list: {self.unrealstereo4k_seq_list}")
                 return []
-            all_scenes = [all_scenes[self.unrealstereo4k_seq]]
-            logger.info(f"UnrealStereo4K: Using sequence {self.unrealstereo4k_seq} only: {all_scenes[0]}")
+
+            all_scenes = selected_scenes
+            logger.info(f"UnrealStereo4K: Using sequences {self.unrealstereo4k_seq_list}: {all_scenes}")
         else:
             logger.info(f"UnrealStereo4K: Using all {len(all_scenes)} scenes")
 
@@ -723,10 +743,16 @@ class ComparisonDataset(Dataset):
         scene_name = sequence[0]['scene_name']
         dataset_scene = f"{self.dataset_name}/{scene_name}"
 
+        # Extract focal lengths from intrinsics [T, 4] -> [T]
+        intrinsics_tensor = torch.stack(intrinsics_list)  # [T, 4]
+        focal_lengths_actual = intrinsics_tensor[:, 0]  # [T] - fx values
+
         batch = {
             'images': torch.stack(images),  # [T, 3, H, W]
             'depths': torch.stack(depths),  # [T, H, W]
-            'intrinsics': torch.stack(intrinsics_list),  # [T, 4]
+            'intrinsics': intrinsics_tensor,  # [T, 4]
+            'focal_lengths': focal_lengths_actual,  # [T] - actual fx for compatibility
+            'focal_lengths_actual': focal_lengths_actual,  # [T] - actual fx
             'scene_name': scene_name,
             'dataset_name': dataset_scene  # e.g., 'eth3d/pipes'
         }
@@ -1377,6 +1403,8 @@ def comparison_collate_fn(batch):
         'images': item['images'].unsqueeze(0),  # [1, T, 3, H, W]
         'depths': item['depths'].unsqueeze(0),  # [1, T, H, W]
         'intrinsics': item['intrinsics'].unsqueeze(0),  # [1, T, 4]
+        'focal_lengths': item['focal_lengths'].unsqueeze(0),  # [1, T] - actual fx
+        'focal_lengths_actual': item['focal_lengths_actual'].unsqueeze(0),  # [1, T] - actual fx
         'scene_name': item['scene_name'],
         'dataset_name': item['dataset_name']  # e.g., 'eth3d/pipes'
     }

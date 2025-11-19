@@ -74,8 +74,39 @@ class ZoeDepthAdapter(MethodAdapter):
 
         # Record processing resolution on first inference (ZoeDepth internal)
         if self.processing_resolution is None:
-            self.processing_resolution = "model-internal"
-            print(f"[ZoeDepth] Processing resolution: model-internal (unknown)")
+            # Try to extract internal processing resolution from model
+            try:
+                # Debug: print model structure
+                print(f"[DEBUG] Model type: {type(self.model)}")
+                print(f"[DEBUG] Model attributes: {[attr for attr in dir(self.model) if not attr.startswith('_')][:20]}")
+
+                # Try different paths to find img_size
+                found = False
+
+                # Path 1: model.core.prep.img_size
+                if hasattr(self.model, 'core') and hasattr(self.model.core, 'prep'):
+                    prep = self.model.core.prep
+                    print(f"[DEBUG] prep type: {type(prep)}")
+                    print(f"[DEBUG] prep attributes: {[attr for attr in dir(prep) if not attr.startswith('_')][:20]}")
+                    if hasattr(prep, 'img_size'):
+                        h, w = prep.img_size
+                        self.processing_resolution = (h, w)
+                        print(f"[ZoeDepth] Processing resolution: {h}×{w} (model-internal, extracted)")
+                        found = True
+
+                # Path 2: model.img_size
+                if not found and hasattr(self.model, 'img_size'):
+                    h, w = self.model.img_size
+                    self.processing_resolution = (h, w)
+                    print(f"[ZoeDepth] Processing resolution: {h}×{w} (model-internal, extracted)")
+                    found = True
+
+                if not found:
+                    self.processing_resolution = "model-internal"
+                    print(f"[ZoeDepth] Processing resolution: model-internal (unknown)")
+            except Exception as e:
+                self.processing_resolution = "model-internal"
+                print(f"[ZoeDepth] Processing resolution: model-internal (extraction failed: {e})")
 
         # Verify and resize if needed
         # Note: ZoeDepth may internally resize, so we ensure output matches input

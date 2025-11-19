@@ -19,6 +19,7 @@ class VideoDepthAnythingAdapter(MethodAdapter):
     def __init__(self, metric=False):
         super().__init__()
         self.metric = metric
+        self._first_inference = True  # Flag for first inference logging
 
         # Add Video-Depth-Anything path to sys.path
         vda_path = Path(__file__).parent.parent / 'refer_test' / 'Video-Depth-Anything'
@@ -51,6 +52,9 @@ class VideoDepthAnythingAdapter(MethodAdapter):
             else:
                 checkpoint_path = str(base_path / f'video_depth_anything_{encoder}.pth')
 
+        print(f"[VDA] Loading checkpoint: {checkpoint_path}")
+        print(f"[VDA] Metric mode: {self.metric}")
+
         # Create model
         encoder_type = 'vitl'  # Use ViT-L by default
         video_depth_anything = VideoDepthAnything(
@@ -58,9 +62,18 @@ class VideoDepthAnythingAdapter(MethodAdapter):
             metric=self.metric
         )
 
+        print(f"[VDA] Model created with metric={self.metric}")
+
         # Load checkpoint
         state_dict = torch.load(checkpoint_path, map_location='cpu')
+        print(f"[VDA] Checkpoint loaded, keys: {len(state_dict)} parameters")
+
+        # Check if checkpoint has metric head
+        has_metric_head = any('metric' in k.lower() for k in state_dict.keys())
+        print(f"[VDA] Checkpoint has metric head: {has_metric_head}")
+
         video_depth_anything.load_state_dict(state_dict, strict=True)
+        print(f"[VDA] Checkpoint loaded successfully!")
 
         self.model = video_depth_anything
         self.input_size = 518
@@ -125,7 +138,7 @@ class VideoDepthAnythingAdapter(MethodAdapter):
 
     def inference(self, image, intrinsics=None):
         """
-        Run Video-Depth-Anything inference on video sequence
+        Run Video-Depth-Anything inference on video sequence using official infer_video_depth()
 
         Args:
             image: torch.Tensor [1, T, 3, H, W] - Input video sequence (0-1 normalized, RGB)
@@ -142,44 +155,69 @@ class VideoDepthAnythingAdapter(MethodAdapter):
             image = image.unsqueeze(1)  # [1, 1, 3, H, W]
 
         B, T, C, orig_H, orig_W = image.shape
+        assert B == 1, "Batch size must be 1"
 
-        # Preprocess each frame individually (preprocess expects [1, 3, H, W])
-        processed_frames = []
-        for t in range(T):
-            frame = image[:, t]  # [B, 3, H, W]
-            processed_frame = self.preprocess(frame)  # [1, 1, 3, H', W']
-            processed_frames.append(processed_frame.squeeze(1))  # [1, 3, H', W']
+        # Convert torch tensor to numpy array for official VDA code
+        # [1, T, 3, H, W] -> [T, H, W, 3]
+        image_np = image[0].permute(0, 2, 3, 1).cpu().numpy()  # [T, H, W, 3]
 
-        # Stack into sequence [B, T, 3, H', W']
-        processed = torch.cat(processed_frames, dim=0).unsqueeze(0)  # [1, T, 3, H', W']
+        # VDA expects 0-255 range
+        image_np = (image_np * 255.0).astype(np.uint8)
 
-        # Record processing resolution on first inference
+        # Use official infer_video_depth method with sliding window + alignment
+        device_str = str(self.device) if self.device is not None else 'cuda'
+
+        # Record processing resolution on first inference (estimated from input)
         if self.processing_resolution is None:
-            proc_H, proc_W = processed.shape[-2:]
+            # Estimate processing resolution from VDA's transform logic
+            ratio = max(orig_H, orig_W) / min(orig_H, orig_W)
+            input_size = self.input_size
+            if ratio > 1.78:
+                input_size = int(input_size * 1.777 / ratio)
+                input_size = round(input_size / 14) * 14
+
+            # Rough estimate - actual may vary slightly
+            if orig_H > orig_W:
+                proc_H = input_size
+                proc_W = int(orig_W * input_size / orig_H / 14) * 14
+            else:
+                proc_W = input_size
+                proc_H = int(orig_H * input_size / orig_W / 14) * 14
+
             self.processing_resolution = (proc_H, proc_W)
-            print(f"[Video-Depth-Anything] Processing resolution: {proc_H}×{proc_W} (adaptive, aspect-ratio preserved)")
+            print(f"[Video-Depth-Anything] Processing resolution: ~{proc_H}×{proc_W} (adaptive, aspect-ratio preserved)")
+            print(f"[VDA] Using official infer_video_depth() with sliding window (INFER_LEN=32, OVERLAP=10)")
+
+        # Call official VDA inference
+        depth_np, _ = self.model.infer_video_depth(
+            frames=image_np,
+            target_fps=30,  # Dummy value, not used for depth prediction
+            input_size=self.input_size,
+            device=device_str,
+            fp32=False  # Use FP16 for speed
+        )
+
+        # Debug: Check depth range (first inference only)
+        if self._first_inference:
+            depth_min = depth_np.min()
+            depth_max = depth_np.max()
+            depth_mean = depth_np.mean()
+            print(f"[VDA Debug] Output depth range: min={depth_min:.3f}, max={depth_max:.3f}, mean={depth_mean:.3f}")
+            if self.metric:
+                if depth_max < 10:
+                    print(f"[VDA WARNING] Metric mode but depth_max={depth_max:.3f} < 10m. This looks like RELATIVE depth!")
+                else:
+                    print(f"[VDA OK] Depth range looks like metric depth (max={depth_max:.1f}m)")
+            self._first_inference = False
+
+        # Convert back to torch tensor
+        # [T, H, W] -> [1, T, H, W]
+        depth = torch.from_numpy(depth_np).unsqueeze(0)  # [1, T, H, W]
 
         if self.device is not None:
-            processed = processed.to(self.device)
+            depth = depth.to(self.device)
 
-        # Run inference on entire sequence
-        with torch.no_grad():
-            with torch.autocast(device_type=str(self.device).split(':')[0] if self.device else 'cpu',
-                               dtype=torch.float16, enabled=True):
-                depth = self.model.forward(processed)  # [B, T, H', W']
-
-        # Resize back to original size
-        B, T, H_out, W_out = depth.shape
-        depth_reshaped = depth.view(B*T, 1, H_out, W_out)
-        depth_resized = F.interpolate(
-            depth_reshaped,
-            size=(orig_H, orig_W),
-            mode='bilinear',
-            align_corners=True
-        )  # [B*T, 1, H, W]
-        depth_resized = depth_resized.view(B, T, orig_H, orig_W)  # [B, T, H, W]
-
-        return depth_resized
+        return depth
 
     def get_required_env(self):
         return "vda"

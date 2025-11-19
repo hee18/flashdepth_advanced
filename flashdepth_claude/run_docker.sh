@@ -82,8 +82,10 @@ show_usage() {
     echo "  --wandb BOOL         Enable/disable WandB logging (default: true)"
     echo "  --wandb-name NAME    Set WandB experiment name (default: auto-generated)"
     echo "  --mamba              Use Mamba2 instead of GRU for Gear5 TemporalScalePredictor (default: false/GRU)"
+    echo "  --seq N              Sequence selection (ignored by test_original_flashdepth, always uses first sequence)"
     echo ""
     echo "Note: Regularization losses are deprecated. Importance map now uses raw DINOv2 attention (frozen)."
+    echo "Note: test_original_flashdepth always tests only the first sequence for FPS measurement."
     echo ""
     echo "Examples:"
     echo "  $0 build                              # Build the image"
@@ -119,6 +121,7 @@ show_usage() {
     echo "  $0 test_original_flashdepth --gpu 0  # Test original FlashDepth (ViT-L)"
     echo "  DATASET=waymo $0 test_original_flashdepth --gpu 1  # Test on Waymo dataset"
     echo "  $0 test_original_flashdepth --config flashdepth-s --gpu 0  # Use ViT-S variant (smaller/faster)"
+    echo "  $0 test_original_flashdepth --config flashdepth-s --no-video --gpu 0  # Skip MP4 and .npy saving (faster testing)"
     echo "  CHECKPOINT=/app/configs/flashdepth-s/iter_14001.pth $0 test_original_flashdepth --config flashdepth-s  # ViT-S with matching checkpoint"
     echo "  $0 train --results-dir train_results/results_2  # Custom results directory"
     echo "  $0 shell                              # Interactive development"
@@ -151,6 +154,7 @@ VISUALIZATION="true"  # Enable visualizations by default (sequence.png, best_fra
 WANDB="true"  # Enable WandB logging by default
 WANDB_NAME=""  # WandB experiment name (empty = auto-generated)
 MAMBA="false"  # Use Mamba2 for Gear5 TemporalScalePredictor (false=GRU, true=Mamba2)
+SEQ=""  # Sequence selection for UnrealStereo4K (test_original_flashdepth)
 
 # Parse arguments
 USER_BATCH_SIZE=""  # Track if user explicitly set batch size
@@ -264,6 +268,10 @@ while [[ $# -gt 0 ]]; do
         --mamba)
             MAMBA="true"
             shift
+            ;;
+        --seq)
+            SEQ="$2"
+            shift 2
             ;;
         -h|--help)
             show_usage
@@ -1380,7 +1388,12 @@ case $COMMAND in
 
     test_original_flashdepth)
         # Test original FlashDepth (without Gear modules)
-        DATASET=${DATASET:-waymo}
+        # Use OBJWISE_DATASET from --dataset option, fallback to waymo
+        if [ -n "$OBJWISE_DATASET" ]; then
+            DATASET="$OBJWISE_DATASET"
+        else
+            DATASET=${DATASET:-waymo}
+        fi
 
         # Initialize CHECKPOINT from FLASHDEPTH_CHECKPOINT or environment variable
         if [ -z "$CHECKPOINT" ]; then
@@ -1397,10 +1410,10 @@ case $COMMAND in
             # User didn't specify checkpoint, use default for selected config
             case "$CONFIG" in
                 flashdepth-l)
-                    CHECKPOINT="/app/configs/flashdepth-l/iter_14001.pth"
+                    CHECKPOINT="/app/configs/flashdepth-l/iter_10001.pth"
                     ;;
                 flashdepth-s)
-                    CHECKPOINT="/app/configs/flashdepth-s/iter_10001.pth"
+                    CHECKPOINT="/app/configs/flashdepth-s/iter_14001.pth"
                     ;;
                 flashdepth)
                     CHECKPOINT="/app/configs/flashdepth/iter_43002.pth"
@@ -1430,14 +1443,28 @@ case $COMMAND in
         # Extract results directory path for host (remove /app prefix for local path)
         LOCAL_OUTFOLDER="${OUTFOLDER#/app/}"
 
+        # Determine visualization settings based on NO_VIDEO flag
+        if [ "$NO_VIDEO" = "true" ]; then
+            OUT_VIDEO="false"
+            SAVE_DEPTH="false"
+            VIS_STATUS="DISABLED (--no-video)"
+        else
+            OUT_VIDEO="true"
+            SAVE_DEPTH="true"
+            VIS_STATUS="ENABLED (MP4 + .npy depth files)"
+        fi
+
         echo "Testing Original FlashDepth (inference mode)..."
         echo "Configuration:"
         echo "  - Config variant: $CONFIG"
-        echo "  - Dataset: $DATASET"
+        echo "  - Dataset: $DATASET (첫 시퀀스만 테스트 - FPS 측정용)"
+        echo "  - Resolution: $RESOLUTION"
         echo "  - GPU: $GPU_ID"
         echo "  - Checkpoint: $CHECKPOINT"
         echo "  - Results directory: $OUTFOLDER"
         echo "  - Inverse colormap: $INVERSE"
+        echo "  - Visualization: $VIS_STATUS"
+        echo "  - DataLoader workers: $WORKERS"
         echo "  - Log file: ${LOCAL_OUTFOLDER}/test.log"
         echo ""
 
@@ -1453,7 +1480,12 @@ case $COMMAND in
           eval.outfolder=$OUTFOLDER \
           load=$CHECKPOINT \
           +eval.inverse=$INVERSE \
-          eval.compile=false"
+          eval.first_seq_only=true \
+          eval.compile=false \
+          eval.out_video=$OUT_VIDEO \
+          eval.save_depth_npy=$SAVE_DEPTH \
+          eval.num_workers=$WORKERS \
+          eval.test_dataset_resolution=$RESOLUTION"
 
         # Run test and save log
         echo "Running FlashDepth inference..."
@@ -1469,7 +1501,10 @@ case $COMMAND in
         echo "  - FPS Summary: ${LOCAL_OUTFOLDER}/fps_results.json"
         echo "  - Per-sequence FPS: ${LOCAL_OUTFOLDER}/per_sequence_fps.json"
         echo "  - Full log: ${LOCAL_OUTFOLDER}/test.log"
-        echo "  - Depth files: ${LOCAL_OUTFOLDER}/"
+        if [ "$NO_VIDEO" != "true" ]; then
+            echo "  - MP4 videos: ${LOCAL_OUTFOLDER}/*/*.mp4"
+            echo "  - Depth files (.npy): ${LOCAL_OUTFOLDER}/*/*.npy"
+        fi
         ;;
 
     clean)

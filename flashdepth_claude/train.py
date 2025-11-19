@@ -147,7 +147,7 @@ def inference(cfg, process_dict):
                                  shuffle=False, drop_last=False) 
         
 
-    for test_idx, batch in enumerate(tqdm(test_dataloader)):        
+    for test_idx, batch in enumerate(tqdm(test_dataloader)):
         if isinstance(batch, list) or isinstance(batch, tuple):
             if len(batch) == 3:
                 video, gt_depth, dataset_scene_name = batch
@@ -168,13 +168,23 @@ def inference(cfg, process_dict):
 
         with torch.cuda.amp.autocast(dtype=torch.bfloat16):
             _, img_grid = model(
-                batch, 
+                batch,
                 gif_path=f'{savepath}/{os.path.basename(cfg.config_dir.rstrip("/"))}_{train_step}_{test_idx}.gif',
                 **eval_args
                 )
 
         if cfg.eval.save_grid:
             img_grid.save(f'{savepath}/{os.path.basename(cfg.config_dir.rstrip("/"))}_{train_step}_{test_idx}.png')
+
+        # Only test first sequence if first_seq_only is enabled (for FPS measurement)
+        try:
+            first_seq_only = cfg.eval.first_seq_only if hasattr(cfg.eval, 'first_seq_only') else False
+        except:
+            first_seq_only = False
+
+        if first_seq_only:
+            logging.info("First sequence only mode: stopping after first sequence")
+            break
 
 
     

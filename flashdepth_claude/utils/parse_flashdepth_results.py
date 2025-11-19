@@ -100,6 +100,12 @@ def parse_flashdepth_log(log_path):
         total_frames_excl_first = total_frames
         total_time_excl_first = total_time
 
+    # Conditional note based on whether first sequence was excluded
+    if len(fps_results) > 1:
+        note = 'First sequence excluded from statistics (warmup). inference_only = data pre-loaded to GPU'
+    else:
+        note = 'All sequences included. inference_only = data pre-loaded to GPU'
+
     summary = {
         'measurement_type': measurement_type,
         'avg_fps': round(avg_fps, 2),
@@ -108,7 +114,7 @@ def parse_flashdepth_log(log_path):
         'sequences_used_for_stats': len(fps_results_for_stats),
         'total_frames': total_frames_excl_first,
         'total_time': round(total_time_excl_first, 2),
-        'note': 'First sequence excluded from statistics (warmup). inference_only = data pre-loaded to GPU'
+        'note': note
     }
 
     return summary, fps_results
@@ -134,18 +140,24 @@ def save_results(summary, fps_results, output_dir):
         logger.info(f"  Average FPS: {summary['avg_fps']:.2f}")
         logger.info(f"  Weighted Avg FPS: {summary['weighted_avg_fps']:.2f}")
         logger.info(f"  Total Sequences: {summary['total_sequences']}")
-        logger.info(f"  Sequences Used for Stats: {summary['sequences_used_for_stats']} (first excluded for warmup)")
+
+        # Conditional message based on whether first sequence was excluded
+        if summary['total_sequences'] > 1:
+            logger.info(f"  Sequences Used for Stats: {summary['sequences_used_for_stats']} (first excluded for warmup)")
+        else:
+            logger.info(f"  Sequences Used for Stats: {summary['sequences_used_for_stats']} (all sequences included)")
+
         logger.info(f"  Total Frames: {summary['total_frames']}")
         logger.info(f"  Total Time: {summary['total_time']:.2f}s")
 
     # Save per-sequence FPS results
     if fps_results:
-        # Mark first sequence as warmup
+        # Mark first sequence as warmup only if there are multiple sequences
         fps_results_with_labels = []
         for idx, result in enumerate(fps_results):
             labeled_result = result.copy()
             labeled_result['sequence_id'] = idx
-            if idx == 0:
+            if idx == 0 and len(fps_results) > 1:
                 labeled_result['note'] = 'warmup - excluded from statistics'
             fps_results_with_labels.append(labeled_result)
 

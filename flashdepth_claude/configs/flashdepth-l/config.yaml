@@ -84,3 +84,4 @@ eval:
   save_vis_map: false
   dummy_timing: false
   large_dir: null
+  first_seq_only: false # Only test first sequence (for FPS measurement)

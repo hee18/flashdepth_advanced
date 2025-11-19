@@ -255,8 +255,8 @@ class VideoComparisonTester:
             # Get only_clone flag for VKITTI
             only_clone = self.config.get('only_clone', False) if dataset_name == 'vkitti' else False
 
-            # Get unrealstereo4k_seq if specified
-            unrealstereo4k_seq = self.config.get('unrealstereo4k_seq', None) if dataset_name == 'unrealstereo4k' else None
+            # Get unrealstereo4k_seq_list if specified
+            unrealstereo4k_seq_list = self.config.get('unrealstereo4k_seq_list', None) if dataset_name == 'unrealstereo4k' else None
 
             dataset = ComparisonDataset(
                 dataset_name=dataset_name,
@@ -265,13 +265,14 @@ class VideoComparisonTester:
                 video_length=video_length,
                 objwise_enabled=self.object_wise_enabled,
                 only_clone=only_clone,
-                unrealstereo4k_seq=unrealstereo4k_seq
+                unrealstereo4k_seq_list=unrealstereo4k_seq_list
             )
             collate_fn = comparison_collate_fn
 
         # For high resolution datasets, use num_workers=0 to avoid OOM and slow worker processes
         num_workers = self.config.get('workers', 4)
-        if dataset_name in ['eth3d', 'unrealstereo4k']:
+        # Handle aliases: unreal4k, unreal → unrealstereo4k
+        if dataset_name in ['eth3d', 'unrealstereo4k', 'unreal4k', 'unreal']:
             num_workers = 0
             logger.info(f"Using num_workers=0 for {dataset_name} (high resolution dataset)")
 
@@ -308,6 +309,10 @@ class VideoComparisonTester:
                 import traceback
                 traceback.print_exc()
                 continue
+
+            # Clear GPU cache after each sequence (like test_comparison.py)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         # Aggregate and save results
         self._aggregate_and_save_results()
@@ -355,11 +360,14 @@ class VideoComparisonTester:
         assert B == 1, "Batch size must be 1 for testing"
 
         # Process GT depth
-        # --objwise flag determines dataset type:
-        # - objwise=True → SegmentationDataset (WaymoSeg/UrbanSynSeg/VKITTISeg) → inverse depth (1/m)
-        # - objwise=False → ComparisonDataset → metric depth (m)
+        # Dataset name determines depth format:
+        # - *_seg datasets (waymo_seg, urbansyn_seg, vkitti_seg) → SegmentationDataset → inverse depth (1/m)
+        # - other datasets → ComparisonDataset → metric depth (m)
 
-        if self.object_wise_enabled:
+        dataset_name = self.config.get('dataset', 'waymo')
+        is_segmentation_dataset = dataset_name.endswith('_seg')
+
+        if is_segmentation_dataset:
             # SegmentationDataset - convert from inverse depth to metric
             gt_depth_processed = 1.0 / (gt_depths + 1e-8)  # [1, T, H, W] inverse → meters
             gt_depth_processed = gt_depth_processed.unsqueeze(2)  # [1, T, 1, H, W]
@@ -400,10 +408,18 @@ class VideoComparisonTester:
         logger.info("Warmup inference...")
         torch.cuda.synchronize()
         with torch.no_grad():
-            _ = self.adapter.inference(
-                images_unnorm,  # [1, T, 3, H, W]
-                intrinsics=intrinsics  # [1, T, 4] or None
-            )
+            if self.config.get('amp', False):
+                amp_dtype = torch.bfloat16 if self.config.get('amp_dtype', 'bf16') == 'bf16' else torch.float16
+                with torch.amp.autocast('cuda', dtype=amp_dtype):
+                    _ = self.adapter.inference(
+                        images_unnorm,  # [1, T, 3, H, W]
+                        intrinsics=intrinsics  # [1, T, 4] or None
+                    )
+            else:
+                _ = self.adapter.inference(
+                    images_unnorm,  # [1, T, 3, H, W]
+                    intrinsics=intrinsics  # [1, T, 4] or None
+                )
 
         # Timed run
         logger.info("Timed inference...")
@@ -411,10 +427,23 @@ class VideoComparisonTester:
         start_time = time.time()
 
         with torch.no_grad():
-            pred_depths = self.adapter.inference(
-                images_unnorm,  # [1, T, 3, H, W]
-                intrinsics=intrinsics  # [1, T, 4] or None
-            )  # Returns [1, T, H, W] in meters
+            if self.config.get('amp', False):
+                amp_dtype = torch.bfloat16 if self.config.get('amp_dtype', 'bf16') == 'bf16' else torch.float16
+                with torch.amp.autocast('cuda', dtype=amp_dtype):
+                    pred_depths = self.adapter.inference(
+                        images_unnorm,  # [1, T, 3, H, W]
+                        intrinsics=intrinsics  # [1, T, 4] or None
+                    )  # Returns [1, T, H, W] in meters
+            else:
+                pred_depths = self.adapter.inference(
+                    images_unnorm,  # [1, T, 3, H, W]
+                    intrinsics=intrinsics  # [1, T, 4] or None
+                )  # Returns [1, T, H, W] in meters
+
+        # Release intermediate tensors after inference
+        # Only delete if new tensors were created (not references to original)
+        if is_imagenet_normalized:
+            del images_unnorm, mean, std
 
         torch.cuda.synchronize()
         end_time = time.time()
@@ -902,8 +931,12 @@ def main():
                        help='Frame interval for sequence.png visualization')
     parser.add_argument('--visualization', type=str, default='true', choices=['true', 'false'],
                        help='Enable/disable visualizations (sequence.png, best_frame.png, etc.). Default: true')
-    parser.add_argument('--seq', type=int, default=None,
-                       help='Sequence number for UnrealStereo4K (0-8). Required for unrealstereo4k dataset.')
+    parser.add_argument('--seq', type=str, default=None,
+                       help='Sequence number(s) for UnrealStereo4K (0-8). Examples: --seq 0, --seq 2,5, --seq 0,3,7')
+    parser.add_argument('--amp', action='store_true',
+                       help='Enable Automatic Mixed Precision (AMP) for inference')
+    parser.add_argument('--amp-dtype', type=str, default='bf16', choices=['bf16', 'fp16'],
+                       help='Data type for AMP (bfloat16 or float16)')
 
     args = parser.parse_args()
 
@@ -915,16 +948,29 @@ def main():
         logger.error(f"   For image models (metric3d, unidepth, depthpro, etc.), use test_comparison.py instead")
         sys.exit(1)
 
-    # Check UnrealStereo4K --seq requirement
-    if args.dataset.lower() == 'unrealstereo4k':
-        if args.seq is None:
-            logger.error("❌ UnrealStereo4K requires --seq option (0-8)")
-            logger.error("   Example: --dataset unrealstereo4k --seq 0")
-            sys.exit(1)
-        if args.seq < 0 or args.seq > 8:
-            logger.error(f"❌ UnrealStereo4K --seq must be between 0 and 8, got {args.seq}")
-            sys.exit(1)
-        logger.info(f"UnrealStereo4K: Testing sequence {args.seq} only")
+    # Parse UnrealStereo4K --seq (supports single or multiple sequences)
+    unrealstereo4k_seq_list = None
+    if args.dataset.lower() in ['unrealstereo4k', 'unreal4k', 'unreal']:
+        if args.seq is not None:
+            # Parse comma-separated sequence numbers
+            try:
+                seq_list = [int(s.strip()) for s in args.seq.split(',')]
+                # Validate range
+                for seq in seq_list:
+                    if seq < 0 or seq > 8:
+                        logger.error(f"❌ UnrealStereo4K --seq must be between 0 and 8, got {seq}")
+                        sys.exit(1)
+                unrealstereo4k_seq_list = seq_list
+                logger.info(f"UnrealStereo4K: Testing sequences {seq_list}")
+            except ValueError:
+                logger.error(f"❌ Invalid --seq format: {args.seq}")
+                logger.error(f"   Examples: --seq 0, --seq 2,5, --seq 0,3,7")
+                sys.exit(1)
+        else:
+            # Auto mode: test all sequences 0-8
+            logger.warning("⚠️  UnrealStereo4K: Testing ALL sequences (0-8) - this may take a long time!")
+            logger.warning("    Recommend: Use --seq N to test one or more sequences")
+            logger.warning("    Example: --dataset unrealstereo4k --seq 0 or --seq 2,5")
 
     # Build method name with version
     method_name = args.method
@@ -953,7 +999,9 @@ def main():
         'frame_interval': args.frame_interval,
         'only_clone': (args.only_clone == 'true'),  # Convert string to bool
         'visualization': (args.visualization == 'true'),  # Convert string to bool
-        'unrealstereo4k_seq': args.seq  # Sequence number for UnrealStereo4K (None for other datasets)
+        'unrealstereo4k_seq_list': unrealstereo4k_seq_list,  # Sequence list for UnrealStereo4K (None for other datasets)
+        'amp': args.amp,
+        'amp_dtype': args.amp_dtype
     }
 
     # Import and create adapter (VIDEO MODELS ONLY)

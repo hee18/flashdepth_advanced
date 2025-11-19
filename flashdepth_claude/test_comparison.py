@@ -406,8 +406,22 @@ class ComparisonTester:
         best_frame_abs_rel = float('inf')
         frame_metrics = []
 
+        # Chunked processing to prevent OOM
+        CHUNK_SIZE = 50
+        num_chunks = (T + CHUNK_SIZE - 1) // CHUNK_SIZE
+        if num_chunks > 1:
+            logger.info(f"Chunked processing: {T} frames → {num_chunks} chunks of {CHUNK_SIZE} frames")
+
         # Process each frame
         for t in range(T):
+            # Clear GPU cache at chunk boundaries (every 50 frames)
+            if t > 0 and t % CHUNK_SIZE == 0:
+                torch.cuda.empty_cache()
+                if torch.cuda.is_available():
+                    gpu_mem_allocated = torch.cuda.memory_allocated(self.device) / 1e9
+                    gpu_mem_reserved = torch.cuda.memory_reserved(self.device) / 1e9
+                    chunk_num = t // CHUNK_SIZE
+                    logger.info(f"Chunk {chunk_num}/{num_chunks}: Cleared GPU cache. Memory: Allocated={gpu_mem_allocated:.2f}GB, Reserved={gpu_mem_reserved:.2f}GB")
             # Start timing after warmup
             if t == warmup_frames:
                 torch.cuda.synchronize()
@@ -441,10 +455,19 @@ class ComparisonTester:
                 frame_intrinsics = None
 
             # Method-specific inference using adapter
-            pred_depth_t = self.adapter.inference(
-                img_t_unnorm.unsqueeze(0),  # [1, 3, H, W] in [0, 1] range
-                intrinsics=frame_intrinsics
-            )  # Returns [1, H, W] in meters
+            # Use Automatic Mixed Precision (AMP) if enabled
+            if self.config.get('amp', False):
+                amp_dtype = torch.bfloat16 if self.config.get('amp_dtype', 'bf16') == 'bf16' else torch.float16
+                with torch.amp.autocast('cuda', dtype=amp_dtype):
+                    pred_depth_t = self.adapter.inference(
+                        img_t_unnorm.unsqueeze(0),  # [1, 3, H, W] in [0, 1] range
+                        intrinsics=frame_intrinsics
+                    )  # Returns [1, H, W] in meters
+            else:
+                pred_depth_t = self.adapter.inference(
+                    img_t_unnorm.unsqueeze(0),  # [1, 3, H, W] in [0, 1] range
+                    intrinsics=frame_intrinsics
+                )  # Returns [1, H, W] in meters
 
             # Log GPU memory usage after first frame
             if t == 0 and torch.cuda.is_available():
@@ -454,6 +477,12 @@ class ComparisonTester:
 
             # Store prediction
             pred_depths.append(pred_depth_t)
+
+            # Release intermediate tensors to prevent memory accumulation
+            # Critical for long sequences (e.g., unreal4k 250 frames)
+            del pred_depth_t
+            if is_imagenet_normalized:
+                del mean, std
 
             # End timing
             if t == T - 1 and start_time is not None:
@@ -932,8 +961,12 @@ def main():
                        help='Frame interval for sequence.png visualization')
     parser.add_argument('--visualization', type=str, default='true', choices=['true', 'false'],
                        help='Enable/disable visualizations (sequence.png, best_frame.png, etc.). Default: true')
-    parser.add_argument('--seq', type=int, default=None,
-                       help='Sequence number for UnrealStereo4K (0-8). Required for unrealstereo4k dataset.')
+    parser.add_argument('--seq', type=str, default=None,
+                       help='Sequence number(s) for UnrealStereo4K (0-8). Examples: --seq 0, --seq 2,5, --seq 0,3,7')
+    parser.add_argument('--amp', action='store_true',
+                       help='Enable Automatic Mixed Precision (AMP) for inference')
+    parser.add_argument('--amp-dtype', type=str, default='bf16', choices=['bf16', 'fp16'],
+                       help='Data type for AMP (bfloat16 or float16)')
 
     args = parser.parse_args()
 
@@ -948,21 +981,28 @@ def main():
         logger.error(f"   Or:      ./run_video_comparison.sh {args.method} --dataset {args.dataset}")
         sys.exit(1)
 
-    # Check UnrealStereo4K --seq
-    if args.dataset.lower() == 'unrealstereo4k':
+    # Parse UnrealStereo4K --seq (supports single or multiple sequences)
+    if args.dataset.lower() in ['unrealstereo4k', 'unreal4k', 'unreal']:
         if args.seq is not None:
-            # Single sequence mode
-            if args.seq < 0 or args.seq > 8:
-                logger.error(f"❌ UnrealStereo4K --seq must be between 0 and 8, got {args.seq}")
+            # Parse comma-separated sequence numbers
+            try:
+                seq_list = [int(s.strip()) for s in args.seq.split(',')]
+                # Validate range
+                for seq in seq_list:
+                    if seq < 0 or seq > 8:
+                        logger.error(f"❌ UnrealStereo4K --seq must be between 0 and 8, got {seq}")
+                        sys.exit(1)
+                logger.info(f"UnrealStereo4K: Testing sequences {seq_list}")
+            except ValueError:
+                logger.error(f"❌ Invalid --seq format: {args.seq}")
+                logger.error(f"   Examples: --seq 0, --seq 2,5, --seq 0,3,7")
                 sys.exit(1)
-            logger.info(f"UnrealStereo4K: Testing sequence {args.seq} only")
-            seq_list = [args.seq]
         else:
             # Auto mode: test all sequences 0-8
             logger.info("UnrealStereo4K: Testing ALL sequences (0-8)")
             seq_list = list(range(9))  # [0, 1, 2, 3, 4, 5, 6, 7, 8]
     else:
-        seq_list = [args.seq]  # For other datasets, seq is None or ignored
+        seq_list = [None]  # For other datasets, seq is ignored
 
     # Build method name with version
     method_name = args.method
@@ -1041,7 +1081,9 @@ def main():
             'frame_interval': args.frame_interval,
             'only_clone': (args.only_clone == 'true'),  # Convert string to bool
             'visualization': (args.visualization == 'true'),  # Convert string to bool
-            'unrealstereo4k_seq': seq_idx  # Current sequence number
+            'unrealstereo4k_seq': seq_idx,  # Current sequence number
+            'amp': args.amp,
+            'amp_dtype': args.amp_dtype
         }
 
         # Create tester and run

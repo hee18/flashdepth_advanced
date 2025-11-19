@@ -19,7 +19,8 @@ from utils.dataset_intrinsics import (
 
 class CombinedDataset(Dataset):
     def __init__(self, root_dir, enable_dataset_flags, resolution=None, split='train',
-                 video_length=8, seed=42, tmp_res=None, color_aug=False, strict_focal_length=True):
+                 video_length=8, seed=42, tmp_res=None, color_aug=False, strict_focal_length=True,
+                 unrealstereo4k_seq=None):
         '''
         enable_dataset_flags: list of datasets to use; e.g. ['spring', 'mvs-synth', 'urbansyn', 'eth3d', 'waymo', 'waymo_seg']
 
@@ -62,7 +63,8 @@ class CombinedDataset(Dataset):
         np.random.seed(seed)
         torch.manual_seed(seed)
 
-
+        # Store unrealstereo4k_seq parameter
+        self.unrealstereo4k_seq = unrealstereo4k_seq
 
         cache_dir = './dataloaders/pairs_cache' if split != 'test' else None
 
@@ -78,7 +80,12 @@ class CombinedDataset(Dataset):
             # waymo_seg only has 'val' split, no 'test' split
             actual_split = 'val' if dataset_name == 'waymo_seg' and split == 'test' else split
             logging.info(f"[DEBUG combined_dataset] Loading dataset: {dataset_name}, split={actual_split}")
-            dataset = BaseDatasetPairs.create(dataset_name, root_dir, actual_split, load_cache=cache_dir)
+
+            # Pass unrealstereo4k_seq to unreal4k dataset
+            if dataset_name.lower() == 'unreal4k' and unrealstereo4k_seq is not None:
+                dataset = BaseDatasetPairs.create(dataset_name, root_dir, actual_split, load_cache=cache_dir, unrealstereo4k_seq=unrealstereo4k_seq)
+            else:
+                dataset = BaseDatasetPairs.create(dataset_name, root_dir, actual_split, load_cache=cache_dir)
             self.pairslist[dataset_name] = dataset.pairs
             self.depth_read_list[dataset_name] = dataset.depth_read
             self.reshape_list[dataset_name] = dataset.reshape_list
@@ -114,7 +121,9 @@ class CombinedDataset(Dataset):
                     elif dataset in ['unreal4k']:
                         self.reshape_list[dataset]['resolution'] = (924,518)
                     elif dataset in ['vkitti']:
-                        self.reshape_list[dataset]['resolution'] = (1246, 378)  # 3.296 ratio, near original, 14x divisible
+                        self.reshape_list[dataset]['resolution'] = (1246, 378) # 3.296 ratio, near original, 14x divisible
+                    elif dataset in ['nuscenes']:
+                        self.reshape_list[dataset]['resolution'] = (924, 518)
 
 
         elif resolution == '2k':
@@ -135,7 +144,9 @@ class CombinedDataset(Dataset):
                     if dataset in ['unreal4k']:
                         self.reshape_list[dataset]['resolution'] = (2044,1148)
                     if dataset in ['vkitti']:
-                        self.reshape_list[dataset]['resolution'] = (1246, 378)  # 3.296 ratio, near original, 14x divisible 
+                        self.reshape_list[dataset]['resolution'] = (1246, 378)  # 3.296 ratio, near original, 14x divisible
+                    elif dataset in ['nuscenes']:
+                        self.reshape_list[dataset]['resolution'] = (1596, 896)
 
         else:
             raise ValueError(f"Resolution should be 'base' or '2k' for training")

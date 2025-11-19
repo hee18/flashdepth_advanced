@@ -215,13 +215,32 @@ class UniDepthAdapter(MethodAdapter):
             # UniDepth processes adaptively, record from depth_features shape
             if "depth_features" in predictions and predictions["depth_features"] is not None:
                 feat_shape = predictions["depth_features"].shape[-2:]
-                self.processing_resolution = (feat_shape[0], feat_shape[1])
-                print(f"[UniDepth-{self.version}] Processing resolution: ~{feat_shape[0]}×{feat_shape[1]} (adaptive)")
+                # Both v1 and v2 use 14-pixel patches (with DINOv2), convert to actual resolution
+                if self.version == 'v2':
+                    actual_h = feat_shape[0] * 14
+                    actual_w = feat_shape[1] * 14
+                    self.processing_resolution = (actual_h, actual_w)
+                    print(f"[UniDepth-v2] Processing resolution: {actual_h}×{actual_w} ({feat_shape[0]}×{feat_shape[1]} patches, 14px/patch)")
+                elif self.version == 'v1':
+                    # v1 also uses 14-pixel patches with DINOv2 encoder
+                    actual_h = feat_shape[0] * 14
+                    actual_w = feat_shape[1] * 14
+                    self.processing_resolution = (actual_h, actual_w)
+                    print(f"[UniDepth-v1] Processing resolution: {actual_h}×{actual_w} ({feat_shape[0]}×{feat_shape[1]} patches, 14px/patch)")
+                else:
+                    self.processing_resolution = (feat_shape[0], feat_shape[1])
+                    print(f"[UniDepth-{self.version}] Processing resolution: {feat_shape[0]}×{feat_shape[1]}")
             else:
                 # Fallback: estimate from config
                 if self.version == 'v1':
-                    self.processing_resolution = (image.shape[2], image.shape[3])  # v1 uses original
-                    print(f"[UniDepth-v1] Processing resolution: {image.shape[2]}×{image.shape[3]} (original)")
+                    # v1 uses fixed resolution from config (462×616)
+                    if hasattr(self.model, 'image_shape'):
+                        h, w = self.model.image_shape
+                        self.processing_resolution = (h, w)
+                        print(f"[UniDepth-v1] Processing resolution: {h}×{w} (fixed, config-based)")
+                    else:
+                        self.processing_resolution = (image.shape[2], image.shape[3])
+                        print(f"[UniDepth-v1] Processing resolution: {image.shape[2]}×{image.shape[3]} (original)")
                 else:
                     self.processing_resolution = "adaptive (200k-600k pixels)"
                     print(f"[UniDepth-v2] Processing resolution: adaptive (200k-600k pixels)")

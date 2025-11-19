@@ -34,6 +34,9 @@ METRIC_MODE=false
 FRAME_INTERVAL=""
 ONLY_CLONE=true  # For VKITTI: only use 'clone' condition by default
 VISUALIZATION="true"  # Enable visualizations by default
+SEQ=""  # Sequence selection for UnrealStereo4K
+AMP=false
+AMP_DTYPE="bf16"
 
 # Help function
 show_help() {
@@ -71,20 +74,17 @@ Options:
   --metric                 Use metric mode (for vda only)
   --frame-interval <n>     Frame interval for sequence.png visualization
   --visualization <true|false> Enable/disable visualizations (sequence.png, best_frame.png, etc.). Default: true
+  --seq <n>                Sequence number(s) for UnrealStereo4K (0-8). Examples: 0, 2,5, 0,3,7
+  --amp                    Enable Automatic Mixed Precision (AMP) for inference
+  --amp-dtype <bf16|fp16>  Data type for AMP (default: bf16)
   --help                   Show this help message
 
 Examples:
-  # Test Video-Depth-Anything on Waymo
-  ./run_comparison.sh vda --dataset waymo --gpu 0
+  # Test UniDepth v2 on Unreal4K with AMP to reduce memory usage
+  ./run_comparison.sh unidepth --version v2 --dataset unreal4k --gpu 0 --amp
 
   # Test Metric3D v2 on Sintel
   ./run_comparison.sh metric3d --version v2 --dataset sintel --gpu 1
-
-  # Test UniDepth v1 with object-wise evaluation
-  ./run_comparison.sh unidepth --version v1 --dataset waymo_seg --gpu 0 --objwise
-
-  # Test DepthPro on KITTI
-  ./run_comparison.sh depthpro --dataset kitti --gpu 0
 
 EOF
 }
@@ -154,6 +154,18 @@ while [[ $# -gt 0 ]]; do
             ;;
         --visualization)
             VISUALIZATION="$2"
+            shift 2
+            ;;
+        --seq)
+            SEQ="$2"
+            shift 2
+            ;;
+        --amp)
+            AMP=true
+            shift
+            ;;
+        --amp-dtype)
+            AMP_DTYPE="$2"
             shift 2
             ;;
         --help)
@@ -235,6 +247,9 @@ if [ -n "$CHECKPOINT" ]; then
     echo "Checkpoint: $CHECKPOINT"
 fi
 echo "Visualization: $VISUALIZATION"
+if [ "$AMP" = true ]; then
+    echo "AMP: ENABLED (dtype: $AMP_DTYPE)"
+fi
 echo "Results Dir: $RESULTS_DIR"
 echo "========================================"
 
@@ -287,6 +302,14 @@ fi
 
 if [ -n "$CHECKPOINT" ]; then
     CMD="$CMD --checkpoint $CHECKPOINT"
+fi
+
+if [ -n "$SEQ" ]; then
+    CMD="$CMD --seq $SEQ"
+fi
+
+if [ "$AMP" = true ]; then
+    CMD="$CMD --amp --amp-dtype $AMP_DTYPE"
 fi
 
 CMD="$CMD --visualization $VISUALIZATION"

@@ -399,6 +399,7 @@ class Gear5Tester:
             logger.info(f"Video length: {video_length}")
             logger.info(f"Resolution: {resolution}")
 
+            # Always use CombinedDataset for test_gear5
             test_dataset = CombinedDataset(
                 root_dir=self.config.dataset.data_root,
                 enable_dataset_flags=test_datasets,
