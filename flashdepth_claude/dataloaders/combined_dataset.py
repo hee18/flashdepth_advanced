@@ -5,10 +5,13 @@ import cv2
 import logging
 import os
 from os.path import join
-import math
 
 from .depthanything_preprocess import _load_and_process_image, _load_and_process_depth
 from .base_dataset_pairs import BaseDatasetPairs
+
+# Import new NuScenesDepth dataset
+from .nuscenes_dataset import NuScenesDepth
+
 from utils.dataset_intrinsics import (
     get_intrinsics_info,
     get_fallback_fx,
@@ -20,7 +23,7 @@ from utils.dataset_intrinsics import (
 class CombinedDataset(Dataset):
     def __init__(self, root_dir, enable_dataset_flags, resolution=None, split='train',
                  video_length=8, seed=42, tmp_res=None, color_aug=False, strict_focal_length=True,
-                 unrealstereo4k_seq=None):
+                 unreal4k_seq=None, limit_scenes=None):
         '''
         enable_dataset_flags: list of datasets to use; e.g. ['spring', 'mvs-synth', 'urbansyn', 'eth3d', 'waymo', 'waymo_seg']
 
@@ -43,7 +46,7 @@ class CombinedDataset(Dataset):
 
         There aren't many other 2k videos for training (spring is the only one I'm familiar with),
         so I'll mix in hd as well
-        # 2k: mvs-synth, urbansyn, unrealstereo4k; (maybe waymo, do an ablation; maybe hoi4d)
+        # 2k: mvs-synth, urbansyn, unreal4k; (maybe waymo, do an ablation; maybe hoi4d)
         # lower res + dynamic: dynamic replica, pointodyssey, sintel, vkitti, tartanair, bedlam
         for the lower res datasets, I can either just do the same 4x downsample through unet;
         or have a condition in the model to not pass them through the unet
@@ -63,8 +66,8 @@ class CombinedDataset(Dataset):
         np.random.seed(seed)
         torch.manual_seed(seed)
 
-        # Store unrealstereo4k_seq parameter
-        self.unrealstereo4k_seq = unrealstereo4k_seq
+        # Store unreal4k_seq parameter
+        self.unreal4k_seq = unreal4k_seq
 
         cache_dir = './dataloaders/pairs_cache' if split != 'test' else None
 
@@ -77,15 +80,21 @@ class CombinedDataset(Dataset):
 
 
         for dataset_name in enable_dataset_flags:
+            # NuScenes is added here
+            if dataset_name == 'nuscenes':
+                dataset = NuScenesDepth(root_dir, split, load_cache=cache_dir, limit_scenes=limit_scenes)
             # waymo_seg only has 'val' split, no 'test' split
-            actual_split = 'val' if dataset_name == 'waymo_seg' and split == 'test' else split
-            logging.info(f"[DEBUG combined_dataset] Loading dataset: {dataset_name}, split={actual_split}")
-
-            # Pass unrealstereo4k_seq to unreal4k dataset
-            if dataset_name.lower() == 'unreal4k' and unrealstereo4k_seq is not None:
-                dataset = BaseDatasetPairs.create(dataset_name, root_dir, actual_split, load_cache=cache_dir, unrealstereo4k_seq=unrealstereo4k_seq)
             else:
-                dataset = BaseDatasetPairs.create(dataset_name, root_dir, actual_split, load_cache=cache_dir)
+                actual_split = 'val' if dataset_name == 'waymo_seg' and split == 'test' else split
+
+                logging.info(f"[DEBUG combined_dataset] Loading dataset: {dataset_name}, split={actual_split}")
+
+                # Pass unreal4k_seq to unreal4k dataset
+                if dataset_name.lower() == 'unreal4k' and unreal4k_seq is not None:
+                    dataset = BaseDatasetPairs.create(dataset_name, root_dir, actual_split, load_cache=cache_dir, unreal4k_seq=unreal4k_seq)
+                else:
+                    dataset = BaseDatasetPairs.create(dataset_name, root_dir, actual_split, load_cache=cache_dir)
+            
             self.pairslist[dataset_name] = dataset.pairs
             self.depth_read_list[dataset_name] = dataset.depth_read
             self.reshape_list[dataset_name] = dataset.reshape_list
@@ -122,7 +131,7 @@ class CombinedDataset(Dataset):
                         self.reshape_list[dataset]['resolution'] = (924,518)
                     elif dataset in ['vkitti']:
                         self.reshape_list[dataset]['resolution'] = (1246, 378) # 3.296 ratio, near original, 14x divisible
-                    elif dataset in ['nuscenes']:
+                    elif dataset in ['nuscenes']: 
                         self.reshape_list[dataset]['resolution'] = (924, 518)
 
 
@@ -145,7 +154,7 @@ class CombinedDataset(Dataset):
                         self.reshape_list[dataset]['resolution'] = (2044,1148)
                     if dataset in ['vkitti']:
                         self.reshape_list[dataset]['resolution'] = (1246, 378)  # 3.296 ratio, near original, 14x divisible
-                    elif dataset in ['nuscenes']:
+                    elif dataset in ['nuscenes']: # Add NuScenes resolution
                         self.reshape_list[dataset]['resolution'] = (1596, 896)
 
         else:
@@ -187,6 +196,10 @@ class CombinedDataset(Dataset):
         # Try dataset-specific getter first
         if self.focal_length_getter_list[dataset_idx] is not None:
             try:
+                # NuScenesDepth's get_item_data returns focal length directly,
+                # but CombinedDataset expects BaseDatasetPairs.create to provide
+                # a dataset object that has a get_focal_length method.
+                # For NuScenes, the get_focal_length will be called on the NuScenesDepth object
                 fx = self.focal_length_getter_list[dataset_idx](pair, image_shape)
                 return fx
             except Exception as e:
@@ -292,7 +305,7 @@ class CombinedDataset(Dataset):
                 - fx_canonical: Canonical focal length (500.0)
                 - fx_actual: Original actual focal length (for reference)
                 - actual_valid_mask: Valid mask in actual space (<70m)
-                - fx_ratio: Focal length ratio (CANONICAL_FX / fx_actual)
+                - fx_ratio: Focal length ratio (CANONICAL_FOCAL_LENGTH / fx_actual)
                 - resize_ratio: Total resize ratio (resize_factor × small_resize_ratio)
         """
         # Convert to numpy for computation
@@ -379,7 +392,7 @@ class CombinedDataset(Dataset):
                 try:
                     image, _current_crop = _load_and_process_image(pair['image'], **self.reshape_list[dataset_idx])
                     depth_inverse_actual = self.depth_read_list[dataset_idx](pair['depth'], is_inverse=True) # Load inverse depth (1/m)
-                    # Keep GT at ORIGINAL resolution (like original FlashDepth)
+                    # Keep GT at ORIGINAL resolution (like original FlashDepth) 
                     # Prediction will be interpolated to GT resolution during validation
 
                     # Get focal length for this frame (at original resolution)
@@ -638,4 +651,3 @@ class CombinedDataset(Dataset):
                 fx_ratio_tensor,  # NEW
                 resize_ratio_tensor,  # NEW
                 dataset_idx)
-       

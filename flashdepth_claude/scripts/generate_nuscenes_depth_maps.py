@@ -9,6 +9,7 @@ import cv2
 from nuscenes.nuscenes import NuScenes
 from nuscenes.utils.data_classes import LidarPointCloud
 from nuscenes.utils.geometry_utils import transform_matrix
+from pyquaternion import Quaternion
 
 def generate_depth_maps(
     nuscenes_root: Path,
@@ -32,8 +33,8 @@ def generate_depth_maps(
         lidar_scan_window: Time window in seconds around camera timestamp to consider LiDAR points.
                            For single sweep, keep this small (e.g., 0.01s).
     """
-    print(f"Initializing NuScenes with version {version} from {nuscenes_root / Path(version)}...")
-    nusc = NuScenes(version=version, dataroot=nuscenes_root / Path(version), verbose=True)
+    print(f"Initializing NuScenes with version {version} from {nuscenes_root}...")
+    nusc = NuScenes(version=version, dataroot=nuscenes_root, verbose=True)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f"Output directory for depth maps: {output_dir}")
@@ -91,22 +92,24 @@ def generate_depth_maps(
         
         cs_record_lidar = nusc.get('calibrated_sensor', pointsensor['calibrated_sensor_token'])
         pc = LidarPointCloud.from_file(lidar_path)
+
+        print(f"DEBUG: pc.points shape before transformations: {pc.points.shape}") # DEBUG
         
         # For precision, only consider the points from a single sweep synchronized with the camera
         # No accumulation from other sweeps, as per user's request.
         
         # 1. Transform lidar points from lidar frame to ego frame
-        pc.rotate(cs_record_lidar['rotation'].as_matrix())
+        pc.rotate(Quaternion(cs_record_lidar['rotation']).rotation_matrix)
         pc.translate(np.array(cs_record_lidar['translation']))
         
         # 2. Transform lidar points from ego frame to global frame
         ego_pose_lidar = nusc.get('ego_pose', pointsensor['ego_pose_token'])
-        pc.rotate(ego_pose_lidar['rotation'].as_matrix())
+        pc.rotate(Quaternion(ego_pose_lidar['rotation']).rotation_matrix)
         pc.translate(np.array(ego_pose_lidar['translation']))
 
         # 3. Transform lidar points from global frame to camera ego frame
         # (inverse of cam_ego_pose to get from global to camera's ego-pose frame)
-        global_from_cam_ego = transform_matrix(cam_ego_pose['translation'], cam_ego_pose['rotation'].elements,
+        global_from_cam_ego = transform_matrix(cam_ego_pose['translation'], Quaternion(cam_ego_pose['rotation']),
                                                  inverse=False)
         cam_ego_from_global = np.linalg.inv(global_from_cam_ego)
         pc.transform(cam_ego_from_global)
@@ -114,18 +117,24 @@ def generate_depth_maps(
         # 4. Transform lidar points from camera ego frame to camera sensor frame
         # (inverse of calibrated_cam to get from camera ego to camera sensor frame)
         cam_cs_record = nusc.get('calibrated_sensor', cam_data['calibrated_sensor_token'])
-        cam_cs_from_cam_ego = transform_matrix(cam_cs_record['translation'], cam_cs_record['rotation'].elements,
+        cam_cs_from_cam_ego = transform_matrix(cam_cs_record['translation'], Quaternion(cam_cs_record['rotation']),
                                               inverse=False)
         cam_sensor_from_cam_ego = np.linalg.inv(cam_cs_from_cam_ego)
         pc.transform(cam_sensor_from_cam_ego)
 
         # 5. Remove points behind the camera
-        points = pc.points
+        points = pc.points # Get current points from LidarPointCloud object
+        print(f"DEBUG: points shape before Z-filter: {points.shape}") # DEBUG
         points = points[:, points[2, :] > 0] # Keep points in front of camera (Z > 0)
+        print(f"DEBUG: points shape after Z-filter: {points.shape}") # DEBUG
+
+        if points.shape[1] == 0:
+            tqdm.write(f"Skipping sample {sample_token}: No points in front of camera.")
+            continue # Skip this sample if no points remain
         
         # 6. Project to image and filter points by distance
         # Intrinsics
-        camera_intrinsics = np.array(cam_cs_record['camera_intrinsics'])
+        camera_intrinsics = np.array(cam_cs_record['camera_intrinsic'])
         
         # Project 3D points to 2D image plane
         points_uvz = camera_intrinsics @ points[:3, :] # (3,3) @ (3,N) = (3,N)

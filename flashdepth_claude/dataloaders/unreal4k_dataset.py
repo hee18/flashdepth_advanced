@@ -15,10 +15,10 @@ from .base_dataset_pairs import BaseDatasetPairs
 
 class Unreal4kDepth(BaseDatasetPairs):
     def __init__(self, root_dir, split, load_cache=None):
-        self.root_dir = os.path.join(root_dir, 'unrealstereo4k')
+        self.root_dir = os.path.join(root_dir, 'unreal4k')
         super().__init__(dataset_name='unreal4k', root_dir=self.root_dir, split=split, load_cache=load_cache)
-        # Set default parameters
-        self.reshape_list['resolution'] = (3840,2160)
+        # Set default parameters (resized version at 0.55× scale)
+        self.reshape_list['resolution'] = (2112, 1188)
         self.reshape_list['stride'] = 2
 
     def get_cache_path(self, cache_dir):
@@ -71,17 +71,21 @@ class Unreal4kDepth(BaseDatasetPairs):
         depth_meters = np.load(path)
 
         # Handle invalid values
+        # UnrealStereo4K: Filter out unrealistic depths (>200m are likely sky/far background)
+        MAX_VALID_DEPTH = 200.0  # meters
         invalid_mask = np.logical_or.reduce((
             np.isinf(depth_meters),
             np.isnan(depth_meters),
-            depth_meters <= 0
+            depth_meters <= 0,
+            depth_meters > MAX_VALID_DEPTH  # Filter out unrealistic depths
         ))
 
         if invalid_mask.any():
             logging.info(f"Found invalid values in {path}: "
                         f"inf: {np.isinf(depth_meters).sum()}, "
                         f"nan: {np.isnan(depth_meters).sum()}, "
-                        f"<=0: {(depth_meters <= 0).sum()}")
+                        f"<=0: {(depth_meters <= 0).sum()}, "
+                        f">200m: {(depth_meters > MAX_VALID_DEPTH).sum()}")
 
         if is_inverse:
             # Convert metric depth to inverse depth for training
@@ -102,13 +106,14 @@ class Unreal4kDepth(BaseDatasetPairs):
 
     def get_focal_length(self, pair, image_shape):
         """
-        Get focal length for UnrealStereo4K dataset.
+        Get focal length for UnrealStereo4K dataset (resized version).
 
-        UnrealStereo4K has fixed intrinsics: fx=1920 for 3840x2160 resolution.
+        Original UnrealStereo4K: fx=1920 for 3840×2160 resolution.
+        Resized version (0.55×): fx=1056 for 2112×1188 resolution.
         This method returns the focal length scaled to the current image_shape.
         """
-        original_fx = 1920.0
-        original_width = 3840
+        original_fx = 1056.0  # Resized from 1920 at 0.55× scale
+        original_width = 2112  # Resized from 3840 at 0.55× scale
 
         # Scale to current image width
         current_width = image_shape[1]

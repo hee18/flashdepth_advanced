@@ -297,40 +297,29 @@ class Gear5Trainer:
         if use_mamba_temporal:
             self.logger.warning("NOTE: FlashDepth's original Mamba modules will be FROZEN. Only TemporalScalePredictor's Mamba2 is trainable.")
 
+        # Determine GSP embed_dim
+        # Phase 1: Use model's embed_dim (ViT-L=1024 or ViT-S=384)
+        # Phase 2 Hybrid: Use Student's embed_dim (384 for FlashDepth-hybrid)
+        #   Reason: Depth prediction is done by Student, so GSP should use Student's CLS tokens
+        gsp_embed_dim = embed_dim
+        if self.phase == 2:
+            self.logger.info(f"Phase 2 Hybrid: Using GSP with Student CLS tokens ({gsp_embed_dim}-dim)")
+        else:
+            self.logger.info(f"Phase 1: Using GSP with {gsp_embed_dim}-dim CLS tokens")
+
         model.gear5_metric_head = Gear5MetricHead(
-            embed_dim=embed_dim,
+            embed_dim=gsp_embed_dim,
             feature_dim=256,
             hidden_dim=128,
             use_mamba=use_mamba_temporal  # NEW: Support Mamba2 option
         )
 
-        # Phase 2: Load Phase 1 checkpoint, then overwrite ViT+DPT with FlashDepth-S hybrid
-        if self.phase == 2 and checkpoint_path and checkpoint_path != 'true' and os.path.exists(checkpoint_path):
-            # Step 1: Load Phase 1 Gear5 checkpoint (all components including gear5_metric_head)
-            self.logger.info(f"Phase 2: Loading Gear5 Phase 1 checkpoint: {checkpoint_path}")
-            checkpoint = torch.load(checkpoint_path, map_location='cpu')
-            if isinstance(checkpoint, dict) and 'model' in checkpoint:
-                state_dict = checkpoint['model']
-            elif isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
-                state_dict = checkpoint['state_dict']
-            else:
-                state_dict = checkpoint
-
-            state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
-
-            # Load all parameters from Phase 1
-            model.load_state_dict(state_dict, strict=False)
-            self.logger.info(f"Phase 2: Loaded Gear5 Phase 1 checkpoint")
-            self.logger.info(f"  - ViT (ViT-L): ✓ (will be overwritten with hybrid)")
-            self.logger.info(f"  - DPT: ✓ (will be overwritten with hybrid)")
-            self.logger.info(f"  - Mamba: ✓ (kept from Phase 1, will be frozen)")
-            self.logger.info(f"  - output_conv: ✓ (kept from Phase 1, will be frozen)")
-            self.logger.info(f"  - Gear5MetricHead: ✓ (kept from Phase 1, trainable)")
-
-            # Step 2: Overwrite ViT + DPT with FlashDepth-S hybrid weights
+        # Phase 2: Load FlashDepth-hybrid, then load GSP from gear_checkpoint
+        if self.phase == 2:
+            # Step 1: Load FlashDepth-hybrid checkpoint (ViT, DPT, Mamba, output_conv)
             hybrid_path = self.config.get('load', 'configs/flashdepth/iter_43002.pth')
             if os.path.exists(hybrid_path):
-                self.logger.info(f"Phase 2: Loading FlashDepth-S hybrid weights from {hybrid_path}")
+                self.logger.info(f"Phase 2: Loading FlashDepth-hybrid weights from {hybrid_path}")
                 hybrid_checkpoint = torch.load(hybrid_path, map_location='cpu')
 
                 # Extract state dict
@@ -344,22 +333,60 @@ class Gear5Trainer:
                 # Remove module. prefix if present
                 hybrid_state_dict = {k.replace('module.', ''): v for k, v in hybrid_state_dict.items()}
 
-                # Load ONLY ViT and DPT parameters (exclude Mamba, output_conv, gear5_metric_head)
+                # Load ViT, DPT, Mamba, and output_conv from FlashDepth-hybrid
+                # Exclude: hybrid_fusion (internal), teacher_model (internal), gear5_metric_head (will load separately)
                 loaded_hybrid = {}
                 for k, v in hybrid_state_dict.items():
-                    # Include only encoder and DPT (exclude Mamba, output_conv, gear5_metric_head)
-                    if not any(x in k for x in ['mamba', 'hybrid_fusion', 'teacher_model',
-                                                 'output_conv1', 'output_conv2', 'gear5_metric_head']):
+                    # Include encoder, DPT, Mamba, output_conv (exclude hybrid_fusion, teacher_model, gear5_metric_head)
+                    if not any(x in k for x in ['hybrid_fusion', 'teacher_model', 'gear5_metric_head']):
                         loaded_hybrid[k] = v
 
-                # Overwrite ViT + DPT parameters with hybrid weights
+                # Load FlashDepth components
                 model.load_state_dict(loaded_hybrid, strict=False)
-                self.logger.info(f"Phase 2: Overwritten {len(loaded_hybrid)} ViT + DPT parameters with hybrid weights")
-                self.logger.info(f"  - ViT (ViT-L + ViT-S + Cross Attn): ✓")
-                self.logger.info(f"  - DPT: ✓")
-                self.logger.info(f"  - Kept from Phase 1: Mamba (frozen), output_conv (frozen), Gear5MetricHead (trainable)")
+                self.logger.info(f"Phase 2: Loaded {len(loaded_hybrid)} parameters from FlashDepth-hybrid")
+                self.logger.info(f"  - Student ViT-S (768-dim): ✓ (from hybrid, will be frozen)")
+                self.logger.info(f"  - Teacher ViT-L (1024-dim): ✓ (from hybrid, will be frozen)")
+                self.logger.info(f"  - DPT (64-dim): ✓ (from hybrid, will be frozen)")
+                self.logger.info(f"  - Mamba (64-dim): ✓ (from hybrid, will be frozen)")
+                self.logger.info(f"  - output_conv1/2: ✓ (from hybrid, will be frozen)")
             else:
-                self.logger.warning(f"FlashDepth-S hybrid checkpoint {hybrid_path} not found! Using Phase 1 ViT + DPT.")
+                self.logger.warning(f"FlashDepth-hybrid checkpoint {hybrid_path} not found!")
+
+            # Step 2: Load GSP weights from gear_checkpoint (must be Phase 1 Small checkpoint!)
+            if checkpoint_path and checkpoint_path != 'true' and os.path.exists(checkpoint_path):
+                self.logger.info(f"Phase 2: Loading GSP-Small weights from {checkpoint_path}")
+                self.logger.info(f"  NOTE: gear_checkpoint must be a Phase 1 Small checkpoint!")
+                gsp_checkpoint = torch.load(checkpoint_path, map_location='cpu')
+
+                # Extract state dict
+                if isinstance(gsp_checkpoint, dict) and 'model' in gsp_checkpoint:
+                    gsp_state_dict = gsp_checkpoint['model']
+                elif isinstance(gsp_checkpoint, dict) and 'state_dict' in gsp_checkpoint:
+                    gsp_state_dict = gsp_checkpoint['state_dict']
+                else:
+                    gsp_state_dict = gsp_checkpoint
+
+                # Remove module. prefix if present
+                gsp_state_dict = {k.replace('module.', ''): v for k, v in gsp_state_dict.items()}
+
+                # Load ONLY gear5_metric_head parameters
+                gsp_params = {}
+                for k, v in gsp_state_dict.items():
+                    if 'gear5_metric_head' in k:
+                        gsp_params[k] = v
+
+                # Load GSP weights
+                missing, unexpected = model.load_state_dict(gsp_params, strict=False)
+                self.logger.info(f"Phase 2: Loaded {len(gsp_params)} GSP-Small parameters")
+                self.logger.info(f"  - Gear5MetricHead (GSP-Small): ✓ (from Phase 1 Small, trainable)")
+
+                if len(gsp_params) == 0:
+                    self.logger.warning(f"WARNING: No GSP parameters found in {checkpoint_path}!")
+                    self.logger.warning(f"  Check that gear_checkpoint is a Phase 1 Small checkpoint!")
+                    self.logger.warning(f"  GSP will start from random initialization!")
+            else:
+                self.logger.warning(f"gear_checkpoint not specified or not found!")
+                self.logger.warning(f"  GSP will start from random initialization!")
 
         # Enable attention weights storage
         # Unified single-stage: use 2 layers for CLS token extraction and importance mapping
@@ -507,6 +534,7 @@ class Gear5Trainer:
             train_datasets = self.config.dataset.get('train_datasets', ['mvs-synth', 'spring'])
             val_datasets = self.config.dataset.get('val_datasets', ['sintel', 'waymo_seg'])
             resolution = '2k'
+            print(f"Resolution is {resolution}")
 
         if self.rank == 0:
             self.logger.info(f"Phase {self.phase} - Train datasets: {train_datasets}")
@@ -1144,10 +1172,11 @@ class Gear5Trainer:
         dataset_sequence_counters = {'sintel': 0, 'waymo_seg': 0}
 
         # Phase 2: Limit validation batches to save memory (2K resolution)
-        # Dataset-specific limits: sintel 4개, waymo_seg 2개 (총 6 batches)
+        # Dataset-specific limits: Phase 2 uses single-frame validation (memory efficient)
         if self.phase >= 2:
-            max_val_batches = 6  # Total max batches
-            dataset_max_sequences = {'sintel': 4, 'waymo_seg': 2}
+            # Increased from 6 to 16 for better validation reliability (no memory impact)
+            max_val_batches = 16  # Total max batches
+            dataset_max_sequences = {'sintel': 8, 'waymo_seg': 8}  # Balanced evaluation
         else:
             max_val_batches = None
             dataset_max_sequences = {}
@@ -1195,11 +1224,17 @@ class Gear5Trainer:
 
                 # Add channel dimension if needed
                 if gt_depth.ndim == 3:
+                    # [B, H, W] → [B, 1, H, W]
                     gt_depth = gt_depth.unsqueeze(1)
                 elif gt_depth.ndim == 4 and gt_depth.shape[1] != 1:
+                    # [B, T, H, W] → [B, T, 1, H, W]
                     gt_depth = gt_depth.unsqueeze(2)
 
                 B, T = images.shape[:2]
+
+                # Handle validation with video_length=1: [B, 1, H, W] → [B, 1, 1, H, W]
+                if gt_depth.ndim == 4 and T == 1:
+                    gt_depth = gt_depth.unsqueeze(2)  # [B, 1, H, W] → [B, 1, 1, H, W]
 
                 # GT depth from dataloader is inverse depth (1/m), scale to 100/m for validation
                 gt_depth_inverse_100 = gt_depth * 100.0  # (1/m) * 100 = 100/m

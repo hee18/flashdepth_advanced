@@ -169,16 +169,16 @@ class VideoComparisonTester:
                 f"\n"
                 f"Example correct usage:\n"
             )
-            
+
             if method == 'depthcrafter':
                 error_msg += f"  python test_comparison.py --method depthcrafter --depth-mode relative --dataset {{dataset}}\n"
             elif method == 'vda':
                 error_msg += f"  python test_comparison.py --method vda --depth-mode relative --dataset {{dataset}}\n"
                 error_msg += f"  # OR for metric VideoDepthAnything:\n"
                 error_msg += f"  python test_comparison.py --method vda --metric --depth-mode metric --dataset {{dataset}}\n"
-            
+
             error_msg += f"{'='*80}\n"
-            
+
             logger.error(error_msg)
             raise ValueError(f"Depth mode mismatch: {method} outputs relative depth but depth_mode='metric'")
         
@@ -255,8 +255,8 @@ class VideoComparisonTester:
             # Get only_clone flag for VKITTI
             only_clone = self.config.get('only_clone', False) if dataset_name == 'vkitti' else False
 
-            # Get unrealstereo4k_seq_list if specified
-            unrealstereo4k_seq_list = self.config.get('unrealstereo4k_seq_list', None) if dataset_name == 'unrealstereo4k' else None
+            # Get unreal4k_seq_list if specified
+            unreal4k_seq_list = self.config.get('unreal4k_seq_list', None) if dataset_name == 'unreal4k' else None
 
             dataset = ComparisonDataset(
                 dataset_name=dataset_name,
@@ -265,14 +265,15 @@ class VideoComparisonTester:
                 video_length=video_length,
                 objwise_enabled=self.object_wise_enabled,
                 only_clone=only_clone,
-                unrealstereo4k_seq_list=unrealstereo4k_seq_list
+                unreal4k_seq_list=unreal4k_seq_list,
+                limit_scenes=self.config.get('limit_scenes') # Pass limit_scenes
             )
             collate_fn = comparison_collate_fn
 
         # For high resolution datasets, use num_workers=0 to avoid OOM and slow worker processes
         num_workers = self.config.get('workers', 4)
-        # Handle aliases: unreal4k, unreal → unrealstereo4k
-        if dataset_name in ['eth3d', 'unrealstereo4k', 'unreal4k', 'unreal']:
+        # Handle aliases: unreal, unrealstereo4k → unreal4k
+        if dataset_name in ['eth3d', 'unreal4k', 'unreal', 'unrealstereo4k']:
             num_workers = 0
             logger.info(f"Using num_workers=0 for {dataset_name} (high resolution dataset)")
 
@@ -373,7 +374,10 @@ class VideoComparisonTester:
             gt_depth_processed = gt_depth_processed.unsqueeze(2)  # [1, T, 1, H, W]
         else:
             # ComparisonDataset - already in meters
-            gt_depth_processed = gt_depths.unsqueeze(2)  # [1, T, 1, H, W]
+            if gt_depths.ndim == 4:
+                gt_depth_processed = gt_depths.unsqueeze(2)  # [1, T, H, W] -> [1, T, 1, H, W]
+            else:
+                gt_depth_processed = gt_depths # Already [1, T, 1, H, W]
 
         # Get focal lengths (for models that need them)
         if intrinsics is not None:
@@ -440,11 +444,6 @@ class VideoComparisonTester:
                     intrinsics=intrinsics  # [1, T, 4] or None
                 )  # Returns [1, T, H, W] in meters
 
-        # Release intermediate tensors after inference
-        # Only delete if new tensors were created (not references to original)
-        if is_imagenet_normalized:
-            del images_unnorm, mean, std
-
         torch.cuda.synchronize()
         end_time = time.time()
 
@@ -502,13 +501,6 @@ class VideoComparisonTester:
         # 2. Object-wise mode is enabled but no segmentations available (fallback)
         has_segmentations = 'segmentations' in batch
         compute_regular_metrics = not self.object_wise_enabled or (self.object_wise_enabled and not has_segmentations)
-
-        # DEBUG: Log evaluation path selection
-        logger.info(f"[OBJWISE DEBUG] Sequence {sequence_id}: object_wise_enabled={self.object_wise_enabled}, has_segmentations={has_segmentations}")
-        logger.info(f"[OBJWISE DEBUG] Sequence {sequence_id}: compute_regular_metrics={compute_regular_metrics}")
-        if has_segmentations and 'dataset_name' in batch:
-            dataset_name_raw = batch.get('dataset_name', 'unknown')
-            logger.info(f"[OBJWISE DEBUG] Sequence {sequence_id}: dataset_name={dataset_name_raw}")
 
         if compute_regular_metrics:
             # Regular metrics computation (full image)
@@ -686,6 +678,13 @@ class VideoComparisonTester:
             # Regular metrics already computed as fallback
             logger.info(f"Object-wise mode enabled but no segmentations available - using regular metrics")
 
+        # DEBUG: Log evaluation path selection
+        logger.info(f"[OBJWISE DEBUG] Sequence {sequence_id}: object_wise_enabled={self.object_wise_enabled}, has_segmentations={has_segmentations}")
+        logger.info(f"[OBJWISE DEBUG] Sequence {sequence_id}: compute_regular_metrics={compute_regular_metrics}")
+        if has_segmentations and 'dataset_name' in batch:
+            dataset_name_raw = batch.get('dataset_name', 'unknown')
+            logger.info(f"[OBJWISE DEBUG] Sequence {sequence_id}: dataset_name={dataset_name_raw}")
+
         # Visualize sequence (simplified version without importance maps)
         # Skip for ETH3D due to very high resolution (6205x4135) making this too slow
         if self.enable_visualization:
@@ -695,7 +694,10 @@ class VideoComparisonTester:
             else:
                 dataset_name_lower = str(dataset_name).lower()
 
-            if 'eth3d' not in dataset_name_lower and 'unrealstereo' not in dataset_name_lower:
+            # Skip visualization for high-resolution datasets
+            skip_viz = any(x in dataset_name_lower for x in ['eth3d', 'unreal4k', 'unreal', 'unrealstereo'])
+
+            if not skip_viz:
                 # Prepare segmentation masks for visualization if object-wise mode
                 seg_masks_for_viz = None
                 if self.object_wise_enabled and 'segmentations' in batch:
@@ -715,10 +717,7 @@ class VideoComparisonTester:
                     object_classes=self.object_wise_metrics.object_classes if self.object_wise_enabled else None
                 )
             else:
-                if 'eth3d' in dataset_name_lower:
-                    logger.info(f"Skipping sequence visualization for ETH3D (high resolution)")
-                elif 'unrealstereo' in dataset_name_lower:
-                    logger.info(f"Skipping sequence visualization for UnrealStereo4K (high resolution)")
+                logger.info(f"Skipping sequence visualization for {dataset_name} (high resolution dataset)")
 
         # Save best frame visualization
         # For object-wise mode: check if metrics exist, for regular: check frame_metrics
@@ -781,8 +780,7 @@ class VideoComparisonTester:
                 dataset_name=dataset_name,
                 focal_length=frame_focal_length,
                 seg_mask=frame_seg_mask,
-                objwise_enabled=self.object_wise_enabled,
-                object_classes=self.object_wise_metrics.object_classes if self.object_wise_enabled else None,
+                objwise_enabled=self.object_wise_metrics.object_classes if self.object_wise_enabled else None,
                 class_names_dict=self.object_wise_metrics.classes if self.object_wise_enabled else None
             )
 
@@ -937,6 +935,8 @@ def main():
                        help='Enable Automatic Mixed Precision (AMP) for inference')
     parser.add_argument('--amp-dtype', type=str, default='bf16', choices=['bf16', 'fp16'],
                        help='Data type for AMP (bfloat16 or float16)')
+    parser.add_argument('--limit-scenes', type=int, default=None,
+                       help='Limit the number of NuScenes scenes to process (for debugging)')
 
     args = parser.parse_args()
 
@@ -948,9 +948,9 @@ def main():
         logger.error(f"   For image models (metric3d, unidepth, depthpro, etc.), use test_comparison.py instead")
         sys.exit(1)
 
-    # Parse UnrealStereo4K --seq (supports single or multiple sequences)
-    unrealstereo4k_seq_list = None
-    if args.dataset.lower() in ['unrealstereo4k', 'unreal4k', 'unreal']:
+    # Parse Unreal4K --seq (supports single or multiple sequences)
+    unreal4k_seq_list = None
+    if args.dataset.lower() in ['unreal4k', 'unreal', 'unrealstereo4k']:
         if args.seq is not None:
             # Parse comma-separated sequence numbers
             try:
@@ -958,19 +958,19 @@ def main():
                 # Validate range
                 for seq in seq_list:
                     if seq < 0 or seq > 8:
-                        logger.error(f"❌ UnrealStereo4K --seq must be between 0 and 8, got {seq}")
+                        logger.error(f"❌ Unreal4K --seq must be between 0 and 8, got {seq}")
                         sys.exit(1)
-                unrealstereo4k_seq_list = seq_list
-                logger.info(f"UnrealStereo4K: Testing sequences {seq_list}")
+                unreal4k_seq_list = seq_list
+                logger.info(f"Unreal4K: Testing sequences {seq_list}")
             except ValueError:
                 logger.error(f"❌ Invalid --seq format: {args.seq}")
                 logger.error(f"   Examples: --seq 0, --seq 2,5, --seq 0,3,7")
                 sys.exit(1)
         else:
             # Auto mode: test all sequences 0-8
-            logger.warning("⚠️  UnrealStereo4K: Testing ALL sequences (0-8) - this may take a long time!")
+            logger.warning("⚠️  Unreal4K: Testing ALL sequences (0-8) - this may take a long time!")
             logger.warning("    Recommend: Use --seq N to test one or more sequences")
-            logger.warning("    Example: --dataset unrealstereo4k --seq 0 or --seq 2,5")
+            logger.warning("    Example: --dataset unreal4k --seq 0 or --seq 2,5")
 
     # Build method name with version
     method_name = args.method
@@ -999,9 +999,10 @@ def main():
         'frame_interval': args.frame_interval,
         'only_clone': (args.only_clone == 'true'),  # Convert string to bool
         'visualization': (args.visualization == 'true'),  # Convert string to bool
-        'unrealstereo4k_seq_list': unrealstereo4k_seq_list,  # Sequence list for UnrealStereo4K (None for other datasets)
+        'unreal4k_seq_list': unreal4k_seq_list,  # Sequence list for Unreal4K (None for other datasets)
         'amp': args.amp,
-        'amp_dtype': args.amp_dtype
+        'amp_dtype': args.amp_dtype,
+        'limit_scenes': args.limit_scenes
     }
 
     # Import and create adapter (VIDEO MODELS ONLY)

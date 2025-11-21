@@ -37,6 +37,7 @@ VISUALIZATION="true"  # Enable visualizations by default
 SEQ=""  # Sequence selection for UnrealStereo4K
 AMP=false
 AMP_DTYPE="bf16"
+LIMIT_SCENES="" # New: Limit NuScenes scenes
 
 # Help function
 show_help() {
@@ -77,6 +78,7 @@ Options:
   --seq <n>                Sequence number(s) for UnrealStereo4K (0-8). Examples: 0, 2,5, 0,3,7
   --amp                    Enable Automatic Mixed Precision (AMP) for inference
   --amp-dtype <bf16|fp16>  Data type for AMP (default: bf16)
+  --limit-scenes <n>       For NuScenes, limit the number of scenes to process (e.g., 50)
   --help                   Show this help message
 
 Examples:
@@ -168,6 +170,10 @@ while [[ $# -gt 0 ]]; do
             AMP_DTYPE="$2"
             shift 2
             ;;
+        --limit-scenes)
+            LIMIT_SCENES="$2"
+            shift 2
+            ;;
         --help)
             show_help
             exit 0
@@ -250,6 +256,9 @@ echo "Visualization: $VISUALIZATION"
 if [ "$AMP" = true ]; then
     echo "AMP: ENABLED (dtype: $AMP_DTYPE)"
 fi
+if [ -n "$LIMIT_SCENES" ]; then
+    echo "Limit Scenes (NuScenes): $LIMIT_SCENES"
+fi
 echo "Results Dir: $RESULTS_DIR"
 echo "========================================"
 
@@ -265,7 +274,7 @@ fi
 CMD="python test_comparison.py"
 CMD="$CMD --method $METHOD"
 CMD="$CMD --dataset $DATASET"
-CMD="$CMD --data-root $DATA_ROOT"
+CMD="$CMD --data-root /data/datasets"
 CMD="$CMD --gpu $CONTAINER_GPU"
 CMD="$CMD --workers $WORKERS"
 CMD="$CMD --video-length $VID_LEN"
@@ -310,6 +319,10 @@ fi
 
 if [ "$AMP" = true ]; then
     CMD="$CMD --amp --amp-dtype $AMP_DTYPE"
+fi
+
+if [ -n "$LIMIT_SCENES" ]; then
+    CMD="$CMD --limit-scenes $LIMIT_SCENES"
 fi
 
 CMD="$CMD --visualization $VISUALIZATION"

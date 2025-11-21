@@ -400,12 +400,18 @@ class Gear5Tester:
             logger.info(f"Resolution: {resolution}")
 
             # Always use CombinedDataset for test_gear5
+            # Get limit_scenes from config if available (for NuScenes dataset limiting)
+            limit_scenes = self.config.dataset.get('limit_scenes', None)
+            if limit_scenes is not None:
+                logger.info(f"Limiting scenes to: {limit_scenes}")
+
             test_dataset = CombinedDataset(
                 root_dir=self.config.dataset.data_root,
                 enable_dataset_flags=test_datasets,
                 resolution=resolution,
                 split='test',  # Use 'test' split (full test dataset)
-                video_length=video_length
+                video_length=video_length,
+                limit_scenes=limit_scenes
             )
             collate_fn = self._collate_fn
 
@@ -1144,6 +1150,27 @@ class Gear5Tester:
                     mae = torch.abs(pred_valid_values - gt_valid_values).mean()
                     logger.info(f"  MAE: {mae:.4f} meters")
 
+                    # Additional debug: AbsRel analysis
+                    abs_diff = torch.abs(pred_valid_values - gt_valid_values)
+                    abs_rel_per_pixel = abs_diff / gt_valid_values
+                    logger.info(f"  AbsRel stats: mean={abs_rel_per_pixel.mean():.4f}, median={abs_rel_per_pixel.median():.4f}, max={abs_rel_per_pixel.max():.4f}")
+
+                    # Find pixels with extreme AbsRel (>10)
+                    extreme_mask = abs_rel_per_pixel > 10.0
+                    if extreme_mask.sum() > 0:
+                        logger.info(f"  Extreme AbsRel pixels (>10): {extreme_mask.sum()} / {len(abs_rel_per_pixel)} ({100*extreme_mask.sum()/len(abs_rel_per_pixel):.1f}%)")
+                        extreme_gt = gt_valid_values[extreme_mask]
+                        extreme_pred = pred_valid_values[extreme_mask]
+                        logger.info(f"    Their GT range: [{extreme_gt.min():.4f}, {extreme_gt.max():.4f}]")
+                        logger.info(f"    Their Pred range: [{extreme_pred.min():.4f}, {extreme_pred.max():.4f}]")
+
+                    # GT distribution analysis
+                    gt_bins = [0, 1, 5, 10, 20, 50, 70]
+                    for i in range(len(gt_bins)-1):
+                        bin_mask = (gt_valid_values >= gt_bins[i]) & (gt_valid_values < gt_bins[i+1])
+                        if bin_mask.sum() > 0:
+                            logger.info(f"  GT bin [{gt_bins[i]}, {gt_bins[i+1]}m): {bin_mask.sum()} pixels ({100*bin_mask.sum()/len(gt_valid_values):.1f}%)")
+
             if valid_mask.sum() > 0:
                 frame_metric = self.metrics.compute_metric_depth_metrics(
                     pred_frame,  # [H, W]
@@ -1284,7 +1311,8 @@ class Gear5Tester:
         # Note: frame_interval is NOT applied to video - use all frames
         # Skip video for long sequences (urbansyn, unreal4k) to save time and disk space
         skip_video_datasets = ['urbansyn', 'unreal4k']
-        should_save_video = dataset_name not in skip_video_datasets
+        should_save_video = not any(skip_name in dataset_name.lower() for skip_name in skip_video_datasets)
+        logger.info(f"Video save decision: dataset_name='{dataset_name}', skip_list={skip_video_datasets}, should_save={should_save_video}")
         if self.enable_visualization and self.config.eval.get('out_video', True) and should_save_video:
             # Use original model resolution for images (following FlashDepth approach)
             # save_gifs_as_grid/save_grid_to_mp4 will handle downsampling to save_res

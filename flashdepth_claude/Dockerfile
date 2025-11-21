@@ -28,7 +28,7 @@ RUN pip install torchvision==0.19.0
 
 # Install other dependencies
 RUN pip install ipdb tqdm wandb
-RUN pip install matplotlib einops scipy h5py OpenEXR seaborn pandas
+RUN pip install matplotlib einops scipy h5py OpenEXR seaborn pandas nuscenes-devkit
 RUN pip install hydra-core
 RUN pip install opencv-python pillow pyarrow
 RUN pip install packaging wheel

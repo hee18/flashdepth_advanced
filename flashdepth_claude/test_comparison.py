@@ -270,8 +270,8 @@ class ComparisonTester:
             # Get only_clone flag for VKITTI
             only_clone = self.config.get('only_clone', False) if base_dataset_name == 'vkitti' else False
 
-            # Get unrealstereo4k_seq if specified
-            unrealstereo4k_seq = self.config.get('unrealstereo4k_seq', None) if base_dataset_name == 'unrealstereo4k' else None
+            # Get unreal4k_seq if specified
+            unreal4k_seq = self.config.get('unreal4k_seq', None) if base_dataset_name == 'unreal4k' else None
 
             # Use base_dataset_name (with _seg removed) for ComparisonDataset
             # ComparisonDataset will look for waymo_seg, vkitti, urbansyn directories
@@ -282,14 +282,15 @@ class ComparisonTester:
                 video_length=video_length,
                 objwise_enabled=False,  # Not using object-wise mode
                 only_clone=only_clone,
-                unrealstereo4k_seq=unrealstereo4k_seq
+                unreal4k_seq=unreal4k_seq,
+                limit_scenes=self.config.get('limit_scenes') # Pass limit_scenes
             )
             collate_fn = comparison_collate_fn
             logger.info(f"Standard dataset: {base_dataset_name} (ComparisonDataset, metric depth)")
 
         # For high resolution datasets, use num_workers=0 to avoid OOM and slow worker processes
         num_workers = self.config.get('workers', 4)
-        if dataset_name in ['eth3d', 'unrealstereo4k']:
+        if dataset_name in ['eth3d', 'unreal4k']:
             num_workers = 0
             logger.info(f"Using num_workers=0 for {dataset_name} (high resolution dataset)")
 
@@ -383,7 +384,11 @@ class ComparisonTester:
             gt_depth_processed = gt_depth_processed.unsqueeze(2)  # [1, T, 1, H, W]
         else:
             # ComparisonDataset - already in meters
-            gt_depth_processed = gt_depths.unsqueeze(2)  # [1, T, 1, H, W]
+            if gt_depths.ndim == 4:
+                gt_depth_processed = gt_depths.unsqueeze(2)  # [1, T, H, W] -> [1, T, 1, H, W]
+            else:
+                gt_depth_processed = gt_depths # Already [1, T, 1, H, W]
+
 
         # Get focal lengths (for models that need them)
         if intrinsics is not None:
@@ -725,7 +730,10 @@ class ComparisonTester:
             else:
                 dataset_name_lower = str(dataset_name).lower()
 
-            if 'eth3d' not in dataset_name_lower and 'unrealstereo' not in dataset_name_lower:
+            # Skip visualization for high-resolution datasets
+            skip_viz = any(x in dataset_name_lower for x in ['eth3d', 'unreal4k', 'unreal', 'unrealstereo'])
+
+            if not skip_viz:
                 # Prepare segmentation masks for visualization if object-wise mode
                 seg_masks_for_viz = None
                 if self.object_wise_enabled and 'segmentations' in batch:
@@ -745,10 +753,7 @@ class ComparisonTester:
                     object_classes=self.object_wise_metrics.object_classes if self.object_wise_enabled else None
                 )
             else:
-                if 'eth3d' in dataset_name_lower:
-                    logger.info(f"Skipping sequence visualization for ETH3D (high resolution)")
-                elif 'unrealstereo' in dataset_name_lower:
-                    logger.info(f"Skipping sequence visualization for UnrealStereo4K (high resolution)")
+                logger.info(f"Skipping sequence visualization for {dataset_name} (high resolution dataset)")
 
         # Save best frame visualization
         # For object-wise mode: check if metrics exist, for regular: check frame_metrics
@@ -967,6 +972,8 @@ def main():
                        help='Enable Automatic Mixed Precision (AMP) for inference')
     parser.add_argument('--amp-dtype', type=str, default='bf16', choices=['bf16', 'fp16'],
                        help='Data type for AMP (bfloat16 or float16)')
+    parser.add_argument('--limit-scenes', type=int, default=None,
+                       help='Limit the number of NuScenes scenes to process (for debugging)')
 
     args = parser.parse_args()
 
@@ -981,8 +988,8 @@ def main():
         logger.error(f"   Or:      ./run_video_comparison.sh {args.method} --dataset {args.dataset}")
         sys.exit(1)
 
-    # Parse UnrealStereo4K --seq (supports single or multiple sequences)
-    if args.dataset.lower() in ['unrealstereo4k', 'unreal4k', 'unreal']:
+    # Parse Unreal4K --seq (supports single or multiple sequences)
+    if args.dataset.lower() in ['unreal4k', 'unreal', 'unrealstereo4k']:
         if args.seq is not None:
             # Parse comma-separated sequence numbers
             try:
@@ -990,16 +997,16 @@ def main():
                 # Validate range
                 for seq in seq_list:
                     if seq < 0 or seq > 8:
-                        logger.error(f"❌ UnrealStereo4K --seq must be between 0 and 8, got {seq}")
+                        logger.error(f"❌ Unreal4K --seq must be between 0 and 8, got {seq}")
                         sys.exit(1)
-                logger.info(f"UnrealStereo4K: Testing sequences {seq_list}")
+                logger.info(f"Unreal4K: Testing sequences {seq_list}")
             except ValueError:
                 logger.error(f"❌ Invalid --seq format: {args.seq}")
                 logger.error(f"   Examples: --seq 0, --seq 2,5, --seq 0,3,7")
                 sys.exit(1)
         else:
             # Auto mode: test all sequences 0-8
-            logger.info("UnrealStereo4K: Testing ALL sequences (0-8)")
+            logger.info("Unreal4K: Testing ALL sequences (0-8)")
             seq_list = list(range(9))  # [0, 1, 2, 3, 4, 5, 6, 7, 8]
     else:
         seq_list = [None]  # For other datasets, seq is ignored
@@ -1045,14 +1052,14 @@ def main():
         logger.error("Make sure the adapter is implemented in adapters/ directory")
         sys.exit(1)
 
-    # Loop through sequences (for UnrealStereo4K) or run once (for other datasets)
+    # Loop through sequences (for Unreal4K) or run once (for other datasets)
     all_seq_results = []
 
     for seq_idx in seq_list:
-        # For UnrealStereo4K multi-sequence mode
-        if args.dataset.lower() == 'unrealstereo4k' and len(seq_list) > 1:
+        # For Unreal4K multi-sequence mode
+        if args.dataset.lower() == 'unreal4k' and len(seq_list) > 1:
             logger.info(f"\n{'='*80}")
-            logger.info(f"Testing UnrealStereo4K sequence {seq_idx}/{len(seq_list)-1}")
+            logger.info(f"Testing Unreal4K sequence {seq_idx}/{len(seq_list)-1}")
             logger.info(f"{'='*80}\n")
             # Create per-sequence results directory
             results_dir = f"{base_results_dir}/seq{seq_idx}"
@@ -1081,9 +1088,10 @@ def main():
             'frame_interval': args.frame_interval,
             'only_clone': (args.only_clone == 'true'),  # Convert string to bool
             'visualization': (args.visualization == 'true'),  # Convert string to bool
-            'unrealstereo4k_seq': seq_idx,  # Current sequence number
+            'unreal4k_seq': seq_idx,  # Current sequence number
             'amp': args.amp,
-            'amp_dtype': args.amp_dtype
+            'amp_dtype': args.amp_dtype,
+            'limit_scenes': args.limit_scenes
         }
 
         # Create tester and run
@@ -1093,7 +1101,7 @@ def main():
         # Collect results if testing multiple sequences
         if len(seq_list) > 1:
             # Read the results JSON
-            results_json_path = Path(results_dir) / "results.json"
+            results_json_path = Path(results_dir) / "test_results.json"
             if results_json_path.exists():
                 with open(results_json_path, 'r') as f:
                     seq_results = json.load(f)

@@ -346,7 +346,7 @@ normal_depth_correction_ratio = 0.726744 / 0.998047 = 0.728166
 - Original focal length: fx_actual = 1920.00
 - Target resolution: (924, 518)
 - Resize factor: 1
-- First frame: `/home/cvlab/hsy/Datasets/unrealstereo4k/UnrealStereo4K_00000/Image0/00000.png`
+- First frame: `/home/cvlab/hsy/Datasets/unreal4k/UnrealStereo4K_00000/Image0/00000.png`
 
 **Calculation:**
 
@@ -762,7 +762,7 @@ normal_depth_correction_ratio = 0.726744 / 0.998047 = 0.728166
 - Original focal length: fx_actual = 1920.00
 - Target resolution: (2044, 1148)
 - Resize factor: 1
-- First frame: `/home/cvlab/hsy/Datasets/unrealstereo4k/UnrealStereo4K_00000/Image0/00000.png`
+- First frame: `/home/cvlab/hsy/Datasets/unreal4k/UnrealStereo4K_00000/Image0/00000.png`
 
 **Calculation:**
 

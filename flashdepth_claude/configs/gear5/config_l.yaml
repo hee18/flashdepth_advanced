@@ -4,6 +4,7 @@
 # Formula: D_metric = Scale × D_relative + Shift
 
 # General settings
+config_variant: l  # Required for train_gear5.py phase detection
 config_dir: null # overwrite by --config-path
 inference: false
 load: configs/flashdepth-l/iter_10001.pth  # FlashDepth-L pretrained weights (ViT + DPT + Mamba + output_conv)

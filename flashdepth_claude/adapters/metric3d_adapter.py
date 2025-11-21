@@ -196,6 +196,8 @@ class Metric3DAdapter(MethodAdapter):
             print(f"[Metric3D] Processing resolution: {self.input_size[0]}×{self.input_size[1]} (padded)")
 
         # Inference
+        # Force float32 (Metric3D doesn't support BFloat16 for upsample operations)
+        rgb = rgb.float() if rgb.dtype == torch.bfloat16 else rgb
         with torch.no_grad():
             pred_depth, confidence, output_dict = self.model.inference({'input': rgb})
 

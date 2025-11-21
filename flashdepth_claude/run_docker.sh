@@ -63,7 +63,7 @@ show_usage() {
     echo "  --gpu ID              Set GPU ID (default: 0)"
     echo "  --results-dir PATH    Set results directory (default: train_results/results_1)"
     echo "  --flashdepth-checkpoint PATH  Set FlashDepth pretrained weights path"
-    echo "  --gear-checkpoint PATH  Set Gear-S Phase 1 checkpoint path (required for --config-variant hybrid)"
+    echo "  --gear-checkpoint PATH  Set Gear Phase 1 checkpoint path (required for --config-variant hybrid)"
     echo "  --frame-interval NUM  Set frame interval for sequence visualization (default: 1)"
     echo "  --vid-len NUM         Set video sequence length for testing (default: 50)"
     echo "  --single-sequence PATH Test on a single sequence directory (e.g., /path/to/dynamicreplica/seq)"
@@ -83,6 +83,7 @@ show_usage() {
     echo "  --wandb-name NAME    Set WandB experiment name (default: auto-generated)"
     echo "  --mamba              Use Mamba2 instead of GRU for Gear5 TemporalScalePredictor (default: false/GRU)"
     echo "  --seq N              Sequence selection (ignored by test_original_flashdepth, always uses first sequence)"
+    echo "  --limit-scenes N     For NuScenes, limit the number of scenes to process (e.g., 50)"
     echo ""
     echo "Note: Regularization losses are deprecated. Importance map now uses raw DINOv2 attention (frozen)."
     echo "Note: test_original_flashdepth always tests only the first sequence for FPS measurement."
@@ -155,6 +156,7 @@ WANDB="true"  # Enable WandB logging by default
 WANDB_NAME=""  # WandB experiment name (empty = auto-generated)
 MAMBA="false"  # Use Mamba2 for Gear5 TemporalScalePredictor (false=GRU, true=Mamba2)
 SEQ=""  # Sequence selection for UnrealStereo4K (test_original_flashdepth)
+LIMIT_SCENES=""  # Limit number of scenes for NuScenes dataset (optional, e.g., 50)
 
 # Parse arguments
 USER_BATCH_SIZE=""  # Track if user explicitly set batch size
@@ -271,6 +273,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --seq)
             SEQ="$2"
+            shift 2
+            ;;
+        --limit-scenes)
+            LIMIT_SCENES="$2"
             shift 2
             ;;
         -h|--help)
@@ -970,6 +976,11 @@ case $COMMAND in
             TEST_CMD="$TEST_CMD object_wise.dataset=$OBJWISE_DATASET_BASE"
         fi
 
+        # Add limit_scenes for NuScenes if specified
+        if [ -n "$LIMIT_SCENES" ]; then
+            TEST_CMD="$TEST_CMD +dataset.limit_scenes=$LIMIT_SCENES"
+        fi
+
         # Add resolution override
         TEST_CMD="$TEST_CMD +resolution=$RESOLUTION"
 
@@ -1086,6 +1097,11 @@ case $COMMAND in
             loss_type=$LOSS_TYPE \
             +results_dir=$RESULTS_DIR"
 
+        # Add gear_checkpoint if specified (required for Phase 2 hybrid)
+        if [ -n "$GEAR_CHECKPOINT" ]; then
+            DOCKER_CMD="$DOCKER_CMD gear_checkpoint=$GEAR_CHECKPOINT"
+        fi
+
         # Add wandb name if specified
         if [ -n "$WANDB_NAME" ]; then
             DOCKER_CMD="$DOCKER_CMD training.wandb_name=$WANDB_NAME"
@@ -1098,10 +1114,11 @@ case $COMMAND in
         # Gear5 DDP training with 2 GPUs
         # Phase 2 (Hybrid): Auto-adjust for 2K resolution if config_variant=hybrid
         if [ "$CONFIG_VARIANT" = "hybrid" ]; then
-            # Hybrid: 2K resolution - reduce both batch size and workers
-            ACTUAL_WORKERS=2  # 2 workers per GPU (total 4 across 2 GPUs)
+            # Hybrid: 2K resolution - reduce batch size, workers, and video length
+            ACTUAL_WORKERS=1  # 1 worker per GPU (total 2 across 2 GPUs) - reduced for memory
             CANONICAL_FX="500.0"
             RES_NAME="2k"
+            VIDEO_LENGTH=2  # Reduced from 5→3→2 for extreme memory constraints
 
             # Auto-adjust batch size for 2K resolution if user didn't specify
             if [ -z "$USER_BATCH_SIZE" ]; then
@@ -1115,6 +1132,7 @@ case $COMMAND in
             ACTUAL_WORKERS=$WORKERS
             CANONICAL_FX="500.0"
             RES_NAME="base"
+            VIDEO_LENGTH=5  # Default video length
         fi
 
         echo "Starting Gear5 training (Multi-GPU: 0,1)..."
@@ -1125,6 +1143,7 @@ case $COMMAND in
         echo "  - Batch size per GPU: $BATCH_SIZE"
         echo "  - Effective batch size: $((BATCH_SIZE * 2))"
         echo "  - Workers per GPU: $ACTUAL_WORKERS"
+        echo "  - Video length: $VIDEO_LENGTH frames"
         echo "  - Total iterations: $TOTAL_ITERS"
         echo "  - GPUs: 0,1"
         echo "  - Results directory: $RESULTS_DIR"
@@ -1137,6 +1156,7 @@ case $COMMAND in
             -e GLOO_SOCKET_IFNAME=eth0 \
             -e NCCL_SOCKET_IFNAME=eth0 \
             -e NCCL_P2P_DISABLE=1 \
+            -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
             -e WANDB_API_KEY=${WANDB_API_KEY:-} \
             -e WANDB_API_KEY=\${WANDB_API_KEY:-} \
             flashdepth torchrun \
@@ -1146,6 +1166,7 @@ case $COMMAND in
             --config-path configs/gear5 \
             --config-name config_$CONFIG_VARIANT \
             dataset.data_root=/data/datasets \
+            dataset.video_length=$VIDEO_LENGTH \
             training.batch_size=$BATCH_SIZE \
             training.workers=$ACTUAL_WORKERS \
             training.iterations=$TOTAL_ITERS \
@@ -1155,6 +1176,11 @@ case $COMMAND in
             use_canonical_space=$USE_CANONICAL \
             loss_type=$LOSS_TYPE \
             +results_dir=$RESULTS_DIR"
+
+        # Add gear_checkpoint if specified (required for Phase 2 hybrid)
+        if [ -n "$GEAR_CHECKPOINT" ]; then
+            DOCKER_CMD="$DOCKER_CMD gear_checkpoint=$GEAR_CHECKPOINT"
+        fi
 
         # Add wandb name if specified
         if [ -n "$WANDB_NAME" ]; then
@@ -1185,10 +1211,10 @@ case $COMMAND in
         fi
         echo ""
 
-        # Build test_gear5 command
+        # Build test_gear5 command with config variant support
         TEST_CMD="python test_gear5.py \
             --config-path configs/gear5 \
-            --config-name config \
+            --config-name config_$CONFIG_VARIANT \
             dataset.data_root=/data/datasets \
             model.use_mamba_temporal=$MAMBA \
             training.workers=$WORKERS \
@@ -1196,7 +1222,8 @@ case $COMMAND in
             +gpu=$GPU_ID \
             +vid_len=$VID_LEN \
             +frame_interval=$FRAME_INTERVAL \
-            +visualization=$VISUALIZATION"
+            +visualization=$VISUALIZATION \
+            +config_dir=configs/gear5/$CONFIG_VARIANT"
 
         # Add --objwise flag if requested
         if [ "$OBJWISE_FLAG" == "true" ]; then
@@ -1211,168 +1238,9 @@ case $COMMAND in
             TEST_CMD="$TEST_CMD object_wise.dataset=$OBJWISE_DATASET_BASE"
         fi
 
-        # Add resolution override
-        TEST_CMD="$TEST_CMD +resolution=$RESOLUTION"
-
-        # Add checkpoint
-        if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
-            TEST_CMD="$TEST_CMD load=$FLASHDEPTH_CHECKPOINT"
-        fi
-
-        CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm flashdepth $TEST_CMD
-        ;;
-
-    test_gear5_objwise)
-        # DEPRECATED: Use test_gear5 --objwise instead
-        echo "⚠️  WARNING: 'test_gear5_objwise' is deprecated!"
-        echo "   Please use: ./run_docker.sh test_gear5 --objwise --dataset $OBJWISE_DATASET"
-        echo ""
-        echo "Redirecting to new command format..."
-        echo ""
-
-        # Redirect to new format
-        OBJWISE_FLAG="true"
-        OBJWISE_DATASET=${OBJWISE_DATASET:-waymo_seg}
-
-        # Call test_gear5 with objwise flag
-        exec "$0" test_gear5 --objwise --dataset "$OBJWISE_DATASET" "${@:2}"
-        ;;
-
-    train_gear5_film)
-        # Auto-set FlashDepth checkpoint based on CONFIG_VARIANT if not explicitly specified
-        if [ "$FLASHDEPTH_CHECKPOINT" = "configs/flashdepth-l/iter_10001.pth" ]; then
-            if [ "$CONFIG_VARIANT" = "s" ]; then
-                FLASHDEPTH_CHECKPOINT="configs/flashdepth-s/iter_10001.pth"
-            elif [ "$CONFIG_VARIANT" = "l" ]; then
-                FLASHDEPTH_CHECKPOINT="configs/flashdepth-l/iter_10001.pth"
-            elif [ "$CONFIG_VARIANT" = "hybrid" ]; then
-                FLASHDEPTH_CHECKPOINT="configs/flashdepth-s/iter_10001.pth"
-            fi
-        fi
-
-        echo "Starting Gear5 FiLM training..."
-        echo "Configuration:"
-        echo "  - Config variant: $CONFIG_VARIANT"
-        echo "  - Config file: configs/gear5_film/config_$CONFIG_VARIANT.yaml"
-        echo "  - Batch size: $BATCH_SIZE"
-        echo "  - Workers: $WORKERS"
-        echo "  - GPU: $GPU_ID"
-        echo "  - Results directory: $RESULTS_DIR"
-        echo "  - Loss type: $LOSS_TYPE"
-        echo ""
-
-        # Build train_gear5_film command with config variant
-        DOCKER_CMD="CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm -e WANDB_API_KEY=${WANDB_API_KEY:-} flashdepth python train_gear5_film.py \
-            --config-path configs/gear5_film \
-            --config-name config_$CONFIG_VARIANT \
-            dataset.data_root=/data/datasets \
-            training.batch_size=$BATCH_SIZE \
-            training.workers=$WORKERS \
-            training.iterations=$TOTAL_ITERS \
-            training.wandb=$WANDB \
-            use_canonical_space=$USE_CANONICAL \
-            loss_type=$LOSS_TYPE \
-            +results_dir=$RESULTS_DIR"
-
-        # Add wandb name if specified
-        if [ -n "$WANDB_NAME" ]; then
-            DOCKER_CMD="$DOCKER_CMD training.wandb_name=$WANDB_NAME"
-        fi
-
-        eval $DOCKER_CMD
-        ;;
-
-    train_gear5_film_ddp)
-        # Gear5 FiLM DDP training with 2 GPUs
-        ACTUAL_WORKERS=$WORKERS
-        CANONICAL_FX="500.0"
-
-        echo "Starting Gear5 FiLM training (Multi-GPU: 0,1)..."
-        echo "Configuration:"
-        echo "  - Config variant: $CONFIG_VARIANT"
-        echo "  - Config file: configs/gear5_film/config_$CONFIG_VARIANT.yaml"
-        echo "  - Batch size per GPU: $BATCH_SIZE"
-        echo "  - Effective batch size: $((BATCH_SIZE * 2))"
-        echo "  - Workers per GPU: $ACTUAL_WORKERS"
-        echo "  - Total iterations: $TOTAL_ITERS"
-        echo "  - GPUs: 0,1"
-        echo "  - Results directory: $RESULTS_DIR"
-        echo "  - FPS measurement: $MEASURE_FPS"
-        echo "  - Loss type: $LOSS_TYPE"
-        echo ""
-
-        DOCKER_CMD="CUDA_VISIBLE_DEVICES=0,1 docker compose run --rm \
-            -e GLOO_SOCKET_IFNAME=eth0 \
-            -e NCCL_SOCKET_IFNAME=eth0 \
-            -e NCCL_P2P_DISABLE=1 \
-            -e WANDB_API_KEY=${WANDB_API_KEY:-} \
-            flashdepth torchrun \
-            --standalone \
-            --nproc_per_node=2 \
-            train_gear5_film.py \
-            --config-path configs/gear5_film \
-            --config-name config_$CONFIG_VARIANT \
-            dataset.data_root=/data/datasets \
-            training.batch_size=$BATCH_SIZE \
-            training.workers=$ACTUAL_WORKERS \
-            training.iterations=$TOTAL_ITERS \
-            training.measure_fps=$MEASURE_FPS \
-            training.wandb=$WANDB \
-            use_canonical_space=$USE_CANONICAL \
-            loss_type=$LOSS_TYPE \
-            +results_dir=$RESULTS_DIR"
-
-        # Add wandb name if specified
-        if [ -n "$WANDB_NAME" ]; then
-            DOCKER_CMD="$DOCKER_CMD training.wandb_name=$WANDB_NAME"
-        fi
-
-        eval $DOCKER_CMD
-        ;;
-
-    test_gear5_film)
-        echo "Starting Gear5 FiLM testing..."
-        echo "Configuration:"
-        echo "  - Video length: $VID_LEN"
-        echo "  - Frame interval: $FRAME_INTERVAL"
-        echo "  - GPU: $GPU_ID"
-        echo "  - Results directory: $RESULTS_DIR"
-        echo "  - Checkpoint: $FLASHDEPTH_CHECKPOINT"
-        echo "  - Config variant: $CONFIG_VARIANT"
-        echo "  - Workers: $WORKERS"
-        if [ "$OBJWISE_FLAG" == "true" ]; then
-            echo "  - Object-wise evaluation: ENABLED"
-        fi
-        if [ -n "$OBJWISE_DATASET" ]; then
-            echo "  - Dataset: $OBJWISE_DATASET"
-        else
-            echo "  - Dataset: Using config defaults (all test datasets)"
-        fi
-        echo ""
-
-        # Build test_gear5_film command
-        TEST_CMD="python test_gear5_film.py \
-            --config-path configs/gear5_film \
-            --config-name config \
-            dataset.data_root=/data/datasets \
-            training.workers=$WORKERS \
-            +results_dir=$RESULTS_DIR \
-            +gpu=$GPU_ID \
-            +vid_len=$VID_LEN \
-            +frame_interval=$FRAME_INTERVAL \
-            +visualization=$VISUALIZATION"
-
-        # Add --objwise flag if requested
-        if [ "$OBJWISE_FLAG" == "true" ]; then
-            TEST_CMD="$TEST_CMD --objwise"
-        fi
-
-        # Add dataset override if specified
-        if [ -n "$OBJWISE_DATASET" ]; then
-            TEST_CMD="$TEST_CMD eval.test_datasets=[$OBJWISE_DATASET]"
-            # Remove _seg suffix for object_wise.dataset config
-            OBJWISE_DATASET_BASE="${OBJWISE_DATASET/_seg/}"
-            TEST_CMD="$TEST_CMD object_wise.dataset=$OBJWISE_DATASET_BASE"
+        # Add limit_scenes if specified
+        if [ -n "$LIMIT_SCENES" ]; then
+            TEST_CMD="$TEST_CMD +dataset.limit_scenes=$LIMIT_SCENES"
         fi
 
         # Add resolution override
@@ -1387,14 +1255,7 @@ case $COMMAND in
         ;;
 
     test_original_flashdepth)
-        # Test original FlashDepth (without Gear modules)
-        # Use OBJWISE_DATASET from --dataset option, fallback to waymo
-        if [ -n "$OBJWISE_DATASET" ]; then
-            DATASET="$OBJWISE_DATASET"
-        else
-            DATASET=${DATASET:-waymo}
-        fi
-
+        
         # Initialize CHECKPOINT from FLASHDEPTH_CHECKPOINT or environment variable
         if [ -z "$CHECKPOINT" ]; then
             CHECKPOINT="$FLASHDEPTH_CHECKPOINT"
@@ -1426,10 +1287,13 @@ case $COMMAND in
             esac
         fi
 
-        # Use custom results dir if provided, otherwise default to test_results/${DATASET}_original_${CONFIG}
+        # Use OBJWISE_DATASET if set, otherwise default to nuscenes
+        TEST_DATASET="${OBJWISE_DATASET:-nuscenes}"
+
+        # Use custom results dir if provided, otherwise default to test_results/${TEST_DATASET}_original_${CONFIG}
         if [ "$RESULTS_DIR" = "train_results/results_1" ]; then
             # Default value not changed by user, use dataset and config specific default
-            OUTFOLDER="/app/test_results/${DATASET}_original_${CONFIG}"
+            OUTFOLDER="/app/test_results/${TEST_DATASET}_original_${CONFIG}"
         else
             # User provided custom results dir
             # If it's a relative path, prefix with /app/ to save to host
@@ -1457,7 +1321,7 @@ case $COMMAND in
         echo "Testing Original FlashDepth (inference mode)..."
         echo "Configuration:"
         echo "  - Config variant: $CONFIG"
-        echo "  - Dataset: $DATASET (첫 시퀀스만 테스트 - FPS 측정용)"
+        echo "  - Dataset: $TEST_DATASET (first sequence only for FPS)"
         echo "  - Resolution: $RESOLUTION"
         echo "  - GPU: $GPU_ID"
         echo "  - Checkpoint: $CHECKPOINT"
@@ -1471,10 +1335,11 @@ case $COMMAND in
         # Create output directory on host
         mkdir -p "$LOCAL_OUTFOLDER"
 
+        # Build base command
         TEST_CMD="cd /FlashDepth && torchrun --nproc_per_node=1 train.py \
           --config-path configs/$CONFIG \
           inference=true \
-          eval.test_datasets=[$DATASET] \
+          eval.test_datasets=[$TEST_DATASET] \
           eval.metrics=true \
           dataset.data_root=/data/datasets \
           eval.outfolder=$OUTFOLDER \
@@ -1487,8 +1352,14 @@ case $COMMAND in
           eval.num_workers=$WORKERS \
           eval.test_dataset_resolution=$RESOLUTION"
 
+        # Add limit_scenes if specified
+        if [ -n "$LIMIT_SCENES" ]; then
+            TEST_CMD="$TEST_CMD \
+          +eval.limit_scenes=$LIMIT_SCENES"
+        fi
+
         # Run test and save log
-        echo "Running FlashDepth inference..."
+        echo "Running FlashDepth inference on $TEST_DATASET..."
         CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm flashdepth bash -c "$TEST_CMD" 2>&1 | tee "${LOCAL_OUTFOLDER}/test.log"
 
         # Parse log and save as JSON

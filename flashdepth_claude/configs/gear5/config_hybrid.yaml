@@ -13,10 +13,11 @@
 # Trainable: Only Gear5MetricHead (~132K params)
 
 # General settings
+config_variant: hybrid  # Required for train_gear5.py phase detection
 config_dir: null # overwrite by --config-path
 inference: false
 load: configs/flashdepth/iter_43002.pth  # FlashDepth-hybrid checkpoint (DINOv2 ViT-L+S + DPT)
-gear_checkpoint: null  # Phase 1 Gear5 checkpoint (for Phase 2)
+gear_checkpoint: null  # Phase 1 Gear5 Small checkpoint (for Phase 2) - must be Small!
 
 # Canonical space settings
 canonical_focal_length: 500.0  # Fixed canonical focal length for all resolutions

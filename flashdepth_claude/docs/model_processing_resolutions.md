@@ -346,9 +346,9 @@ python test_comparison.py --method depthanythingv2 --dataset waymo --gpu 0
 python test_comparison.py --method metric3d --version v2 --dataset waymo --gpu 0
 python test_comparison.py --method unidepth --version v2 --dataset waymo --gpu 0
 
-# UnrealStereo4K (single sequence)
-python test_comparison.py --method depthanythingv2 --dataset unrealstereo4k --seq 0 --gpu 0
-python test_comparison.py --method depthpro --dataset unrealstereo4k --seq 0 --gpu 0
+# Unreal4K (single sequence)
+python test_comparison.py --method depthanythingv2 --dataset unreal4k --seq 0 --gpu 0
+python test_comparison.py --method depthpro --dataset unreal4k --seq 0 --gpu 0
 
 # VKITTI (clone only)
 python test_comparison.py --method depthanythingv2 --dataset vkitti --only-clone true --gpu 0
