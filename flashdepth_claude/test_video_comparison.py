@@ -255,8 +255,8 @@ class VideoComparisonTester:
             # Get only_clone flag for VKITTI
             only_clone = self.config.get('only_clone', False) if dataset_name == 'vkitti' else False
 
-            # Get unreal4k_seq_list if specified
-            unreal4k_seq_list = self.config.get('unreal4k_seq_list', None) if dataset_name == 'unreal4k' else None
+            # Get seq_list from config (supports all datasets now)
+            seq_list = self.config.get('seq_list', None)
 
             dataset = ComparisonDataset(
                 dataset_name=dataset_name,
@@ -265,7 +265,7 @@ class VideoComparisonTester:
                 video_length=video_length,
                 objwise_enabled=self.object_wise_enabled,
                 only_clone=only_clone,
-                unreal4k_seq_list=unreal4k_seq_list,
+                seq_list=seq_list,  # Supports all datasets now
                 limit_scenes=self.config.get('limit_scenes') # Pass limit_scenes
             )
             collate_fn = comparison_collate_fn
@@ -784,6 +784,17 @@ class VideoComparisonTester:
                 class_names_dict=self.object_wise_metrics.classes if self.object_wise_enabled else None
             )
 
+            # Export individual frames if --figure option is enabled
+            if self.config.get('figure', False):
+                self._export_figure_frames(
+                    images=images[0],  # [T, 3, H, W]
+                    pred_depths=pred_depths,  # [T, 1, H, W]
+                    gt_depths=gt_depth_processed[0],  # [T, 1, H, W]
+                    best_frame_idx=best_frame_idx,
+                    sequence_id=sequence_id,
+                    dataset_name=dataset_name
+                )
+
         return metrics
 
     def _aggregate_and_save_results(self):
@@ -892,6 +903,96 @@ class VideoComparisonTester:
                 )
                 logger.info(f"Object-wise results saved to {object_wise_path}")
 
+    def _export_figure_frames(self, images, pred_depths, gt_depths, best_frame_idx, sequence_id, dataset_name):
+        """
+        Export individual frames around best_frame (±4 frames, total 9 frames).
+        Saves: original image, GT depth (colormap), pred depth (colormap)
+
+        Args:
+            images: [T, 3, H, W] tensor
+            pred_depths: [T, 1, H, W] tensor in meters
+            gt_depths: [T, 1, H, W] tensor in meters
+            best_frame_idx: int, index of best frame
+            sequence_id: int, sequence identifier
+            dataset_name: str, name of dataset
+        """
+        import cv2
+        import matplotlib.pyplot as plt
+
+        T = images.shape[0]
+
+        # Determine frame range: best_frame ± 4
+        start_idx = max(0, best_frame_idx - 4)
+        end_idx = min(T, best_frame_idx + 5)  # +5 because range is exclusive
+
+        logger.info(f"Exporting figure frames for sequence {sequence_id}: frames {start_idx}-{end_idx-1} (best={best_frame_idx})")
+
+        # Create figures directory
+        figures_dir = self.save_dir / "figures" / f"seq{sequence_id:04d}"
+        figures_dir.mkdir(parents=True, exist_ok=True)
+
+        for t in range(start_idx, end_idx):
+            # 1. Save original image
+            img = images[t].cpu().numpy()  # [3, H, W]
+            img = np.transpose(img, (1, 2, 0))  # [H, W, 3]
+            img = (img * 255).astype(np.uint8)
+            img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)  # Convert RGB to BGR for cv2
+            img_path = figures_dir / f"frame_{t:04d}_image.png"
+            cv2.imwrite(str(img_path), img)
+
+            # 2. Save GT depth (colormap)
+            gt_depth = gt_depths[t, 0].cpu().numpy()  # [H, W] in meters
+            gt_depth_vis = self._depth_to_colormap(gt_depth)
+            gt_path = figures_dir / f"frame_{t:04d}_gt_depth.png"
+            cv2.imwrite(str(gt_path), gt_depth_vis)
+
+            # 3. Save pred depth (colormap)
+            pred_depth = pred_depths[t, 0].cpu().numpy()  # [H, W] in meters
+            pred_depth_vis = self._depth_to_colormap(pred_depth)
+            pred_path = figures_dir / f"frame_{t:04d}_pred_depth.png"
+            cv2.imwrite(str(pred_path), pred_depth_vis)
+
+        logger.info(f"Exported {end_idx - start_idx} frames × 3 types = {(end_idx - start_idx) * 3} images to {figures_dir}")
+
+    def _depth_to_colormap(self, depth, vmin=None, vmax=None):
+        """
+        Convert depth map to colormap visualization.
+
+        Args:
+            depth: [H, W] numpy array in meters
+            vmin: minimum depth for colormap (default: use data min)
+            vmax: maximum depth for colormap (default: use data max)
+
+        Returns:
+            [H, W, 3] BGR image (uint8)
+        """
+        import matplotlib.pyplot as plt
+
+        # Handle invalid values
+        valid_mask = np.isfinite(depth) & (depth > 0)
+        if not valid_mask.any():
+            # All invalid - return black image
+            return np.zeros((*depth.shape, 3), dtype=np.uint8)
+
+        # Auto-scale if not provided
+        if vmin is None:
+            vmin = depth[valid_mask].min()
+        if vmax is None:
+            vmax = depth[valid_mask].max()
+
+        # Normalize to [0, 1]
+        depth_normalized = np.clip((depth - vmin) / (vmax - vmin + 1e-8), 0, 1)
+
+        # Apply colormap (turbo is good for depth)
+        cmap = plt.get_cmap('turbo')
+        depth_colored = cmap(depth_normalized)[:, :, :3]  # [H, W, 3] RGB in [0, 1]
+
+        # Convert to BGR uint8
+        depth_colored = (depth_colored * 255).astype(np.uint8)
+        depth_colored = cv2.cvtColor(depth_colored, cv2.COLOR_RGB2BGR)
+
+        return depth_colored
+
 
 def main():
     parser = argparse.ArgumentParser(description='Test VIDEO depth estimation methods')
@@ -930,7 +1031,9 @@ def main():
     parser.add_argument('--visualization', type=str, default='true', choices=['true', 'false'],
                        help='Enable/disable visualizations (sequence.png, best_frame.png, etc.). Default: true')
     parser.add_argument('--seq', type=str, default=None,
-                       help='Sequence number(s) for UnrealStereo4K (0-8). Examples: --seq 0, --seq 2,5, --seq 0,3,7')
+                       help='Sequence number(s) to test (e.g., --seq 0, --seq 2,5, --seq 0,3,7)')
+    parser.add_argument('--figure', action='store_true',
+                       help='Export best_frame ±4 frames (9 total) as individual images/depth maps (requires --seq)')
     parser.add_argument('--amp', action='store_true',
                        help='Enable Automatic Mixed Precision (AMP) for inference')
     parser.add_argument('--amp-dtype', type=str, default='bf16', choices=['bf16', 'fp16'],
@@ -948,29 +1051,17 @@ def main():
         logger.error(f"   For image models (metric3d, unidepth, depthpro, etc.), use test_comparison.py instead")
         sys.exit(1)
 
-    # Parse Unreal4K --seq (supports single or multiple sequences)
-    unreal4k_seq_list = None
-    if args.dataset.lower() in ['unreal4k', 'unreal', 'unrealstereo4k']:
-        if args.seq is not None:
-            # Parse comma-separated sequence numbers
-            try:
-                seq_list = [int(s.strip()) for s in args.seq.split(',')]
-                # Validate range
-                for seq in seq_list:
-                    if seq < 0 or seq > 8:
-                        logger.error(f"❌ Unreal4K --seq must be between 0 and 8, got {seq}")
-                        sys.exit(1)
-                unreal4k_seq_list = seq_list
-                logger.info(f"Unreal4K: Testing sequences {seq_list}")
-            except ValueError:
-                logger.error(f"❌ Invalid --seq format: {args.seq}")
-                logger.error(f"   Examples: --seq 0, --seq 2,5, --seq 0,3,7")
-                sys.exit(1)
-        else:
-            # Auto mode: test all sequences 0-8
-            logger.warning("⚠️  Unreal4K: Testing ALL sequences (0-8) - this may take a long time!")
-            logger.warning("    Recommend: Use --seq N to test one or more sequences")
-            logger.warning("    Example: --dataset unreal4k --seq 0 or --seq 2,5")
+    # Parse --seq (supports single or multiple sequences, for all datasets)
+    seq_list = None
+    if args.seq is not None:
+        # Parse comma-separated sequence numbers
+        try:
+            seq_list = [int(s.strip()) for s in args.seq.split(',')]
+            logger.info(f"{args.dataset}: Testing sequences {seq_list}")
+        except ValueError:
+            logger.error(f"❌ Invalid --seq format: {args.seq}")
+            logger.error(f"   Examples: --seq 0, --seq 2,5, --seq 0,3,7")
+            sys.exit(1)
 
     # Build method name with version
     method_name = args.method
@@ -999,7 +1090,8 @@ def main():
         'frame_interval': args.frame_interval,
         'only_clone': (args.only_clone == 'true'),  # Convert string to bool
         'visualization': (args.visualization == 'true'),  # Convert string to bool
-        'unreal4k_seq_list': unreal4k_seq_list,  # Sequence list for Unreal4K (None for other datasets)
+        'seq_list': seq_list,  # Pass seq_list for filtering
+        'figure': args.figure,  # Export individual frames if enabled
         'amp': args.amp,
         'amp_dtype': args.amp_dtype,
         'limit_scenes': args.limit_scenes

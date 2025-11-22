@@ -56,36 +56,65 @@ class Unreal4kDepth(BaseDatasetPairs):
         """
         Read depth from UnrealStereo4K.
 
-        UnrealStereo4K stores METRIC DEPTH (m) in .npy files, NOT disparity.
-        For training, we need to convert to inverse depth.
+        UnrealStereo4K stores DISPARITY maps in .npy files, not metric depth.
+        We convert disparity to metric depth using:
+            depth (m) = (baseline × focal_length) / disparity
+        
+        Baselines:
+        - Indoor scenes (seq 4, 6): 0.2m (20cm)
+        - Outdoor scenes (seq 0, 1, 2, 3, 5, 7, 8): 0.5m (50cm)
+        
+        Focal length (downsampled resolution 2112×1188): fx = 1056
 
         Args:
-            path: Path to .npy depth file
+            path: Path to .npy disparity file
             is_inverse: If True, convert metric depth to inverse depth (1/m)
             return_torch: If True, return torch.Tensor
 
         Returns:
             Inverse depth (1/m) if is_inverse=True, else metric depth (m)
         """
-        # Load metric depth (already in meters)
-        depth_meters = np.load(path)
-
+        # Load disparity
+        disparity = np.load(path)
+        
+        # Extract sequence ID from path
+        # Path format: .../UnrealStereo4K_0000X/Disp0/XXXXX.npy
+        seq_id = int(path.split('UnrealStereo4K_')[1].split('/')[0][-1])
+        
+        # Determine baseline based on sequence ID
+        INDOOR_SEQS = [4, 6]
+        BASELINE_INDOOR = 0.2   # 20cm
+        BASELINE_OUTDOOR = 0.5  # 50cm
+        
+        baseline = BASELINE_INDOOR if seq_id in INDOOR_SEQS else BASELINE_OUTDOOR
+        
+        # Focal length for downsampled resolution (2112×1188)
+        # Note: Original resolution (3840×2160) had fx=1920
+        # Downsampled by factor 0.55, so fx = 1920 × 0.55 = 1056
+        fx = 1056.0
+        
+        # Convert disparity to metric depth
+        # depth = (baseline × fx) / disparity
+        # Handle division by zero
+        with np.errstate(divide='ignore', invalid='ignore'):
+            depth_meters = (baseline * fx) / disparity
+        
         # Handle invalid values
-        # UnrealStereo4K: Filter out unrealistic depths (>200m are likely sky/far background)
-        MAX_VALID_DEPTH = 200.0  # meters
+        MAX_VALID_DEPTH = 1000.0  # meters (outdoor scenes can be far)
         invalid_mask = np.logical_or.reduce((
             np.isinf(depth_meters),
             np.isnan(depth_meters),
             depth_meters <= 0,
-            depth_meters > MAX_VALID_DEPTH  # Filter out unrealistic depths
+            depth_meters > MAX_VALID_DEPTH,
+            disparity <= 0
         ))
 
-        if invalid_mask.any():
+        if invalid_mask.any() and kwargs.get('print_minmax', False):
             logging.info(f"Found invalid values in {path}: "
                         f"inf: {np.isinf(depth_meters).sum()}, "
                         f"nan: {np.isnan(depth_meters).sum()}, "
                         f"<=0: {(depth_meters <= 0).sum()}, "
-                        f">200m: {(depth_meters > MAX_VALID_DEPTH).sum()}")
+                        f">1000m: {(depth_meters > MAX_VALID_DEPTH).sum()}")
 
         if is_inverse:
             # Convert metric depth to inverse depth for training
@@ -95,7 +124,7 @@ class Unreal4kDepth(BaseDatasetPairs):
             inverse_depth[invalid_mask] = -1
             result = inverse_depth
         else:
-            # Return metric depth as-is
+            # Return metric depth
             depth_meters[invalid_mask] = -1
             result = depth_meters
 

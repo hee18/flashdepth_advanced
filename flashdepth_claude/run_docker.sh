@@ -82,8 +82,9 @@ show_usage() {
     echo "  --wandb BOOL         Enable/disable WandB logging (default: true)"
     echo "  --wandb-name NAME    Set WandB experiment name (default: auto-generated)"
     echo "  --mamba              Use Mamba2 instead of GRU for Gear5 TemporalScalePredictor (default: false/GRU)"
-    echo "  --seq N              Sequence selection (ignored by test_original_flashdepth, always uses first sequence)"
+    echo "  --seq N              Sequence selection (e.g., --seq 0,4 for sequences 0 and 4)"
     echo "  --limit-scenes N     For NuScenes, limit the number of scenes to process (e.g., 50)"
+    echo "  --figure             Export best_frame ±4 frames (9 total) as individual images/depth maps (requires --seq)"
     echo ""
     echo "Note: Regularization losses are deprecated. Importance map now uses raw DINOv2 attention (frozen)."
     echo "Note: test_original_flashdepth always tests only the first sequence for FPS measurement."
@@ -157,6 +158,7 @@ WANDB_NAME=""  # WandB experiment name (empty = auto-generated)
 MAMBA="false"  # Use Mamba2 for Gear5 TemporalScalePredictor (false=GRU, true=Mamba2)
 SEQ=""  # Sequence selection for UnrealStereo4K (test_original_flashdepth)
 LIMIT_SCENES=""  # Limit number of scenes for NuScenes dataset (optional, e.g., 50)
+FIGURE="false"  # Export best_frame ±4 frames (9 total) as individual images/depth maps
 
 # Parse arguments
 USER_BATCH_SIZE=""  # Track if user explicitly set batch size
@@ -278,6 +280,10 @@ while [[ $# -gt 0 ]]; do
         --limit-scenes)
             LIMIT_SCENES="$2"
             shift 2
+            ;;
+        --figure)
+            FIGURE="true"
+            shift
             ;;
         -h|--help)
             show_usage
@@ -1241,6 +1247,16 @@ case $COMMAND in
         # Add limit_scenes if specified
         if [ -n "$LIMIT_SCENES" ]; then
             TEST_CMD="$TEST_CMD +dataset.limit_scenes=$LIMIT_SCENES"
+        fi
+
+        # Add seq_list if specified
+        if [ -n "$SEQ" ]; then
+            TEST_CMD="$TEST_CMD +seq_list='[$SEQ]'"
+        fi
+
+        # Add figure export if specified
+        if [ "$FIGURE" == "true" ]; then
+            TEST_CMD="$TEST_CMD +figure=true"
         fi
 
         # Add resolution override

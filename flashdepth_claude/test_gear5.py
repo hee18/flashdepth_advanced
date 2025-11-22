@@ -405,13 +405,19 @@ class Gear5Tester:
             if limit_scenes is not None:
                 logger.info(f"Limiting scenes to: {limit_scenes}")
 
+            # Get seq_list from config if available (for sequence filtering)
+            seq_list = self.config.get('seq_list', None)
+            if seq_list is not None:
+                logger.info(f"Filtering to sequences: {seq_list}")
+
             test_dataset = CombinedDataset(
                 root_dir=self.config.dataset.data_root,
                 enable_dataset_flags=test_datasets,
                 resolution=resolution,
                 split='test',  # Use 'test' split (full test dataset)
                 video_length=video_length,
-                limit_scenes=limit_scenes
+                limit_scenes=limit_scenes,
+                seq_list=seq_list
             )
             collate_fn = self._collate_fn
 
@@ -1380,6 +1386,17 @@ class Gear5Tester:
                 dataset_name  # Add dataset name for object class mapping
             )
 
+            # Export individual frames if --figure option is enabled
+            if self.config.get('figure', False):
+                self._export_figure_frames(
+                    images=images[0],  # [T, 3, H, W]
+                    pred_depths=pred_depths,  # [T, 1, H, W]
+                    gt_depths=gt_depth_metric,  # [T, 1, H, W]
+                    best_frame_idx=best_frame_idx,
+                    sequence_id=sequence_id,
+                    dataset_name=dataset_name
+                )
+
         return metrics
 
     def _visualize_sequence(self, images, pred_depths, gt_depths, importance_maps,
@@ -1959,6 +1976,96 @@ class Gear5Tester:
         plt.close(fig)
 
         logger.info(f"Saved Gear5 best frame visualization: {save_path}")
+
+    def _export_figure_frames(self, images, pred_depths, gt_depths, best_frame_idx, sequence_id, dataset_name):
+        """
+        Export individual frames around best_frame (±4 frames, total 9 frames).
+        Saves: original image, GT depth (colormap), pred depth (colormap)
+
+        Args:
+            images: [T, 3, H, W] tensor
+            pred_depths: [T, 1, H, W] tensor in meters
+            gt_depths: [T, 1, H, W] tensor in meters
+            best_frame_idx: int, index of best frame
+            sequence_id: int, sequence identifier
+            dataset_name: str, name of dataset
+        """
+        import cv2
+        import matplotlib.pyplot as plt
+
+        T = images.shape[0]
+
+        # Determine frame range: best_frame ± 4
+        start_idx = max(0, best_frame_idx - 4)
+        end_idx = min(T, best_frame_idx + 5)  # +5 because range is exclusive
+
+        logger.info(f"Exporting figure frames for sequence {sequence_id}: frames {start_idx}-{end_idx-1} (best={best_frame_idx})")
+
+        # Create figures directory
+        figures_dir = self.save_dir / "figures" / f"seq{sequence_id:04d}"
+        figures_dir.mkdir(parents=True, exist_ok=True)
+
+        for t in range(start_idx, end_idx):
+            # 1. Save original image
+            img = images[t].cpu().numpy()  # [3, H, W]
+            img = np.transpose(img, (1, 2, 0))  # [H, W, 3]
+            img = (img * 255).astype(np.uint8)
+            img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)  # Convert RGB to BGR for cv2
+            img_path = figures_dir / f"frame_{t:04d}_image.png"
+            cv2.imwrite(str(img_path), img)
+
+            # 2. Save GT depth (colormap)
+            gt_depth = gt_depths[t, 0].cpu().numpy()  # [H, W] in meters
+            gt_depth_vis = self._depth_to_colormap(gt_depth)
+            gt_path = figures_dir / f"frame_{t:04d}_gt_depth.png"
+            cv2.imwrite(str(gt_path), gt_depth_vis)
+
+            # 3. Save pred depth (colormap)
+            pred_depth = pred_depths[t, 0].cpu().numpy()  # [H, W] in meters
+            pred_depth_vis = self._depth_to_colormap(pred_depth)
+            pred_path = figures_dir / f"frame_{t:04d}_pred_depth.png"
+            cv2.imwrite(str(pred_path), pred_depth_vis)
+
+        logger.info(f"Exported {end_idx - start_idx} frames × 3 types = {(end_idx - start_idx) * 3} images to {figures_dir}")
+
+    def _depth_to_colormap(self, depth, vmin=None, vmax=None):
+        """
+        Convert depth map to colormap visualization.
+
+        Args:
+            depth: [H, W] numpy array in meters
+            vmin: minimum depth for colormap (default: use data min)
+            vmax: maximum depth for colormap (default: use data max)
+
+        Returns:
+            [H, W, 3] BGR image (uint8)
+        """
+        import matplotlib.pyplot as plt
+
+        # Handle invalid values
+        valid_mask = np.isfinite(depth) & (depth > 0)
+        if not valid_mask.any():
+            # All invalid - return black image
+            return np.zeros((*depth.shape, 3), dtype=np.uint8)
+
+        # Auto-scale if not provided
+        if vmin is None:
+            vmin = depth[valid_mask].min()
+        if vmax is None:
+            vmax = depth[valid_mask].max()
+
+        # Normalize to [0, 1]
+        depth_normalized = np.clip((depth - vmin) / (vmax - vmin + 1e-8), 0, 1)
+
+        # Apply colormap (turbo is good for depth)
+        cmap = plt.get_cmap('turbo')
+        depth_colored = cmap(depth_normalized)[:, :, :3]  # [H, W, 3] RGB in [0, 1]
+
+        # Convert to BGR uint8
+        depth_colored = (depth_colored * 255).astype(np.uint8)
+        depth_colored = cv2.cvtColor(depth_colored, cv2.COLOR_RGB2BGR)
+
+        return depth_colored
 
     def _aggregate_metrics(self, all_metrics):
         """Aggregate metrics across sequences"""

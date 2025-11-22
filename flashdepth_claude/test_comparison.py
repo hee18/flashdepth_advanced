@@ -270,8 +270,8 @@ class ComparisonTester:
             # Get only_clone flag for VKITTI
             only_clone = self.config.get('only_clone', False) if base_dataset_name == 'vkitti' else False
 
-            # Get unreal4k_seq if specified
-            unreal4k_seq = self.config.get('unreal4k_seq', None) if base_dataset_name == 'unreal4k' else None
+            # Get seq_list from config (supports all datasets now)
+            seq_list = self.config.get('seq_list', None)
 
             # Use base_dataset_name (with _seg removed) for ComparisonDataset
             # ComparisonDataset will look for waymo_seg, vkitti, urbansyn directories
@@ -282,7 +282,7 @@ class ComparisonTester:
                 video_length=video_length,
                 objwise_enabled=False,  # Not using object-wise mode
                 only_clone=only_clone,
-                unreal4k_seq=unreal4k_seq,
+                seq_list=seq_list,  # Supports all datasets now
                 limit_scenes=self.config.get('limit_scenes') # Pass limit_scenes
             )
             collate_fn = comparison_collate_fn
@@ -967,7 +967,9 @@ def main():
     parser.add_argument('--visualization', type=str, default='true', choices=['true', 'false'],
                        help='Enable/disable visualizations (sequence.png, best_frame.png, etc.). Default: true')
     parser.add_argument('--seq', type=str, default=None,
-                       help='Sequence number(s) for UnrealStereo4K (0-8). Examples: --seq 0, --seq 2,5, --seq 0,3,7')
+                       help='Sequence number(s) to test (e.g., --seq 0, --seq 2,5, --seq 0,3,7)')
+    parser.add_argument('--figure', action='store_true',
+                       help='Export best_frame ±4 frames (9 total) as individual images/depth maps (requires --seq)')
     parser.add_argument('--amp', action='store_true',
                        help='Enable Automatic Mixed Precision (AMP) for inference')
     parser.add_argument('--amp-dtype', type=str, default='bf16', choices=['bf16', 'fp16'],
@@ -988,28 +990,17 @@ def main():
         logger.error(f"   Or:      ./run_video_comparison.sh {args.method} --dataset {args.dataset}")
         sys.exit(1)
 
-    # Parse Unreal4K --seq (supports single or multiple sequences)
-    if args.dataset.lower() in ['unreal4k', 'unreal', 'unrealstereo4k']:
-        if args.seq is not None:
-            # Parse comma-separated sequence numbers
-            try:
-                seq_list = [int(s.strip()) for s in args.seq.split(',')]
-                # Validate range
-                for seq in seq_list:
-                    if seq < 0 or seq > 8:
-                        logger.error(f"❌ Unreal4K --seq must be between 0 and 8, got {seq}")
-                        sys.exit(1)
-                logger.info(f"Unreal4K: Testing sequences {seq_list}")
-            except ValueError:
-                logger.error(f"❌ Invalid --seq format: {args.seq}")
-                logger.error(f"   Examples: --seq 0, --seq 2,5, --seq 0,3,7")
-                sys.exit(1)
-        else:
-            # Auto mode: test all sequences 0-8
-            logger.info("Unreal4K: Testing ALL sequences (0-8)")
-            seq_list = list(range(9))  # [0, 1, 2, 3, 4, 5, 6, 7, 8]
-    else:
-        seq_list = [None]  # For other datasets, seq is ignored
+    # Parse --seq (supports single or multiple sequences, for all datasets)
+    seq_list = None
+    if args.seq is not None:
+        # Parse comma-separated sequence numbers
+        try:
+            seq_list = [int(s.strip()) for s in args.seq.split(',')]
+            logger.info(f"{args.dataset}: Testing sequences {seq_list}")
+        except ValueError:
+            logger.error(f"❌ Invalid --seq format: {args.seq}")
+            logger.error(f"   Examples: --seq 0, --seq 2,5, --seq 0,3,7")
+            sys.exit(1)
 
     # Build method name with version
     method_name = args.method
@@ -1052,112 +1043,38 @@ def main():
         logger.error("Make sure the adapter is implemented in adapters/ directory")
         sys.exit(1)
 
-    # Loop through sequences (for Unreal4K) or run once (for other datasets)
-    all_seq_results = []
+    # Create config (seq_list filtering is now handled by ComparisonDataset)
+    config = {
+        'method': args.method,
+        'version': args.version,
+        'dataset': args.dataset,
+        'data_root': args.data_root,
+        'checkpoint_path': args.checkpoint,
+        'results_dir': base_results_dir,
+        'gpu': args.gpu,
+        'workers': args.workers,
+        'video_length': args.video_length,
+        'object_wise': {
+            'enabled': args.objwise,
+            'dataset': args.dataset.replace('_seg', '')
+        },
+        # New depth mode and model-specific settings
+        'depth_mode': args.depth_mode,
+        'indoor': args.indoor,
+        'metric': args.metric,
+        'frame_interval': args.frame_interval,
+        'only_clone': (args.only_clone == 'true'),  # Convert string to bool
+        'visualization': (args.visualization == 'true'),  # Convert string to bool
+        'seq_list': seq_list,  # Pass seq_list for filtering
+        'figure': args.figure,  # Export individual frames if enabled
+        'amp': args.amp,
+        'amp_dtype': args.amp_dtype,
+        'limit_scenes': args.limit_scenes
+    }
 
-    for seq_idx in seq_list:
-        # For Unreal4K multi-sequence mode
-        if args.dataset.lower() == 'unreal4k' and len(seq_list) > 1:
-            logger.info(f"\n{'='*80}")
-            logger.info(f"Testing Unreal4K sequence {seq_idx}/{len(seq_list)-1}")
-            logger.info(f"{'='*80}\n")
-            # Create per-sequence results directory
-            results_dir = f"{base_results_dir}/seq{seq_idx}"
-        else:
-            results_dir = base_results_dir
-
-        # Create config for this sequence
-        config = {
-            'method': args.method,
-            'version': args.version,
-            'dataset': args.dataset,
-            'data_root': args.data_root,
-            'checkpoint_path': args.checkpoint,
-            'results_dir': results_dir,
-            'gpu': args.gpu,
-            'workers': args.workers,
-            'video_length': args.video_length,
-            'object_wise': {
-                'enabled': args.objwise,
-                'dataset': args.dataset.replace('_seg', '')
-            },
-            # New depth mode and model-specific settings
-            'depth_mode': args.depth_mode,
-            'indoor': args.indoor,
-            'metric': args.metric,
-            'frame_interval': args.frame_interval,
-            'only_clone': (args.only_clone == 'true'),  # Convert string to bool
-            'visualization': (args.visualization == 'true'),  # Convert string to bool
-            'unreal4k_seq': seq_idx,  # Current sequence number
-            'amp': args.amp,
-            'amp_dtype': args.amp_dtype,
-            'limit_scenes': args.limit_scenes
-        }
-
-        # Create tester and run
-        tester = ComparisonTester(method_name, config, adapter)
-        tester.test()
-
-        # Collect results if testing multiple sequences
-        if len(seq_list) > 1:
-            # Read the results JSON
-            results_json_path = Path(results_dir) / "test_results.json"
-            if results_json_path.exists():
-                with open(results_json_path, 'r') as f:
-                    seq_results = json.load(f)
-                    all_seq_results.append({
-                        'sequence': seq_idx,
-                        'metrics': seq_results
-                    })
-                logger.info(f"Sequence {seq_idx} results saved")
-
-        # Clear GPU cache between sequences
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            logger.info("GPU cache cleared")
-
-    # If multiple sequences, compute and save aggregated results
-    if len(seq_list) > 1 and all_seq_results:
-        logger.info(f"\n{'='*80}")
-        logger.info("Computing aggregated results across all sequences")
-        logger.info(f"{'='*80}\n")
-
-        # Compute average metrics
-        avg_metrics = {}
-        metric_keys = list(all_seq_results[0]['metrics'].keys())
-
-        for key in metric_keys:
-            values = [r['metrics'][key] for r in all_seq_results if key in r['metrics']]
-            if values and isinstance(values[0], (int, float)):
-                avg_metrics[key] = sum(values) / len(values)
-            else:
-                # Skip non-numeric metrics
-                avg_metrics[key] = values[0] if values else None
-
-        # Save aggregated results
-        aggregated_results = {
-            'method': method_name,
-            'dataset': args.dataset,
-            'num_sequences': len(seq_list),
-            'sequences_tested': list(range(len(seq_list))),
-            'average_metrics': avg_metrics,
-            'per_sequence_results': all_seq_results
-        }
-
-        aggregated_path = Path(base_results_dir) / "aggregated_results.json"
-        aggregated_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(aggregated_path, 'w') as f:
-            json.dump(aggregated_results, f, indent=2)
-
-        logger.info(f"\n{'='*80}")
-        logger.info("AGGREGATED RESULTS (Average across all sequences)")
-        logger.info(f"{'='*80}")
-        for key, value in avg_metrics.items():
-            if isinstance(value, float):
-                logger.info(f"{key}: {value:.4f}")
-            else:
-                logger.info(f"{key}: {value}")
-        logger.info(f"Aggregated results saved to: {aggregated_path}")
+    # Create tester and run (seq_list filtering handled by ComparisonDataset)
+    tester = ComparisonTester(method_name, config, adapter)
+    tester.test()
 
     logger.info("\nTesting completed successfully!")
 

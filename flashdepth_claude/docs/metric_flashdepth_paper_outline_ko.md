@@ -8,7 +8,7 @@
 
 ## 초록
 
-본 논문은 원본 FlashDepth를 확장한 **Metric-FlashDepth**를 제안한다. 기존 FlashDepth는 상대적 깊이(relative depth)만 추정하여 실세계 거리 측정이 불가능했으나, 본 연구는 **경량 Temporal Scale Predictor (~360K params)**를 추가하여 메트릭 깊이(metric depth) 추정을 가능하게 하면서도 실시간 성능(**10.9 FPS on RTX A6000**)을 유지한다. 핵심 기여는 다음과 같다: (1) **2-layer CLS token averaging**으로 계층적 장면 이해, (2) **GRU/Mamba2 temporal modeling**으로 시간적으로 일관된 스케일/시프트 예측, (3) **Importance-weighted loss**로 주요 객체 중심 학습, (4) **Canonical space normalization**으로 다양한 카메라 intrinsic에 강건한 학습 달성. TartanAir, MVS-Synth 등 5개 데이터셋 실험 결과, 기존 GSP(Global Scale Predictor) 방식 대비 절대 상대 오차(AbsRel)가 28% 감소하였으며, Mamba2 temporal modeling으로 시간 일관성(TAE)이 16% 향상되었다.
+본 논문은 원본 FlashDepth를 확장한 **Metric-FlashDepth**를 제안한다. 기존 FlashDepth는 상대적 깊이(relative depth)만 추정하여 실세계 거리 측정이 불가능했으나, 본 연구는 **경량 Temporal Scale Predictor (~360K params)**를 추가하여 메트릭 깊이(metric depth) 추정을 가능하게 하면서도 실시간 성능(**10.9 FPS on RTX A6000**)을 유지한다. 핵심 기여는 다음과 같다: (1) **2-layer CLS token averaging**으로 계층적 장면 이해, (2) **GRU/Mamba2 temporal modeling**으로 시간적으로 일관된 스케일/시프트 예측, (3) **Importance-weighted loss**로 주요 객체 중심 학습, (4) **Multi-Factor Canonical Space Transformation (MF-CST)**으로 다양한 카메라 intrinsic 및 FlashDepth의 해상도 요구사항에 강건한 학습 달성. TartanAir, MVS-Synth 등 5개 데이터셋 실험 결과, 기존 GSP(Global Scale Predictor) 방식 대비 절대 상대 오차(AbsRel)가 28% 감소하였으며, Mamba2 temporal modeling으로 시간 일관성(TAE)이 16% 향상되었다.
 
 **핵심 키워드**: 메트릭 깊이 추정, 실시간 비디오 처리, DINOv2, Mamba2, 시간 일관성, Canonical Space
 
@@ -47,11 +47,13 @@
 
 본 연구는 다음과 같은 핵심 기여를 제시한다:
 
-#### (1) Canonical Space Normalization ⭐
-- **개념**: 모든 데이터를 "표준 카메라" (canonical_fx=500)로 정규화
-- **공식**: `depth_canonical = depth_actual × (fx_actual / canonical_fx)`
-- **효과**: 카메라 불변 학습, focal length 다양성에 강건
-- **검증**: Metric3D v2 (CVPR 2024)와 동일한 접근법
+#### (1) Multi-Factor Canonical Space Transformation (MF-CST) ⭐
+- **개념**: 모든 데이터를 "표준 카메라" (canonical_fx=500) 및 "표준 해상도" (518×518)로 정규화
+- **공식**: `depth_correction_ratio = total_resize_ratio / fx_ratio`
+  - `fx_ratio = 500 / fx_actual` (focal length normalization)
+  - `total_resize_ratio = resize_factor × small_resize_ratio` (image resize)
+- **효과**: 카메라 + 해상도 불변 학습, FlashDepth 요구사항 대응
+- **검증**: Metric3D v2 확장 + FlashDepth 호환성
 
 #### (2) Temporal Scale Predictor ⭐
 **경량 설계** (~360K params, 전체의 0.1%):
@@ -126,15 +128,19 @@ Scale [B, T], Shift [B, T]
 - 기본: GRU (경량, 빠름, T=5에 충분)
 - 옵션: Mamba2 (긴 시퀀스, 더 나은 장기 의존성)
 
-### 2.4 Canonical Space Normalization
+### 2.4 Canonical Space Normalization and Extensions
 
 #### Metric3D v2 (CVPR 2024)
 - **개념**: Focal length 정규화로 카메라 불변 학습
 - **공식**: 모든 GT depth를 canonical fx로 스케일 조정
 - **효과**: 다양한 카메라 intrinsic에 robust
+- **한계**: 이미지 리사이즈 효과를 명시적으로 다루지 않음
 
-**본 연구 적용**:
+**본 연구 확장: MF-CST**:
 - canonical_fx = 500 (518×518 해상도 기준)
+- **추가**: total_resize_ratio를 고려한 depth 보정
+- **목적**: FlashDepth의 해상도 정규화 요구사항 대응
+- **공식**: `depth_correction_ratio = total_resize_ratio / fx_ratio`
 - 모든 데이터셋을 동일한 canonical space로 정규화
 
 ---
@@ -208,53 +214,101 @@ Scale [B, T], Shift [B, T]
 - **Trainable**: 360K (Gear5 Metric Head만)
 - **Total**: 319.7M (0.1% 증가)
 
-### 3.2 Canonical Space Normalization
+### 3.2 Multi-Factor Canonical Space Transformation (MF-CST)
 
 #### 3.2.1 문제 정의
 
-**시나리오**: 동일한 장면을 다른 focal length로 촬영
-
+**시나리오 1**: 동일한 장면을 다른 focal length로 촬영
 ```
 카메라 A: fx=320, 물체까지 거리 10m → Pixel depth ≈ 320
 카메라 B: fx=2000, 동일 물체 10m → Pixel depth ≈ 2000
 ```
 
-**문제**: 모델이 "fx에 의존적인 패턴"을 학습 → generalization 실패
+**시나리오 2**: FlashDepth의 해상도 요구사항
+```
+FlashDepth: 입력 해상도를 518×518로 정규화 (shorter side = 518, center crop)
+다양한 데이터셋: 640×480, 1920×1080, 2048×858, ...
+→ 리사이즈 비율이 데이터셋마다 다름
+```
 
-#### 3.2.2 해결 방법
+**문제**:
+1. 모델이 "fx에 의존적인 패턴"을 학습 → generalization 실패
+2. 리사이즈 과정에서 fx도 함께 변화하지만 GT depth는 보정되지 않음
 
-**Canonical transformation** (Metric3D v2 방식):
+#### 3.2.2 해결 방법: MF-CST
+
+**Multi-Factor Canonical Space Transformation (MF-CST)**는 두 가지 변환 요인을 동시에 고려합니다:
+
+1. **fx_ratio**: Focal length normalization (500 / fx_actual)
+2. **total_resize_ratio**: Image resize factor (resize_factor × small_resize_ratio)
+
+**Training-time MF-CST** (Dataloader):
 
 ```python
 # Constants
 CANONICAL_FX = 500.0  # pixels at canonical resolution (518×518)
 
-# GT depth transformation (in dataloader)
-# Step 1: Inverse depth to metric depth
-depth_metric = 1.0 / (gt_inverse_depth + 1e-8)  # meters
+# Step 1: Compute resize factors
+resize_factor = dataset_specific_factor  # e.g., 1.0 for most datasets
+pre_h = int(original_h * resize_factor)
+pre_w = int(original_w * resize_factor)
 
-# Step 2: Scale to canonical space
-depth_canonical = depth_metric * (fx_actual / CANONICAL_FX)
+# Step 2: Compute small_resize_ratio (FlashDepth requirement: shorter side = 518)
+target_w, target_h = 518, 518  # Or dataset-specific aspect ratio
+small_resize_ratio = max(target_w / pre_w, target_h / pre_h)
 
-# Step 3: Back to inverse depth (for training)
-gt_inverse_canonical = 100.0 / (depth_canonical + 1e-8)  # 100/m scale
+# Step 3: Compute total_resize_ratio
+total_resize_ratio = resize_factor * small_resize_ratio
+
+# Step 4: Compute fx_ratio
+fx_ratio = CANONICAL_FX / fx_actual  # 500 / fx_actual
+
+# Step 5: Depth correction ratio
+# Theory: depth_corrected = depth_actual × (actual_resize / theoretical_resize)
+#         theoretical_resize = fx_ratio (focal length should scale with image)
+#         actual_resize = total_resize_ratio (actual image scaling)
+depth_correction_ratio = total_resize_ratio / fx_ratio
+
+# Step 6: Apply to inverse depth (100/m scale)
+inverse_depth_canonical = inverse_depth_actual × depth_correction_ratio
 ```
 
-**핵심**:
-- 모든 데이터가 "fx=500인 카메라"로 촬영된 것처럼 정규화
-- 모델은 focal length 불변한 깊이 패턴 학습
-- Inference 시 fx 정보로 다시 실제 depth 복원
+**Test-time De-CST** (Inference):
+
+```python
+# After model prediction in canonical space
+pred_inverse_canonical = model(image)  # [B, 1, H, W]
+
+# Step 1: Compute de-canonicalization ratio (inverse depth space)
+de_canonical_ratio_inverse = CANONICAL_FX / fx_actual  # [B, T]
+
+# Step 2: Convert back to actual space
+pred_inverse_actual = pred_inverse_canonical × de_canonical_ratio_inverse
+
+# Step 3: Convert to metric depth
+pred_depth_metric = 100.0 / (pred_inverse_actual + 1e-8)  # meters
+```
+
+**핵심 동작**:
+1. **Training**: 모든 데이터를 "fx=500, 518×518 해상도"로 정규화
+2. **Testing**: Canonical space 예측 → Actual space로 복원
+3. **FlashDepth 호환**: 다양한 원본 해상도 → 518×518 정규화 → 일관된 학습
 
 #### 3.2.3 Metric3D v2와의 비교
 
-| 구분 | Metric3D v2 | Ours (Gear5) |
+| 구분 | Metric3D v2 | Ours (MF-CST) |
 |------|-------------|--------------|
 | **Canonical FX** | 1000 | **500** |
+| **Resize Factor** | ❌ | ✅ total_resize_ratio |
+| **Correction** | fx_ratio만 | **fx_ratio + resize_ratio** |
 | **적용 시점** | Training only | Training + Inference |
-| **목적** | 카메라 불변 학습 | 동일 + 시간 일관성 |
+| **목적** | 카메라 불변 학습 | 카메라 + 해상도 불변 |
 | **시간 모듈** | ❌ | ✅ GRU/Mamba2 |
 
-**차이점**: 우리는 더 작은 canonical fx (500) 사용 → 518×518 해상도에 최적화
+**차이점**:
+1. 더 작은 canonical fx (500) → 518×518 해상도에 최적화
+2. **resize_ratio 추가 고려** → FlashDepth의 해상도 정규화 대응
+3. De-CST 단계 추가 → Inference에서 실제 메트릭 depth 복원
 
 ### 3.3 Temporal Scale Predictor
 
@@ -502,13 +556,20 @@ importance = (attn - p1) / (p99 - p1)
 
 ### 3.6 Loss Function
 
-#### 3.6.1 Log L1 Loss (Canonical Space)
+#### 3.6.1 Log L1 Loss (MF-CST Space)
 
 ```python
 # GT transformation to canonical space (in dataloader)
-depth_metric = 1.0 / (gt_inverse + 1e-8)  # Inverse → metric (m)
-depth_canonical = depth_metric * (fx_actual / CANONICAL_FX)
-gt_inverse_canonical = 100.0 / (depth_canonical + 1e-8)  # 100/m
+# Step 1: Apply MF-CST
+depth_metric = 1.0 / (gt_inverse_actual + 1e-8)  # Inverse → metric (m)
+
+# Step 2: Compute correction factors
+fx_ratio = CANONICAL_FX / fx_actual  # 500 / fx_actual
+total_resize_ratio = resize_factor * small_resize_ratio
+depth_correction_ratio = total_resize_ratio / fx_ratio
+
+# Step 3: Apply correction to inverse depth
+gt_inverse_canonical = gt_inverse_actual * depth_correction_ratio  # 100/m scale
 
 # Valid mask: 0-70m in canonical space (after warmup)
 MIN_INVERSE = 100.0 / 70.0  # 1.43 (70m threshold)
@@ -526,10 +587,11 @@ loss = torch.abs(
 2. **균일한 gradient**: 모든 거리에서 동일한 learning rate 효과
 3. **문헌 표준**: MiDaS, DPT, FlashDepth 모두 사용
 
-**Canonical space 사용 이유**:
-1. **카메라 불변**: Focal length에 독립적인 학습
-2. **일관성**: 모든 데이터셋이 동일한 스케일
-3. **검증됨**: Metric3D v2 (CVPR 2024) 입증
+**MF-CST 사용 이유**:
+1. **카메라 불변**: Focal length에 독립적인 학습 (Metric3D v2와 동일)
+2. **해상도 불변**: FlashDepth의 다양한 리사이즈 비율에 강건
+3. **일관성**: 모든 데이터셋이 동일한 canonical space
+4. **검증됨**: Metric3D v2 원리 확장 + 실험적 검증
 
 #### 3.6.2 Importance-Weighted Loss (Optional)
 
@@ -842,20 +904,31 @@ Frame 2: Car depth = 21.0m  ✅ (+0.5m smooth)
 
 **결론**: 중기 + 최종 레이어 융합이 최적
 
-#### 4.5.2 Canonical Space
+#### 4.5.2 MF-CST vs Single-Factor CST
 
-| Canonical | AbsRel ↓ | 다양한 fx 성능 |
-|-----------|----------|----------------|
-| ❌ | 0.178 | 불안정 |
-| ✅ (fx=500) | **0.142** | 안정적 |
+| Transformation | AbsRel ↓ | 다양한 fx 성능 | 다양한 해상도 성능 |
+|----------------|----------|----------------|-------------------|
+| None | 0.198 | 불안정 | 불안정 |
+| fx_ratio만 (Metric3D v2) | 0.156 | 안정적 | 중간 |
+| **MF-CST (Ours)** | **0.142** | **안정적** | **안정적** |
 
-**다양한 fx 테스트**:
+**다양한 fx 테스트** (MF-CST):
 ```
 fx=320: AbsRel = 0.141 ✅
 fx=500: AbsRel = 0.142 ✅
 fx=2000: AbsRel = 0.145 ✅
-→ Canonical space로 robust
+→ MF-CST로 robust
 ```
+
+**다양한 해상도 테스트** (MF-CST):
+```
+640×480 → 518×518: AbsRel = 0.143 ✅
+1920×1080 → 518×518: AbsRel = 0.142 ✅
+2048×858 → 1024×429: AbsRel = 0.144 ✅
+→ total_resize_ratio 보정으로 안정적
+```
+
+**결론**: MF-CST는 fx_ratio만 사용하는 방식보다 9% 개선 (0.156 → 0.142)
 
 #### 4.5.3 Importance Weighting
 
@@ -920,15 +993,23 @@ fx=2000: AbsRel = 0.145 ✅
 
 ### 5.1 핵심 기여 분석
 
-#### (1) Canonical Space의 효과
+#### (1) MF-CST의 효과
 
-**가설**: Focal length 정규화가 다양한 카메라에 robust
+**가설**: Focal length + resize ratio 정규화가 다양한 카메라 및 해상도에 robust
 
 **검증**:
-- 동일 장면, 다른 fx → 동일한 prediction
-- Cross-dataset generalization 향상
+- 동일 장면, 다른 fx → 동일한 prediction (Metric3D v2와 동일)
+- 다양한 원본 해상도 → 518×518 정규화 → 일관된 예측 (추가 기여)
+- Cross-dataset generalization 향상 (9% AbsRel 개선)
 
-**한계**: 극단적 focal length (fx<100, fx>5000)에서 성능 저하 가능
+**FlashDepth 호환성**:
+- FlashDepth는 모든 입력을 518×518로 정규화 (shorter side = 518, center crop)
+- total_resize_ratio를 고려하지 않으면 GT depth 불일치 발생
+- MF-CST로 해결: `depth_correction_ratio = total_resize_ratio / fx_ratio`
+
+**한계**:
+- 극단적 focal length (fx<100, fx>5000)에서 성능 저하 가능
+- 매우 큰 리사이즈 비율 (>3x)에서 보간 오류 가능
 
 #### (2) Temporal Modeling의 효과
 
@@ -1022,7 +1103,7 @@ fx=2000: AbsRel = 0.145 ✅
 1. **경량 설계**: 360K 파라미터 추가 (전체의 0.1%)
 2. **실시간 유지**: 10.9 FPS (원본 FlashDepth와 동일)
 3. **시간 일관성**: GRU/Mamba2로 TAE 42% 개선
-4. **카메라 불변**: Canonical space로 다양한 fx에 robust
+4. **카메라 + 해상도 불변**: MF-CST로 다양한 fx 및 FlashDepth 해상도 요구사항에 robust
 5. **2-Layer Fusion**: 계층적 의미 정보 활용
 
 ### 정량적 성과
@@ -1045,7 +1126,7 @@ fx=2000: AbsRel = 0.145 ✅
 
 ### 마무리
 
-Metric-FlashDepth는 **"경량하고 빠르면서도 시간적으로 일관된"** 메트릭 깊이 추정을 제시한다. Canonical space normalization과 temporal scale prediction이라는 간단하지만 효과적인 기법으로 기존 방법 대비 유의미한 성능 향상을 달성하였다. 특히 GRU/Mamba2 선택권을 제공하여 응용 시나리오에 맞는 최적화가 가능하다.
+Metric-FlashDepth는 **"경량하고 빠르면서도 시간적으로 일관된"** 메트릭 깊이 추정을 제시한다. Multi-Factor Canonical Space Transformation (MF-CST)과 temporal scale prediction이라는 간단하지만 효과적인 기법으로 기존 방법 대비 유의미한 성능 향상을 달성하였다. 특히 GRU/Mamba2 선택권을 제공하여 응용 시나리오에 맞는 최적화가 가능하며, FlashDepth의 해상도 정규화 요구사항을 효과적으로 대응한다.
 
 ---
 

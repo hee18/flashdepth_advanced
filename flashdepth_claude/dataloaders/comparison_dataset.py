@@ -42,7 +42,7 @@ class ComparisonDataset(Dataset):
     according to their own requirements.
     """
 
-    def __init__(self, dataset_name, data_root, split='test', video_length=50, chunk_size=None, objwise_enabled=False, only_clone=False, unreal4k_seq_list=None, unreal4k_seq=None, limit_scenes=None):
+    def __init__(self, dataset_name, data_root, split='test', video_length=50, chunk_size=None, objwise_enabled=False, only_clone=False, unreal4k_seq_list=None, unreal4k_seq=None, limit_scenes=None, seq_list=None):
             """
             Args:
                 dataset_name: Name of dataset ('eth3d', 'kitti', 'sintel', etc.)
@@ -53,9 +53,10 @@ class ComparisonDataset(Dataset):
                            Useful for high-resolution datasets (e.g., 50 for 4K images)
                 objwise_enabled: If True, load segmentation masks for object-wise evaluation
                 only_clone: If True and dataset is VKITTI, only use 'clone' condition (5 sequences instead of 50)
-                unreal4k_seq_list: If set, only use these sequence numbers (list of 0-8) for Unreal4K
-                unreal4k_seq: (deprecated, use unreal4k_seq_list) Single sequence number for backward compatibility
+                unreal4k_seq_list: (deprecated, use seq_list) If set, only use these sequence numbers for Unreal4K
+                unreal4k_seq: (deprecated, use seq_list) Single sequence number for backward compatibility
                 limit_scenes: For NuScenes, limit the number of scenes to load.
+                seq_list: If set, only use these sequence indices (list of ints, e.g., [0, 4]) for any dataset
             """
             # Handle dataset name aliases
             dataset_name_lower = dataset_name.lower()
@@ -65,13 +66,17 @@ class ComparisonDataset(Dataset):
             self.dataset_name = dataset_name_lower
             self.data_root = data_root
 
-            # Handle backward compatibility: convert single seq to list
-            if unreal4k_seq_list is not None:
-                self.unreal4k_seq_list = unreal4k_seq_list
+            # Handle backward compatibility: unreal4k_seq_list/unreal4k_seq → seq_list
+            if seq_list is not None:
+                self.seq_list = seq_list
+            elif unreal4k_seq_list is not None:
+                self.seq_list = unreal4k_seq_list
+                logger.info(f"[ComparisonDataset] Using deprecated unreal4k_seq_list, please use seq_list instead")
             elif unreal4k_seq is not None:
-                self.unreal4k_seq_list = [unreal4k_seq]
+                self.seq_list = [unreal4k_seq]
+                logger.info(f"[ComparisonDataset] Using deprecated unreal4k_seq, please use seq_list instead")
             else:
-                self.unreal4k_seq_list = None
+                self.seq_list = None
     
             self.split = split
             self.video_length = video_length
@@ -112,7 +117,14 @@ class ComparisonDataset(Dataset):
             else:
                 # Build sequence list for other datasets
                 self.sequences = self._build_sequences()
-                logger.info(f"[ComparisonDataset] {dataset_name} {split}: {len(self.sequences)} sequences")
+
+                # Apply seq_list filtering for all datasets
+                if self.seq_list is not None:
+                    original_len = len(self.sequences)
+                    self.sequences = [self.sequences[i] for i in self.seq_list if i < original_len]
+                    logger.info(f"[ComparisonDataset] Filtered {dataset_name}: {original_len} → {len(self.sequences)} sequences (seq_list={self.seq_list})")
+                else:
+                    logger.info(f"[ComparisonDataset] {dataset_name} {split}: {len(self.sequences)} sequences")
 
     def _build_sequences(self):
         """Build list of sequences for the dataset"""
@@ -155,20 +167,11 @@ class ComparisonDataset(Dataset):
             return sequences
         
         # Get all scene directories (UnrealStereo4K_00000, UnrealStereo4K_00001, etc.)
-        all_scenes = sorted([d for d in os.listdir(unreal4k_dir) 
+        all_scenes = sorted([d for d in os.listdir(unreal4k_dir)
                             if os.path.isdir(os.path.join(unreal4k_dir, d)) and d.startswith('UnrealStereo4K_')])
-        
-        # Filter by sequence list if provided
-        if self.unreal4k_seq_list is not None:
-            filtered_scenes = []
-            for seq_num in self.unreal4k_seq_list:
-                scene_name = f"UnrealStereo4K_{seq_num:05d}"
-                if scene_name in all_scenes:
-                    filtered_scenes.append(scene_name)
-                else:
-                    logger.warning(f"Requested Unreal4K sequence {seq_num} not found: {scene_name}")
-            all_scenes = filtered_scenes
-            logger.info(f"Filtering Unreal4K to sequences {self.unreal4k_seq_list}: {len(all_scenes)} scenes")
+
+        # NOTE: Sequence filtering is now handled in __init__ after _build_sequences()
+        # This allows uniform filtering for all datasets, not just Unreal4K
         
         # Build sequences for each scene
         for scene_name in all_scenes:
@@ -642,27 +645,53 @@ class ComparisonDataset(Dataset):
         """
         Load Unreal4K depth (.npy file)
 
-        Unreal4K stores METRIC DEPTH (m) in .npy format.
-        Despite variable names suggesting "disparity" in some places, the actual
-        data is already in meters and should NOT be inverted.
-
-        Confirmed by data analysis: median values 20-250m are reasonable metric depths,
-        while 1/x conversion would give unrealistic sub-centimeter values.
+        UnrealStereo4K provides DISPARITY maps, not metric depth.
+        We convert disparity to metric depth using:
+            depth (m) = (baseline × focal_length) / disparity
+        
+        Baselines:
+        - Indoor scenes (seq 4, 6): 0.2m (20cm)
+        - Outdoor scenes (seq 0, 1, 2, 3, 5, 7, 8): 0.5m (50cm)
+        
+        Focal length (downsampled resolution 2112×1188): fx = 1056
         """
-        # Load metric depth (already in meters)
-        depth_meters = np.load(path)
-
+        # Load disparity
+        disparity = np.load(path)
+        
+        # Extract sequence ID from path
+        # Path format: .../UnrealStereo4K_0000X/Disp0/XXXXX.npy
+        seq_id = int(path.split('UnrealStereo4K_')[1].split('/')[0][-1])
+        
+        # Determine baseline based on sequence ID
+        INDOOR_SEQS = [4, 6]
+        BASELINE_INDOOR = 0.2   # 20cm
+        BASELINE_OUTDOOR = 0.5  # 50cm
+        
+        baseline = BASELINE_INDOOR if seq_id in INDOOR_SEQS else BASELINE_OUTDOOR
+        
+        # Focal length for downsampled resolution (2112×1188)
+        # Note: Original resolution (3840×2160) had fx=1920
+        # Downsampled by factor 0.55, so fx = 1920 × 0.55 = 1056
+        fx = 1056.0
+        
+        # Convert disparity to metric depth
+        # depth = (baseline × fx) / disparity
+        # Handle division by zero
+        with np.errstate(divide='ignore', invalid='ignore'):
+            depth_meters = (baseline * fx) / disparity
+        
         # Handle invalid values
         invalid_mask = np.logical_or.reduce((
             np.isinf(depth_meters),
             np.isnan(depth_meters),
-            depth_meters <= 0
+            depth_meters <= 0,
+            disparity <= 0
         ))
-
+        
         # Set invalid to 0
         depth_meters[invalid_mask] = 0
-
-        return torch.from_numpy(depth_meters).float()  # [H, W] in meters
+        
+        return torch.from_numpy(depth_meters).float()  # [H, W] in meters  # [H, W] in meters
 
     def _load_urbansyn_depth(self, path):
         """

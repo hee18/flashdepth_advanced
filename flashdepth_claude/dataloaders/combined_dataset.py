@@ -23,7 +23,7 @@ from utils.dataset_intrinsics import (
 class CombinedDataset(Dataset):
     def __init__(self, root_dir, enable_dataset_flags, resolution=None, split='train',
                  video_length=8, seed=42, tmp_res=None, color_aug=False, strict_focal_length=True,
-                 unreal4k_seq=None, limit_scenes=None):
+                 unreal4k_seq=None, limit_scenes=None, seq_list=None):
         '''
         enable_dataset_flags: list of datasets to use; e.g. ['spring', 'mvs-synth', 'urbansyn', 'eth3d', 'waymo', 'waymo_seg']
 
@@ -99,6 +99,14 @@ class CombinedDataset(Dataset):
             self.depth_read_list[dataset_name] = dataset.depth_read
             self.reshape_list[dataset_name] = dataset.reshape_list
             logging.info(f"[DEBUG combined_dataset] Dataset {dataset_name} loaded: {len(dataset.pairs)} pairs/sequences")
+
+            # Apply sequence filtering if seq_list is provided
+            if seq_list is not None and split != 'train':
+                original_len = len(self.pairslist[dataset_name])
+                # Filter sequences by indices in seq_list
+                filtered_pairs = [self.pairslist[dataset_name][i] for i in seq_list if i < original_len]
+                self.pairslist[dataset_name] = filtered_pairs
+                logging.info(f"[CombinedDataset] Filtered {dataset_name}: {original_len} → {len(filtered_pairs)} sequences (seq_list={seq_list})")
 
             # Store focal length getter method if dataset has it, otherwise None
             if hasattr(dataset, 'get_focal_length'):
