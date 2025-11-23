@@ -84,7 +84,8 @@ show_usage() {
     echo "  --mamba              Use Mamba2 instead of GRU for Gear5 TemporalScalePredictor (default: false/GRU)"
     echo "  --seq N              Sequence selection (e.g., --seq 0,4 for sequences 0 and 4)"
     echo "  --limit-scenes N     For NuScenes, limit the number of scenes to process (e.g., 50)"
-    echo "  --figure             Export best_frame ±4 frames (9 total) as individual images/depth maps (requires --seq)"
+    echo "  --best-figure        Export best_frame ±4 frames (9 total) as individual images/depth maps"
+    echo "  --frame N            Export frame N ±4 frames (9 total) as individual images/depth maps (e.g., --seq 6 --frame 459)"
     echo ""
     echo "Note: Regularization losses are deprecated. Importance map now uses raw DINOv2 attention (frozen)."
     echo "Note: test_original_flashdepth always tests only the first sequence for FPS measurement."
@@ -158,7 +159,8 @@ WANDB_NAME=""  # WandB experiment name (empty = auto-generated)
 MAMBA="false"  # Use Mamba2 for Gear5 TemporalScalePredictor (false=GRU, true=Mamba2)
 SEQ=""  # Sequence selection for UnrealStereo4K (test_original_flashdepth)
 LIMIT_SCENES=""  # Limit number of scenes for NuScenes dataset (optional, e.g., 50)
-FIGURE="false"  # Export best_frame ±4 frames (9 total) as individual images/depth maps
+BEST_FIGURE="false"  # Export best_frame ±4 frames (9 total) as individual images/depth maps
+FRAME=""  # Specific frame to export ±4 frames
 
 # Parse arguments
 USER_BATCH_SIZE=""  # Track if user explicitly set batch size
@@ -281,9 +283,13 @@ while [[ $# -gt 0 ]]; do
             LIMIT_SCENES="$2"
             shift 2
             ;;
-        --figure)
-            FIGURE="true"
+        --best-figure)
+            BEST_FIGURE="true"
             shift
+            ;;
+        --frame)
+            FRAME="$2"
+            shift 2
             ;;
         -h|--help)
             show_usage
@@ -1254,9 +1260,14 @@ case $COMMAND in
             TEST_CMD="$TEST_CMD +seq_list='[$SEQ]'"
         fi
 
-        # Add figure export if specified
-        if [ "$FIGURE" == "true" ]; then
-            TEST_CMD="$TEST_CMD +figure=true"
+        # Add best-figure export if specified
+        if [ "$BEST_FIGURE" == "true" ]; then
+            TEST_CMD="$TEST_CMD +best_figure=true"
+        fi
+
+        # Add frame export if specified
+        if [ -n "$FRAME" ]; then
+            TEST_CMD="$TEST_CMD +frame=$FRAME"
         fi
 
         # Add resolution override

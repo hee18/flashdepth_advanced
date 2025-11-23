@@ -110,6 +110,14 @@ class Gear5Tester:
         # Can be overridden via command line: frame_interval=X
         self.frame_interval = self.config.get('frame_interval', None)
 
+        # Figure export options
+        self.export_best_figure = self.config.get('best_figure', False)
+        self.export_frame = self.config.get('frame', None)  # Specific frame index (int or None)
+        if self.export_best_figure:
+            logger.info("Best-figure export ENABLED (will save best_frame ±4 as individual images)")
+        if self.export_frame is not None:
+            logger.info(f"Frame-specific export ENABLED (will save frame {self.export_frame} ±4 as individual images)")
+
         if self.object_wise_enabled:
             logger.info(f"Object-wise evaluation ENABLED for dataset: {self.object_wise_dataset}")
             self.object_wise_metrics = ObjectWiseMetrics(dataset_type=self.object_wise_dataset)
@@ -1386,16 +1394,29 @@ class Gear5Tester:
                 dataset_name  # Add dataset name for object class mapping
             )
 
-            # Export individual frames if --figure option is enabled
-            if self.config.get('figure', False):
-                self._export_figure_frames(
-                    images=images[0],  # [T, 3, H, W]
-                    pred_depths=pred_depths,  # [T, 1, H, W]
-                    gt_depths=gt_depth_metric,  # [T, 1, H, W]
-                    best_frame_idx=best_frame_idx,
-                    sequence_id=sequence_id,
-                    dataset_name=dataset_name
-                )
+        # Export individual frames if --best-figure or --frame option is enabled
+        # NOTE: This is independent of --visualization flag
+        export_frame_idx = None
+        if self.export_best_figure and len(frame_metrics) > 0:
+            export_frame_idx = best_frame_idx
+            logger.info(f"Exporting best frame {best_frame_idx} ±4 (--best-figure)")
+        elif self.export_frame is not None:
+            # User specified exact frame index
+            if self.export_frame < len(pred_depths):
+                export_frame_idx = self.export_frame
+                logger.info(f"Exporting user-specified frame {self.export_frame} ±4 (--frame)")
+            else:
+                logger.warning(f"Requested frame {self.export_frame} exceeds sequence length {len(pred_depths)}, skipping export")
+
+        if export_frame_idx is not None:
+            self._export_figure_frames(
+                images=images[0],  # [T, 3, H, W]
+                pred_depths=pred_depths,  # [T, 1, H, W]
+                gt_depths=gt_depth_metric,  # [T, 1, H, W]
+                best_frame_idx=export_frame_idx,
+                sequence_id=sequence_id,
+                dataset_name=dataset_name
+            )
 
         return metrics
 
@@ -2008,7 +2029,16 @@ class Gear5Tester:
         for t in range(start_idx, end_idx):
             # 1. Save original image
             img = images[t].cpu().numpy()  # [3, H, W]
+            
+            # Check if ImageNet normalized (value range check)
+            if img.min() < -2.0 or img.max() > 2.0:
+                # ImageNet normalized - unnormalize first
+                mean = np.array([0.485, 0.456, 0.406]).reshape(3, 1, 1)
+                std = np.array([0.229, 0.224, 0.225]).reshape(3, 1, 1)
+                img = img * std + mean  # Unnormalize to [0, 1]
+            
             img = np.transpose(img, (1, 2, 0))  # [H, W, 3]
+            img = np.clip(img, 0, 1)  # Ensure [0, 1] range
             img = (img * 255).astype(np.uint8)
             img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)  # Convert RGB to BGR for cv2
             img_path = figures_dir / f"frame_{t:04d}_image.png"
@@ -2016,53 +2046,70 @@ class Gear5Tester:
 
             # 2. Save GT depth (colormap)
             gt_depth = gt_depths[t, 0].cpu().numpy()  # [H, W] in meters
+            # Get GT range for consistent normalization
             gt_depth_vis = self._depth_to_colormap(gt_depth)
             gt_path = figures_dir / f"frame_{t:04d}_gt_depth.png"
             cv2.imwrite(str(gt_path), gt_depth_vis)
+            
+            # Get vmin/vmax from GT for pred normalization
+            valid_mask = np.isfinite(gt_depth) & (gt_depth > 0)
+            if valid_mask.any():
+                gt_vmin = np.nanpercentile(gt_depth[valid_mask], 2)
+                gt_vmax = np.nanpercentile(gt_depth[valid_mask], 98)
+            else:
+                gt_vmin, gt_vmax = None, None
 
-            # 3. Save pred depth (colormap)
+            # 3. Save pred depth (colormap) - use GT range for comparison
             pred_depth = pred_depths[t, 0].cpu().numpy()  # [H, W] in meters
-            pred_depth_vis = self._depth_to_colormap(pred_depth)
+            pred_depth_vis = self._depth_to_colormap(pred_depth, vmin=gt_vmin, vmax=gt_vmax)
             pred_path = figures_dir / f"frame_{t:04d}_pred_depth.png"
             cv2.imwrite(str(pred_path), pred_depth_vis)
 
         logger.info(f"Exported {end_idx - start_idx} frames × 3 types = {(end_idx - start_idx) * 3} images to {figures_dir}")
 
-    def _depth_to_colormap(self, depth, vmin=None, vmax=None):
+    def _depth_to_colormap(self, depth, vmin=None, vmax=None, percentile_range=(2, 98)):
         """
-        Convert depth map to colormap visualization.
+        Convert depth map to colormap visualization (matching gear5_visualization.py style).
 
         Args:
             depth: [H, W] numpy array in meters
-            vmin: minimum depth for colormap (default: use data min)
-            vmax: maximum depth for colormap (default: use data max)
+            vmin: minimum depth for colormap (default: use 2nd percentile)
+            vmax: maximum depth for colormap (default: use 98th percentile)
+            percentile_range: tuple of (low, high) percentiles for auto-scaling
 
         Returns:
             [H, W, 3] BGR image (uint8)
         """
-        import matplotlib.pyplot as plt
+        import matplotlib
+        import cv2
 
         # Handle invalid values
         valid_mask = np.isfinite(depth) & (depth > 0)
         if not valid_mask.any():
-            # All invalid - return black image
             return np.zeros((*depth.shape, 3), dtype=np.uint8)
 
-        # Auto-scale if not provided
+        valid_depth = depth[valid_mask]
+
+        # Use percentile normalization if vmin/vmax not provided (matching gear5_visualization.py)
         if vmin is None:
-            vmin = depth[valid_mask].min()
+            vmin = np.nanpercentile(valid_depth, percentile_range[0])
         if vmax is None:
-            vmax = depth[valid_mask].max()
+            vmax = np.nanpercentile(valid_depth, percentile_range[1])
+
+        # Create depth with NaN for invalid pixels
+        depth_vis = np.where(valid_mask, depth, np.nan)
 
         # Normalize to [0, 1]
-        depth_normalized = np.clip((depth - vmin) / (vmax - vmin + 1e-8), 0, 1)
+        depth_normalized = np.clip((depth_vis - vmin) / (vmax - vmin + 1e-8), 0, 1)
 
-        # Apply colormap (turbo is good for depth)
-        cmap = plt.get_cmap('turbo')
-        depth_colored = cmap(depth_normalized)[:, :, :3]  # [H, W, 3] RGB in [0, 1]
+        # Apply colormap (plasma_r to match gear5_visualization.py)
+        # Use new matplotlib API to avoid deprecation warning
+        cmap = matplotlib.colormaps.get_cmap('plasma_r').copy()
+        cmap.set_bad(color='black')  # NaN pixels = black
+        depth_colored_rgba = cmap(depth_normalized)
+        depth_colored = (depth_colored_rgba[:, :, :3] * 255).astype(np.uint8)
 
-        # Convert to BGR uint8
-        depth_colored = (depth_colored * 255).astype(np.uint8)
+        # Convert RGB to BGR for cv2
         depth_colored = cv2.cvtColor(depth_colored, cv2.COLOR_RGB2BGR)
 
         return depth_colored

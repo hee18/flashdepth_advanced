@@ -70,6 +70,15 @@ class ComparisonTester:
         self.depth_mode = config.get('depth_mode', 'metric')
         self.frame_interval = config.get('frame_interval', None)
         self.enable_visualization = config.get('visualization', True)
+        
+        # Figure export settings
+        self.export_best_figure = config.get('best_figure', False)
+        self.export_frame = config.get('frame', None)  # Specific frame index (int or None)
+        
+        if self.export_best_figure:
+            logger.info("Best-figure export ENABLED (will save best_frame ±4 as individual images)")
+        if self.export_frame is not None:
+            logger.info(f"Frame-specific export ENABLED (will save frame {self.export_frame} ±4 as individual images)")
 
         logger.info(f"Depth evaluation mode: {self.depth_mode}")
         if self.frame_interval is not None:
@@ -821,6 +830,37 @@ class ComparisonTester:
                 class_names_dict=self.object_wise_metrics.classes if self.object_wise_enabled else None
             )
 
+        # Export individual frames if --best-figure or --frame option is enabled
+        # This runs AFTER visualization block (can run even if enable_visualization=False)
+        export_frame_idx = None
+        if self.export_best_figure and len(frame_metrics) > 0:
+            export_frame_idx = best_frame_idx
+            logger.info(f"Exporting best frame {best_frame_idx} ±4 (--best-figure)")
+        elif self.export_frame is not None:
+            # User specified a specific frame
+            if self.export_frame < len(pred_depths):
+                export_frame_idx = self.export_frame
+                logger.info(f"Exporting user-specified frame {self.export_frame} ±4 (--frame)")
+            else:
+                logger.warning(f"Requested frame {self.export_frame} exceeds sequence length {len(pred_depths)}, skipping export")
+
+        if export_frame_idx is not None:
+            # Extract dataset name for export (may not be defined if visualization is disabled)
+            dataset_name_raw = batch.get('dataset_name', 'unknown')
+            if isinstance(dataset_name_raw, list):
+                dataset_name = dataset_name_raw[0] if len(dataset_name_raw) > 0 else 'unknown'
+            else:
+                dataset_name = dataset_name_raw
+
+            self._export_figure_frames(
+                images[0],  # [T, 3, H, W]
+                pred_depths,  # [T, 1, H, W]
+                gt_depth_processed[0],  # [T, 1, H, W]
+                best_frame_idx=export_frame_idx,
+                sequence_id=sequence_id,
+                dataset_name=dataset_name
+            )
+
         return metrics
 
     def _aggregate_and_save_results(self):
@@ -929,6 +969,123 @@ class ComparisonTester:
                 )
                 logger.info(f"Object-wise results saved to {object_wise_path}")
 
+    def _export_figure_frames(self, images, pred_depths, gt_depths, best_frame_idx, sequence_id, dataset_name):
+        """
+        Export individual frames around best_frame (±4 frames, total 9 frames).
+        Saves: original image, GT depth (colormap), pred depth (colormap)
+
+        Args:
+            images: [T, 3, H, W] tensor
+            pred_depths: [T, 1, H, W] tensor in meters
+            gt_depths: [T, 1, H, W] tensor in meters
+            best_frame_idx: int, index of best frame
+            sequence_id: int, sequence identifier
+            dataset_name: str, name of dataset
+        """
+        import cv2
+        import matplotlib.pyplot as plt
+
+        T = images.shape[0]
+
+        # Determine frame range: best_frame ± 4
+        start_idx = max(0, best_frame_idx - 4)
+        end_idx = min(T, best_frame_idx + 5)  # +5 because range is exclusive
+
+        logger.info(f"Exporting figure frames for sequence {sequence_id}: frames {start_idx}-{end_idx-1} (best={best_frame_idx})")
+
+        # Create figures directory
+        figures_dir = self.save_dir / "figures" / f"seq{sequence_id:04d}"
+        figures_dir.mkdir(parents=True, exist_ok=True)
+
+        for t in range(start_idx, end_idx):
+            # 1. Save original image
+            img = images[t].cpu().numpy()  # [3, H, W]
+            
+            # Check if ImageNet normalized (value range check)
+            if img.min() < -2.0 or img.max() > 2.0:
+                # ImageNet normalized - unnormalize first
+                mean = np.array([0.485, 0.456, 0.406]).reshape(3, 1, 1)
+                std = np.array([0.229, 0.224, 0.225]).reshape(3, 1, 1)
+                img = img * std + mean  # Unnormalize to [0, 1]
+            
+            img = np.transpose(img, (1, 2, 0))  # [H, W, 3]
+            img = np.clip(img, 0, 1)  # Ensure [0, 1] range
+            img = (img * 255).astype(np.uint8)
+            img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)  # Convert RGB to BGR for cv2
+            img_path = figures_dir / f"frame_{t:04d}_image.png"
+            cv2.imwrite(str(img_path), img)
+
+            # 2. Save GT depth (colormap)
+            gt_depth = gt_depths[t, 0].cpu().numpy()  # [H, W] in meters
+            # Get GT range for consistent normalization
+            gt_depth_vis = self._depth_to_colormap(gt_depth)
+            gt_path = figures_dir / f"frame_{t:04d}_gt_depth.png"
+            cv2.imwrite(str(gt_path), gt_depth_vis)
+            
+            # Get vmin/vmax from GT for pred normalization
+            valid_mask = np.isfinite(gt_depth) & (gt_depth > 0)
+            if valid_mask.any():
+                gt_vmin = np.nanpercentile(gt_depth[valid_mask], 2)
+                gt_vmax = np.nanpercentile(gt_depth[valid_mask], 98)
+            else:
+                gt_vmin, gt_vmax = None, None
+
+            # 3. Save pred depth (colormap) - use GT range for comparison
+            pred_depth = pred_depths[t, 0].cpu().numpy()  # [H, W] in meters
+            pred_depth_vis = self._depth_to_colormap(pred_depth, vmin=gt_vmin, vmax=gt_vmax)
+            pred_path = figures_dir / f"frame_{t:04d}_pred_depth.png"
+            cv2.imwrite(str(pred_path), pred_depth_vis)
+
+        logger.info(f"Exported {end_idx - start_idx} frames × 3 types = {(end_idx - start_idx) * 3} images to {figures_dir}")
+
+    def _depth_to_colormap(self, depth, vmin=None, vmax=None, percentile_range=(2, 98)):
+        """
+        Convert depth map to colormap visualization (matching gear5_visualization.py style).
+
+        Args:
+            depth: [H, W] numpy array in meters
+            vmin: minimum depth for colormap (default: use 2nd percentile)
+            vmax: maximum depth for colormap (default: use 98th percentile)
+            percentile_range: tuple of (low, high) percentiles for auto-scaling
+
+        Returns:
+            [H, W, 3] BGR image (uint8)
+        """
+        import matplotlib
+        import cv2
+
+        # Handle invalid values
+        valid_mask = np.isfinite(depth) & (depth > 0)
+        if not valid_mask.any():
+            # All invalid - return black image
+            return np.zeros((*depth.shape, 3), dtype=np.uint8)
+
+        valid_depth = depth[valid_mask]
+
+        # Use percentile normalization if vmin/vmax not provided (matching gear5_visualization.py)
+        if vmin is None:
+            vmin = np.nanpercentile(valid_depth, percentile_range[0])
+        if vmax is None:
+            vmax = np.nanpercentile(valid_depth, percentile_range[1])
+
+        # Normalize to [0, 1]
+        depth_normalized = np.clip((depth - vmin) / (vmax - vmin + 1e-8), 0, 1)
+
+        # Apply colormap (plasma_r to match gear5_visualization.py)
+        # Use new matplotlib API to avoid deprecation warning
+        cmap = matplotlib.colormaps.get_cmap('plasma_r').copy()
+        cmap.set_bad(color='black')  # NaN pixels = black
+        depth_colored_rgba = cmap(depth_normalized)
+        depth_colored = (depth_colored_rgba[:, :, :3] * 255).astype(np.uint8)
+
+        # Set invalid pixels to black
+        depth_colored[~valid_mask] = 0
+
+        # Convert RGB to BGR for cv2
+        depth_colored = cv2.cvtColor(depth_colored, cv2.COLOR_RGB2BGR)
+
+        return depth_colored
+
 
 def main():
     parser = argparse.ArgumentParser(description='Test IMAGE depth estimation methods (frame-by-frame processing)')
@@ -968,8 +1125,10 @@ def main():
                        help='Enable/disable visualizations (sequence.png, best_frame.png, etc.). Default: true')
     parser.add_argument('--seq', type=str, default=None,
                        help='Sequence number(s) to test (e.g., --seq 0, --seq 2,5, --seq 0,3,7)')
-    parser.add_argument('--figure', action='store_true',
+    parser.add_argument('--best-figure', action='store_true',
                        help='Export best_frame ±4 frames (9 total) as individual images/depth maps (requires --seq)')
+    parser.add_argument('--frame', type=int, default=None,
+                       help='Export specific frame ±4 frames (9 total) as individual images/depth maps (requires --seq)')
     parser.add_argument('--amp', action='store_true',
                        help='Enable Automatic Mixed Precision (AMP) for inference')
     parser.add_argument('--amp-dtype', type=str, default='bf16', choices=['bf16', 'fp16'],
@@ -1066,7 +1225,8 @@ def main():
         'only_clone': (args.only_clone == 'true'),  # Convert string to bool
         'visualization': (args.visualization == 'true'),  # Convert string to bool
         'seq_list': seq_list,  # Pass seq_list for filtering
-        'figure': args.figure,  # Export individual frames if enabled
+        'best_figure': args.best_figure,  # Export best frame ±4 if enabled
+        'frame': args.frame,  # Export specific frame ±4 if specified
         'amp': args.amp,
         'amp_dtype': args.amp_dtype,
         'limit_scenes': args.limit_scenes

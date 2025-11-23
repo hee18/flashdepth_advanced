@@ -103,10 +103,23 @@ class CombinedDataset(Dataset):
             # Apply sequence filtering if seq_list is provided
             if seq_list is not None and split != 'train':
                 original_len = len(self.pairslist[dataset_name])
+                # Convert seq_list to list of ints (handle Hydra string formats)
+                if isinstance(seq_list, str):
+                    # Hydra may pass as string like "[5]" or "5" or "0,3,7"
+                    import ast
+                    try:
+                        # Try parsing as Python literal (e.g., "[5]")
+                        seq_list = ast.literal_eval(seq_list)
+                    except (ValueError, SyntaxError):
+                        # If that fails, try comma-separated (e.g., "0,3,7")
+                        seq_list = [s.strip() for s in seq_list.split(',')]
+
+                # Convert all elements to int
+                seq_list_int = [int(i) for i in seq_list]
                 # Filter sequences by indices in seq_list
-                filtered_pairs = [self.pairslist[dataset_name][i] for i in seq_list if i < original_len]
+                filtered_pairs = [self.pairslist[dataset_name][i] for i in seq_list_int if i < original_len]
                 self.pairslist[dataset_name] = filtered_pairs
-                logging.info(f"[CombinedDataset] Filtered {dataset_name}: {original_len} → {len(filtered_pairs)} sequences (seq_list={seq_list})")
+                logging.info(f"[CombinedDataset] Filtered {dataset_name}: {original_len} → {len(filtered_pairs)} sequences (seq_list={seq_list_int})")
 
             # Store focal length getter method if dataset has it, otherwise None
             if hasattr(dataset, 'get_focal_length'):

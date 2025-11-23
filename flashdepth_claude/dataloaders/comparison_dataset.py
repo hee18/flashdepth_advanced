@@ -42,214 +42,604 @@ class ComparisonDataset(Dataset):
     according to their own requirements.
     """
 
-    def __init__(self, dataset_name, data_root, split='test', video_length=50, chunk_size=None, objwise_enabled=False, only_clone=False, unreal4k_seq_list=None, unreal4k_seq=None, limit_scenes=None, seq_list=None):
-            """
-            Args:
-                dataset_name: Name of dataset ('eth3d', 'kitti', 'sintel', etc.)
-                data_root: Root directory containing datasets
-                split: 'test' or 'val'
-                video_length: Maximum sequence length
-                chunk_size: If set, load frames in chunks to reduce memory usage
-                           Useful for high-resolution datasets (e.g., 50 for 4K images)
-                objwise_enabled: If True, load segmentation masks for object-wise evaluation
-                only_clone: If True and dataset is VKITTI, only use 'clone' condition (5 sequences instead of 50)
-                unreal4k_seq_list: (deprecated, use seq_list) If set, only use these sequence numbers for Unreal4K
-                unreal4k_seq: (deprecated, use seq_list) Single sequence number for backward compatibility
-                limit_scenes: For NuScenes, limit the number of scenes to load.
-                seq_list: If set, only use these sequence indices (list of ints, e.g., [0, 4]) for any dataset
-            """
-            # Handle dataset name aliases
-            dataset_name_lower = dataset_name.lower()
-            if dataset_name_lower in ['unreal', 'unrealstereo4k']:
-                dataset_name_lower = 'unreal4k'
+    def __init__(self, dataset_name, data_root, split='test', video_length=50, chunk_size=None, objwise_enabled=False, only_clone=False, unrealstereo4k_seq_list=None, unrealstereo4k_seq=None, limit_scenes=None, seq_list=None):
+        """
+        Args:
+            dataset_name: Name of dataset ('eth3d', 'kitti', 'sintel', etc.)
+            data_root: Root directory containing datasets
+            split: 'test' or 'val'
+            video_length: Maximum sequence length
+            chunk_size: If set, load frames in chunks to reduce memory usage
+                       Useful for high-resolution datasets (e.g., 50 for 4K images)
+            objwise_enabled: If True, load segmentation masks for object-wise evaluation
+            only_clone: If True and dataset is VKITTI, only use 'clone' condition (5 sequences instead of 50)
+            unrealstereo4k_seq_list: If set, only use these sequence numbers (list of 0-8) for UnrealStereo4K
+            unrealstereo4k_seq: (deprecated, use unrealstereo4k_seq_list) Single sequence number for backward compatibility
+            limit_scenes: For NuScenes, limit the number of scenes to load
+            seq_list: If set, only use these sequence indices (list of ints, e.g., [0, 4]) for any dataset
+        """
+        # Handle dataset name aliases
+        dataset_name_lower = dataset_name.lower()
+        if dataset_name_lower in ['unrealstereo4k', 'unreal']:
+            dataset_name_lower = 'unreal4k'
 
-            self.dataset_name = dataset_name_lower
-            self.data_root = data_root
+        self.dataset_name = dataset_name_lower
+        self.data_root = data_root
+        self.limit_scenes = limit_scenes
+        self.seq_list = seq_list
 
-            # Handle backward compatibility: unreal4k_seq_list/unreal4k_seq → seq_list
-            if seq_list is not None:
-                self.seq_list = seq_list
-            elif unreal4k_seq_list is not None:
-                self.seq_list = unreal4k_seq_list
-                logger.info(f"[ComparisonDataset] Using deprecated unreal4k_seq_list, please use seq_list instead")
-            elif unreal4k_seq is not None:
-                self.seq_list = [unreal4k_seq]
-                logger.info(f"[ComparisonDataset] Using deprecated unreal4k_seq, please use seq_list instead")
-            else:
-                self.seq_list = None
-    
-            self.split = split
-            self.video_length = video_length
-            self.objwise_enabled = objwise_enabled
-            self.only_clone = only_clone
-            
-            self.nuscenes_comparison_dataset = None # Initialize to None
-    
-            # Auto-set chunk_size for efficient memory usage
-            # DISABLED: chunk_size limits total frames loaded, which breaks video models
-            # Instead, we rely on:
-            # 1. video_length to limit sequence length (user-specified via --vid-len)
-            # 2. num_workers=0 for high-res datasets to avoid OOM from parallel loading
-            # 3. GPU memory management (empty_cache after each sequence)
-            if chunk_size is None:
-                self.chunk_size = None  # Disabled by default
-            else:
-                self.chunk_size = chunk_size  # Allow user override if needed
-    
-            # Cache for intrinsics to avoid repeated file reads
-            self._intrinsics_cache = {}
-    
-            # Load dataset-specific configuration
-            self.dataset_path = os.path.join(data_root, self.dataset_name)
-    
-            # --- NuScenes specific handling ---
-            if self.dataset_name == 'nuscenes':
-                self.nuscenes_comparison_dataset = NuscenesComparisonDataset(
-                    data_root=self.dataset_path, # Pass the dataset-specific path
-                    split=self.split,
-                    dataset_name=self.dataset_name,
-                    limit_scenes=limit_scenes # Pass limit_scenes to NuScenesComparisonDataset
-                )
-                # For NuScenes, the ComparisonDataset itself will be the nuscenes_comparison_dataset
-                # so self.sequences is not used in the traditional sense
-                self.sequences = [] # Initialize as empty, as it's not used directly
-                logger.info(f"[ComparisonDataset] Using NuscenesComparisonDataset for {self.dataset_name} {self.split}: {len(self.nuscenes_comparison_dataset)} samples")
-            else:
-                # Build sequence list for other datasets
-                self.sequences = self._build_sequences()
+        # Handle backward compatibility: convert single seq to list
+        if unrealstereo4k_seq_list is not None:
+            self.unrealstereo4k_seq_list = unrealstereo4k_seq_list
+        elif unrealstereo4k_seq is not None:
+            self.unrealstereo4k_seq_list = [unrealstereo4k_seq]
+        else:
+            self.unrealstereo4k_seq_list = None
 
-                # Apply seq_list filtering for all datasets
-                if self.seq_list is not None:
-                    original_len = len(self.sequences)
-                    self.sequences = [self.sequences[i] for i in self.seq_list if i < original_len]
-                    logger.info(f"[ComparisonDataset] Filtered {dataset_name}: {original_len} → {len(self.sequences)} sequences (seq_list={self.seq_list})")
-                else:
-                    logger.info(f"[ComparisonDataset] {dataset_name} {split}: {len(self.sequences)} sequences")
+        self.split = split
+        self.video_length = video_length
+        self.objwise_enabled = objwise_enabled
+        self.only_clone = only_clone
+
+        # Auto-set chunk_size for efficient memory usage
+        # DISABLED: chunk_size limits total frames loaded, which breaks video models
+        # Instead, we rely on:
+        # 1. video_length to limit sequence length (user-specified via --vid-len)
+        # 2. num_workers=0 for high-res datasets to avoid OOM from parallel loading
+        # 3. GPU memory management (empty_cache after each sequence)
+        if chunk_size is None:
+            self.chunk_size = None  # Disabled by default
+        else:
+            self.chunk_size = chunk_size  # Allow user override if needed
+
+        # Load dataset-specific configuration
+        self.dataset_path = os.path.join(data_root, self.dataset_name)
+
+        # Cache for intrinsics to avoid repeated file reads
+        self._intrinsics_cache = {}
+
+        # Build sequence list
+        self.sequences = self._build_sequences()
+
+        logger.info(f"[ComparisonDataset] {dataset_name} {split}: {len(self.sequences)} sequences")
 
     def _build_sequences(self):
         """Build list of sequences for the dataset"""
         if self.dataset_name == 'eth3d':
-            return self._build_eth3d_sequences()
+            sequences = self._build_eth3d_sequences()
         elif self.dataset_name == 'kitti':
-            return self._build_kitti_sequences()
+            sequences = self._build_kitti_sequences()
         elif self.dataset_name == 'sintel':
-            return self._build_sintel_sequences()
+            sequences = self._build_sintel_sequences()
         elif self.dataset_name == 'scannet':
-            return self._build_scannet_sequences()
+            sequences = self._build_scannet_sequences()
         elif self.dataset_name == 'tartanair':
-            return self._build_tartanair_sequences()
+            sequences = self._build_tartanair_sequences()
         elif self.dataset_name == 'bonn':
-            return self._build_bonn_sequences()
+            sequences = self._build_bonn_sequences()
         elif self.dataset_name == 'nyu':
-            return self._build_nyu_sequences()
+            sequences = self._build_nyu_sequences()
         elif self.dataset_name == 'vkitti':
-            return self._build_vkitti_sequences()
+            sequences = self._build_vkitti_sequences()
         elif self.dataset_name == 'waymo_seg':
-            return self._build_waymo_seg_sequences()
+            sequences = self._build_waymo_seg_sequences()
         elif self.dataset_name == 'unreal4k':
-            return self._build_unreal4k_sequences()
+            sequences = self._build_unrealstereo4k_sequences()
         elif self.dataset_name == 'urbansyn':
-            return self._build_urbansyn_sequences()
-        # NuScenes handled in __init__
+            sequences = self._build_urbansyn_sequences()
         else:
             raise ValueError(f"Unknown dataset: {self.dataset_name}")
+        
+        # Apply seq_list filtering if provided
+        if self.seq_list is not None:
+            sequences = [sequences[i] for i in self.seq_list if i < len(sequences)]
+            logger.info(f"Filtered to {len(sequences)} sequences using seq_list: {self.seq_list}")
+        
+        return sequences
 
-    def _build_unreal4k_sequences(self):
-        """Build list of sequences for Unreal4K dataset"""
-        import os
+    def _build_eth3d_sequences(self):
+        """Build ETH3D sequences
+
+        Sequence selection (matching FlashDepth's eth3d_dataset.py):
+        - 'val' split: Use first 8 scenes only (filter out scenes[8:])
+        - 'test' split: Use all scenes (no filtering)
+        """
+        scenes_path = self.dataset_path
         sequences = []
-        
-        # Unreal4K dataset path
-        unreal4k_dir = os.path.join(self.data_root, 'unreal4k')
-        
-        if not os.path.exists(unreal4k_dir):
-            logger.warning(f"Unreal4K directory not found: {unreal4k_dir}")
-            return sequences
-        
-        # Get all scene directories (UnrealStereo4K_00000, UnrealStereo4K_00001, etc.)
-        all_scenes = sorted([d for d in os.listdir(unreal4k_dir)
-                            if os.path.isdir(os.path.join(unreal4k_dir, d)) and d.startswith('UnrealStereo4K_')])
 
-        # NOTE: Sequence filtering is now handled in __init__ after _build_sequences()
-        # This allows uniform filtering for all datasets, not just Unreal4K
-        
-        # Build sequences for each scene
-        for scene_name in all_scenes:
-            scene_dir = os.path.join(unreal4k_dir, scene_name)
-            image_dir = os.path.join(scene_dir, 'Image0')
-            depth_dir = os.path.join(scene_dir, 'Disp0')
-            
-            if not os.path.exists(image_dir):
-                logger.warning(f"Image directory not found: {image_dir}")
+        # Get all scene directories
+        all_scenes = sorted([s for s in os.listdir(scenes_path)
+                           if os.path.isdir(os.path.join(scenes_path, s))])
+
+        # Exclude multi_view_training_dslr_undistorted if present
+        all_scenes = [s for s in all_scenes if s != 'multi_view_training_dslr_undistorted']
+
+        # Filter scenes based on split (matching FlashDepth)
+        if self.split == 'val':
+            # FlashDepth filters out scenes[8:], so use first 8 scenes only
+            scenes = all_scenes[:8]
+            logger.info(f"ETH3D val split: Using first 8 scenes (for validation)")
+        else:
+            # 'test' split or other: Use all scenes (no filtering)
+            scenes = all_scenes
+            logger.info(f"ETH3D {self.split} split: Using all {len(scenes)} scenes")
+
+        for scene in scenes:
+            scene_path = os.path.join(scenes_path, scene)
+            rgb_path = os.path.join(scene_path, 'images', 'dslr_images')
+            depth_path = os.path.join(scene_path, 'ground_truth_depth', 'dslr_images')
+            cameras_file = os.path.join(scene_path, 'dslr_calibration_undistorted', 'cameras.txt')
+
+            if not os.path.exists(rgb_path) or not os.path.exists(depth_path):
                 continue
-            if not os.path.exists(depth_dir):
-                logger.warning(f"Depth directory not found: {depth_dir}")
-                continue
-            
-            # Get all image files sorted by frame number
-            image_files = sorted([f for f in os.listdir(image_dir) if f.endswith('.png')],
-                                key=lambda x: int(os.path.splitext(x)[0]))
-            
-            if len(image_files) == 0:
-                logger.warning(f"No images found in {image_dir}")
-                continue
-            
-            # Build sequence of frame dictionaries
+
+            # Get sorted image files
+            img_files = sorted([f for f in os.listdir(rgb_path) if f.endswith('.JPG')],
+                             key=lambda x: int(x.split('DSC_')[1].split('.JPG')[0]))
+
+            # Build sequence
             sequence = []
-            for img_file in image_files:
-                frame_num = os.path.splitext(img_file)[0]
-                depth_file = f"{frame_num}.npy"
-                
-                image_path = os.path.join(image_dir, img_file)
-                depth_path = os.path.join(depth_dir, depth_file)
-                
-                # Check if depth file exists
-                if not os.path.exists(depth_path):
-                    logger.warning(f"Depth file not found: {depth_path}")
-                    continue
-                
+            for img_file in img_files[:self.video_length]:
                 sequence.append({
-                    'image': image_path,
-                    'depth': depth_path,
-                    'scene_name': scene_name,
-                    'frame_num': frame_num
+                    'image': os.path.join(rgb_path, img_file),
+                    'depth': os.path.join(depth_path, img_file),
+                    'cameras_file': cameras_file,
+                    'scene_name': scene,
+                    'img_name': img_file
                 })
-            
+
             if len(sequence) > 0:
                 sequences.append(sequence)
-                logger.debug(f"Unreal4K {scene_name}: {len(sequence)} frames")
-        
-        logger.info(f"Unreal4K: Built {len(sequences)} sequences, {sum(len(s) for s in sequences)} total frames")
+
+        return sequences
+
+    def _build_kitti_sequences(self):
+        """Build KITTI sequences (placeholder)"""
+        # TODO: Implement KITTI sequence building
+        logger.warning("KITTI dataset not yet implemented")
+        return []
+
+    def _build_sintel_sequences(self):
+        """
+        Build Sintel sequences
+
+        Sequence selection (matching FlashDepth's sintel_dataset.py):
+        - 'val' split: Exclude first 8 scenes (use remaining scenes for validation)
+        - Other splits: Use all scenes
+        """
+        scenes_path = os.path.join(self.dataset_path, 'images', 'training', 'clean')
+        sequences = []
+
+        if not os.path.exists(scenes_path):
+            logger.warning(f"Sintel path not found: {scenes_path}")
+            return []
+
+        # Get all scene directories
+        all_scenes = sorted([s for s in os.listdir(scenes_path)
+                           if os.path.isdir(os.path.join(scenes_path, s))])
+
+        # Filter scenes based on split
+        if self.split == 'val':
+            scenes = all_scenes[8:]  # Exclude first 8 scenes
+            logger.info(f"Sintel val split: Using last {len(scenes)} scenes (excluding first 8)")
+        else:
+            scenes = all_scenes
+            logger.info(f"Sintel: Using all {len(scenes)} scenes")
+
+        for scene in scenes:
+            scene_path = os.path.join(scenes_path, scene)
+            depth_path = scene_path.replace('images/training/clean', 'depth/training/depth')
+
+            if not os.path.exists(depth_path):
+                continue
+
+            # Get sorted image files
+            img_files = sorted([f for f in os.listdir(scene_path) if f.endswith('.png')],
+                             key=lambda x: int(x.split('_')[1].split('.')[0]))
+
+            # Build sequence
+            sequence = []
+            for img_file in img_files[:self.video_length]:
+                depth_file = img_file.replace('.png', '.dpt')
+                sequence.append({
+                    'image': os.path.join(scene_path, img_file),
+                    'depth': os.path.join(depth_path, depth_file),
+                    'scene_name': scene,
+                    'img_name': img_file
+                })
+
+            if len(sequence) > 0:
+                sequences.append(sequence)
+
+        return sequences
+
+    def _build_scannet_sequences(self):
+        """Build ScanNet sequences (placeholder)"""
+        logger.warning("ScanNet dataset not yet implemented")
+        return []
+
+    def _build_tartanair_sequences(self):
+        """Build TartanAir sequences (placeholder)"""
+        logger.warning("TartanAir dataset not yet implemented")
+        return []
+
+    def _build_bonn_sequences(self):
+        """Build Bonn sequences (placeholder)"""
+        logger.warning("Bonn dataset not yet implemented")
+        return []
+
+    def _build_nyu_sequences(self):
+        """
+        Build NYU Depth V2 sequences
+
+        Expects preprocessed structure:
+        nyuv2_preprocessed/val/
+            seq_000/
+                0000/
+                    rgb.png
+                    depth.png
+                0001/...
+            seq_001/...
+        """
+        sequences = []
+        nyu_root = os.path.join(self.data_root, 'nyuv2_preprocessed', self.split)
+
+        if not os.path.exists(nyu_root):
+            logger.warning(f"NYU preprocessed root not found: {nyu_root}")
+            logger.warning("Please run: python scripts/preprocess_nyu.py")
+            return []
+
+        # Get all sequence directories
+        seq_dirs = sorted([d for d in os.listdir(nyu_root)
+                          if os.path.isdir(os.path.join(nyu_root, d)) and d.startswith('seq_')])
+
+        logger.info(f"NYU: Found {len(seq_dirs)} sequences")
+
+        for seq_name in seq_dirs:
+            seq_path = os.path.join(nyu_root, seq_name)
+
+            # Get all frame directories
+            frame_dirs = sorted([d for d in os.listdir(seq_path)
+                                if os.path.isdir(os.path.join(seq_path, d))],
+                               key=lambda x: int(x))
+
+            # Build sequence
+            sequence = []
+            for frame_dir in frame_dirs[:self.video_length]:
+                frame_path = os.path.join(seq_path, frame_dir)
+                rgb_path = os.path.join(frame_path, 'rgb.png')
+                depth_path = os.path.join(frame_path, 'depth.png')
+
+                if os.path.exists(rgb_path) and os.path.exists(depth_path):
+                    sequence.append({
+                        'image': rgb_path,
+                        'depth': depth_path,
+                        'scene_name': seq_name,
+                        'img_name': frame_dir
+                    })
+
+            if len(sequence) > 0:
+                sequences.append(sequence)
+
+        return sequences
+
+    def _build_waymo_seg_sequences(self):
+        """
+        Build Waymo segmentation sequences
+
+        Note: waymo_seg uses validation split with specific sequences
+        """
+        sequences = []
+        waymo_root = os.path.join(self.data_root, 'waymo_seg', self.split)
+
+        if not os.path.exists(waymo_root):
+            logger.warning(f"Waymo root not found: {waymo_root}")
+            return []
+
+        # Get all sequence directories
+        all_seq_dirs = sorted([d for d in os.listdir(waymo_root)
+                              if os.path.isdir(os.path.join(waymo_root, d)) and d.startswith('segment-')])
+
+        # For validation split: use exactly these 8 sequences
+        if self.split == 'val':
+            val_sequence_names = [
+                'segment-10017090168044687777_6380_000_6400_000',
+                'segment-10023947602400723454_1120_000_1140_000',
+                'segment-1005081002024129653_5313_150_5333_150',
+                'segment-10061305430875486848_1080_000_1100_000',
+                'segment-10072140764565668044_4060_000_4080_000',
+                'segment-10072231702153043603_5725_000_5745_000',
+                'segment-10075870402459732738_1060_000_1080_000',
+                'segment-10094743350625019937_3420_000_3440_000',
+            ]
+            seq_name_to_dir = {d: d for d in all_seq_dirs}
+            seq_dirs = [seq_name_to_dir[name] for name in val_sequence_names if name in seq_name_to_dir]
+            logger.info(f"Waymo val split: Using {len(seq_dirs)} specified sequences")
+        else:
+            seq_dirs = all_seq_dirs
+            logger.info(f"Waymo: Using all {len(seq_dirs)} sequences")
+
+        for seq_name in seq_dirs:
+            seq_dir = os.path.join(waymo_root, seq_name)
+            camera_dir = os.path.join(seq_dir, 'FRONT')
+            rgb_dir = os.path.join(camera_dir, 'rgb', 'original')
+            depth_dir = os.path.join(camera_dir, 'depth')
+
+            if not os.path.exists(rgb_dir) or not os.path.exists(depth_dir):
+                continue
+
+            # Get sorted files
+            rgb_files = sorted([f for f in os.listdir(rgb_dir) if f.endswith('.jpg')])
+
+            # Build sequence
+            sequence = []
+            for rgb_file in rgb_files[:self.video_length]:
+                frame_idx = int(rgb_file.split('.')[0])
+                depth_file = f'{frame_idx:04d}.npy'
+                sequence.append({
+                    'image': os.path.join(rgb_dir, rgb_file),
+                    'depth': os.path.join(depth_dir, depth_file),
+                    'scene_name': seq_name,
+                    'img_name': rgb_file
+                })
+
+            if len(sequence) > 0:
+                sequences.append(sequence)
+
+        return sequences
+
+    def _build_vkitti_sequences(self):
+        """
+        Build Virtual KITTI 2 sequences
+
+        Structure:
+        vkitti/
+            Scene01/
+                clone/
+                    frames/
+                        rgb/Camera_0/rgb_00000.jpg
+                        depth/Camera_0/depth_00000.png
+                        classSegmentation/Camera_0/classgt_00000.png
+                overcast/...
+                rain/...
+            Scene02/...
+        """
+        sequences = []
+        vkitti_root = os.path.join(self.data_root, 'vkitti')
+
+        if not os.path.exists(vkitti_root):
+            logger.warning(f"VKITTI root not found: {vkitti_root}")
+            return []
+
+        # Get all scene directories (Scene01, Scene02, ...)
+        scene_dirs = sorted([d for d in os.listdir(vkitti_root)
+                           if os.path.isdir(os.path.join(vkitti_root, d)) and d.startswith('Scene')])
+
+        logger.info(f"VKITTI: Found {len(scene_dirs)} scenes")
+
+        # Condition types in VKITTI2
+        all_conditions = ['clone', 'overcast', 'sunset', 'morning', 'rain', 'fog',
+                         '15-deg-left', '15-deg-right', '30-deg-left', '30-deg-right']
+
+        for scene_name in scene_dirs:
+            scene_path = os.path.join(vkitti_root, scene_name)
+
+            # Get available conditions for this scene
+            available_conditions = [c for c in all_conditions
+                                   if os.path.isdir(os.path.join(scene_path, c))]
+
+            # Filter by only_clone flag
+            if self.only_clone:
+                available_conditions = ['clone'] if 'clone' in available_conditions else []
+
+            for condition in available_conditions:
+                condition_path = os.path.join(scene_path, condition, 'frames')
+                rgb_dir = os.path.join(condition_path, 'rgb', 'Camera_0')
+                depth_dir = os.path.join(condition_path, 'depth', 'Camera_0')
+                seg_dir = os.path.join(condition_path, 'classSegmentation', 'Camera_0') if self.objwise_enabled else None
+
+                if not os.path.exists(rgb_dir) or not os.path.exists(depth_dir):
+                    continue
+
+                # Check if segmentation is available when required
+                if self.objwise_enabled:
+                    if os.path.exists(seg_dir):
+                        logger.info(f"[VKITTI DEBUG] Segmentation directory found: {seg_dir}")
+                    else:
+                        logger.warning(f"[VKITTI DEBUG] Object-wise enabled but no segmentation found: {seg_dir}")
+                        continue
+
+                # Get sorted RGB files
+                rgb_files = sorted([f for f in os.listdir(rgb_dir) if f.startswith('rgb_') and f.endswith('.jpg')])
+
+                # Build sequence
+                sequence = []
+                seg_count = 0
+                for rgb_file in rgb_files[:self.video_length]:
+                    # Extract frame number
+                    frame_num = int(rgb_file.split('_')[1].split('.')[0])
+                    depth_file = f'depth_{frame_num:05d}.png'
+                    seg_file = f'classgt_{frame_num:05d}.png' if self.objwise_enabled else None
+
+                    depth_path = os.path.join(depth_dir, depth_file)
+                    seg_path = os.path.join(seg_dir, seg_file) if self.objwise_enabled else None
+
+                    # Check if required files exist
+                    if not os.path.exists(depth_path):
+                        continue
+                    if self.objwise_enabled and not os.path.exists(seg_path):
+                        if seg_count == 0:  # Only log first missing file
+                            logger.warning(f"[VKITTI DEBUG] Segmentation file not found: {seg_path}")
+                        continue
+
+                    if self.objwise_enabled and os.path.exists(seg_path):
+                        seg_count += 1
+
+                    frame_info = {
+                        'image': os.path.join(rgb_dir, rgb_file),
+                        'depth': depth_path,
+                        'scene_name': f'{scene_name}_{condition}',
+                        'img_name': rgb_file,
+                        'condition': condition
+                    }
+
+                    if self.objwise_enabled:
+                        frame_info['segmentation'] = seg_path
+
+                    sequence.append(frame_info)
+
+                if len(sequence) > 0:
+                    if self.objwise_enabled:
+                        logger.info(f"[VKITTI DEBUG] Built sequence {scene_name}_{condition}: {len(sequence)} frames, {seg_count} with segmentation")
+                    sequences.append(sequence)
+
+        if self.only_clone:
+            logger.info(f"VKITTI: Created {len(sequences)} sequences (clone condition only)")
+        else:
+            logger.info(f"VKITTI: Created {len(sequences)} sequences (all conditions)")
+        return sequences
+
+    def _build_unrealstereo4k_sequences(self):
+        """
+        Build UnrealStereo4K sequences
+
+        If unrealstereo4k_seq_list is specified, only load those sequence numbers (0-8).
+        """
+        sequences = []
+        unreal_root = os.path.join(self.data_root, self.dataset_name)
+
+        if not os.path.exists(unreal_root):
+            logger.warning(f"UnrealStereo4K root not found: {unreal_root}")
+            return []
+
+        # Get all scene directories
+        all_scenes = sorted([s for s in os.listdir(unreal_root)
+                           if os.path.isdir(os.path.join(unreal_root, s))])
+
+        # Filter by sequence numbers if specified
+        if self.unrealstereo4k_seq_list is not None:
+            selected_scenes = []
+            for seq_idx in self.unrealstereo4k_seq_list:
+                if seq_idx < 0 or seq_idx >= len(all_scenes):
+                    logger.error(f"UnrealStereo4K seq {seq_idx} out of range (0-{len(all_scenes)-1})")
+                    continue
+                selected_scenes.append(all_scenes[seq_idx])
+
+            if len(selected_scenes) == 0:
+                logger.error(f"No valid sequences in seq_list: {self.unrealstereo4k_seq_list}")
+                return []
+
+            all_scenes = selected_scenes
+            logger.info(f"UnrealStereo4K: Using sequences {self.unrealstereo4k_seq_list}: {all_scenes}")
+        else:
+            logger.info(f"UnrealStereo4K: Using all {len(all_scenes)} scenes")
+
+        for scene in all_scenes:
+            scene_path = os.path.join(unreal_root, scene)
+            rgb_path = os.path.join(scene_path, 'Image0')
+            depth_path = os.path.join(scene_path, 'Disp0')
+
+            if not os.path.exists(rgb_path) or not os.path.exists(depth_path):
+                continue
+
+            # Get sorted image files
+            img_files = sorted([f for f in os.listdir(rgb_path) if f.endswith('.png')],
+                             key=lambda x: int(os.path.basename(x).split('.png')[0]))
+
+            # Build sequence
+            sequence = []
+            for img_file in img_files[:self.video_length]:
+                depth_file = img_file.replace('.png', '.npy')
+                sequence.append({
+                    'image': os.path.join(rgb_path, img_file),
+                    'depth': os.path.join(depth_path, depth_file),
+                    'scene_name': scene,
+                    'img_name': img_file
+                })
+
+            if len(sequence) > 0:
+                sequences.append(sequence)
+
+        return sequences
+
+    def _build_urbansyn_sequences(self):
+        """
+        Build UrbanSyn sequences
+        """
+        sequences = []
+        urbansyn_root = os.path.join(self.data_root, 'urbansyn')
+
+        if not os.path.exists(urbansyn_root):
+            logger.warning(f"UrbanSyn root not found: {urbansyn_root}")
+            return []
+
+        rgb_dir = os.path.join(urbansyn_root, 'rgb')
+        depth_dir = os.path.join(urbansyn_root, 'depth')
+
+        if not os.path.exists(rgb_dir) or not os.path.exists(depth_dir):
+            logger.warning(f"UrbanSyn rgb or depth directory not found")
+            return []
+
+        # Get all RGB files (up to 1000 frames)
+        all_rgb_files = sorted([f for f in os.listdir(rgb_dir) if f.endswith('.png')])[:1000]
+
+        # Extract frame numbers and check if depth exists
+        available_frames = []
+        for f in all_rgb_files:
+            frame_num = int(f.split('_')[1].split('.')[0])
+            depth_file = f'depth_{frame_num:04d}.exr'
+            if os.path.exists(os.path.join(depth_dir, depth_file)):
+                available_frames.append(frame_num)
+
+        logger.info(f"UrbanSyn: Found {len(available_frames)} frames")
+
+        # Create sequences (consecutive frames)
+        for i in range(0, len(available_frames) - self.video_length + 1):
+            frames = available_frames[i:i + self.video_length]
+            # Check if frames are consecutive
+            if frames[-1] - frames[0] == self.video_length - 1:
+                sequence = []
+                for frame_num in frames:
+                    sequence.append({
+                        'image': os.path.join(rgb_dir, f'rgb_{frame_num:04d}.png'),
+                        'depth': os.path.join(depth_dir, f'depth_{frame_num:04d}.exr'),
+                        'scene_name': f'urbansyn_{frame_num:04d}',
+                        'img_name': f'rgb_{frame_num:04d}.png'
+                    })
+                sequences.append(sequence)
+
         return sequences
 
     def __len__(self):
-        if self.dataset_name == 'nuscenes':
-            return len(self.nuscenes_comparison_dataset)
-        else:
-            return len(self.sequences)
+        return len(self.sequences)
 
     def __getitem__(self, idx):
-        if self.dataset_name == 'nuscenes':
-            return self.nuscenes_comparison_dataset[idx]
-        
-        # --- Existing logic for other datasets ---
+        """
+        Returns a sequence of frames at ORIGINAL resolution
+
+        Note: For datasets with variable-sized images within a sequence (e.g., ETH3D),
+        all images are resized to match the first image's size.
+
+        Returns:
+            dict with keys:
+                'images': Tensor [T, 3, H, W] - RGB images (0-1 normalized)
+                'depths': Tensor [T, H, W] - GT depth in meters
+                'intrinsics': Tensor [T, 4] - Camera intrinsics [fx, fy, cx, cy]
+                'scene_name': str - Scene identifier
+        """
         sequence = self.sequences[idx]
 
-        # Apply video_length limit (from --vid-len flag)
-        # Priority: chunk_size > video_length > full sequence
+        # Apply chunk_size to limit memory usage
         if self.chunk_size and self.chunk_size < len(sequence):
             max_frames = self.chunk_size
             logger.info(f"Applying chunk_size: loading {max_frames}/{len(sequence)} frames from sequence {idx}")
-        elif self.video_length and self.video_length < len(sequence):
-            max_frames = self.video_length
-            logger.info(f"Applying video_length limit: loading {max_frames}/{len(sequence)} frames from sequence {idx}")
         else:
             max_frames = len(sequence)
 
         # Warning for large sequences
         if max_frames > 200:
             logger.warning(f"Loading large sequence with {max_frames} frames at high resolution. "
-                          f"This may take several minutes and require strong memory. "
+                          f"This may take several minutes and require significant memory. "
                           f"Consider using --vid-len 100 to reduce sequence length.")
 
         images = []
@@ -419,8 +809,8 @@ class ComparisonDataset(Dataset):
             return self._load_vkitti_depth(path)
         elif self.dataset_name == 'waymo_seg':
             return self._load_waymo_depth(path, frame_info)
-        elif self.dataset_name == 'unreal4k':
-            return self._load_unreal4k_depth(path)
+        elif self.dataset_name in ['unrealstereo4k', 'unreal4k']:
+            return self._load_unrealstereo4k_depth(path)
         elif self.dataset_name == 'urbansyn':
             return self._load_urbansyn_depth(path)
         else:
@@ -641,11 +1031,11 @@ class ComparisonDataset(Dataset):
 
         return torch.from_numpy(depth_map).float()  # [H, W] in meters
 
-    def _load_unreal4k_depth(self, path):
+    def _load_unrealstereo4k_depth(self, path):
         """
-        Load Unreal4K depth (.npy file)
+        Load UnrealStereo4K depth from disparity (.npy file)
 
-        UnrealStereo4K provides DISPARITY maps, not metric depth.
+        UnrealStereo4K stores DISPARITY maps in .npy files, not metric depth.
         We convert disparity to metric depth using:
             depth (m) = (baseline × focal_length) / disparity
         
@@ -653,14 +1043,19 @@ class ComparisonDataset(Dataset):
         - Indoor scenes (seq 4, 6): 0.2m (20cm)
         - Outdoor scenes (seq 0, 1, 2, 3, 5, 7, 8): 0.5m (50cm)
         
-        Focal length (downsampled resolution 2112×1188): fx = 1056
+        Focal length (original resolution 3840×2160): fx = 1920
         """
         # Load disparity
         disparity = np.load(path)
         
         # Extract sequence ID from path
         # Path format: .../UnrealStereo4K_0000X/Disp0/XXXXX.npy
-        seq_id = int(path.split('UnrealStereo4K_')[1].split('/')[0][-1])
+        seq_id = None
+        try:
+            if 'UnrealStereo4K_' in path:
+                seq_id = int(path.split('UnrealStereo4K_')[1].split('/')[0][-1])
+        except:
+            pass
         
         # Determine baseline based on sequence ID
         INDOOR_SEQS = [4, 6]
@@ -668,12 +1063,12 @@ class ComparisonDataset(Dataset):
         BASELINE_OUTDOOR = 0.5  # 50cm
         
         baseline = BASELINE_INDOOR if seq_id in INDOOR_SEQS else BASELINE_OUTDOOR
-        
+
         # Focal length for downsampled resolution (2112×1188)
-        # Note: Original resolution (3840×2160) had fx=1920
+        # Original resolution (3840×2160) had fx=1920
         # Downsampled by factor 0.55, so fx = 1920 × 0.55 = 1056
         fx = 1056.0
-        
+
         # Convert disparity to metric depth
         # depth = (baseline × fx) / disparity
         # Handle division by zero
@@ -681,10 +1076,12 @@ class ComparisonDataset(Dataset):
             depth_meters = (baseline * fx) / disparity
         
         # Handle invalid values
+        MAX_VALID_DEPTH = 1000.0  # meters (outdoor scenes can be far)
         invalid_mask = np.logical_or.reduce((
             np.isinf(depth_meters),
             np.isnan(depth_meters),
             depth_meters <= 0,
+            depth_meters > MAX_VALID_DEPTH,
             disparity <= 0
         ))
         
@@ -722,18 +1119,16 @@ class ComparisonDataset(Dataset):
         """Load camera intrinsics"""
         if self.dataset_name == 'eth3d':
             return self._load_eth3d_intrinsics(frame_info)
-        elif self.dataset_name == 'kitti':
-            return self._load_kitti_intrinsics(frame_info)
-        elif self.dataset_name == 'sintel':
-            return self._load_sintel_intrinsics(frame_info)
         elif self.dataset_name == 'nyu':
             return self._load_nyu_intrinsics(frame_info)
         elif self.dataset_name == 'vkitti':
             return self._load_vkitti_intrinsics(frame_info)
-        elif self.dataset_name == 'unreal4k':
-            return self._load_unreal4k_intrinsics(frame_info)
+        elif self.dataset_name in ['unrealstereo4k', 'unreal4k']:
+            return self._load_unrealstereo4k_intrinsics(frame_info)
         elif self.dataset_name == 'urbansyn':
             return self._load_urbansyn_intrinsics(frame_info)
+        elif self.dataset_name == 'sintel':
+            return self._load_sintel_intrinsics(frame_info)
         elif self.dataset_name == 'waymo_seg':
             return self._load_waymo_intrinsics(frame_info)
         else:
@@ -813,14 +1208,14 @@ class ComparisonDataset(Dataset):
         """
         return torch.tensor([725.0, 725.0, 620.5, 187.0])
 
-    def _load_unreal4k_intrinsics(self, frame_info):
+    def _load_unrealstereo4k_intrinsics(self, frame_info):
         """
-        Load Unreal4K camera intrinsics from Extrinsics file (with caching)
+        Load UnrealStereo4K camera intrinsics from Extrinsics file (with caching)
 
         Format (line 1): fx skew cx 0 fy cy 0 0 1
         This represents the K matrix in row-major order.
 
-        Unreal4K resolution: 2112×1188 (resized from 3840×2160)
+        UnrealStereo4K resolution: 3840×2160 (4K)
         Note: All frames in the same scene share the same intrinsics, so we cache by scene_name.
         """
         scene_name = frame_info['scene_name']
@@ -831,13 +1226,14 @@ class ComparisonDataset(Dataset):
             return self._intrinsics_cache[cache_key]
 
         # Load from first frame's extrinsics (all frames in scene have same intrinsics)
-        extrinsics_dir = os.path.join(self.data_root, 'unreal4k', scene_name, 'Extrinsics0')
+        extrinsics_dir = os.path.join(self.data_root, self.dataset_name, scene_name, 'Extrinsics0')
         extrinsics_file = os.path.join(extrinsics_dir, '00000.txt')
 
         if not os.path.exists(extrinsics_file):
             logger.warning(f"Extrinsics file not found: {extrinsics_file}")
-            # Default intrinsics for Unreal4K (resized: 2112×1188, original: 3840×2160)
-            # Scaled by 0.55: fx=1920*0.55=1056, cx=1920*0.55=1056, cy=1080*0.55=594
+            # Default intrinsics for UnrealStereo4K (downsampled 2112×1188)
+            # Original (3840×2160): fx=1920, fy=1920, cx=1920, cy=1080
+            # Downsampled by 0.55: fx=1056, fy=1056, cx=1056, cy=594
             intrinsics = torch.tensor([1056.0, 1056.0, 1056.0, 594.0])
             self._intrinsics_cache[cache_key] = intrinsics
             return intrinsics
@@ -851,10 +1247,18 @@ class ComparisonDataset(Dataset):
                 # Parse first line: fx skew cx 0 fy cy 0 0 1
                 k_values = list(map(float, lines[0].split()))
                 if len(k_values) >= 9:
-                    fx = k_values[0]
-                    cx = k_values[2]
-                    fy = k_values[4]
-                    cy = k_values[5]
+                    fx_original = k_values[0]
+                    cx_original = k_values[2]
+                    fy_original = k_values[4]
+                    cy_original = k_values[5]
+
+                    # Extrinsics file contains original resolution (3840×2160) intrinsics
+                    # Scale to downsampled resolution (2112×1188) by factor 0.55
+                    DOWNSAMPLE_FACTOR = 0.55
+                    fx = fx_original * DOWNSAMPLE_FACTOR
+                    fy = fy_original * DOWNSAMPLE_FACTOR
+                    cx = cx_original * DOWNSAMPLE_FACTOR
+                    cy = cy_original * DOWNSAMPLE_FACTOR
 
                     intrinsics = torch.tensor([fx, fy, cx, cy])
                     self._intrinsics_cache[cache_key] = intrinsics
@@ -863,8 +1267,8 @@ class ComparisonDataset(Dataset):
                     raise ValueError(f"Invalid K matrix format: {len(k_values)} values")
 
         except Exception as e:
-            logger.warning(f"Error loading Unreal4K intrinsics: {e}")
-            # Resized intrinsics (scaled by 0.55)
+            logger.warning(f"Error loading UnrealStereo4K intrinsics: {e}")
+            # Default intrinsics for downsampled resolution (2112×1188)
             intrinsics = torch.tensor([1056.0, 1056.0, 1056.0, 594.0])
             self._intrinsics_cache[cache_key] = intrinsics
             return intrinsics

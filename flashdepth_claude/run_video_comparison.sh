@@ -33,6 +33,9 @@ METRIC_MODE=false
 FRAME_INTERVAL=""
 ONLY_CLONE=true  # For VKITTI: only use 'clone' condition by default
 VISUALIZATION="true"  # Enable visualizations by default
+SEQ=""  # Sequence selection
+BEST_FIGURE=false  # Export best_frame ±4 frames (9 total) as individual images/depth maps
+FRAME=""  # Specific frame to export ±4 frames
 AMP=false
 AMP_DTYPE="bf16"
 LIMIT_SCENES="" # New: Limit NuScenes scenes
@@ -67,6 +70,9 @@ Options:
   --metric                 Use metric mode (for vda only)
   --frame-interval <n>     Frame interval for sequence.png visualization
   --visualization <true|false> Enable/disable visualizations (sequence.png, best_frame.png, etc.). Default: true
+  --seq <n>                Sequence number(s) to test. Examples: 0, 2,5, 0,3,7
+  --best-figure            Export best_frame ±4 frames (9 total) as individual images/depth maps
+  --frame <n>              Export frame N ±4 frames (9 total) as individual images/depth maps (e.g., --seq 6 --frame 459)
   --amp                    Enable Automatic Mixed Precision (AMP) for inference
   --amp-dtype <bf16|fp16>  Data type for AMP (default: bf16)
   --limit-scenes <n>       For NuScenes, limit the number of scenes to process (e.g., 50)
@@ -78,6 +84,12 @@ Examples:
 
   # Test Video-Depth-Anything on Waymo with AMP
   ./run_video_comparison.sh vda --dataset waymo --gpu 0 --amp
+
+  # Test with specific sequences and export best figure frames
+  ./run_video_comparison.sh vda --dataset sintel --seq 0,3,7 --best-figure --gpu 0
+
+  # Test specific frame export
+  ./run_video_comparison.sh depthcrafter --dataset sintel --seq 6 --frame 459 --gpu 0
 
 EOF
 }
@@ -148,7 +160,19 @@ while [[ $# -gt 0 ]]; do
         --visualization)
             VISUALIZATION="$2"
             shift 2
-            ;; 
+            ;;
+        --seq)
+            SEQ="$2"
+            shift 2
+            ;;
+        --best-figure)
+            BEST_FIGURE=true
+            shift
+            ;;
+        --frame)
+            FRAME="$2"
+            shift 2
+            ;;
         --amp)
             AMP=true
             shift
@@ -292,6 +316,18 @@ fi
 
 if [ -n "$LIMIT_SCENES" ]; then
     CMD="$CMD --limit-scenes $LIMIT_SCENES"
+fi
+
+if [ -n "$SEQ" ]; then
+    CMD="$CMD --seq $SEQ"
+fi
+
+if [ "$BEST_FIGURE" = true ]; then
+    CMD="$CMD --best-figure"
+fi
+
+if [ -n "$FRAME" ]; then
+    CMD="$CMD --frame $FRAME"
 fi
 
 CMD="$CMD --visualization $VISUALIZATION"
