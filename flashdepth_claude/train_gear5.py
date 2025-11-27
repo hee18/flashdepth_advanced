@@ -2,7 +2,7 @@
 Gear5 Training Script: Unified Single-Stage Temporal Scale Prediction
 
 Single-stage training approach:
-    - Input: 2-layer CLS tokens [11, 23] for ViT-L or [5, 11] for ViT-S
+    - Input: Multi-layer CLS tokens (default: layers 2,4 → blocks [11, 23] for ViT-L or [5, 11] for ViT-S)
     - Processing: GRU-based temporal modeling for scale/shift
     - Output: Frame-wise scale and shift parameters
     - Applied to: Final relative depth output (after output_conv2)
@@ -14,7 +14,7 @@ Freezing Strategy:
 
 Loss:
     - Importance-weighted Log L1 loss
-    - Importance map from 2-layer attention weights
+    - Importance map from multi-layer attention weights (configurable via --cls-layer)
     - Weighted by foreground ratio (alpha)
 
 Key features:
@@ -291,7 +291,7 @@ class Gear5Trainer:
                 self.logger.warning(f"Checkpoint {checkpoint_path} not found")
 
         # Add Gear5 metric head (unified single-stage)
-        # Uses 2-layer CLS tokens and GRU/Mamba2 for temporal modeling
+        # Uses multi-layer CLS tokens (configurable) and GRU/Mamba2 for temporal modeling
         use_mamba_temporal = self.config.model.get('use_mamba_temporal', False)
         self.logger.info(f"Gear5 TemporalScalePredictor backend: {'Mamba2' if use_mamba_temporal else 'GRU'}")
         if use_mamba_temporal:
@@ -389,12 +389,39 @@ class Gear5Trainer:
                 self.logger.warning(f"  GSP will start from random initialization!")
 
         # Enable attention weights storage
-        # Unified single-stage: use 2 layers for CLS token extraction and importance mapping
-        # Layers [11, 23] for ViT-L or [5, 11] for ViT-S
-        target_blocks = {
-            'vitl': [11, 23],
-            'vits': [5, 11]
-        }[model.encoder]
+        # CLS layer selection: user can specify which intermediate layers to use (1-4)
+        # Default: [2, 4] (2nd and 4th intermediate layers)
+        #
+        # Mapping (1-indexed user input to 0-indexed intermediate_layer_idx):
+        #   ViT-L: intermediate_layer_idx = [4, 11, 17, 23]
+        #          Layer 1→block 4, Layer 2→block 11, Layer 3→block 17, Layer 4→block 23
+        #   ViT-S: intermediate_layer_idx = [2, 5, 8, 11]
+        #          Layer 1→block 2, Layer 2→block 5, Layer 3→block 8, Layer 4→block 11
+
+        # Get cls_layers from config (default: [2, 4])
+        cls_layers = self.config.get('cls_layers', [2, 4])
+        if isinstance(cls_layers, (list, tuple)):
+            cls_layers = list(cls_layers)
+        else:
+            cls_layers = [cls_layers]  # Single value case
+
+        # Validate cls_layers (must be 1-4)
+        for layer in cls_layers:
+            if layer < 1 or layer > 4:
+                raise ValueError(f"cls_layers must be between 1 and 4, got {layer}")
+
+        # Get intermediate_layer_idx for the encoder
+        intermediate_idx = model.intermediate_layer_idx[model.encoder]
+
+        # Convert user's 1-indexed layer numbers to actual block indices
+        # cls_layers=[4] → encoder_indices=[3] → target_blocks=[23] for ViT-L
+        # cls_layers=[2,4] → encoder_indices=[1,3] → target_blocks=[11,23] for ViT-L
+        encoder_indices = [layer - 1 for layer in cls_layers]  # Convert to 0-indexed
+        target_blocks = [intermediate_idx[idx] for idx in encoder_indices]
+
+        self.logger.info(f"CLS layer selection: user specified layers {cls_layers}")
+        self.logger.info(f"  → encoder_indices: {encoder_indices}")
+        self.logger.info(f"  → target_blocks: {target_blocks} (actual ViT block indices)")
 
         for i, block in enumerate(model.pretrained.blocks):
             if i in target_blocks:
@@ -403,21 +430,15 @@ class Gear5Trainer:
             else:
                 block.attn.store_attn_weights = False
 
-        self.logger.info(f"2-layer attention storage: blocks {target_blocks}")
+        self.logger.info(f"{len(target_blocks)}-layer attention storage: blocks {target_blocks}")
 
-        # Store target blocks and compute encoder_features indices
-        # encoder_features from get_intermediate_layers returns features at intermediate_layer_idx
-        # For vitl: intermediate_layer_idx = [4, 11, 17, 23], target_blocks = [11, 23]
-        #           encoder_indices = [1, 3] (indices for layers 11 and 23)
-        # For vits: intermediate_layer_idx = [2, 5, 8, 11], target_blocks = [5, 11]
-        #           encoder_indices = [1, 3] (indices for layers 5 and 11)
-        intermediate_idx = model.intermediate_layer_idx[model.encoder]
-        encoder_indices = [intermediate_idx.index(block) for block in target_blocks]
+        # Store encoder_indices for CLS token extraction
         self.encoder_indices = encoder_indices
         self.logger.info(f"Encoder features indices: {encoder_indices} (for CLS token extraction)")
 
-        # Store target blocks for use in training/validation steps
+        # Store target blocks and cls_layers for use in training/validation steps
         self.target_blocks = target_blocks
+        self.cls_layers = cls_layers  # User-specified layer numbers (1-indexed)
 
         model = model.to(self.device)
 
@@ -800,7 +821,7 @@ class Gear5Trainer:
                         cls_token = None
 
                         # Gear5: Collect CLS tokens and attention weights from multiple layers
-                        # Collect 2-layer CLS tokens and average them
+                        # Collect multi-layer CLS tokens and average them
                         cls_tokens_list = [
                             encoder_features[i][:, 0]  # CLS token from each layer [B*T, embed_dim]
                             for i in self.encoder_indices
@@ -1000,7 +1021,7 @@ class Gear5Trainer:
                 # Get patch tokens from encoder layers (for DPT)
                 # encoder_features is a list of [B*T, N, C] tensors
 
-            # Extract 2-layer CLS tokens for Gear5 (from target_blocks [11, 23])
+            # Extract multi-layer CLS tokens for Gear5 (from target_blocks configured via cls_layers)
             # target_blocks are absolute ViT block indices, need to map to encoder_features indices
             target_blocks = self.config.model.target_blocks  # [11, 23] for ViT-L
             intermediate_layers = model.intermediate_layer_idx[model.encoder]  # [4, 11, 17, 23] for ViT-L
@@ -1071,9 +1092,16 @@ class Gear5Trainer:
 
             # Apply scale and shift to convert relative depth to metric depth
             # D_metric_inverse = scale * D_relative_inverse + shift
+
+            # Apply shift lower bound constraint (same as validation)
+            # This prevents metric depth from becoming negative
+            GLOBAL_MIN_INVERSE = 100.0 / 300.0  # 0.333 (300m max depth assumption)
+            shift_lower_bound = -scale.abs() * GLOBAL_MIN_INVERSE  # [B, T]
+            shift_clamped = torch.clamp(shift, min=shift_lower_bound)  # [B, T]
+
             # Reshape scale and shift to match pred dimensions: [B, T] -> [B, T, 1, 1, 1]
             scale_expanded = scale.view(B_orig, T_orig, 1, 1, 1)  # [B, T, 1, 1, 1]
-            shift_expanded = shift.view(B_orig, T_orig, 1, 1, 1)  # [B, T, 1, 1, 1]
+            shift_expanded = shift_clamped.view(B_orig, T_orig, 1, 1, 1)  # [B, T, 1, 1, 1]
 
             # Apply transformation (this is where gradients flow to scale/shift!)
             pred_metric_inverse = scale_expanded * pred_relative_inverse + shift_expanded  # [B, T, 1, H, W]
@@ -1267,9 +1295,10 @@ class Gear5Trainer:
                 )  # Returns [path_4, path_3, path_2, path_1]
                 path_1 = dpt_features[-1]  # Extract path_1: (B*T, dpt_dim, h, w)
 
-                # Gear5: Extract 2-layer CLS tokens and attention weights
-                # For ViT-L: layers [11, 23], encoder_indices = [1, 3]
-                # For ViT-S: layers [5, 11], encoder_indices = [1, 3]
+                # Gear5: Extract multi-layer CLS tokens and attention weights
+                # Layers configured via cls_layers (default: [2, 4])
+                # For ViT-L: default → blocks [11, 23], encoder_indices = [1, 3]
+                # For ViT-S: default → blocks [5, 11], encoder_indices = [1, 3]
                 cls_tokens_list = [
                     encoder_features[i][:, 0]  # CLS token: [B*T, embed_dim]
                     for i in self.encoder_indices
@@ -1279,7 +1308,7 @@ class Gear5Trainer:
                     for block_idx in self.target_blocks
                 ]
 
-                # Average 2-layer CLS tokens and reshape to [B, T, embed_dim]
+                # Average multi-layer CLS tokens and reshape to [B, T, embed_dim]
                 cls_tokens_avg = torch.stack(cls_tokens_list, dim=0).mean(dim=0)  # [B*T, embed_dim]
                 cls_tokens = rearrange(cls_tokens_avg, '(b t) d -> b t d', b=B_orig, t=T_orig)  # [B, T, embed_dim]
 

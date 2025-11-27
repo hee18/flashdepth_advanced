@@ -74,7 +74,7 @@ model:
   num_mamba_layers: 4
   downsample_mamba: [0.1]
   mamba_pos_embed: null
-  mamba_in_dpt_layer: [1]
+  mamba_in_dpt_layer: [3]  # ViT-L uses path_1 (layer 3) - same as original FlashDepth-L
   mamba_d_conv: 4
   mamba_d_state: 256
   use_hydra: false

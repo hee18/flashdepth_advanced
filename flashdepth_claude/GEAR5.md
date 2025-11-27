@@ -1,337 +1,437 @@
 # GEAR5: Metric Depth Enhancement System
 
-This document covers three variants for enhancing FlashDepth with metric depth capabilities:
-- **Gear5 (GRU)**: GRU-based temporal scale/shift prediction (default)
-- **Gear5 (Mamba)**: Mamba2-based temporal scale/shift prediction (lightweight alternative)
-- **Gear5 FiLM**: FiLM-style channel-wise feature modulation (trainable Mamba)
-
-All variants share common components (CLS token extraction, importance map generation) but differ in their temporal modeling and modulation strategies.
+This document covers the Gear5 architecture for enhancing FlashDepth with metric depth capabilities using **Mamba2-based Temporal Scale Predictor (TSP)**.
 
 ---
 
 ## Table of Contents
 - [Architecture Overview](#architecture-overview)
-- [Gear5 GRU: GRU-Based Temporal Modulation](#gear5-gru-gru-based-temporal-modulation)
-- [Gear5 Mamba: Mamba2-Based Temporal Modulation](#gear5-mamba-mamba2-based-temporal-modulation)
-- [Gear5 FiLM: Channel-Wise Feature Modulation](#gear5-film-channel-wise-feature-modulation)
-- [Comparison](#comparison)
+- [TSP (Temporal Scale Predictor) Deep Dive](#tsp-temporal-scale-predictor-deep-dive)
+- [MambaBlock Architecture](#mambablock-architecture)
+- [Dimension Flow](#dimension-flow)
 - [Loss Functions](#loss-functions)
 - [Training & Testing](#training--testing)
 - [Configuration](#configuration)
-- [Recent Updates](#recent-updates)
 
 ---
 
 ## Architecture Overview
 
-All Gear5 variants extend FlashDepth with metric depth prediction capabilities by:
+Gear5 extends FlashDepth with metric depth prediction by:
 1. Extracting semantic features from multi-layer CLS tokens
 2. Generating importance maps from attention weights for loss weighting
-3. Applying learned transformations to enhance depth predictions
+3. Using TSP (Temporal Scale Predictor) to predict per-frame scale/shift for metric conversion
 
-**Key Shared Components**:
+```
+Video Input [B, T, 3, H, W]
+    ↓
+ ViT Encoder (Frozen)
+    ↓
+CLS Tokens [Layers 11, 23] → ImportanceMapGenerator → Importance Map
+    ↓                              ↓
+TemporalScalePredictor          Loss Weighting
+ (Mamba2-based TSP)
+    ↓
+Scale [B, T, 1, 1, 1], Shift [B, T, 1, 1, 1]
+    ↓
+Relative Depth × Scale + Shift = Metric Depth
+```
+
+**Key Components:**
 - **Multi-layer CLS Token Extraction**: Layers [11, 23] for ViT-L, [5, 11] for ViT-S
 - **ImportanceMapGenerator**: CLS-to-patch attention → importance map for loss weighting
-- **Loss Functions**: All support `log_l1` (standard) and `importance` (weighted) loss types
-- **Canonical Space**: All training/inference uses canonical focal length (500.0 for 518×518, configurable via `canonical_focal_length`; on/off via `use_canonical_space`)
-
-**Key Differences**:
-| Component | Gear5 (GRU) | Gear5 (Mamba) | Gear5 FiLM |
-|-----------|-------------|---------------|------------|
-| **Modulation Target** | Final relative depth | Final relative depth | DPT path_1 features |
-| **Modulation Method** | GRU-based scale/shift | Mamba2-based scale/shift | FiLM gamma/beta |
-| **Temporal Backend** | Bi-GRU (in head) | Mamba2 (in head) | Mamba (existing) |
-| **Trainable Params** | ~132K | ~147K | ~1.03M |
-| **Frozen Components** | All except Gear5Head | All except Gear5Head | ViT + DPT + conv1 |
-| **Training Speed** | Fast | Fast | Slower |
-| **Memory Usage** | Low | Low | Higher |
+- **TSP (Temporal Scale Predictor)**: Mamba2-based temporal modeling for scale/shift prediction
+- **Canonical Space**: All training/inference uses canonical focal length (500.0 for 518×518)
 
 ---
 
-## Gear5 (GRU): GRU-Based Temporal Modulation
+## TSP (Temporal Scale Predictor) Deep Dive
 
-### Architecture
+### What is TSP?
 
-Gear5 (GRU) applies **temporal scale and shift** to the final relative depth output using a GRU-based predictor.
-
-```
-Video Input [B, T, 3, H, W]
-    ↓
- ViT Encoder (Frozen)
-    ↓
-CLS Tokens [Layers 11, 23] → ImportanceMapGenerator → Importance Map
-    ↓                              ↓
-TemporalScalePredictor          Loss Weighting
- (Bi-GRU, 2 layers)
-    ↓
-Scale [B, T, 1, 1, 1], Shift [B, T, 1, 1, 1]
-    ↓
-Relative Depth × Scale + Shift = Metric Depth
-```
-
-### Key Components
-
-#### 1. TemporalScalePredictor (GRU)
-Predicts scale and shift parameters using a bidirectional GRU for temporal consistency.
+TSP는 FlashDepth의 상대적 깊이(relative depth)를 절대적 메트릭 깊이(metric depth)로 변환하기 위한 **프레임별 scale과 shift를 예측**하는 모듈입니다.
 
 ```python
-class TemporalScalePredictor(nn.Module):
-    """
-    CLS token [B, T, 1024] → Linear → Bi-GRU → Linear → Scale/Shift
-
-    Architecture:
-        - Input projection: 1024 → 256
-        - Bi-directional GRU: hidden_dim=256, 2 layers
-        - Output projection: 512 (bidirectional) → 2 (scale, shift)
-
-    Trainable params: ~132K
-    """
+metric_depth = scale × relative_depth + shift
 ```
 
-**Forward Flow**:
+### TSP vs FlashDepth의 MambaModel 차이점
+
+**중요**: TSP는 FlashDepth의 기존 `MambaModel`과 **완전히 별개**입니다!
+
+| 구분 | FlashDepth MambaModel | Gear5 TSP |
+|------|----------------------|-----------|
+| **역할** | DPT feature의 temporal modeling | Scale/Shift prediction |
+| **입력** | DPT path features [B, 256, H, W] | CLS tokens [B, T, 1024] |
+| **출력** | Modulated DPT features | Scale [B,T], Shift [B,T] |
+| **위치** | DPT 파이프라인 내부 | DPT 파이프라인 외부 (별도) |
+| **학습** | **Frozen** (동결) | **Trainable** (학습) |
+| **MambaBlock 수** | 4 layers | 1 layer |
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     FlashDepth Pipeline                         │
+│  ┌──────────┐    ┌─────────────────────────────────────────┐   │
+│  │   ViT    │───▶│  DPT with MambaModel (FROZEN)           │   │
+│  │ Encoder  │    │  - 4 MambaBlocks at path_3              │   │
+│  │ (Frozen) │    │  - Temporal feature modulation          │   │
+│  └──────────┘    └─────────────────────────────────────────┘   │
+│       │                         │                               │
+│       │                         ▼                               │
+│       │                  Relative Depth                         │
+│       │                         │                               │
+│       ▼                         │                               │
+│  CLS Tokens                     │                               │
+│  [B, T, 1024]                   │                               │
+│       │                         │                               │
+└───────┼─────────────────────────┼───────────────────────────────┘
+        │                         │
+        ▼                         │
+┌───────────────────────┐         │
+│  TSP (TRAINABLE)      │         │
+│  - 1 MambaBlock       │         │
+│  - Scale/Shift pred   │         │
+└───────────────────────┘         │
+        │                         │
+        │ Scale, Shift            │
+        │ [B, T]                  │
+        ▼                         ▼
+┌─────────────────────────────────────────────────────────────────┐
+│     Metric Depth = Scale × Relative Depth + Shift               │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### TSP의 MambaBlock 사용
+
+TSP는 `flashdepth/mamba.py`의 `MambaBlock` 클래스를 **그대로 재사용**합니다:
+
 ```python
-cls_token: [B, T, 1024]  # Last layer CLS token (Layer 23)
-    ↓ Linear(1024 → 256)
-cls_features: [B, T, 256]
-    ↓ Bi-GRU(2 layers, 256 hidden)
-gru_output: [B, T, 512]  # 256 × 2 (bidirectional)
-    ↓ Linear(512 → 2)
-scale_shift: [B, T, 2]
-    ↓ Split
-scale: [B, T, 1, 1, 1] = exp(scale_raw)  # Ensures positive
-shift: [B, T, 1, 1, 1] = shift_raw        # Real number (can be negative)
+# flashdepth/gear5_modules.py - TemporalScalePredictor
+from .mamba import MambaBlock
+
+self.temporal_mamba = MambaBlock(
+    d_model=feature_dim,  # 256
+    layer_idx=0,          # Single layer
+    expand=2,
+    d_state=64,
+    d_conv=4,
+    headdim=64,
+    use_hydra=False
+)
 ```
 
-**Temporal Processing**: GRU processes sequence bidirectionally, ensuring each frame's scale/shift considers past and future context.
-
-### Training Command
-
-```bash
-# Single GPU
-CUDA_VISIBLE_DEVICES=1 python train_gear5.py \
-  --config-path configs/gear5 \
-  training.iterations=60001 \
-  dataset.data_root=/path/to/datasets \
-  +loss_type=log_l1
-
-# Multi-GPU (DDP)
-./train_gear5_ddp.sh \
-  --config-path configs/gear5 \
-  --results-dir train_results/results_X/gear_5_gru/large/ \
-  --batch-size 20 \
-  --loss importance
-```
-
-**Key Parameters**:
-- `training.gear5_lr`: 1.0e-4 (TemporalScalePredictor learning rate)
-- `training.batch_size`: 20 per GPU (effective 40 with 2 GPUs)
-- Trainable params: ~132K
+**핵심 포인트:**
+- TSP가 사용하는 MambaBlock은 FlashDepth 원본과 **구조적으로 동일**
+- 다만 **새로운 인스턴스**로 초기화되어 TSP 전용으로 학습됨
+- FlashDepth의 기존 MambaModel은 동결(frozen)된 상태로 유지
 
 ---
 
-## Gear5 (Mamba): Mamba2-Based Temporal Modulation
+## MambaBlock Architecture
 
-### Architecture
+### MambaBlock의 출처와 구조
 
-Gear5 (Mamba) replaces the GRU with **Mamba2** for temporal scale/shift prediction, offering a lightweight alternative with similar parameter count.
-
-```
-Video Input [B, T, 3, H, W]
-    ↓
- ViT Encoder (Frozen)
-    ↓
-CLS Tokens [Layers 11, 23] → ImportanceMapGenerator → Importance Map
-    ↓                              ↓
-TemporalScalePredictor          Loss Weighting
- (Mamba2, 1 layer)
-    ↓
-Scale [B, T, 1, 1, 1], Shift [B, T, 1, 1, 1]
-    ↓
-Relative Depth × Scale + Shift = Metric Depth
-```
-
-### Key Components
-
-#### 1. TemporalScalePredictor (Mamba2)
-Uses Mamba2 for efficient temporal modeling with state-space architecture.
+`MambaBlock`은 FlashDepth 저자가 `mamba_ssm` 라이브러리의 표준 패턴을 따라 구현한 것입니다:
 
 ```python
-class TemporalScalePredictor(nn.Module):
-    """
-    CLS token [B, T, 1024] → Linear → Mamba2 → Linear → Scale/Shift
+class MambaBlock(nn.Module):
+    def __init__(self, d_model, layer_idx, expand, d_state=64, d_conv=4, headdim=64, use_hydra=False):
+        super().__init__()
+        from mamba_ssm import Mamba2
 
-    Architecture:
-        - Input projection: 1024 → 256
-        - Mamba2: d_model=256, d_state=64, d_conv=4, expand=2
-        - Output projection: 256 → 2 (scale, shift)
+        # 1. Pre-normalization
+        self.norm1 = nn.LayerNorm(d_model)
 
-    Trainable params: ~147K
-    """
+        # 2. Core Mamba2 (from mamba_ssm library)
+        self.mamba = Mamba2(
+            d_model=d_model,
+            d_state=d_state,
+            d_conv=d_conv,
+            expand=expand,
+            layer_idx=layer_idx,
+            headdim=headdim
+        )
+
+        # 3. MLP block (Transformer-style)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, d_model * 4),
+            nn.GELU(),
+            nn.Linear(d_model * 4, d_model)
+        )
+
+    def forward(self, x, inference_params=None):
+        # Transformer-style block with residual connections
+
+        # Sub-block 1: Mamba2 with residual
+        residual = x
+        x = self.norm1(x)
+        x = self.mamba(x, inference_params=inference_params)
+        x = residual + x
+
+        # Sub-block 2: MLP with residual
+        residual = x
+        x = self.norm2(x)
+        x = self.mlp(x)
+        x = residual + x
+
+        return x
 ```
 
-**Forward Flow**:
-```python
-cls_token: [B, T, 1024]  # Last layer CLS token (Layer 23)
-    ↓ Linear(1024 → 256)
-cls_features: [B, T, 256]
-    ↓ Mamba2(d_state=64, d_conv=4)
-mamba_output: [B, T, 256]
-    ↓ Linear(256 → 2)
-scale_shift: [B, T, 2]
-    ↓ Split
-scale: [B, T, 1, 1, 1] = exp(scale_raw)  # Ensures positive
-shift: [B, T, 1, 1, 1] = shift_raw        # Real number (can be negative)
+### MambaBlock 구조 분석
+
+```
+MambaBlock = Transformer 스타일 블록
+
+┌────────────────────────────────────────────────────────────────┐
+│                        MambaBlock                              │
+├────────────────────────────────────────────────────────────────┤
+│  Input [B, T, d_model]                                         │
+│       │                                                        │
+│       ├──────────────────┐                                     │
+│       │                  │                                     │
+│       ▼                  │                                     │
+│  LayerNorm (norm1)       │ (residual)                          │
+│       │                  │                                     │
+│       ▼                  │                                     │
+│  ┌──────────────┐        │                                     │
+│  │   Mamba2     │        │                                     │
+│  │ (mamba_ssm)  │        │                                     │
+│  │  ~432K params│        │                                     │
+│  └──────────────┘        │                                     │
+│       │                  │                                     │
+│       ▼                  │                                     │
+│       + ◄────────────────┘                                     │
+│       │                                                        │
+│       ├──────────────────┐                                     │
+│       │                  │                                     │
+│       ▼                  │                                     │
+│  LayerNorm (norm2)       │ (residual)                          │
+│       │                  │                                     │
+│       ▼                  │                                     │
+│  ┌──────────────┐        │                                     │
+│  │     MLP      │        │                                     │
+│  │ (4x expand)  │        │                                     │
+│  │  ~526K params│        │                                     │
+│  └──────────────┘        │                                     │
+│       │                  │                                     │
+│       ▼                  │                                     │
+│       + ◄────────────────┘                                     │
+│       │                                                        │
+│       ▼                                                        │
+│  Output [B, T, d_model]                                        │
+└────────────────────────────────────────────────────────────────┘
 ```
 
-**Advantages over GRU**:
-- More efficient temporal modeling with state-space mechanism
-- Better long-range dependency capture
-- Slightly higher parameter count (~147K vs ~132K)
+### 파라미터 분석 (d_model=256, expand=2)
 
-### Training Command
+| 컴포넌트 | 출처 | 파라미터 | 비율 |
+|---------|------|---------|------|
+| Mamba2 core | mamba_ssm 라이브러리 | 431,768 | 45.1% |
+| LayerNorm (×2) | FlashDepth 추가 | 1,024 | 0.1% |
+| MLP (FFN) | FlashDepth 추가 | 525,568 | 54.8% |
+| **Total** | | **958,360** | 100% |
 
-```bash
-# Single GPU with Mamba2 backend
-CUDA_VISIBLE_DEVICES=1 python train_gear5.py \
-  --config-path configs/gear5 \
-  training.iterations=60001 \
-  dataset.data_root=/path/to/datasets \
-  +loss_type=log_l1 \
-  +use_mamba_predictor=true
+**이 구조는 mamba_ssm 라이브러리의 표준 패턴입니다:**
+- Mamba 논문에서 "H3 블록과 MLP 블록을 결합"하는 구조 권장
+- `mamba_ssm.modules.block.Block` 클래스에서도 동일한 패턴 제공
+- FlashDepth는 공식 Block 대신 자체 구현했지만 구조는 동일
 
-# Multi-GPU (DDP) - using Docker script
-./train_gear5_ddp.sh \
-  --config-path configs/gear5 \
-  --results-dir train_results/results_X/gear_5_mamba/large/ \
-  --batch-size 20 \
-  --loss importance \
-  --mamba  # Enable Mamba2 instead of GRU
+### MambaBlock 사용 위치 비교
+
+FlashDepth와 gear5 모두 **동일한 MambaBlock 클래스**를 사용하며, **동일한 위치 전략**을 따릅니다:
+
+```
+DPT Layer 구조와 Mamba 삽입 위치:
+
+┌─────────────────────────────────────────────────────────────────┐
+│                          DPT Head                               │
+├─────────────────────────────────────────────────────────────────┤
+│  encoder → layer_4_rn                                           │
+│               ↓                                                 │
+│           path_4 (refinenet4) ─── [0] Mamba 삽입 가능           │
+│               ↓                                                 │
+│           path_3 (refinenet3) ─── [1] Small/Hybrid 삽입 위치    │
+│               ↓                                                 │
+│           path_2 (refinenet2) ─── [2] Mamba 삽입 가능           │
+│               ↓                                                 │
+│           path_1 (refinenet1) ─── [3] Large 삽입 위치           │
+│               ↓                                                 │
+│           output_conv                                           │
+│               ↓                                                 │
+│           depth output                                          │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-**Key Parameters**:
-- `use_mamba_predictor`: true (use Mamba2 instead of GRU)
-- `training.gear5_lr`: 1.0e-4
-- Trainable params: ~147K
+**모델별 Mamba 배치 설정 (원본 FlashDepth = gear5):**
+
+| Config | `mamba_in_dpt_layer` | 삽입 위치 | Feature 해상도 | d_model |
+|--------|---------------------|----------|---------------|---------|
+| **Large (ViT-L)** | `[3]` | path_1 이후 | 148×148 | 256 |
+| **Small (ViT-S)** | `[1]` | path_3 이후 | 74×74 | 64 |
+| **Hybrid** | `[1]` | path_3 이후 | 74×74 | 64 |
+
+**왜 Large와 Small/Hybrid가 다른 위치를 사용하나?**
+- **Large (path_1)**: 고해상도 feature에서 temporal modeling → 더 세밀한 시간적 일관성
+- **Small/Hybrid (path_3)**: 저해상도 feature에서 temporal modeling → 계산 효율성
+
+**Mamba 입력 차원:**
+```
+Mamba 입력: [B, L, d_model]
+├─ d_model: 256 (ViT-L) 또는 64 (ViT-S) → config에 따라 자동 설정
+└─ L = h × w: 해상도에 따라 동적으로 변함 (Mamba2가 가변 길이 지원)
+
+예시 (518×518 입력, patch_size=14 → 37×37 patches):
+- path_1 (Large): L = 148 × 148 = 21,904
+- path_3 (Small/Hybrid): L = 74 × 74 = 5,476
+```
+
+**결론: "MambaBlock을 어디에, 몇 개 사용할지"의 의미:**
+- **어디에**: `mamba_in_dpt_layer` 설정으로 DPT 파이프라인의 삽입 위치 결정
+- **몇 개**: `num_mamba_layers` 설정으로 연속된 MambaBlock 개수 결정 (기본: 4)
+- MambaBlock 클래스 자체는 변경 없이 그대로 사용
+- **시퀀스 길이(L)는 동적**이므로 Mamba 코드 수정 불필요
 
 ---
 
-## Gear5 FiLM: Channel-Wise Feature Modulation
+## Dimension Flow
 
-### Architecture
-
-Gear5 FiLM applies **channel-wise FiLM modulation** to DPT features before Mamba temporal modeling.
+### TSP 차원 흐름 (TemporalScalePredictor)
 
 ```
-Video Input [B, T, 3, H, W]
-    ↓
- ViT Encoder (Frozen)
-    ↓
-CLS Tokens [Layers 11, 23] → GlobalFeatureNetwork → ModulationNetwork
-    ↓                              ↓                      ↓
-DPT (Frozen)                  Global Feature         Gamma, Beta
-    ↓                              ↓                      ↓
-path_1 features          SimpleFeatureModulator (Channel-wise)
-    ↓
-Modulated path_1 → Mamba (Trainable) → output_conv2 (Trainable) → Metric Depth
-    ↓
-ImportanceMapGenerator → Importance Map (Loss Weighting)
+┌─────────────────────────────────────────────────────────────────┐
+│              TSP (Temporal Scale Predictor) Flow                │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  CLS Token (from ViT Layer 23)                                  │
+│  Shape: [B, T, 1024]                                            │
+│       │                                                         │
+│       ▼                                                         │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │  Feature Extractor                                       │   │
+│  │  Linear(1024 → 256) + ReLU                               │   │
+│  │  Params: 1024×256 + 256 = 262,400                        │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│       │                                                         │
+│       ▼                                                         │
+│  Features: [B, T, 256]                                          │
+│       │                                                         │
+│       ▼                                                         │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │  MambaBlock (temporal modeling)                          │   │
+│  │  d_model=256, expand=2, d_state=64                       │   │
+│  │                                                          │   │
+│  │  ┌─────────────────────────────────────────────────┐    │   │
+│  │  │ norm1: LayerNorm(256)           →      512 params│    │   │
+│  │  │ mamba: Mamba2(256, expand=2)    → ~431,768 params│    │   │
+│  │  │ norm2: LayerNorm(256)           →      512 params│    │   │
+│  │  │ mlp: 256→1024→256               → ~525,568 params│    │   │
+│  │  │ ─────────────────────────────────────────────────│    │   │
+│  │  │ Total MambaBlock:               → ~958,360 params│    │   │
+│  │  └─────────────────────────────────────────────────┘    │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│       │                                                         │
+│       ▼                                                         │
+│  Mamba Output: [B, T, 256]                                      │
+│       │                                                         │
+│       ▼                                                         │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │  Projection Layer                                        │   │
+│  │  Linear(256 → 128)                                       │   │
+│  │  Params: 256×128 + 128 = 32,896                          │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│       │                                                         │
+│       ▼                                                         │
+│  Hidden States: [B, T, 128]                                     │
+│       │                                                         │
+│       ├────────────────────────┬───────────────────────────┐   │
+│       ▼                        ▼                           │   │
+│  ┌──────────────┐      ┌──────────────┐                    │   │
+│  │ Scale Head   │      │ Shift Head   │                    │   │
+│  │ Linear(128→1)│      │ Linear(128→1)│                    │   │
+│  │ 129 params   │      │ 129 params   │                    │   │
+│  └──────────────┘      └──────────────┘                    │   │
+│       │                        │                                │
+│       ▼                        ▼                                │
+│  Softplus()               Identity()                            │
+│       │                        │                                │
+│       ▼                        ▼                                │
+│  Scale: [B, T]            Shift: [B, T]                         │
+│  (positive)               (any value)                           │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+
+TSP 총 파라미터:
+├─ Feature Extractor:  262,400
+├─ MambaBlock:         958,360
+├─ Projection:          32,896
+├─ Scale Head:             129
+└─ Shift Head:             129
+─────────────────────────────────
+Total:              ~1,253,914 params (~1.25M)
 ```
 
-### Key Components
+### 전체 Gear5 파이프라인 차원 흐름
 
-#### 1. GlobalFeatureNetwork
-Extracts global semantic features from CLS token.
-
-```python
-class GlobalFeatureNetwork(nn.Module):
-    """
-    CLS token → Global semantic feature
-
-    Architecture:
-        - Linear(1024 → 512) → ReLU
-        - Linear(512 → 256) → ReLU
-    """
 ```
-
-#### 2. ModulationNetwork
-Generates channel-wise gamma and beta for FiLM modulation.
-
-```python
-class ModulationNetwork(nn.Module):
-    """
-    Global feature → Gamma, Beta (channel-wise)
-
-    Architecture:
-        - Linear(256 → 512) → ReLU
-        - Linear(512 → 512)  # First 256: gamma, Last 256: beta
-    """
+┌─────────────────────────────────────────────────────────────────┐
+│                    Complete Gear5 Pipeline                      │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Input Video                                                    │
+│  Shape: [B, T, 3, 518, 518]                                     │
+│       │                                                         │
+│       ▼                                                         │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │  ViT Encoder (DINOv2 ViT-L, FROZEN)                      │   │
+│  │  Patch size: 14×14 → 37×37 patches                       │   │
+│  │  Params: ~304M (frozen)                                  │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│       │                                                         │
+│       ├─────────────────────────────────────────────┐          │
+│       │                                             │          │
+│       ▼                                             ▼          │
+│  Patch Tokens                              CLS Tokens          │
+│  [B×T, 1369, 1024]                         [B, T, 1024]        │
+│       │                                             │          │
+│       ▼                                             │          │
+│  ┌─────────────────────────────────┐               │          │
+│  │  DPT Head (FROZEN)              │               │          │
+│  │  with MambaModel at path_3      │               │          │
+│  │  (4 × MambaBlock = ~3.83M)      │               │          │
+│  └─────────────────────────────────┘               │          │
+│       │                                             │          │
+│       ▼                                             │          │
+│  Relative Depth                                     │          │
+│  [B, T, 1, 518, 518]                               │          │
+│  (normalized 0~1)                                   │          │
+│       │                                             │          │
+│       │                                             ▼          │
+│       │                           ┌─────────────────────────┐  │
+│       │                           │  TSP (TRAINABLE)        │  │
+│       │                           │  1 × MambaBlock         │  │
+│       │                           │  ~1.25M params          │  │
+│       │                           └─────────────────────────┘  │
+│       │                                             │          │
+│       │                                  Scale, Shift          │
+│       │                                  [B, T]    [B, T]      │
+│       │                                             │          │
+│       └──────────────────┬──────────────────────────┘          │
+│                          │                                      │
+│                          ▼                                      │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │  Metric Depth Conversion                                 │   │
+│  │  metric_depth = scale × relative_depth + shift           │   │
+│  │  scale: [B,T,1,1,1], shift: [B,T,1,1,1]                  │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                          │                                      │
+│                          ▼                                      │
+│  Metric Depth                                                   │
+│  [B, T, 1, 518, 518]                                           │
+│  (meters, absolute scale)                                       │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
 ```
-
-**Key Concept**: Each of 256 DPT channels gets its own gamma/beta pair, applied uniformly across spatial locations.
-
-#### 3. SimpleFeatureModulator
-Applies FiLM modulation: `feature * gamma + beta`
-
-### Training Command
-
-```bash
-# Single GPU
-CUDA_VISIBLE_DEVICES=1 python train_gear5_film.py \
-  --config-path configs/gear5_film \
-  training.iterations=60001 \
-  dataset.data_root=/path/to/datasets \
-  +loss_type=log_l1
-
-# Multi-GPU (DDP)
-./train_gear5_film_ddp.sh \
-  --config-path configs/gear5_film \
-  --results-dir train_results/results_X/gear_5_film/large/ \
-  --batch-size 20 \
-  --loss importance
-```
-
-**Key Parameters**:
-- `training.film_lr`: 1.0e-4 (Gear5FilmHead learning rate)
-- `training.mamba_lr`: 1.0e-5 (Mamba temporal modules)
-- `training.output_lr`: 1.0e-5 (output_conv2)
-- Trainable params: ~1.03M (head + Mamba + conv2)
-
----
-
-## Comparison
-
-### Feature Comparison
-
-| Feature | Gear5 (GRU) | Gear5 (Mamba) | Gear5 FiLM |
-|---------|-------------|---------------|------------|
-| **Modulation Target** | Final depth map | Final depth map | DPT features |
-| **Modulation Timing** | After all processing | After all processing | Before Mamba |
-| **Modulation Type** | Scalar scale/shift | Scalar scale/shift | Channel-wise (256×) |
-| **Temporal Backend** | Bi-GRU (2 layers) | Mamba2 (1 layer) | Mamba (4 layers) |
-| **Trainable Params** | ~132K | ~147K | ~1.03M |
-| **Frozen Components** | All except head | All except head | ViT + DPT + conv1 |
-| **Training Speed** | Fast | Fast | Slower |
-| **Memory Usage** | Low | Low | Higher |
-| **Long-range Dependency** | Good (bidirectional) | Better (state-space) | Best (4-layer Mamba) |
-| **Modulation Granularity** | Coarse (1 scale/shift) | Coarse (1 scale/shift) | Fine (256 gamma/beta) |
-
-### When to Use Which?
-
-**Use Gear5 (GRU)** when:
-- You want proven, stable temporal modeling
-- Minimal parameters (~132K) with bidirectional context
-- Standard training setup without special dependencies
-
-**Use Gear5 (Mamba)** when:
-- You want efficient state-space temporal modeling
-- Better long-range dependency capture than GRU
-- Similar parameter count (~147K) but better scaling
-
-**Use Gear5 FiLM** when:
-- You want fine-grained channel-wise modulation
-- You can afford more trainable parameters (~1.03M)
-- You want modulation integrated early in pipeline
-- Best temporal modeling with 4-layer Mamba
 
 ---
 
@@ -368,11 +468,6 @@ def log_l1_loss(pred, target, valid_mask):
     return loss[valid_mask].mean()
 ```
 
-**Usage**:
-```bash
-python train_gear5.py --config-path configs/gear5 +loss_type=log_l1
-```
-
 ### Importance-Weighted Loss
 
 ```python
@@ -387,34 +482,6 @@ def importance_weighted_loss(pred, target, valid_mask, importance_map):
         - importance: Spatial map from CLS attention [0, 1]
         - fg_ratio: Fraction of high-attention pixels
     """
-    # Compute base loss (NaN-safe)
-    epsilon = 1e-8
-    pred = torch.clamp(pred, min=epsilon)
-    target = torch.clamp(target, min=epsilon)
-
-    pred_inv = 100.0 / (pred + epsilon)
-    target_inv = 100.0 / (target + epsilon)
-    loss = torch.abs(torch.log(pred_inv + epsilon) - torch.log(target_inv + epsilon))
-
-    # Resize importance map to depth resolution
-    importance_resized = F.interpolate(
-        importance_map.view(B*T, 1, patch_h, patch_w),
-        size=(H, W), mode='bilinear', align_corners=True
-    )
-
-    # Compute foreground ratio
-    importance_threshold = importance_resized.mean()
-    fg_ratio = (importance_resized > importance_threshold).float().mean()
-
-    # Apply importance weighting
-    weighted_loss = loss * (1.0 + fg_ratio * importance_resized)
-
-    return weighted_loss[valid_mask].mean()
-```
-
-**Usage**:
-```bash
-python train_gear5.py --config-path configs/gear5 +loss_type=importance
 ```
 
 **Effect**: Higher loss weights on semantically important regions (high CLS attention), lower weights on background.
@@ -423,15 +490,11 @@ python train_gear5.py --config-path configs/gear5 +loss_type=importance
 
 ## Valid Mask Criteria
 
-**CRITICAL**: All Gear5 variants follow consistent valid mask criteria:
-
 ### Training & Validation
 ```python
 # Valid mask: GT > 0 (all valid pixels, no distance threshold)
 valid_mask = (gt_depth_inverse > 0) & (pred_depth_inverse > 0)
 ```
-
-**No 70m threshold** in training/validation to use all available GT data.
 
 ### Testing
 ```python
@@ -440,39 +503,14 @@ MIN_INVERSE_DEPTH = 100.0 / 70.0  # 1.4286 (inverse of 70m)
 valid_mask = (gt_depth_inverse >= MIN_INVERSE_DEPTH) & (pred_depth_inverse > 0)
 ```
 
-**Why 70m threshold in test?**
-- Canonical space (fx=500 at 518×518) evaluation standard
-- Ensures fair comparison across datasets
-- Filters out unreliable far-depth regions
-
 ---
 
 ## Training & Testing
 
 ### Training
 
-#### Gear5 (GRU) - Default
-
 ```bash
-# Single GPU
-CUDA_VISIBLE_DEVICES=1 python train_gear5.py \
-  --config-path configs/gear5 \
-  training.iterations=60001 \
-  dataset.data_root=/path/to/datasets \
-  +loss_type=log_l1
-
-# Multi-GPU (DDP)
-./train_gear5_ddp.sh \
-  --config-path configs/gear5 \
-  --results-dir train_results/results_X/gear_5_gru/large/ \
-  --batch-size 20 \
-  --loss importance
-```
-
-#### Gear5 (Mamba) - With Mamba2 Backend
-
-```bash
-# Single GPU
+# Single GPU with Mamba2 backend
 CUDA_VISIBLE_DEVICES=1 python train_gear5.py \
   --config-path configs/gear5 \
   training.iterations=60001 \
@@ -480,36 +518,58 @@ CUDA_VISIBLE_DEVICES=1 python train_gear5.py \
   +loss_type=log_l1 \
   +use_mamba_predictor=true
 
-# Multi-GPU (DDP) - Docker
-./train_gear5_ddp.sh \
-  --config-path configs/gear5 \
+# Multi-GPU (DDP)
+./run_docker.sh train_gear5_ddp \
+  --mamba \
+  --config-variant l \
   --results-dir train_results/results_X/gear_5_mamba/large/ \
   --batch-size 20 \
-  --loss importance \
-  --mamba  # Enable Mamba2 backend
-```
-
-#### Gear5 FiLM
-
-```bash
-# Single GPU
-CUDA_VISIBLE_DEVICES=1 python train_gear5_film.py \
-  --config-path configs/gear5_film \
-  training.iterations=60001 \
-  dataset.data_root=/path/to/datasets \
-  +loss_type=log_l1
-
-# Multi-GPU (DDP)
-./train_gear5_film_ddp.sh \
-  --config-path configs/gear5_film \
-  --results-dir train_results/results_X/gear_5_film/large/ \
-  --batch-size 20 \
   --loss importance
+
+# With custom CLS layer selection (single layer - only 4th)
+./run_docker.sh train_gear5_ddp \
+  --mamba \
+  --config-variant hybrid \
+  --gear-checkpoint train_results/results_X/gear_5_mamba/small/best.pth \
+  --results-dir train_results/results_X/gear_5_mamba/hybrid/ \
+  --batch-size 1 \
+  --epochs 60001 \
+  --cls-layer 4
 ```
+
+**Key Parameters:**
+- `--mamba`: Use Mamba2-based TSP (default: GRU)
+- `--cls-layer`: CLS token extraction layers (1-4). Examples:
+  - `4` → 4번째 레이어만 사용 (ViT-L: block 23, ViT-S: block 11)
+  - `2,4` → 2번째, 4번째 레이어 사용 (기본값)
+  - `1,2,3,4` → 모든 4개 레이어 사용
+- `training.gear5_lr`: 1.0e-4
+- Trainable params: ~1.25M (TSP only, rest frozen)
+
+### CLS Layer Selection
+
+ViT의 4개 intermediate layer 중 어느 레이어에서 CLS token을 추출할지 선택할 수 있습니다:
+
+```
+ViT-L: intermediate_layer_idx = [4, 11, 17, 23]
+       --cls-layer 1 → block 4
+       --cls-layer 2 → block 11 (default)
+       --cls-layer 3 → block 17
+       --cls-layer 4 → block 23 (default)
+
+ViT-S: intermediate_layer_idx = [2, 5, 8, 11]
+       --cls-layer 1 → block 2
+       --cls-layer 2 → block 5 (default)
+       --cls-layer 3 → block 8
+       --cls-layer 4 → block 11 (default)
+```
+
+**사용 예시:**
+- `--cls-layer 4`: 마지막 레이어만 사용 (가장 고수준 semantic)
+- `--cls-layer 2,4`: 중간 + 마지막 레이어 (기본값, 다양한 수준의 feature)
+- `--cls-layer 1,2,3,4`: 모든 레이어 사용 (실험용)
 
 ### Testing
-
-#### Gear5 (GRU/Mamba)
 
 ```bash
 CUDA_VISIBLE_DEVICES=1 python test_gear5.py \
@@ -519,48 +579,12 @@ CUDA_VISIBLE_DEVICES=1 python test_gear5.py \
   --gpu 1
 ```
 
-#### Gear5 FiLM
-
-```bash
-CUDA_VISIBLE_DEVICES=1 python test_gear5_film.py \
-  --config-path configs/gear5_film \
-  --checkpoint train_results/results_X/gear_5_film/phase_1/checkpoint_step60000.pth \
-  --results-dir test_results/gear5_film_results \
-  --gpu 1
-```
-
-**Output**:
+**Output:**
 - Depth predictions (npy/png)
 - Visualization grids (input, prediction, GT, valid masks)
 - Metrics JSON (MAE, RMSE, AbsRel, δ1/δ2/δ3, TAE)
-- Scale/shift visualizations (GRU/Mamba variants)
-- Gamma/beta visualizations (FiLM variant)
+- Scale/shift visualizations
 - Importance maps
-
-### Docker Commands
-
-**Build**:
-```bash
-./run_docker.sh build
-```
-
-**Training**:
-```bash
-# Gear5 (GRU)
-./run_docker.sh train_gear5_ddp --loss importance --batch-size 20 --gpu 0,1
-
-# Gear5 (Mamba)
-./run_docker.sh train_gear5_ddp --loss importance --batch-size 20 --mamba --gpu 0,1
-
-# Gear5 FiLM
-./run_docker.sh train_gear5_film_ddp --loss log_l1 --batch-size 20 --gpu 0,1
-```
-
-**Testing**:
-```bash
-./run_docker.sh test_gear5 --gpu 1
-./run_docker.sh test_gear5_film --gpu 1
-```
 
 ---
 
@@ -582,7 +606,7 @@ use_canonical_space: true
 loss_type: "log_l1"
 
 # Temporal predictor backend
-use_mamba_predictor: false  # false = GRU (default), true = Mamba2
+use_mamba_predictor: true  # Mamba2-based TSP
 
 # Dataset
 dataset:
@@ -603,7 +627,7 @@ training:
   wandb: false
 
   # Learning rate
-  gear5_lr: 1.0e-4     # TemporalScalePredictor
+  gear5_lr: 1.0e-4     # TSP learning rate
   weight_decay: 1.0e-6
 
 # Model
@@ -616,11 +640,11 @@ model:
   target_blocks: [11, 23]      # ViT-L
   target_blocks_s: [5, 11]     # ViT-S
 
-  # Mamba (frozen in Gear5)
+  # Mamba (frozen in Gear5 - original FlashDepth temporal modules)
   use_mamba: true
   mamba_type: "add"
   num_mamba_layers: 4
-  mamba_in_dpt_layer: [1]
+  mamba_in_dpt_layer: [3]  # ViT-L uses path_1 (layer 3), ViT-S/Hybrid uses [1] (path_3)
   mamba_d_conv: 4
   mamba_d_state: 256
 
@@ -633,107 +657,38 @@ eval:
   save_vis_map: true
 ```
 
-### Gear5 FiLM Config (`configs/gear5_film/config.yaml`)
-
-```yaml
-# (Similar structure to Gear5)
-
-# Loss function
-loss_type: "log_l1"
-
-# Training
-training:
-  batch_size: 20
-  workers: 8
-  iterations: 60001
-
-  # Learning rates (3 separate rates)
-  film_lr: 1.0e-4      # FiLM modules
-  mamba_lr: 1.0e-5     # Mamba (trainable)
-  output_lr: 1.0e-5    # output_conv2
-  weight_decay: 1.0e-6
-
-# Model
-model:
-  use_mamba: true  # Trainable in FiLM variant
-  # ... (same Mamba config)
-```
-
 ---
 
-## Recent Updates
+## Parameter Summary
 
-### NaN Loss Fix (2025-11-16)
+| Component | Parameters | Status |
+|-----------|------------|--------|
+| ViT-L Encoder | ~304M | Frozen |
+| DPT Head | ~9.4M | Frozen |
+| DPT MambaModel (4 layers) | ~3.83M | Frozen |
+| **TSP (Trainable)** | **~1.25M** | **Trainable** |
+| - Feature Extractor | 262K | |
+| - MambaBlock | 958K | |
+| - Projection + Heads | 33K | |
 
-**Problem**: Occasional `loss=nan` during training due to:
-1. `log(negative_value)` or `log(0)` when shift is negative
-2. Invalid GT pixels (0 or negative) not filtered before log
-
-**Solution**: Added `torch.clamp(min=epsilon)` before all log operations:
-
-```python
-# train_gear5.py & train_gear5_film.py
-epsilon = 1e-8
-pred_depth_flat = torch.clamp(pred_depth_flat, min=epsilon)
-gt_depth_flat = torch.clamp(gt_depth_flat, min=epsilon)
-
-loss = torch.abs(
-    torch.log(pred_depth_flat + epsilon) -
-    torch.log(gt_depth_flat + epsilon)
-)
-```
-
-```python
-# utils/gear_losses.py (LogL1Loss)
-epsilon = 1e-8
-pred_valid = torch.clamp(pred_valid, min=epsilon)
-gt_valid = torch.clamp(gt_valid, min=epsilon)
-
-loss = F.l1_loss(
-    torch.log(pred_valid + epsilon),
-    torch.log(gt_valid + epsilon),
-    reduction='mean'
-)
-```
-
-**Files Modified**:
-- `train_gear5.py`: Lines 1073-1083
-- `train_gear5_film.py`: Lines 1013-1022
-- `utils/gear_losses.py`: Lines 48-69
-
-**Impact**: All Gear variants (2, 3, 4, 5, 5_film) now NaN-safe.
-
-### Valid Mask Standardization (2025-11-16)
-
-**Changes**:
-- Train/Validation: `GT > 0` (no 70m threshold)
-- Test: `GT >= 100/70` (70m threshold in canonical space)
-- Consistent across all Gear variants
-
-**Files Modified**:
-- `train_gear2.py`, `train_gear3.py`, `train_gear4.py`
-- `train_gear5.py`, `train_gear5_film.py`
+**Total Trainable: ~1.25M parameters** (전체 모델의 ~0.4%)
 
 ---
 
 ## Summary
 
-**Gear5 (GRU)**: Proven, stable GRU-based temporal scale/shift prediction (~132K params)
+**Gear5 핵심 아키텍처:**
 
-**Gear5 (Mamba)**: Efficient Mamba2-based temporal modeling (~147K params) with better long-range dependencies
+1. **FlashDepth 파이프라인 전체 동결** (ViT + DPT + MambaModel)
+2. **TSP만 학습** (~1.25M params)
+3. TSP는 CLS token → Scale/Shift 예측
+4. `metric_depth = scale × relative_depth + shift`
 
-**Gear5 FiLM**: Fine-grained channel-wise modulation with trainable Mamba (~1.03M params)
+**MambaBlock 사용:**
+- FlashDepth의 MambaModel: DPT path_3에서 4개 MambaBlock (동결)
+- TSP: 별도 1개 MambaBlock (학습)
+- 두 MambaBlock은 **같은 클래스**이지만 **다른 용도**
 
-All variants:
-- Support canonical space normalization (fx=500 @ 518×518)
-- Generate importance maps for loss weighting
-- Support `log_l1` and `importance` loss types
-- Use multi-layer CLS tokens [11, 23] from ViT-L
-- **NaN-safe** loss computation with clamping
-- Consistent valid mask criteria (train/val: GT>0, test: 70m threshold)
-
-Choose based on:
-- **Parameter budget**: GRU/Mamba (~132-147K) vs FiLM (~1.03M)
-- **Temporal modeling**: GRU (bidirectional) vs Mamba2 (state-space) vs 4-layer Mamba
-- **Modulation granularity**: Scalar (GRU/Mamba) vs Channel-wise (FiLM)
-- **Training time**: Fast (GRU/Mamba) vs Slower (FiLM)
+**Canonical Space:**
+- 학습/추론 모두 fx=500 (518×518) 기준
+- 테스트 시 70m threshold 적용
