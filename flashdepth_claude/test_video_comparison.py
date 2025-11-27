@@ -943,20 +943,40 @@ class VideoComparisonTester:
 
         T = images.shape[0]
 
-        # Determine frame range: best_frame ± 4
-        start_idx = max(0, best_frame_idx - 4)
-        end_idx = min(T, best_frame_idx + 5)  # +5 because range is exclusive
+        # Determine frame range with frame_interval support
+        # If frame_interval is set, expand range and use interval for sampling
+        # Example: frame=9, interval=2 → frames 1, 3, 5, 7, 9, 11, 13, 15, 17
+        frame_interval = self.frame_interval if self.frame_interval is not None else 1
+        frame_offset = 4 * frame_interval  # ±4 intervals
+        start_idx = max(0, best_frame_idx - frame_offset)
+        end_idx = min(T, best_frame_idx + frame_offset + 1)  # +1 for inclusive end
 
-        logger.info(f"Exporting figure frames for sequence {sequence_id}: frames {start_idx}-{end_idx-1} (best={best_frame_idx})")
+        # Generate frame indices with interval
+        frame_indices = list(range(start_idx, end_idx, frame_interval))
+        # Ensure best_frame_idx is included even if not perfectly aligned
+        if best_frame_idx not in frame_indices:
+            frame_indices.append(best_frame_idx)
+            frame_indices.sort()
+
+        logger.info(f"Exporting figure frames for sequence {sequence_id}: frames {frame_indices} (center={best_frame_idx}, interval={frame_interval})")
 
         # Create figures directory
         figures_dir = self.save_dir / "figures" / f"seq{sequence_id:04d}"
         figures_dir.mkdir(parents=True, exist_ok=True)
 
-        for t in range(start_idx, end_idx):
+        for t in frame_indices:
             # 1. Save original image
             img = images[t].cpu().numpy()  # [3, H, W]
+            
+            # Check if ImageNet normalized (value range check)
+            if img.min() < -2.0 or img.max() > 2.0:
+                # ImageNet normalized - unnormalize first
+                mean = np.array([0.485, 0.456, 0.406]).reshape(3, 1, 1)
+                std = np.array([0.229, 0.224, 0.225]).reshape(3, 1, 1)
+                img = img * std + mean  # Unnormalize to [0, 1]
+            
             img = np.transpose(img, (1, 2, 0))  # [H, W, 3]
+            img = np.clip(img, 0, 1)  # Ensure [0, 1] range
             img = (img * 255).astype(np.uint8)
             img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)  # Convert RGB to BGR for cv2
             img_path = figures_dir / f"frame_{t:04d}_image.png"
@@ -964,19 +984,28 @@ class VideoComparisonTester:
 
             # 2. Save GT depth (colormap)
             gt_depth = gt_depths[t, 0].cpu().numpy()  # [H, W] in meters
+            # Get GT range for consistent normalization
             gt_depth_vis = self._depth_to_colormap(gt_depth)
             gt_path = figures_dir / f"frame_{t:04d}_gt_depth.png"
             cv2.imwrite(str(gt_path), gt_depth_vis)
+            
+            # Get vmin/vmax from GT for pred normalization
+            gt_valid_mask = np.isfinite(gt_depth) & (gt_depth > 0)
+            if gt_valid_mask.any():
+                gt_vmin = np.nanpercentile(gt_depth[gt_valid_mask], 2)
+                gt_vmax = np.nanpercentile(gt_depth[gt_valid_mask], 98)
+            else:
+                gt_vmin, gt_vmax = None, None
 
-            # 3. Save pred depth (colormap)
+            # 3. Save pred depth (colormap) - use GT range and GT valid mask for comparison
             pred_depth = pred_depths[t, 0].cpu().numpy()  # [H, W] in meters
-            pred_depth_vis = self._depth_to_colormap(pred_depth)
+            pred_depth_vis = self._depth_to_colormap(pred_depth, vmin=gt_vmin, vmax=gt_vmax, external_mask=gt_valid_mask)
             pred_path = figures_dir / f"frame_{t:04d}_pred_depth.png"
             cv2.imwrite(str(pred_path), pred_depth_vis)
 
-        logger.info(f"Exported {end_idx - start_idx} frames × 3 types = {(end_idx - start_idx) * 3} images to {figures_dir}")
+        logger.info(f"Exported {len(frame_indices)} frames × 3 types = {len(frame_indices) * 3} images to {figures_dir}")
 
-    def _depth_to_colormap(self, depth, vmin=None, vmax=None, percentile_range=(2, 98)):
+    def _depth_to_colormap(self, depth, vmin=None, vmax=None, percentile_range=(2, 98), external_mask=None):
         """
         Convert depth map to colormap visualization (matching gear5_visualization.py style).
 
@@ -985,6 +1014,7 @@ class VideoComparisonTester:
             vmin: minimum depth for colormap (default: use 2nd percentile)
             vmax: maximum depth for colormap (default: use 98th percentile)
             percentile_range: tuple of (low, high) percentiles for auto-scaling
+            external_mask: [H, W] boolean mask to restrict valid region (e.g., GT valid mask for pred depth)
 
         Returns:
             [H, W, 3] BGR image (uint8)
@@ -992,10 +1022,14 @@ class VideoComparisonTester:
         import matplotlib
         import cv2
 
-        # Handle invalid values
-        valid_mask = np.isfinite(depth) & (depth > 0)
+        # Handle invalid values (matching test_gear5 exactly)
+        # If external_mask is provided (e.g., GT valid mask), use it to restrict valid region
+        if external_mask is not None:
+            valid_mask = np.isfinite(depth) & (depth > 0) & external_mask
+        else:
+            valid_mask = np.isfinite(depth) & (depth > 0)
+
         if not valid_mask.any():
-            # All invalid - return black image
             return np.zeros((*depth.shape, 3), dtype=np.uint8)
 
         valid_depth = depth[valid_mask]
@@ -1065,6 +1099,8 @@ def main():
                        help='Sequence number(s) to test (e.g., --seq 0, --seq 2,5, --seq 0,3,7)')
     parser.add_argument('--figure', action='store_true',
                        help='Export best_frame ±4 frames (9 total) as individual images/depth maps (requires --seq)')
+    parser.add_argument('--frame', type=int, default=None,
+                       help='Export specific frame ±4 frames (9 total) as individual images (e.g., --seq 6 --frame 459)')
     parser.add_argument('--amp', action='store_true',
                        help='Enable Automatic Mixed Precision (AMP) for inference')
     parser.add_argument('--amp-dtype', type=str, default='bf16', choices=['bf16', 'fp16'],
@@ -1123,6 +1159,7 @@ def main():
         'visualization': (args.visualization == 'true'),  # Convert string to bool
         'seq_list': seq_list,  # Pass seq_list for filtering
         'figure': args.figure,  # Export individual frames if enabled
+        'frame': args.frame,  # Export specific frame ±4 frames
         'amp': args.amp,
         'amp_dtype': args.amp_dtype,
         'limit_scenes': args.limit_scenes

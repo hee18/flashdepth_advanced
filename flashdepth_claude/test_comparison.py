@@ -987,17 +987,28 @@ class ComparisonTester:
 
         T = images.shape[0]
 
-        # Determine frame range: best_frame ± 4
-        start_idx = max(0, best_frame_idx - 4)
-        end_idx = min(T, best_frame_idx + 5)  # +5 because range is exclusive
+        # Determine frame range with frame_interval support
+        # If frame_interval is set, expand range and use interval for sampling
+        # Example: frame=9, interval=2 → frames 1, 3, 5, 7, 9, 11, 13, 15, 17
+        frame_interval = self.frame_interval if self.frame_interval is not None else 1
+        frame_offset = 4 * frame_interval  # ±4 intervals
+        start_idx = max(0, best_frame_idx - frame_offset)
+        end_idx = min(T, best_frame_idx + frame_offset + 1)  # +1 for inclusive end
 
-        logger.info(f"Exporting figure frames for sequence {sequence_id}: frames {start_idx}-{end_idx-1} (best={best_frame_idx})")
+        # Generate frame indices with interval
+        frame_indices = list(range(start_idx, end_idx, frame_interval))
+        # Ensure best_frame_idx is included even if not perfectly aligned
+        if best_frame_idx not in frame_indices:
+            frame_indices.append(best_frame_idx)
+            frame_indices.sort()
+
+        logger.info(f"Exporting figure frames for sequence {sequence_id}: frames {frame_indices} (center={best_frame_idx}, interval={frame_interval})")
 
         # Create figures directory
         figures_dir = self.save_dir / "figures" / f"seq{sequence_id:04d}"
         figures_dir.mkdir(parents=True, exist_ok=True)
 
-        for t in range(start_idx, end_idx):
+        for t in frame_indices:
             # 1. Save original image
             img = images[t].cpu().numpy()  # [3, H, W]
             
@@ -1023,22 +1034,22 @@ class ComparisonTester:
             cv2.imwrite(str(gt_path), gt_depth_vis)
             
             # Get vmin/vmax from GT for pred normalization
-            valid_mask = np.isfinite(gt_depth) & (gt_depth > 0)
-            if valid_mask.any():
-                gt_vmin = np.nanpercentile(gt_depth[valid_mask], 2)
-                gt_vmax = np.nanpercentile(gt_depth[valid_mask], 98)
+            gt_valid_mask = np.isfinite(gt_depth) & (gt_depth > 0)
+            if gt_valid_mask.any():
+                gt_vmin = np.nanpercentile(gt_depth[gt_valid_mask], 2)
+                gt_vmax = np.nanpercentile(gt_depth[gt_valid_mask], 98)
             else:
                 gt_vmin, gt_vmax = None, None
 
-            # 3. Save pred depth (colormap) - use GT range for comparison
+            # 3. Save pred depth (colormap) - use GT range and GT valid mask for comparison
             pred_depth = pred_depths[t, 0].cpu().numpy()  # [H, W] in meters
-            pred_depth_vis = self._depth_to_colormap(pred_depth, vmin=gt_vmin, vmax=gt_vmax)
+            pred_depth_vis = self._depth_to_colormap(pred_depth, vmin=gt_vmin, vmax=gt_vmax, external_mask=gt_valid_mask)
             pred_path = figures_dir / f"frame_{t:04d}_pred_depth.png"
             cv2.imwrite(str(pred_path), pred_depth_vis)
 
-        logger.info(f"Exported {end_idx - start_idx} frames × 3 types = {(end_idx - start_idx) * 3} images to {figures_dir}")
+        logger.info(f"Exported {len(frame_indices)} frames × 3 types = {len(frame_indices) * 3} images to {figures_dir}")
 
-    def _depth_to_colormap(self, depth, vmin=None, vmax=None, percentile_range=(2, 98)):
+    def _depth_to_colormap(self, depth, vmin=None, vmax=None, percentile_range=(2, 98), external_mask=None):
         """
         Convert depth map to colormap visualization (matching gear5_visualization.py style).
 
@@ -1047,6 +1058,7 @@ class ComparisonTester:
             vmin: minimum depth for colormap (default: use 2nd percentile)
             vmax: maximum depth for colormap (default: use 98th percentile)
             percentile_range: tuple of (low, high) percentiles for auto-scaling
+            external_mask: [H, W] boolean mask to restrict valid region (e.g., GT valid mask for pred depth)
 
         Returns:
             [H, W, 3] BGR image (uint8)
@@ -1054,10 +1066,14 @@ class ComparisonTester:
         import matplotlib
         import cv2
 
-        # Handle invalid values
-        valid_mask = np.isfinite(depth) & (depth > 0)
+        # Handle invalid values (matching test_gear5 exactly)
+        # If external_mask is provided (e.g., GT valid mask), use it to restrict valid region
+        if external_mask is not None:
+            valid_mask = np.isfinite(depth) & (depth > 0) & external_mask
+        else:
+            valid_mask = np.isfinite(depth) & (depth > 0)
+
         if not valid_mask.any():
-            # All invalid - return black image
             return np.zeros((*depth.shape, 3), dtype=np.uint8)
 
         valid_depth = depth[valid_mask]
@@ -1068,8 +1084,11 @@ class ComparisonTester:
         if vmax is None:
             vmax = np.nanpercentile(valid_depth, percentile_range[1])
 
+        # Create depth with NaN for invalid pixels
+        depth_vis = np.where(valid_mask, depth, np.nan)
+
         # Normalize to [0, 1]
-        depth_normalized = np.clip((depth - vmin) / (vmax - vmin + 1e-8), 0, 1)
+        depth_normalized = np.clip((depth_vis - vmin) / (vmax - vmin + 1e-8), 0, 1)
 
         # Apply colormap (plasma_r to match gear5_visualization.py)
         # Use new matplotlib API to avoid deprecation warning
@@ -1077,9 +1096,6 @@ class ComparisonTester:
         cmap.set_bad(color='black')  # NaN pixels = black
         depth_colored_rgba = cmap(depth_normalized)
         depth_colored = (depth_colored_rgba[:, :, :3] * 255).astype(np.uint8)
-
-        # Set invalid pixels to black
-        depth_colored[~valid_mask] = 0
 
         # Convert RGB to BGR for cv2
         depth_colored = cv2.cvtColor(depth_colored, cv2.COLOR_RGB2BGR)

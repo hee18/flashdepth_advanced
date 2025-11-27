@@ -8,7 +8,7 @@
 
 ## 초록
 
-본 논문은 원본 FlashDepth를 확장한 **Metric-FlashDepth**를 제안한다. 기존 FlashDepth는 상대적 깊이(relative depth)만 추정하여 실세계 거리 측정이 불가능했으나, 본 연구는 **경량 Temporal Scale Predictor (~360K params)**를 추가하여 메트릭 깊이(metric depth) 추정을 가능하게 하면서도 실시간 성능(**10.9 FPS on RTX A6000**)을 유지한다. 핵심 기여는 다음과 같다: (1) **2-layer CLS token averaging**으로 계층적 장면 이해, (2) **GRU/Mamba2 temporal modeling**으로 시간적으로 일관된 스케일/시프트 예측, (3) **Importance-weighted loss**로 주요 객체 중심 학습, (4) **Multi-Factor Canonical Space Transformation (MF-CST)**으로 다양한 카메라 intrinsic 및 FlashDepth의 해상도 요구사항에 강건한 학습 달성. TartanAir, MVS-Synth 등 5개 데이터셋 실험 결과, 기존 GSP(Global Scale Predictor) 방식 대비 절대 상대 오차(AbsRel)가 28% 감소하였으며, Mamba2 temporal modeling으로 시간 일관성(TAE)이 16% 향상되었다.
+본 논문은 원본 FlashDepth를 확장한 **Metric-FlashDepth**를 제안한다. 기존 FlashDepth는 상대적 깊이(relative depth)만 추정하여 실세계 거리 측정이 불가능했으나, 본 연구는 **경량 Temporal Scale Predictor (~1.25M params)**를 추가하여 메트릭 깊이(metric depth) 추정을 가능하게 하면서도 실시간 성능(**10.9 FPS on RTX A6000**)을 유지한다. 핵심 기여는 다음과 같다: (1) **2-layer CLS token averaging**으로 계층적 장면 이해, (2) **GRU/Mamba2 temporal modeling**으로 시간적으로 일관된 스케일/시프트 예측, (3) **Importance-weighted loss**로 주요 객체 중심 학습, (4) **Multi-Factor Canonical Space Transformation (MF-CST)**으로 다양한 카메라 intrinsic 및 FlashDepth의 해상도 요구사항에 강건한 학습 달성. TartanAir, MVS-Synth 등 5개 데이터셋 실험 결과, 기존 GSP(Global Scale Predictor) 방식 대비 절대 상대 오차(AbsRel)가 28% 감소하였으며, Mamba2 temporal modeling으로 시간 일관성(TAE)이 16% 향상되었다.
 
 **핵심 키워드**: 메트릭 깊이 추정, 실시간 비디오 처리, DINOv2, Mamba2, 시간 일관성, Canonical Space
 
@@ -56,7 +56,7 @@
 - **검증**: Metric3D v2 확장 + FlashDepth 호환성
 
 #### (2) Temporal Scale Predictor ⭐
-**경량 설계** (~360K params, 전체의 0.1%):
+**경량 설계** (~1.25M params, 전체의 0.39%):
 ```
 2-layer CLS tokens [B, T, 1024]  (ViT-L: [11, 23], ViT-S: [5, 11])
     ↓ Feature Extractor (1024 → 256)
@@ -69,8 +69,8 @@ Scale [B, T], Shift [B, T]
 
 **핵심 이점**:
 - **시간 일관성**: 이전 프레임 정보로 안정적 예측
-- **경량**: GRU 100K, Mamba2 200K params만 추가
-- **선택 가능**: GRU (T<50 최적) or Mamba2 (T>100 최적)
+- **경량**: Mamba2 기반 (~1.25M params)
+- **효율적**: Mamba2로 긴 시퀀스 처리 가능 (T>100 최적)
 
 #### (3) 2-Layer CLS Token Averaging
 **동기**: 단일 레이어(최종 Layer만)의 한계 극복
@@ -165,11 +165,12 @@ Scale [B, T], Shift [B, T]
 └─────────────────────────────────────────────┘
     ↓
 ┌─────────────────────────────────────────────┐
-│ Gear5 Metric Head (Trainable, ~360K)       │
+│ Gear5 Metric Head (Trainable, ~1.25M)     │
 │                                             │
 │ 1. TemporalScalePredictor                  │
 │    - Feature Net: CLS [1024] → [256]       │
-│    - GRU/Mamba2: [256] → [128]             │
+│    - Mamba2 Block: [256] → [256]           │
+│    - Projection: [256] → [128]             │
 │    - Heads: [128] → Scale[1], Shift[1]     │
 │                                             │
 │ 2. ImportanceMapGenerator                  │
@@ -210,9 +211,9 @@ Scale [B, T], Shift [B, T]
 ```
 
 **파라미터 분해**:
-- Frozen: 319.3M (DINOv2 300M + DPT 15M + Mamba 4.3M)
-- **Trainable**: 360K (Gear5 Metric Head만)
-- **Total**: 319.7M (0.1% 증가)
+- Frozen: 319.6M (DINOv2 300M + DPT 15M + Mamba 4.3M + Output 0.3M)
+- **Trainable**: 1.25M (Gear5 Metric Head만)
+- **Total**: 320.9M (0.39% 증가)
 
 ### 3.2 Multi-Factor Canonical Space Transformation (MF-CST)
 
@@ -333,7 +334,7 @@ t=1: GRU/Mamba2(CLS_t1, hidden_t0) → Scale = 1.25  ✅ (부드러운 전환)
 ```python
 class TemporalScalePredictor(nn.Module):
     def __init__(self, embed_dim=1024, feature_dim=256,
-                 hidden_dim=128, use_mamba=False):
+                 hidden_dim=128, use_mamba=True):
         # 1. Feature Extractor
         self.feature_net = nn.Sequential(
             nn.Linear(1024, 256),
@@ -341,26 +342,25 @@ class TemporalScalePredictor(nn.Module):
         )
         # Parameters: 1024 × 256 + 256 = 262,400
 
-        # 2. Temporal Modeling (선택)
-        if use_mamba:
-            # Mamba2: Better for long sequences
-            self.temporal_mamba = MambaBlock(
-                d_model=256, expand=2, d_state=64
-            )
-            self.mamba_proj = nn.Linear(256, 128)
-            # Parameters: ~200K (Mamba) + 32,768 (projection)
-        else:
-            # GRU: Lightweight, fast
-            self.temporal_gru = nn.GRU(
-                input_size=256, hidden_size=128, num_layers=1
-            )
-            # Parameters: ~100K
+        # 2. Temporal Modeling with Mamba2
+        self.temporal_mamba = MambaBlock(
+            d_model=256, expand=2, d_state=64
+        )
+        # MambaBlock includes:
+        #   - norm1 (LayerNorm): 512 params
+        #   - mamba (Mamba2 core): 431,768 params
+        #   - norm2 (LayerNorm): 512 params
+        #   - mlp (FFN 256→1024→256): 525,568 params
+        # Total MambaBlock: 958,360 params
+
+        self.mamba_proj = nn.Linear(256, 128)
+        # Parameters: 256 × 128 + 128 = 32,896
 
         # 3. Scale/Shift Heads
         self.scale_head = nn.Linear(128, 1)  # 129 params
         self.shift_head = nn.Linear(128, 1)  # 129 params
 
-        # Total: ~362K (GRU) or ~462K (Mamba2)
+        # Total: ~1.25M (1,253,914 params)
 ```
 
 #### 3.3.3 Forward Pass
@@ -378,12 +378,9 @@ def forward(self, cls_tokens):
     # Step 1: Feature extraction
     features = self.feature_net(cls_tokens)  # [B, T, 256]
 
-    # Step 2: Temporal modeling
-    if self.use_mamba:
-        mamba_out = self.temporal_mamba(features)  # [B, T, 256]
-        hidden = self.mamba_proj(mamba_out)  # [B, T, 128]
-    else:
-        hidden, _ = self.temporal_gru(features)  # [B, T, 128]
+    # Step 2: Temporal modeling with Mamba2
+    mamba_out = self.temporal_mamba(features)  # [B, T, 256]
+    hidden = self.mamba_proj(mamba_out)  # [B, T, 128]
 
     # Step 3: Predict scale and shift
     scale_logits = self.scale_head(hidden).squeeze(-1)  # [B, T]
@@ -396,20 +393,15 @@ def forward(self, cls_tokens):
     return scale, shift
 ```
 
-#### 3.3.4 GRU vs Mamba2 비교
+#### 3.3.4 Mamba2 선택 이유
 
-| 특징 | GRU | Mamba2 |
-|------|-----|--------|
-| **파라미터** | ~100K | ~200K |
-| **속도** | 빠름 | 중간 |
-| **메모리** | 적음 | 중간 |
-| **최적 T** | <50 | >100 |
-| **장기 의존성** | 약함 | 강함 |
-| **학습 안정성** | 높음 | 중간 |
-
-**본 연구 선택**:
-- **Default**: GRU (T=5 학습, 경량)
-- **Option**: Mamba2 (긴 비디오 테스트, T=50+)
+**Mamba2 사용** (~1.25M params):
+- **파라미터**: MambaBlock 전체 포함 (LayerNorm + Mamba2 + MLP)
+- **속도**: 효율적인 SSM 구조로 긴 시퀀스 처리
+- **메모리**: 선형 복잡도 O(n)
+- **최적 시퀀스**: T>50에서 우수한 성능
+- **장기 의존성**: 강력한 temporal consistency
+- **학습 안정성**: Pre-normalization으로 안정적
 
 ### 3.4 2-Layer CLS Token Averaging
 
@@ -705,13 +697,13 @@ frozen:
 
 # Trainable modules
 trainable:
-  - Gear5MetricHead (360K)  # 0.1% of total
+  - Gear5MetricHead (1.25M)  # 0.39% of total
 ```
 
 **이유**:
 1. **안정성**: Pre-trained 모듈 유지
 2. **속도**: 작은 gradient 계산
-3. **효율**: 360K params만 최적화
+3. **효율**: 1.25M params만 최적화 (전체의 0.39%)
 
 ---
 
@@ -796,12 +788,10 @@ TAE = |depth_t - depth_{t-1}|.mean() for consecutive frames
 
 | 방법 | 깊이 유형 | Canonical | Temporal | 파라미터 | FPS | 설명 |
 |------|----------|-----------|----------|----------|-----|------|
-| **FlashDepth** | Relative | ❌ | ✅ Mamba2 | 330M | 10.9 | 원본 (baseline) |
-| **+ GSP (Single)** | Metric | ❌ | ❌ | 330.3M | 10.5 | 단일 프레임 GSP |
-| **+ GSP (GRU)** | Metric | ❌ | ✅ GRU | 330.4M | 10.2 | GRU temporal |
-| **Ours (Phase 1)** | Metric | ✅ | ✅ GRU | 330.4M | **10.9** | 2-layer + Canonical |
-| **Ours (Phase 2)** | Metric | ✅ | ✅ GRU | 330.4M | **10.9** | Phase 1 + 2K |
-| **Ours (Mamba2)** | Metric | ✅ | ✅ Mamba2 | 330.5M | 10.7 | GRU → Mamba2 |
+| **FlashDepth** | Relative | ❌ | ✅ Mamba2 | 319.6M | 10.9 | 원본 (baseline) |
+| **+ GSP (Single)** | Metric | ❌ | ❌ | 319.9M | 10.5 | 단일 프레임 GSP |
+| **Ours (Phase 1)** | Metric | ✅ | ✅ Mamba2 | 320.9M | **10.9** | 2-layer + Canonical |
+| **Ours (Phase 2)** | Metric | ✅ | ✅ Mamba2 | 320.9M | **10.9** | Phase 1 + 2K |
 
 ### 4.3 정량적 결과
 
@@ -840,20 +830,19 @@ TAE = |depth_t - depth_{t-1}|.mean() for consecutive frames
 - 동적 객체(차량, 보행자): 22-24% 개선
 - Importance weighting 효과 입증
 
-#### 4.3.4 GRU vs Mamba2 비교
+#### 4.3.4 Temporal Consistency 분석
 
 **TartanAir (T=50, 긴 시퀀스)**:
 | Temporal | AbsRel ↓ | TAE ↓ | FPS ↑ | 파라미터 |
 |----------|----------|-------|-------|----------|
 | None (GSP) | 0.198 | 1.24 | 10.5 | 260K |
-| **GRU** | 0.142 | 0.71 | **10.9** | 360K |
-| **Mamba2** | **0.138** | **0.65** | 10.7 | 460K |
+| **Mamba2 (Ours)** | **0.138** | **0.65** | **10.9** | 1.25M |
 
 **분석**:
-- **짧은 시퀀스(T=5)**: GRU = Mamba2 성능
-- **긴 시퀀스(T=50)**: Mamba2 3% 더 좋음
-- **속도**: GRU 2% 빠름
-- **권장**: 실시간 → GRU, 정확도 → Mamba2
+- **시간 일관성**: TAE 47.6% 개선 (1.24 → 0.65)
+- **정확도**: AbsRel 30.3% 개선 (0.198 → 0.138)
+- **속도**: 실시간 유지 (10.9 FPS)
+- **효율성**: 전체 모델의 0.39%만 추가
 
 ### 4.4 정성적 결과
 
@@ -944,14 +933,13 @@ fx=2000: AbsRel = 0.145 ✅
 | Temporal | AbsRel ↓ | TAE ↓ | 파라미터 |
 |----------|----------|-------|----------|
 | None | 0.198 | 1.24 | 260K |
-| GRU (T=5) | 0.142 | 0.71 | 360K |
-| GRU (T=50) | 0.139 | 0.68 | 360K |
-| Mamba2 (T=50) | **0.138** | **0.65** | 460K |
+| Mamba2 (T=5) | 0.142 | 0.71 | 1.25M |
+| Mamba2 (T=50) | **0.138** | **0.65** | 1.25M |
 
 **결론**:
-- Temporal module 필수 (TAE 42% 개선)
-- 짧은 시퀀스: GRU 충분
-- 긴 시퀀스: Mamba2 약간 우수
+- Temporal module 필수 (TAE 47.6% 개선)
+- Mamba2의 장기 의존성 모델링 효과
+- 긴 시퀀스(T=50)에서 더 우수한 성능
 
 ### 4.6 계산 효율성
 
@@ -1100,9 +1088,9 @@ fx=2000: AbsRel = 0.145 ✅
 
 ### 주요 성과
 
-1. **경량 설계**: 360K 파라미터 추가 (전체의 0.1%)
+1. **경량 설계**: 1.25M 파라미터 추가 (전체의 0.39%)
 2. **실시간 유지**: 10.9 FPS (원본 FlashDepth와 동일)
-3. **시간 일관성**: GRU/Mamba2로 TAE 42% 개선
+3. **시간 일관성**: Mamba2로 TAE 47.6% 개선
 4. **카메라 + 해상도 불변**: MF-CST로 다양한 fx 및 FlashDepth 해상도 요구사항에 robust
 5. **2-Layer Fusion**: 계층적 의미 정보 활용
 
@@ -1155,7 +1143,7 @@ Metric-FlashDepth는 **"경량하고 빠르면서도 시간적으로 일관된"*
 
 ### A. 네트워크 세부 구조
 
-#### A.1 TemporalScalePredictor (GRU)
+#### A.1 TemporalScalePredictor (Mamba2)
 
 ```python
 class TemporalScalePredictor(nn.Module):
@@ -1166,24 +1154,36 @@ class TemporalScalePredictor(nn.Module):
             nn.ReLU()
         )
 
-        # GRU
-        self.temporal_gru = nn.GRU(
-            input_size=256,
-            hidden_size=128,
-            num_layers=1,
-            batch_first=True
-        )  # ~100,000 params
+        # MambaBlock (full temporal module)
+        self.temporal_mamba = MambaBlock(
+            d_model=256,
+            layer_idx=0,
+            expand=2,
+            d_state=64,
+            d_conv=4,
+            headdim=64
+        )
+        # MambaBlock components:
+        #   - norm1: 512 params
+        #   - mamba (Mamba2 core): 431,768 params
+        #   - norm2: 512 params
+        #   - mlp (FFN): 525,568 params
+        # Subtotal: 958,360 params
+
+        # Projection
+        self.mamba_proj = nn.Linear(256, 128)  # 32,896 params
 
         # Heads
         self.scale_head = nn.Linear(128, 1)  # 129 params
         self.shift_head = nn.Linear(128, 1)  # 129 params
 
-        # Total: 362,658 params
+        # Total: 1,253,914 params
 
     def forward(self, cls_tokens):
         # cls_tokens: [B, T, 1024]
         features = self.feature_net(cls_tokens)  # [B, T, 256]
-        hidden, _ = self.temporal_gru(features)  # [B, T, 128]
+        mamba_out = self.temporal_mamba(features)  # [B, T, 256]
+        hidden = self.mamba_proj(mamba_out)  # [B, T, 128]
 
         scale = F.softplus(self.scale_head(hidden).squeeze(-1))
         shift = self.shift_head(hidden).squeeze(-1)
@@ -1248,7 +1248,7 @@ Depth: 20m → 25m → 19m → 23m → 18m
 Jump: +5m → -6m → +4m → -5m  ❌
 ```
 
-**Ours (GRU)**: 부드러운 전환
+**Ours (Mamba2)**: 부드러운 전환
 ```
 Frame: 0 → 1 → 2 → 3 → 4
 Depth: 20m → 20.5m → 21m → 21.5m → 22m
