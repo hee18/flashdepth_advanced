@@ -25,7 +25,7 @@ import cv2
 from PIL import Image
 from einops import rearrange
 import hydra
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig, OmegaConf, ListConfig
 from tqdm import tqdm
 
 # Add project root to path
@@ -153,7 +153,7 @@ class Gear5Tester:
         model = FlashDepth(**model_config)
 
         # Add Gear5 metric head (unified single-stage)
-        embed_dim = 1024 if model.encoder == 'vitl' else 384
+        model_embed_dim = 1024 if model.encoder == 'vitl' else 384
 
         # Get use_mamba_temporal from config (matches train_gear5.py)
         use_mamba_temporal = self.config.model.get('use_mamba_temporal', False)
@@ -162,20 +162,71 @@ class Gear5Tester:
         else:
             logger.info("TemporalScalePredictor: Using GRU for temporal modeling")
 
+        # Determine GSP embed_dim based on tsp_mode (same logic as train_gear5.py)
+        tsp_mode = self.config.model.get('tsp_mode', 'auto')
+        if tsp_mode == 'l':
+            gsp_embed_dim = 1024
+            logger.info(f"TSP mode 'l': Using TSP-L with 1024-dim CLS tokens (forced)")
+        elif tsp_mode == 's':
+            gsp_embed_dim = 384
+            logger.info(f"TSP mode 's': Using TSP-S with 384-dim CLS tokens (forced)")
+        else:  # auto
+            gsp_embed_dim = model_embed_dim
+            logger.info(f"TSP mode 'auto': Using TSP with {gsp_embed_dim}-dim CLS tokens")
+
         model.gear5_metric_head = Gear5MetricHead(
-            embed_dim=embed_dim,
+            embed_dim=gsp_embed_dim,
             feature_dim=256,
             hidden_dim=128,
             use_mamba=use_mamba_temporal  # Support Mamba2 option
         )
 
-        # Enable attention weights storage for 2 layers (unified)
-        # ViT-L: [11, 23] (middle 2 DPT layers)
-        # ViT-S: [5, 11] (middle 2 DPT layers)
-        target_blocks = {
-            'vitl': [11, 23],
-            'vits': [5, 11]
-        }[model.encoder]
+        # Enable attention weights storage
+        # CLS layer selection: user can specify which intermediate layers to use (1-4)
+        # Default: [2, 4] (2nd and 4th intermediate layers)
+        #
+        # Mapping (1-indexed user input to 0-indexed intermediate_layer_idx):
+        #   ViT-L: intermediate_layer_idx = [4, 11, 17, 23]
+        #          Layer 1→block 4, Layer 2→block 11, Layer 3→block 17, Layer 4→block 23
+        #   ViT-S: intermediate_layer_idx = [2, 5, 8, 11]
+        #          Layer 1→block 2, Layer 2→block 5, Layer 3→block 8, Layer 4→block 11
+
+        # Get cls_layers from config (default: [2, 4])
+        cls_layers = self.config.get('cls_layers', [2, 4])
+
+        # Convert OmegaConf ListConfig to plain Python list if needed
+        if isinstance(cls_layers, ListConfig):
+            cls_layers = OmegaConf.to_container(cls_layers)
+
+        # Handle string input like '[2,4]' from command line
+        if isinstance(cls_layers, str):
+            # Remove brackets and split by comma
+            cls_layers = cls_layers.strip('[]').split(',')
+            cls_layers = [int(x.strip()) for x in cls_layers if x.strip()]
+
+        # Ensure it's a flat list of integers
+        if isinstance(cls_layers, (list, tuple)):
+            cls_layers = [int(x) for x in cls_layers]
+        else:
+            cls_layers = [int(cls_layers)]  # Single value case
+
+        # Validate cls_layers (must be 1-4)
+        for layer in cls_layers:
+            if layer < 1 or layer > 4:
+                raise ValueError(f"cls_layers must be between 1 and 4, got {layer}")
+
+        # Get intermediate_layer_idx for the encoder
+        intermediate_idx = model.intermediate_layer_idx[model.encoder]
+
+        # Convert user's 1-indexed layer numbers to actual block indices
+        # cls_layers=[4] → encoder_indices=[3] → target_blocks=[23] for ViT-L
+        # cls_layers=[2,4] → encoder_indices=[1,3] → target_blocks=[11,23] for ViT-L
+        encoder_indices = [layer - 1 for layer in cls_layers]  # Convert to 0-indexed
+        target_blocks = [intermediate_idx[idx] for idx in encoder_indices]
+
+        logger.info(f"CLS layer selection: user specified layers {cls_layers}")
+        logger.info(f"  → encoder_indices: {encoder_indices}")
+        logger.info(f"  → target_blocks: {target_blocks} (actual ViT block indices)")
 
         for i, block in enumerate(model.pretrained.blocks):
             if i in target_blocks:
@@ -184,16 +235,9 @@ class Gear5Tester:
             else:
                 block.attn.store_attn_weights = False
 
-        logger.info(f"2-layer attention storage: blocks {target_blocks}")
+        logger.info(f"{len(target_blocks)}-layer attention storage: blocks {target_blocks}")
 
-        # Store target blocks and compute encoder_features indices
-        # encoder_features from get_intermediate_layers returns features at intermediate_layer_idx
-        # For vitl: intermediate_layer_idx = [4, 11, 17, 23], target_blocks = [11, 23]
-        #           encoder_indices = [1, 3] (indices for layers 11 and 23)
-        # For vits: intermediate_layer_idx = [2, 5, 8, 11], target_blocks = [5, 11]
-        #           encoder_indices = [1, 3] (indices for layers 5 and 11)
-        intermediate_idx = model.intermediate_layer_idx[model.encoder]
-        encoder_indices = [intermediate_idx.index(block) for block in target_blocks]
+        # Store target blocks and encoder_indices for CLS token extraction
         self.encoder_indices = encoder_indices
         self.target_blocks = target_blocks
         logger.info(f"Encoder features indices: {encoder_indices} (for CLS token extraction)")
@@ -703,7 +747,8 @@ class Gear5Tester:
             logger.info(f"Results saved to {results_path}")
 
             # Reorder per-sequence results
-            metric_order = ['abs_rel', 'a1', 'a2', 'a3', 'fps', 'tae', 'boundary_f1', 'mae', 'rmse']
+            metric_order = ['abs_rel', 'a1', 'a2', 'a3', 'fps', 'tae', 'boundary_f1', 'mae', 'rmse',
+                            'tsp_scale_mean', 'tsp_shift_mean', 'tsp_scale_std', 'tsp_shift_std']
             reordered_metrics = []
             for result in all_metrics:
                 reordered = {}
@@ -1239,6 +1284,12 @@ class Gear5Tester:
 
         # Add FPS to metrics
         metrics['fps'] = fps
+
+        # Add TSP scale/shift statistics to metrics
+        metrics['tsp_scale_mean'] = float(scales.mean().item())
+        metrics['tsp_shift_mean'] = float(shifts.mean().item())
+        metrics['tsp_scale_std'] = float(scales.std().item())
+        metrics['tsp_shift_std'] = float(shifts.std().item())
 
         # Object-wise evaluation: compute per-class metrics for all frames
         # Initialize variables
@@ -2120,16 +2171,17 @@ class Gear5Tester:
         aggregated_raw = {}
 
         for key in metric_keys:
-            # Skip nested dictionaries (like object_wise metrics)
-            if key == 'object_wise':
+            # Skip nested dictionaries (like object_wise metrics) and non-aggregable keys
+            if key == 'object_wise' or key == 'sequence_id':
                 continue
 
             values = [m[key] for m in all_metrics if key in m]
             if values:
                 aggregated_raw[key] = np.mean(values)
 
-        # Reorder metrics: abs_rel, a1, a2, a3, fps, tae, f1, mae, rmse
-        metric_order = ['abs_rel', 'a1', 'a2', 'a3', 'fps', 'tae', 'boundary_f1', 'mae', 'rmse']
+        # Reorder metrics: abs_rel, a1, a2, a3, fps, tae, f1, mae, rmse, then TSP stats
+        metric_order = ['abs_rel', 'a1', 'a2', 'a3', 'fps', 'tae', 'boundary_f1', 'mae', 'rmse',
+                        'tsp_scale_mean', 'tsp_shift_mean', 'tsp_scale_std', 'tsp_shift_std']
         aggregated = {}
         for key in metric_order:
             if key in aggregated_raw:

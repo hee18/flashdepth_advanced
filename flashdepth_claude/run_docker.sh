@@ -83,6 +83,7 @@ show_usage() {
     echo "  --wandb-name NAME    Set WandB experiment name (default: auto-generated)"
     echo "  --mamba              Use Mamba2 instead of GRU for Gear5 TemporalScalePredictor (default: false/GRU)"
     echo "  --cls-layer LAYERS   Select CLS token extraction layers (1-4). Examples: '4' (single), '2,4' (default), '1,2,3,4' (all)"
+    echo "  --tsp-mode MODE      TSP embed_dim mode: auto (default), l (1024-dim), s (384-dim). Use 'l' to force TSP-L in hybrid mode"
     echo "  --seq N              Sequence selection (e.g., --seq 0,4 for sequences 0 and 4)"
     echo "  --limit-scenes N     For NuScenes, limit the number of scenes to process (e.g., 50)"
     echo "  --best-figure        Export best_frame ±4 frames (9 total) as individual images/depth maps"
@@ -159,6 +160,7 @@ WANDB="true"  # Enable WandB logging by default
 WANDB_NAME=""  # WandB experiment name (empty = auto-generated)
 MAMBA="false"  # Use Mamba2 for Gear5 TemporalScalePredictor (false=GRU, true=Mamba2)
 CLS_LAYERS="2,4"  # CLS token extraction layers (1-4): default is 2,4 (2nd and 4th intermediate layers)
+TSP_MODE="auto"  # TSP embed_dim mode: auto (Phase1→model dim, Phase2→Student dim), l (1024), s (384)
 SEQ=""  # Sequence selection for UnrealStereo4K (test_original_flashdepth)
 LIMIT_SCENES=""  # Limit number of scenes for NuScenes dataset (optional, e.g., 50)
 BEST_FIGURE="false"  # Export best_frame ±4 frames (9 total) as individual images/depth maps
@@ -279,6 +281,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --cls-layer)
             CLS_LAYERS="$2"
+            shift 2
+            ;;
+        --tsp-mode)
+            TSP_MODE="$2"
             shift 2
             ;;
         --seq)
@@ -1100,6 +1106,7 @@ case $COMMAND in
         echo "  - Loss type: $LOSS_TYPE"
         echo "  - Temporal backend: $([ "$MAMBA" = "true" ] && echo "Mamba2" || echo "GRU")"
         echo "  - CLS layers: $CLS_LAYERS"
+        echo "  - TSP mode: $TSP_MODE"
         echo ""
 
         # Build train_gear5 command with config variant
@@ -1112,6 +1119,7 @@ case $COMMAND in
             training.iterations=$TOTAL_ITERS \
             training.wandb=$WANDB \
             model.use_mamba_temporal=$MAMBA \
+            model.tsp_mode=$TSP_MODE \
             use_canonical_space=$USE_CANONICAL \
             loss_type=$LOSS_TYPE \
             +cls_layers='[$CLS_LAYERS]' \
@@ -1171,6 +1179,7 @@ case $COMMAND in
         echo "  - Loss type: $LOSS_TYPE"
         echo "  - Temporal backend: $([ "$MAMBA" = "true" ] && echo "Mamba2" || echo "GRU")"
         echo "  - CLS layers: $CLS_LAYERS"
+        echo "  - TSP mode: $TSP_MODE"
         echo ""
 
         DOCKER_CMD="CUDA_VISIBLE_DEVICES=0,1 docker compose run --rm \
@@ -1194,6 +1203,7 @@ case $COMMAND in
             training.measure_fps=$MEASURE_FPS \
             training.wandb=$WANDB \
             model.use_mamba_temporal=$MAMBA \
+            model.tsp_mode=$TSP_MODE \
             use_canonical_space=$USE_CANONICAL \
             loss_type=$LOSS_TYPE \
             +cls_layers='[$CLS_LAYERS]' \
@@ -1223,6 +1233,8 @@ case $COMMAND in
         echo "  - Config variant: $CONFIG_VARIANT"
         echo "  - Workers: $WORKERS"
         echo "  - Temporal backend: $([ "$MAMBA" = "true" ] && echo "Mamba2" || echo "GRU")"
+        echo "  - CLS layers: $CLS_LAYERS"
+        echo "  - TSP mode: $TSP_MODE"
         if [ "$OBJWISE_FLAG" == "true" ]; then
             echo "  - Object-wise evaluation: ENABLED"
         fi
@@ -1239,12 +1251,14 @@ case $COMMAND in
             --config-name config_$CONFIG_VARIANT \
             dataset.data_root=/data/datasets \
             model.use_mamba_temporal=$MAMBA \
+            model.tsp_mode=$TSP_MODE \
             training.workers=$WORKERS \
             +results_dir=$RESULTS_DIR \
             +gpu=$GPU_ID \
             +vid_len=$VID_LEN \
             +frame_interval=$FRAME_INTERVAL \
             +visualization=$VISUALIZATION \
+            +cls_layers='[$CLS_LAYERS]' \
             +config_dir=configs/gear5/$CONFIG_VARIANT"
 
         # Add --objwise flag if requested

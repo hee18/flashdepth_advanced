@@ -39,7 +39,7 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 )
 import logging
 import hydra
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig, OmegaConf, ListConfig
 import wandb
 from tqdm import tqdm
 import numpy as np
@@ -297,15 +297,24 @@ class Gear5Trainer:
         if use_mamba_temporal:
             self.logger.warning("NOTE: FlashDepth's original Mamba modules will be FROZEN. Only TemporalScalePredictor's Mamba2 is trainable.")
 
-        # Determine GSP embed_dim
-        # Phase 1: Use model's embed_dim (ViT-L=1024 or ViT-S=384)
-        # Phase 2 Hybrid: Use Student's embed_dim (384 for FlashDepth-hybrid)
-        #   Reason: Depth prediction is done by Student, so GSP should use Student's CLS tokens
-        gsp_embed_dim = embed_dim
-        if self.phase == 2:
-            self.logger.info(f"Phase 2 Hybrid: Using GSP with Student CLS tokens ({gsp_embed_dim}-dim)")
-        else:
-            self.logger.info(f"Phase 1: Using GSP with {gsp_embed_dim}-dim CLS tokens")
+        # Determine GSP embed_dim based on tsp_mode
+        # tsp_mode options:
+        #   - "auto": Phase 1→model's embed_dim, Phase 2→Student's embed_dim (default behavior)
+        #   - "l": Force TSP-L (1024-dim) regardless of phase
+        #   - "s": Force TSP-S (384-dim) regardless of phase
+        tsp_mode = self.config.model.get('tsp_mode', 'auto')
+        if tsp_mode == 'l':
+            gsp_embed_dim = 1024
+            self.logger.info(f"TSP mode 'l': Using TSP-L with 1024-dim CLS tokens (forced)")
+        elif tsp_mode == 's':
+            gsp_embed_dim = 384
+            self.logger.info(f"TSP mode 's': Using TSP-S with 384-dim CLS tokens (forced)")
+        else:  # auto
+            gsp_embed_dim = embed_dim
+            if self.phase == 2:
+                self.logger.info(f"TSP mode 'auto' (Phase 2 Hybrid): Using TSP with Student CLS tokens ({gsp_embed_dim}-dim)")
+            else:
+                self.logger.info(f"TSP mode 'auto' (Phase 1): Using TSP with {gsp_embed_dim}-dim CLS tokens")
 
         model.gear5_metric_head = Gear5MetricHead(
             embed_dim=gsp_embed_dim,
@@ -400,10 +409,16 @@ class Gear5Trainer:
 
         # Get cls_layers from config (default: [2, 4])
         cls_layers = self.config.get('cls_layers', [2, 4])
+
+        # Convert OmegaConf ListConfig to plain Python list
+        if isinstance(cls_layers, ListConfig):
+            cls_layers = OmegaConf.to_container(cls_layers)
+
+        # Ensure it's a flat list of integers
         if isinstance(cls_layers, (list, tuple)):
-            cls_layers = list(cls_layers)
+            cls_layers = [int(x) for x in cls_layers]
         else:
-            cls_layers = [cls_layers]  # Single value case
+            cls_layers = [int(cls_layers)]  # Single value case
 
         # Validate cls_layers (must be 1-4)
         for layer in cls_layers:

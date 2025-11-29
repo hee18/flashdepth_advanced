@@ -69,6 +69,10 @@ model:
   # The original FlashDepth Mamba modules (below) are ALWAYS frozen during Gear5 training.
   use_mamba_temporal: false  # false=GRU (fast for T<50), true=Mamba2 (better for T>100)
 
+  # TSP (Temporal Scale Predictor) embed_dim mode
+  # Options: "auto" (default), "l" (1024-dim), "s" (384-dim)
+  tsp_mode: "auto"
+
   # FlashDepth Mamba configuration (FROZEN during Gear5 training)
   use_mamba: true
   mamba_type: "add"

@@ -13,8 +13,8 @@ services:
       - TRITON_CACHE_DIR=/app/.triton_cache
       - TRITON_PRINT_AUTOTUNING=1
     volumes:
-      # Mount datasets directory
-      - /home/cvlab/hsy/Datasets:/data/datasets:ro
+      # Mount datasets directory (rw for fg_mask generation)
+      - /home/cvlab/hsy/Datasets:/data/datasets
       # Mount entire project directory for easy development
       - .:/app
       # Mount original FlashDepth directory for comparison
