@@ -23,13 +23,17 @@ import torch.nn.functional as F
 from pathlib import Path
 import logging
 
+# Import completed depth utilities for ETH3D/Waymo visualization
+from utils.completed_depth import load_completed_depth, has_completed_depth
+
 logger = logging.getLogger(__name__)
 
 
 def visualize_sequence_simplified(images, pred_depths, gt_depths, valid_mask,
                                    sequence_id, metrics, fps, save_dir,
                                    frame_interval=None, focal_lengths=None, config=None,
-                                   seg_masks=None, objwise_enabled=False, object_classes=None):
+                                   seg_masks=None, objwise_enabled=False, object_classes=None,
+                                   depth_paths=None, dataset_name=None):
     """
     Create simplified sequence visualization (3-row grid without importance maps)
 
@@ -48,6 +52,8 @@ def visualize_sequence_simplified(images, pred_depths, gt_depths, valid_mask,
         seg_masks: [T, H, W] - Optional segmentation masks for object-wise mode
         objwise_enabled: bool - Whether to overlay object masks
         object_classes: list - List of object class names (e.g., ['vehicle', 'pedestrian'])
+        depth_paths: list[str] - Optional list of GT depth file paths for completed depth loading
+        dataset_name: str - Dataset name (e.g., 'eth3d', 'waymo_seg') for completed depth
     """
     T = images.shape[0]
     frames_to_show = min(10, T)
@@ -129,12 +135,36 @@ def visualize_sequence_simplified(images, pred_depths, gt_depths, valid_mask,
         axes[1, col].set_title(f'Pred Depth')
         axes[1, col].axis('off')
 
-        # Row 2: GT metric depth
-        gt_display = np.where(gt_valid, gt, np.nan)
+        # Row 2: GT metric depth (use completed depth for ETH3D/Waymo visualization)
+        gt_for_display = gt  # Default to sparse GT
+        gt_display_title = 'GT Depth'
+
+        # Try to load completed depth for ETH3D/Waymo
+        if depth_paths is not None and dataset_name in ['eth3d', 'waymo_seg']:
+            try:
+                depth_path = depth_paths[t] if t < len(depth_paths) else None
+                if depth_path:
+                    H, W = gt.shape
+                    completed = load_completed_depth(depth_path, dataset_name, target_size=(H, W))
+                    if completed is not None:
+                        gt_for_display = completed.numpy()
+                        gt_display_title = 'GT Depth (completed)'
+            except Exception as e:
+                logger.debug(f"Could not load completed depth for frame {t}: {e}")
+
+        # Create display with handling for Waymo's no-LiDAR regions (-1)
+        if dataset_name == 'waymo_seg':
+            # For Waymo: show no-LiDAR regions as black
+            no_lidar_mask = gt_for_display < 0
+            valid_for_display = (gt_for_display > 0) & (gt_for_display < MAX_DEPTH)
+            gt_display = np.where(valid_for_display, gt_for_display, np.nan)
+        else:
+            gt_display = np.where((gt_for_display > 0) & (gt_for_display < MAX_DEPTH), gt_for_display, np.nan)
+
         cmap_gt = plt.cm.plasma_r.copy()
         cmap_gt.set_bad(color='black')
         axes[2, col].imshow(gt_display, cmap=cmap_gt, vmin=gt_vmin, vmax=gt_vmax)
-        axes[2, col].set_title(f'GT Depth')
+        axes[2, col].set_title(gt_display_title)
         axes[2, col].axis('off')
 
     # Add overall title with metrics (removed importance-related metrics)
@@ -166,7 +196,8 @@ def visualize_sequence_simplified(images, pred_depths, gt_depths, valid_mask,
 def visualize_best_frame_simplified(image, gt_depth, pred_depth, metrics,
                                      save_dir, sequence_id, frame_idx,
                                      dataset_name=None, focal_length=None,
-                                     seg_mask=None, objwise_enabled=False, object_classes=None, class_names_dict=None):
+                                     seg_mask=None, objwise_enabled=False, object_classes=None, class_names_dict=None,
+                                     gt_depth_path=None):
     """
     Save improved best frame visualization (3×3 grid with Valid/Object Mask and Depth Distribution)
 
@@ -177,7 +208,7 @@ def visualize_best_frame_simplified(image, gt_depth, pred_depth, metrics,
 
     Args:
         image: [3, H, W] or [H, W, 3] - RGB image
-        gt_depth: [H, W] - Ground truth metric depth
+        gt_depth: [H, W] - Ground truth metric depth (used for error/metrics calculation)
         pred_depth: [H, W] - Predicted metric depth
         metrics: dict - Pre-computed metrics dictionary
         save_dir: Path - Save directory
@@ -187,6 +218,7 @@ def visualize_best_frame_simplified(image, gt_depth, pred_depth, metrics,
         focal_length: float - Optional focal length
         seg_mask: [H, W] - Optional segmentation mask for object-wise visualization
         objwise_enabled: bool - Whether to show object mask instead of valid mask
+        gt_depth_path: str - Optional path to GT depth file for completed depth loading (ETH3D/Waymo)
     """
     # Convert tensors to numpy
     if isinstance(image, torch.Tensor):
@@ -220,21 +252,46 @@ def visualize_best_frame_simplified(image, gt_depth, pred_depth, metrics,
     ax_img.set_title('Input Image', fontsize=12, fontweight='bold', pad=8)
     ax_img.axis('off')
 
-    # Row 0, Col 1: GT Depth
+    # Row 0, Col 1: GT Depth (use completed depth for ETH3D/Waymo visualization)
     ax_gt = fig.add_subplot(gs[0, 1])
-    gt_valid = (gt_depth > 0) & (gt_depth < MAX_DEPTH)
-    gt_display = np.where(gt_valid, gt_depth, np.nan)
+    gt_valid = (gt_depth > 0) & (gt_depth < MAX_DEPTH)  # Keep original for error calculation
+
+    # Try to load completed depth for visualization
+    gt_for_display = gt_depth  # Default to sparse GT
+    gt_display_title = 'Ground Truth Depth (m)'
+
+    # Extract base dataset name (e.g., 'eth3d' from 'eth3d/pipes')
+    base_dataset = dataset_name.split('/')[0] if dataset_name else None
+
+    if gt_depth_path is not None and base_dataset in ['eth3d', 'waymo_seg']:
+        try:
+            H, W = gt_depth.shape
+            completed = load_completed_depth(gt_depth_path, base_dataset, target_size=(H, W))
+            if completed is not None:
+                gt_for_display = completed.numpy()
+                gt_display_title = 'GT Depth (completed)'
+        except Exception as e:
+            logger.debug(f"Could not load completed depth: {e}")
+
+    # Create display with handling for Waymo's no-LiDAR regions (-1)
+    if base_dataset == 'waymo_seg':
+        valid_for_display = (gt_for_display > 0) & (gt_for_display < MAX_DEPTH)
+        gt_display = np.where(valid_for_display, gt_for_display, np.nan)
+    else:
+        gt_display = np.where((gt_for_display > 0) & (gt_for_display < MAX_DEPTH), gt_for_display, np.nan)
 
     if gt_valid.sum() > 0:
-        gt_vmin = np.nanpercentile(gt_display, 2)
-        gt_vmax = np.nanpercentile(gt_display, 98)
+        # Use original sparse GT for vmin/vmax calculation
+        gt_sparse_display = np.where(gt_valid, gt_depth, np.nan)
+        gt_vmin = np.nanpercentile(gt_sparse_display, 2)
+        gt_vmax = np.nanpercentile(gt_sparse_display, 98)
     else:
         gt_vmin, gt_vmax = 0, 1
 
     cmap_gt = plt.cm.plasma_r.copy()
     cmap_gt.set_bad(color='black')
     im_gt = ax_gt.imshow(gt_display, cmap=cmap_gt, vmin=gt_vmin, vmax=gt_vmax)
-    ax_gt.set_title('Ground Truth Depth (m)', fontsize=12, fontweight='bold', pad=8)
+    ax_gt.set_title(gt_display_title, fontsize=12, fontweight='bold', pad=8)
     ax_gt.axis('off')
     plt.colorbar(im_gt, ax=ax_gt, fraction=0.046, pad=0.04)
 

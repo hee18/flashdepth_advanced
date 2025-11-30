@@ -795,7 +795,9 @@ class VideoComparisonTester:
                     frame_interval=self.frame_interval,  # Pass frame interval for visualization
                     seg_masks=seg_masks_for_viz,
                     objwise_enabled=self.object_wise_enabled,
-                    object_classes=self.object_wise_metrics.object_classes if self.object_wise_enabled else None
+                    object_classes=self.object_wise_metrics.object_classes if self.object_wise_enabled else None,
+                    depth_paths=depth_paths,  # For completed depth visualization (ETH3D/Waymo)
+                    dataset_name=dataset_name_lower  # e.g., 'eth3d', 'waymo_seg'
                 )
             else:
                 logger.info(f"Skipping sequence visualization for {dataset_name} (high resolution dataset)")
@@ -862,7 +864,8 @@ class VideoComparisonTester:
                 focal_length=frame_focal_length,
                 seg_mask=frame_seg_mask,
                 objwise_enabled=self.object_wise_metrics.object_classes if self.object_wise_enabled else None,
-                class_names_dict=self.object_wise_metrics.classes if self.object_wise_enabled else None
+                class_names_dict=self.object_wise_metrics.classes if self.object_wise_enabled else None,
+                gt_depth_path=depth_paths[best_frame_idx] if depth_paths and best_frame_idx < len(depth_paths) else None
             )
 
         # Export individual frames if --best-figure or --frame option is enabled
