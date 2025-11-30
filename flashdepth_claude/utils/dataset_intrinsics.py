@@ -152,6 +152,17 @@ DATASET_INTRINSICS = {
         'source': 'ETH3D dataset documentation (https://www.eth3d.net/documentation)',
         'notes': 'COLMAP format. cameras.txt: CAMERA_ID MODEL WIDTH HEIGHT fx fy cx cy. images.txt maps image names to camera IDs.'
     },
+
+    'bonn': {
+        'type': 'fixed',
+        'fx': 542.822841,
+        'fy': 542.576870,
+        'cx': 315.593520,
+        'cy': 237.756098,
+        'resolution': (640, 480),
+        'source': 'Bonn RGB-D Dynamic Dataset (https://www.ipb.uni-bonn.de/data/rgbd-dynamic-dataset/)',
+        'notes': 'Fixed camera intrinsics for all 26 sequences. Depth stored as uint16 PNG in millimeters.'
+    },
 }
 
 

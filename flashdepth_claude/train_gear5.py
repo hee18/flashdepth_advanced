@@ -1037,19 +1037,13 @@ class Gear5Trainer:
                 # encoder_features is a list of [B*T, N, C] tensors
 
             # Extract multi-layer CLS tokens for Gear5 (from target_blocks configured via cls_layers)
-            # target_blocks are absolute ViT block indices, need to map to encoder_features indices
-            target_blocks = self.config.model.target_blocks  # [11, 23] for ViT-L
-            intermediate_layers = model.intermediate_layer_idx[model.encoder]  # [4, 11, 17, 23] for ViT-L
-
-            # Map target_blocks to encoder_features indices
-            # e.g., target_blocks [11, 23] -> encoder_features indices [1, 3]
-            encoder_feature_indices = [intermediate_layers.index(block_idx) for block_idx in target_blocks]
-
+            # Use self.target_blocks (set in _setup_model based on --cls-layer argument)
+            # self.encoder_indices already maps to encoder_features indices
             # Get CLS tokens from target layers: encoder_features[i][:, 0] is CLS token
             cls_tokens_list = []
             attention_weights_list = []
 
-            for feat_idx, block_idx in zip(encoder_feature_indices, target_blocks):
+            for feat_idx, block_idx in zip(self.encoder_indices, self.target_blocks):
                 # CLS token: [B*T, embed_dim]
                 cls_token = encoder_features[feat_idx][:, 0]
                 cls_tokens_list.append(cls_token)

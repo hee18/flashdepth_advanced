@@ -8,7 +8,7 @@ fg_mask를 활용한 foreground-wise depth evaluation 구현 계획
 # fg_mask 생성 스크립트 실행
 python scripts/generate_fg_masks.py \
     --data-root /path/to/datasets \
-    --checkpoint configs/flashdepth-l/iter_43002.pth \
+    --checkpoint configs/flashdepth-l/iter_10001.pth \
     --datasets eth3d,sintel,waymo_seg,vkitti,unreal4k \
     --gpu 0
 ```

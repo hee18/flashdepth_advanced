@@ -99,7 +99,7 @@ eval:
   metrics: true
   save_grid: true
   outfolder: "test_gear5"
-  test_datasets: [sintel, waymo_seg, eth3d, urbansyn, unreal4k]  # All test datasets (not used in training)
+  test_datasets: [sintel, waymo_seg, eth3d, urbansyn, unreal4k, bonn]  # All test datasets (not used in training)
   test_dataset_resolution: 'base'
   random_input: null
   out_video: true
@@ -115,3 +115,8 @@ eval:
 object_wise:
   enabled: false  # Enable object-wise evaluation (set via CLI: object_wise.enabled=true)
   dataset: waymo_seg  # Dataset type for object-wise eval: waymo_seg, sintel
+
+# FG-wise (foreground-wise) evaluation configuration
+# Uses ViT attention-based fg_masks to evaluate depth accuracy separately for FG/BG regions
+fg_wise:
+  enabled: false  # Enable FG-wise evaluation (set via CLI: fg_wise.enabled=true)

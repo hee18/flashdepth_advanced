@@ -165,6 +165,7 @@ SEQ=""  # Sequence selection for UnrealStereo4K (test_original_flashdepth)
 LIMIT_SCENES=""  # Limit number of scenes for NuScenes dataset (optional, e.g., 50)
 BEST_FIGURE="false"  # Export best_frame ±4 frames (9 total) as individual images/depth maps
 FRAME=""  # Specific frame to export ±4 frames
+FGWISE_FLAG="false"  # Enable FG-wise (foreground-wise) evaluation using ViT attention masks
 
 # Parse arguments
 USER_BATCH_SIZE=""  # Track if user explicitly set batch size
@@ -233,6 +234,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --objwise)
             OBJWISE_FLAG="true"
+            shift
+            ;;
+        --fgwise)
+            FGWISE_FLAG="true"
             shift
             ;;
         --resolution)
@@ -1238,6 +1243,9 @@ case $COMMAND in
         if [ "$OBJWISE_FLAG" == "true" ]; then
             echo "  - Object-wise evaluation: ENABLED"
         fi
+        if [ "$FGWISE_FLAG" == "true" ]; then
+            echo "  - FG-wise evaluation: ENABLED"
+        fi
         if [ -n "$OBJWISE_DATASET" ]; then
             echo "  - Dataset: $OBJWISE_DATASET"
         else
@@ -1264,6 +1272,11 @@ case $COMMAND in
         # Add --objwise flag if requested
         if [ "$OBJWISE_FLAG" == "true" ]; then
             TEST_CMD="$TEST_CMD --objwise"
+        fi
+
+        # Add --fgwise flag if requested (use + prefix to add new config key)
+        if [ "$FGWISE_FLAG" == "true" ]; then
+            TEST_CMD="$TEST_CMD +fg_wise.enabled=true"
         fi
 
         # Add dataset override if specified

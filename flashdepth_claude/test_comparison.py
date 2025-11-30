@@ -39,6 +39,10 @@ from dataloaders.urbansyn_segmentation_dataset import UrbanSynSegmentationDatase
 from dataloaders.vkitti_segmentation_dataset import VKITTISegmentationDataset, collate_fn as vkitti_collate_fn
 from utils.metric_depth_metrics import MetricDepthMetrics, RelativeDepthMetrics
 from utils.object_wise_evaluation import ObjectWiseMetrics
+from utils.fgwise_evaluation import (
+    FGWiseMetrics, aggregate_fgwise_metrics,
+    save_fgwise_visualization, draw_fg_contours, create_depth_with_fg_overlay
+)
 from utils.comparison_visualization import visualize_sequence_simplified, visualize_best_frame_simplified
 
 # Setup logging
@@ -116,6 +120,15 @@ class ComparisonTester:
             if self.dataset_name == 'waymo_seg' and self.frame_interval is None:
                 self.frame_interval = 2
                 logger.info(f"Auto-setting frame_interval=2 for waymo_seg objwise mode")
+
+        # FG-wise evaluation setup
+        self.fgwise_enabled = config.get('fg_wise', {}).get('enabled', False)
+        if self.fgwise_enabled:
+            data_root = config.dataset.get('data_root', '/data/datasets')
+            logger.info(f"FG-wise evaluation ENABLED (data_root: {data_root})")
+            self.fgwise_data_root = data_root
+        else:
+            self.fgwise_data_root = None
 
         # Metrics calculators
         self.metrics = MetricDepthMetrics()
@@ -367,11 +380,15 @@ class ComparisonTester:
             intrinsics = batch.get('intrinsics', None)
             if intrinsics is not None:
                 intrinsics = intrinsics.to(self.device)  # [1, T, 4] - fx, fy, cx, cy
+
+            # Get depth file paths for completed depth loading (visualization)
+            depth_paths = batch.get('depth_paths', None)  # List[str] or None
         else:
             # Legacy CombinedDataset format (resized)
             images = batch['image'].to(self.device)  # [1, T, 3, H, W]
             gt_depths = batch['depth'].to(self.device)  # [1, T, H, W] - inverse depth!
             intrinsics = None
+            depth_paths = None  # Not available in legacy format
 
         # Ensure proper dimensions
         if images.ndim == 4:
@@ -730,6 +747,61 @@ class ComparisonTester:
             # Regular metrics already computed as fallback
             logger.info(f"Object-wise mode enabled but no segmentations available - using regular metrics")
 
+        # FG-wise evaluation: compute metrics separately for FG/BG regions
+        if self.fgwise_enabled and 'image_paths' in batch:
+            try:
+                dataset_name = batch.get('dataset_name', [''])[0] if isinstance(batch.get('dataset_name'), list) else batch.get('dataset_name', '')
+                fgwise_metrics_calc = FGWiseMetrics(self.fgwise_data_root, dataset_name)
+
+                fgwise_metrics_list = []
+                image_paths = batch['image_paths'][0]  # batch size is 1
+                T_fg = min(len(image_paths), pred_depths.shape[0])
+
+                for t in range(T_fg):
+                    pred_frame = pred_depths[t, 0].cpu().numpy() if isinstance(pred_depths, torch.Tensor) else pred_depths[t, 0]
+                    gt_frame = gt_depths[t, 0].cpu().numpy() if isinstance(gt_depths, torch.Tensor) else gt_depths[t, 0]
+
+                    # Extract scene and frame from image path
+                    image_path = image_paths[t]
+                    scene, frame = self._extract_scene_frame_for_fgwise(image_path, dataset_name)
+
+                    if scene and frame:
+                        # Create valid mask with 70m limit (consistent with regular metrics)
+                        gt_valid_mask = (gt_frame > 0) & (gt_frame < MAX_DEPTH)
+                        pred_valid_mask = (pred_frame > 0) & (pred_frame < MAX_DEPTH)
+                        valid_mask_fgwise = gt_valid_mask & pred_valid_mask
+
+                        frame_fgwise = fgwise_metrics_calc.compute_frame_metrics(
+                            pred_depth=pred_frame,
+                            gt_depth=gt_frame,
+                            scene=scene,
+                            frame=frame,
+                            valid_mask=valid_mask_fgwise,
+                            min_pixels=100
+                        )
+                        if frame_fgwise:
+                            fgwise_metrics_list.append(frame_fgwise)
+
+                # Aggregate FG-wise metrics across frames
+                if fgwise_metrics_list:
+                    aggregated_fgwise = aggregate_fgwise_metrics(fgwise_metrics_list)
+                    metrics['fg_wise'] = aggregated_fgwise
+                    fg_abs_rel = aggregated_fgwise.get('fg_abs_rel', float('nan'))
+                    bg_abs_rel = aggregated_fgwise.get('bg_abs_rel', float('nan'))
+                    logger.info(f"FG-wise metrics: FG AbsRel={fg_abs_rel:.4f}, BG AbsRel={bg_abs_rel:.4f}")
+                else:
+                    logger.warning(f"No FG masks found for dataset '{dataset_name}'")
+                    metrics['fg_wise'] = {}
+
+                # Clear cache
+                fgwise_metrics_calc.clear_cache()
+
+            except Exception as e:
+                logger.error(f"Error computing FG-wise metrics: {e}")
+                import traceback
+                traceback.print_exc()
+                metrics['fg_wise'] = {}
+
         # Visualize sequence (simplified version without importance maps)
         # Skip for ETH3D due to very high resolution (6205x4135) making this too slow
         if self.enable_visualization:
@@ -858,7 +930,8 @@ class ComparisonTester:
                 gt_depth_processed[0],  # [T, 1, H, W]
                 best_frame_idx=export_frame_idx,
                 sequence_id=sequence_id,
-                dataset_name=dataset_name
+                dataset_name=dataset_name,
+                depth_paths=depth_paths  # For completed depth visualization
             )
 
         return metrics
@@ -969,10 +1042,50 @@ class ComparisonTester:
                 )
                 logger.info(f"Object-wise results saved to {object_wise_path}")
 
-    def _export_figure_frames(self, images, pred_depths, gt_depths, best_frame_idx, sequence_id, dataset_name):
+        # Aggregate and save FG-wise metrics
+        if self.fgwise_enabled:
+            all_fgwise_metrics = [r['fg_wise'] for r in self.all_results if 'fg_wise' in r and r['fg_wise']]
+
+            if all_fgwise_metrics:
+                logger.info("\n" + "="*80)
+                logger.info("FG-WISE EVALUATION RESULTS")
+                logger.info("="*80)
+
+                # Aggregate FG-wise metrics across all sequences
+                aggregated_fgwise = aggregate_fgwise_metrics(all_fgwise_metrics)
+
+                # Print summary
+                fg_abs_rel = aggregated_fgwise.get('fg_abs_rel', float('nan'))
+                bg_abs_rel = aggregated_fgwise.get('bg_abs_rel', float('nan'))
+                fg_a1 = aggregated_fgwise.get('fg_a1', float('nan'))
+                bg_a1 = aggregated_fgwise.get('bg_a1', float('nan'))
+                fg_pixels = aggregated_fgwise.get('fg_num_pixels', 0)
+                bg_pixels = aggregated_fgwise.get('bg_num_pixels', 0)
+
+                logger.info(f"Foreground (FG) metrics:")
+                logger.info(f"  AbsRel: {fg_abs_rel:.4f}")
+                logger.info(f"  δ1: {fg_a1:.4f}")
+                logger.info(f"  Pixels: {fg_pixels:,}")
+                logger.info(f"Background (BG) metrics:")
+                logger.info(f"  AbsRel: {bg_abs_rel:.4f}")
+                logger.info(f"  δ1: {bg_a1:.4f}")
+                logger.info(f"  Pixels: {bg_pixels:,}")
+
+                if 'fg_bg_absrel_ratio' in aggregated_fgwise:
+                    logger.info(f"FG/BG AbsRel ratio: {aggregated_fgwise['fg_bg_absrel_ratio']:.4f}")
+
+                # Save to JSON
+                fgwise_path = self.save_dir / "fgwise_results.json"
+                with open(fgwise_path, 'w') as f:
+                    json.dump(aggregated_fgwise, f, indent=2)
+                logger.info(f"FG-wise results saved to {fgwise_path}")
+
+    def _export_figure_frames(self, images, pred_depths, gt_depths, best_frame_idx, sequence_id, dataset_name, depth_paths=None):
         """
         Export individual frames around best_frame (±4 frames, total 9 frames).
         Saves: original image, GT depth (colormap), pred depth (colormap)
+
+        For ETH3D and Waymo datasets, uses completed depth maps for visualization instead of sparse GT.
 
         Args:
             images: [T, 3, H, W] tensor
@@ -980,7 +1093,8 @@ class ComparisonTester:
             gt_depths: [T, 1, H, W] tensor in meters
             best_frame_idx: int, index of best frame
             sequence_id: int, sequence identifier
-            dataset_name: str, name of dataset
+            dataset_name: str, name of dataset (e.g., 'eth3d/pipes', 'waymo_seg/segment-xxx')
+            depth_paths: List[str] or None, paths to depth files for completed depth loading
         """
         import cv2
         import matplotlib.pyplot as plt
@@ -1008,17 +1122,30 @@ class ComparisonTester:
         figures_dir = self.save_dir / "figures" / f"seq{sequence_id:04d}"
         figures_dir.mkdir(parents=True, exist_ok=True)
 
+        # Check if completed depth is available for this dataset
+        # Extract base dataset name (e.g., 'eth3d' from 'eth3d/pipes')
+        base_dataset = dataset_name.split('/')[0] if '/' in dataset_name else dataset_name
+        use_completed_depth = base_dataset in ['eth3d', 'waymo_seg'] and depth_paths is not None
+
+        if use_completed_depth:
+            try:
+                from utils.completed_depth import load_completed_depth, depth_to_colormap
+                logger.info(f"Using completed depth for {base_dataset} visualization")
+            except ImportError:
+                logger.warning("Could not import completed_depth module, using sparse GT")
+                use_completed_depth = False
+
         for t in frame_indices:
             # 1. Save original image
             img = images[t].cpu().numpy()  # [3, H, W]
-            
+
             # Check if ImageNet normalized (value range check)
             if img.min() < -2.0 or img.max() > 2.0:
                 # ImageNet normalized - unnormalize first
                 mean = np.array([0.485, 0.456, 0.406]).reshape(3, 1, 1)
                 std = np.array([0.229, 0.224, 0.225]).reshape(3, 1, 1)
                 img = img * std + mean  # Unnormalize to [0, 1]
-            
+
             img = np.transpose(img, (1, 2, 0))  # [H, W, 3]
             img = np.clip(img, 0, 1)  # Ensure [0, 1] range
             img = (img * 255).astype(np.uint8)
@@ -1027,27 +1154,160 @@ class ComparisonTester:
             cv2.imwrite(str(img_path), img)
 
             # 2. Save GT depth (colormap)
-            gt_depth = gt_depths[t, 0].cpu().numpy()  # [H, W] in meters
-            # Get GT range for consistent normalization
-            gt_depth_vis = self._depth_to_colormap(gt_depth)
+            # For ETH3D/Waymo, try to use completed depth for visualization
+            gt_depth_sparse = gt_depths[t, 0].cpu().numpy()  # [H, W] in meters (sparse)
+            target_size = (gt_depth_sparse.shape[0], gt_depth_sparse.shape[1])
+
+            completed_depth_loaded = False
+            if use_completed_depth and t < len(depth_paths):
+                completed_depth = load_completed_depth(
+                    depth_paths[t], base_dataset, target_size=target_size
+                )
+                if completed_depth is not None:
+                    completed_depth_np = completed_depth.numpy()
+                    # Use completed depth for visualization
+                    gt_depth_vis = depth_to_colormap(completed_depth_np)
+                    gt_depth_vis = cv2.cvtColor(gt_depth_vis, cv2.COLOR_RGB2BGR)  # RGB to BGR
+                    completed_depth_loaded = True
+
+                    # Get vmin/vmax from completed depth for pred normalization
+                    # For Waymo, exclude -1 regions (no LiDAR coverage)
+                    if base_dataset == 'waymo_seg':
+                        valid_mask = (completed_depth_np > 0) & np.isfinite(completed_depth_np)
+                    else:
+                        valid_mask = np.isfinite(completed_depth_np) & (completed_depth_np > 0)
+
+                    if valid_mask.any():
+                        gt_vmin = np.nanpercentile(completed_depth_np[valid_mask], 2)
+                        gt_vmax = np.nanpercentile(completed_depth_np[valid_mask], 98)
+                    else:
+                        gt_vmin, gt_vmax = None, None
+
+            if not completed_depth_loaded:
+                # Fallback to sparse GT depth
+                gt_depth_vis = self._depth_to_colormap(gt_depth_sparse)
+
+                # Get vmin/vmax from GT for pred normalization
+                gt_valid_mask = np.isfinite(gt_depth_sparse) & (gt_depth_sparse > 0)
+                if gt_valid_mask.any():
+                    gt_vmin = np.nanpercentile(gt_depth_sparse[gt_valid_mask], 2)
+                    gt_vmax = np.nanpercentile(gt_depth_sparse[gt_valid_mask], 98)
+                else:
+                    gt_vmin, gt_vmax = None, None
+
             gt_path = figures_dir / f"frame_{t:04d}_gt_depth.png"
             cv2.imwrite(str(gt_path), gt_depth_vis)
-            
-            # Get vmin/vmax from GT for pred normalization
-            gt_valid_mask = np.isfinite(gt_depth) & (gt_depth > 0)
-            if gt_valid_mask.any():
-                gt_vmin = np.nanpercentile(gt_depth[gt_valid_mask], 2)
-                gt_vmax = np.nanpercentile(gt_depth[gt_valid_mask], 98)
-            else:
-                gt_vmin, gt_vmax = None, None
 
-            # 3. Save pred depth (colormap) - use GT range and GT valid mask for comparison
+            # 3. Save pred depth (colormap) - use GT range for comparison
             pred_depth = pred_depths[t, 0].cpu().numpy()  # [H, W] in meters
+
+            # Use external mask from sparse GT for pred visualization (shows same valid region)
+            gt_valid_mask = np.isfinite(gt_depth_sparse) & (gt_depth_sparse > 0)
             pred_depth_vis = self._depth_to_colormap(pred_depth, vmin=gt_vmin, vmax=gt_vmax, external_mask=gt_valid_mask)
             pred_path = figures_dir / f"frame_{t:04d}_pred_depth.png"
             cv2.imwrite(str(pred_path), pred_depth_vis)
 
-        logger.info(f"Exported {len(frame_indices)} frames × 3 types = {len(frame_indices) * 3} images to {figures_dir}")
+        completed_info = " (using completed depth)" if use_completed_depth else ""
+        logger.info(f"Exported {len(frame_indices)} frames × 3 types = {len(frame_indices) * 3} images to {figures_dir}{completed_info}")
+
+    def _extract_scene_frame_for_fgwise(self, image_path: str, dataset_name: str):
+        """
+        Extract scene and frame identifiers from image path for FG-wise evaluation.
+
+        Each dataset has different path structure, so we need dataset-specific parsing.
+
+        Args:
+            image_path: Full path to the image file
+            dataset_name: Name of the dataset (e.g., 'sintel', 'waymo_seg', 'bonn')
+                          Can include scene path like 'waymo_seg/segment-xxx'
+
+        Returns:
+            Tuple (scene, frame) or (None, None) if parsing fails
+        """
+        import os
+        try:
+            parts = image_path.replace('\\', '/').split('/')
+            # Extract base dataset name (e.g., 'waymo_seg/segment-xxx' -> 'waymo_seg')
+            base_dataset_name = dataset_name.lower().split('/')[0]
+
+            if base_dataset_name == 'eth3d':
+                scene_idx = parts.index('eth3d') + 1 if 'eth3d' in parts else -1
+                if scene_idx > 0 and scene_idx < len(parts):
+                    scene = parts[scene_idx]
+                    frame = os.path.splitext(parts[-1])[0]
+                    return scene, frame
+
+            elif base_dataset_name == 'sintel':
+                if 'clean' in parts:
+                    clean_idx = parts.index('clean')
+                    if clean_idx + 2 < len(parts):
+                        scene = parts[clean_idx + 1]
+                        frame = os.path.splitext(parts[-1])[0]
+                        return scene, frame
+
+            elif base_dataset_name == 'waymo_seg':
+                if 'FRONT' in parts:
+                    front_idx = parts.index('FRONT')
+                    if front_idx >= 2:
+                        segment = parts[front_idx - 1]
+                        frame = os.path.splitext(parts[-1])[0]
+                        return segment, frame
+
+            elif base_dataset_name == 'vkitti':
+                if 'vkitti' in parts and 'rgb' in parts[-1]:
+                    vkitti_idx = parts.index('vkitti')
+                    if vkitti_idx + 1 < len(parts):
+                        scene = parts[vkitti_idx + 1]
+                        filename = os.path.splitext(parts[-1])[0]
+                        if filename.startswith('rgb_'):
+                            frame = filename[4:]
+                            return scene, frame
+
+            elif base_dataset_name == 'unreal4k':
+                for part in parts:
+                    if part.startswith('UnrealStereo4K_'):
+                        scene = part.replace('UnrealStereo4K_', '')
+                        frame = os.path.splitext(parts[-1])[0]
+                        return scene, frame
+
+            elif base_dataset_name == 'urbansyn':
+                if 'urbansyn' in parts and 'rgb' in parts:
+                    urbansyn_idx = parts.index('urbansyn')
+                    rgb_idx = parts.index('rgb')
+                    if urbansyn_idx + 1 == rgb_idx - 1:
+                        scene = parts[urbansyn_idx + 1]
+                        frame = os.path.splitext(parts[-1])[0]
+                        return scene, frame
+
+            elif base_dataset_name == 'tartanair':
+                if 'tartanair' in parts and 'image_left' in parts:
+                    tartanair_idx = parts.index('tartanair')
+                    if tartanair_idx + 1 < len(parts):
+                        scene = parts[tartanair_idx + 1]
+                        filename = os.path.splitext(parts[-1])[0]
+                        if filename.endswith('_left'):
+                            frame = filename[:-5]
+                        else:
+                            frame = filename
+                        return scene, frame
+
+            elif base_dataset_name == 'bonn':
+                for part in parts:
+                    if part.startswith('rgbd_bonn_'):
+                        scene = part
+                        frame = os.path.splitext(parts[-1])[0]
+                        return scene, frame
+
+            # Generic fallback
+            if len(parts) >= 2:
+                scene = parts[-2]
+                frame = os.path.splitext(parts[-1])[0]
+                return scene, frame
+
+        except Exception as e:
+            logger.warning(f"Failed to extract scene/frame from {image_path}: {e}")
+
+        return None, None
 
     def _depth_to_colormap(self, depth, vmin=None, vmax=None, percentile_range=(2, 98), external_mask=None):
         """

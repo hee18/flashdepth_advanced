@@ -49,6 +49,8 @@ class BaseDatasetPairs(Dataset):
             from .nuscenes_dataset import NuScenesDepth as DepthDataset
         elif dataset_name.lower() == 'vkitti':
             from .vkitti_dataset import VKITTIDepth as DepthDataset
+        elif dataset_name.lower() == 'bonn':
+            from .bonn_dataset import BonnDepth as DepthDataset
         else:
             raise ValueError(f"Unknown dataset: {dataset_name}")
 

@@ -264,9 +264,112 @@ class ComparisonDataset(Dataset):
         return []
 
     def _build_bonn_sequences(self):
-        """Build Bonn sequences (placeholder)"""
-        logger.warning("Bonn dataset not yet implemented")
-        return []
+        """
+        Build Bonn RGB-D Dynamic sequences
+
+        Structure:
+        bonn/
+            rgbd_bonn_balloon/
+                rgb/
+                    1548266469.85281.png
+                    ...
+                depth/
+                    1548266469.88217.png
+                    ...
+                rgb.txt
+                depth.txt
+            rgbd_bonn_crowd/
+                ...
+
+        Returns:
+            list: List of sequence dicts with frames
+        """
+        sequences = []
+        bonn_root = os.path.join(self.data_root, 'bonn')
+
+        if not os.path.exists(bonn_root):
+            logger.warning(f"Bonn root not found: {bonn_root}")
+            return sequences
+
+        # Get all sequence directories
+        seq_dirs = sorted([d for d in os.listdir(bonn_root)
+                          if os.path.isdir(os.path.join(bonn_root, d)) and d.startswith('rgbd_bonn_')])
+
+        for seq_name in seq_dirs:
+            seq_path = os.path.join(bonn_root, seq_name)
+            rgb_dir = os.path.join(seq_path, 'rgb')
+            depth_dir = os.path.join(seq_path, 'depth')
+            rgb_txt = os.path.join(seq_path, 'rgb.txt')
+            depth_txt = os.path.join(seq_path, 'depth.txt')
+
+            if not all(os.path.exists(p) for p in [rgb_dir, depth_dir, rgb_txt, depth_txt]):
+                logger.warning(f"Incomplete Bonn sequence: {seq_name}")
+                continue
+
+            # Parse timestamp files
+            rgb_entries = self._parse_bonn_timestamp_file(rgb_txt)
+            depth_entries = self._parse_bonn_timestamp_file(depth_txt)
+
+            if not rgb_entries or not depth_entries:
+                continue
+
+            # Match RGB and depth frames by timestamp
+            frames = []
+            depth_idx = 0
+
+            for rgb_ts, rgb_file in rgb_entries:
+                # Find closest depth timestamp
+                best_depth_idx = depth_idx
+                best_diff = abs(depth_entries[depth_idx][0] - rgb_ts)
+
+                while depth_idx < len(depth_entries) - 1:
+                    diff = abs(depth_entries[depth_idx + 1][0] - rgb_ts)
+                    if diff < best_diff:
+                        best_diff = diff
+                        best_depth_idx = depth_idx + 1
+                        depth_idx += 1
+                    else:
+                        break
+
+                # Only match if time difference is reasonable (< 50ms)
+                if best_diff < 0.05:
+                    rgb_path = os.path.join(rgb_dir, os.path.basename(rgb_file))
+                    depth_path = os.path.join(depth_dir, os.path.basename(depth_entries[best_depth_idx][1]))
+
+                    if os.path.exists(rgb_path) and os.path.exists(depth_path):
+                        frames.append({
+                            'rgb': rgb_path,
+                            'depth': depth_path,
+                            'timestamp': rgb_ts
+                        })
+
+            if len(frames) > 0:
+                sequences.append({
+                    'name': seq_name,
+                    'frames': frames
+                })
+                logger.info(f"Bonn: {seq_name} - {len(frames)} frames")
+
+        logger.info(f"Built {len(sequences)} Bonn sequences")
+        return sequences
+
+    def _parse_bonn_timestamp_file(self, txt_path):
+        """Parse Bonn rgb.txt or depth.txt file."""
+        entries = []
+        try:
+            with open(txt_path, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        timestamp = float(parts[0])
+                        filename = parts[1]
+                        entries.append((timestamp, filename))
+        except Exception as e:
+            logger.warning(f"Error parsing {txt_path}: {e}")
+        return sorted(entries, key=lambda x: x[0])
 
     def _build_nyu_sequences(self):
         """
@@ -644,6 +747,7 @@ class ComparisonDataset(Dataset):
 
         images = []
         depths = []
+        depth_paths = []  # Track depth file paths for completed depth loading
         intrinsics_list = []
         segmentations = [] if self.objwise_enabled else None
 
@@ -666,6 +770,7 @@ class ComparisonDataset(Dataset):
                 frame_data = {
                     'image': image,
                     'depth': depth,
+                    'depth_path': frame['depth'],  # Original depth file path
                     'intrinsics': intrinsics
                 }
 
@@ -748,6 +853,7 @@ class ComparisonDataset(Dataset):
 
             images.append(image)
             depths.append(depth)
+            depth_paths.append(frame_data['depth_path'])  # Collect depth file paths
             intrinsics_list.append(intrinsics)
 
             if seg is not None:
@@ -764,6 +870,7 @@ class ComparisonDataset(Dataset):
         batch = {
             'images': torch.stack(images),  # [T, 3, H, W]
             'depths': torch.stack(depths),  # [T, H, W]
+            'depth_paths': depth_paths,  # List[str] - depth file paths for completed depth loading
             'intrinsics': intrinsics_tensor,  # [T, 4]
             'focal_lengths': focal_lengths_actual,  # [T] - actual fx for compatibility
             'focal_lengths_actual': focal_lengths_actual,  # [T] - actual fx
@@ -805,6 +912,8 @@ class ComparisonDataset(Dataset):
             return self._load_sintel_depth(path)
         elif self.dataset_name == 'nyu':
             return self._load_nyu_depth(path)
+        elif self.dataset_name == 'bonn':
+            return self._load_bonn_depth(path)
         elif self.dataset_name == 'vkitti':
             return self._load_vkitti_depth(path)
         elif self.dataset_name == 'waymo_seg':
@@ -867,6 +976,31 @@ class ComparisonDataset(Dataset):
         depth_meters = depth_mm.astype(np.float32) / 1000.0
 
         # Handle invalid values
+        invalid_mask = (depth_meters <= 0) | np.isinf(depth_meters) | np.isnan(depth_meters)
+        depth_meters[invalid_mask] = 0
+
+        return torch.from_numpy(depth_meters).float()  # [H, W] in meters
+
+    def _load_bonn_depth(self, path):
+        """
+        Load Bonn RGB-D depth (uint16 PNG)
+
+        Bonn depth is stored as uint16 PNG in millimeters.
+        Convert to meters for metric depth evaluation.
+
+        Returns:
+            torch.Tensor: Depth in meters [H, W]
+        """
+        # Load uint16 depth in millimeters
+        depth_mm = cv2.imread(path, cv2.IMREAD_ANYDEPTH)
+
+        if depth_mm is None:
+            raise ValueError(f"Failed to load Bonn depth from {path}")
+
+        # Convert millimeters to meters
+        depth_meters = depth_mm.astype(np.float32) / 1000.0
+
+        # Handle invalid values (depth == 0 means no measurement)
         invalid_mask = (depth_meters <= 0) | np.isinf(depth_meters) | np.isnan(depth_meters)
         depth_meters[invalid_mask] = 0
 
@@ -1121,6 +1255,8 @@ class ComparisonDataset(Dataset):
             return self._load_eth3d_intrinsics(frame_info)
         elif self.dataset_name == 'nyu':
             return self._load_nyu_intrinsics(frame_info)
+        elif self.dataset_name == 'bonn':
+            return self._load_bonn_intrinsics(frame_info)
         elif self.dataset_name == 'vkitti':
             return self._load_vkitti_intrinsics(frame_info)
         elif self.dataset_name in ['unrealstereo4k', 'unreal4k']:
@@ -1139,42 +1275,81 @@ class ComparisonDataset(Dataset):
 
     def _load_eth3d_intrinsics(self, frame_info):
         """
-        Load ETH3D camera intrinsics from cameras.txt
+        Load ETH3D camera intrinsics from cameras.txt, matching image to camera via images.txt
 
-        Format: CAMERA_ID MODEL WIDTH HEIGHT fx fy cx cy
+        ETH3D has multiple cameras per scene. Each image is associated with a specific camera.
+        - cameras.txt format: CAMERA_ID MODEL WIDTH HEIGHT fx fy cx cy
+        - images.txt format: IMAGE_ID QW QX QY QZ TX TY TZ CAMERA_ID NAME
         """
         cameras_file = frame_info['cameras_file']
-        img_name = frame_info['img_name']
+        img_name = frame_info['img_name']  # e.g., 'DSC_0457.JPG'
+
+        # Default intrinsics for ETH3D 6048x4032
+        default_intrinsics = torch.tensor([4251.0, 4251.0, 3024.0, 2016.0])
 
         if not os.path.exists(cameras_file):
             logger.warning(f"Cameras file not found: {cameras_file}")
-            # ETH3D default intrinsics for 6048x4032
-            return torch.tensor([4251.0, 4251.0, 3024.0, 2016.0])
+            return default_intrinsics
+
+        # images.txt is in the same directory as cameras.txt
+        images_file = os.path.join(os.path.dirname(cameras_file), 'images.txt')
 
         try:
+            # Step 1: Load all cameras from cameras.txt
+            cameras = {}  # {camera_id: [fx, fy, cx, cy]}
             with open(cameras_file, 'r') as f:
                 for line in f:
                     line = line.strip()
                     if line.startswith('#') or not line:
                         continue
-
                     parts = line.split()
                     if len(parts) >= 8:
                         # CAMERA_ID MODEL WIDTH HEIGHT fx fy cx cy
+                        camera_id = int(parts[0])
                         fx = float(parts[4])
                         fy = float(parts[5])
                         cx = float(parts[6])
                         cy = float(parts[7])
+                        cameras[camera_id] = [fx, fy, cx, cy]
 
-                        return torch.tensor([fx, fy, cx, cy])
+            if not cameras:
+                logger.warning(f"No cameras found in {cameras_file}")
+                return default_intrinsics
 
-            # If no matching camera found, use default
-            logger.warning(f"No intrinsics found in {cameras_file}, using default")
-            return torch.tensor([4251.0, 4251.0, 3024.0, 2016.0])
+            # Step 2: Find camera_id for this image from images.txt
+            camera_id_for_image = None
+            if os.path.exists(images_file):
+                with open(images_file, 'r') as f:
+                    for line in f:
+                        line = line.strip()
+                        if line.startswith('#') or not line:
+                            continue
+                        parts = line.split()
+                        # images.txt format: IMAGE_ID QW QX QY QZ TX TY TZ CAMERA_ID NAME
+                        # NAME is the last field and may contain path like 'dslr_images_undistorted/DSC_0457.JPG'
+                        if len(parts) >= 10:
+                            camera_id = int(parts[8])
+                            image_path = parts[9]
+                            # Extract just the filename from the path
+                            image_filename = os.path.basename(image_path)
+                            if image_filename == img_name:
+                                camera_id_for_image = camera_id
+                                break
+
+            # Step 3: Return matching intrinsics
+            if camera_id_for_image is not None and camera_id_for_image in cameras:
+                intrinsics = cameras[camera_id_for_image]
+                return torch.tensor(intrinsics)
+            else:
+                # Fallback: use first camera if no match found
+                first_camera_id = list(cameras.keys())[0]
+                if camera_id_for_image is not None:
+                    logger.warning(f"Camera ID {camera_id_for_image} not found for {img_name}, using camera {first_camera_id}")
+                return torch.tensor(cameras[first_camera_id])
 
         except Exception as e:
-            logger.warning(f"Error loading intrinsics: {e}")
-            return torch.tensor([4251.0, 4251.0, 3024.0, 2016.0])
+            logger.warning(f"Error loading ETH3D intrinsics: {e}")
+            return default_intrinsics
 
     def _load_nyu_intrinsics(self, frame_info):
         """
@@ -1191,6 +1366,22 @@ class ComparisonDataset(Dataset):
             torch.Tensor: [fx, fy, cx, cy]
         """
         return torch.tensor([518.86, 519.47, 325.58, 253.74])
+
+    def _load_bonn_intrinsics(self, frame_info):
+        """
+        Load Bonn RGB-D camera intrinsics (hardcoded fixed values)
+
+        Bonn dataset uses fixed camera intrinsics for all sequences:
+        - fx = 542.822841
+        - fy = 542.576870
+        - cx = 315.593520
+        - cy = 237.756098
+        - Resolution: 640×480
+
+        Returns:
+            torch.Tensor: [fx, fy, cx, cy]
+        """
+        return torch.tensor([542.822841, 542.576870, 315.593520, 237.756098])
 
     def _load_vkitti_intrinsics(self, frame_info):
         """

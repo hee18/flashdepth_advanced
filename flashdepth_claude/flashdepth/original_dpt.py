@@ -101,7 +101,8 @@ class DPTHead(nn.Module):
             nn.ReLU(),
             nn.Conv2d(head_dim_2, 1, kernel_size=1, stride=1, padding=0),
             nn.ReLU(),
-            nn.Identity(),
+            nn.Identity(),  # Original FlashDepth
+            # nn.Softplus(),
         )
     
     def forward(self, encoder_features, patch_h, patch_w, 

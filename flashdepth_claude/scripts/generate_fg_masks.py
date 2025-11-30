@@ -483,6 +483,58 @@ def process_unreal4k(data_root: Path, generator: FGMaskGenerator, skip_existing:
     logger.info(f"Unreal4K: processed {total_processed}, skipped {total_skipped}")
 
 
+def process_bonn(data_root: Path, generator: FGMaskGenerator, skip_existing: bool = True):
+    """Process Bonn RGB-D Dynamic Dataset."""
+    bonn_root = data_root / 'bonn'
+    if not bonn_root.exists():
+        logger.warning(f"Bonn not found at {bonn_root}")
+        return
+
+    logger.info(f"Processing Bonn from {bonn_root}")
+
+    # Get all sequence directories (rgbd_bonn_*)
+    sequences = sorted([d for d in bonn_root.iterdir()
+                       if d.is_dir() and d.name.startswith('rgbd_bonn_')])
+
+    if not sequences:
+        logger.warning(f"No Bonn sequences found at {bonn_root}")
+        return
+
+    total_processed = 0
+    total_skipped = 0
+
+    for seq_dir in tqdm(sequences, desc="Bonn sequences"):
+        rgb_dir = seq_dir / 'rgb'
+        if not rgb_dir.exists():
+            logger.warning(f"RGB dir not found: {rgb_dir}")
+            continue
+
+        # Create fg_masks directory
+        fg_masks_dir = seq_dir / 'fg_masks'
+        fg_masks_dir.mkdir(parents=True, exist_ok=True)
+
+        # Get RGB images
+        image_files = sorted(rgb_dir.glob('*.png'))
+
+        for img_path in tqdm(image_files, desc=f"  {seq_dir.name}", leave=False):
+            out_path = fg_masks_dir / img_path.name
+
+            if skip_existing and out_path.exists():
+                total_skipped += 1
+                continue
+
+            image = cv2.imread(str(img_path))
+            if image is None:
+                continue
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+            fg_mask = generator.generate_fg_mask(image)
+            cv2.imwrite(str(out_path), fg_mask)
+            total_processed += 1
+
+    logger.info(f"Bonn: processed {total_processed}, skipped {total_skipped}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Generate FG masks from FlashDepth-L attention")
     parser.add_argument('--data-root', type=str, required=True,
@@ -520,6 +572,7 @@ def main():
         'waymo_seg': process_waymo_seg,
         'vkitti': process_vkitti,
         'unreal4k': process_unreal4k,
+        'bonn': process_bonn,
     }
 
     for dataset in datasets:

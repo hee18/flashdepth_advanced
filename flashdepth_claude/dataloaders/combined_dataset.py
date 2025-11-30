@@ -478,6 +478,7 @@ class CombinedDataset(Dataset):
             actual_valid_masks = []
             fx_ratios = []  # NEW
             resize_ratios = []  # NEW
+            image_paths = []  # For FG-wise evaluation
 
             # Get dataset-specific settings
             target_resolution = self.reshape_list[dataset_idx]['resolution']  # (H, W)
@@ -497,6 +498,7 @@ class CombinedDataset(Dataset):
                 )
 
                 images.append(image)
+                image_paths.append(pair['image'])  # Store image path for FG-wise eval
                 # Convert to torch.Tensor if numpy array (for validation/test consistency)
                 if isinstance(depth_inverse_canonical, np.ndarray):
                     depth_inverse_canonical = torch.from_numpy(depth_inverse_canonical).float()
@@ -521,7 +523,8 @@ class CombinedDataset(Dataset):
                     torch.stack(actual_valid_masks).bool(),
                     fx_ratio_tensor,  # NEW
                     resize_ratio_tensor,  # NEW
-                    return_name)
+                    return_name,
+                    image_paths)  # Return image paths for FG-wise eval
 
 
         # dataset_idx: i-th dataset; e.g. pointodyssey is 0, spring is 1...etc
