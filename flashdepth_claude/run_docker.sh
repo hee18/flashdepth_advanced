@@ -47,6 +47,7 @@ show_usage() {
     echo "  train_gear5_film     Start Gear5 FiLM training - Channel-wise FiLM modulation before Mamba"
     echo "  train_gear5_film_ddp Start Gear5 FiLM training with 2 GPUs (GPU 0,1)"
     echo "  test_gear5_film      Start Gear5 FiLM testing"
+    echo "  infer_avante         Run Gear5 inference on avante_images (custom dataset)"
     echo "  test_gear2_objwise  Start Gear2 object-wise evaluation (Waymo segmentation)"
     echo "  test_gear3_objwise  Start Gear3 object-wise evaluation (Waymo segmentation)"
     echo "  test_gear4_objwise  Start Gear4 object-wise evaluation"
@@ -88,6 +89,8 @@ show_usage() {
     echo "  --limit-scenes N     For NuScenes, limit the number of scenes to process (e.g., 50)"
     echo "  --best-figure        Export best_frame ±4 frames (9 total) as individual images/depth maps"
     echo "  --frame N            Export frame N ±4 frames (9 total) as individual images/depth maps (e.g., --seq 6 --frame 459)"
+    echo "  --section START,END  Frame section for infer_avante (e.g., --section 450,480 for frames 450-480)"
+    echo "  --max-depth METERS   Max valid depth threshold for infer_avante (default: 70.0)"
     echo ""
     echo "Note: Regularization losses are deprecated. Importance map now uses raw DINOv2 attention (frozen)."
     echo "Note: test_original_flashdepth always tests only the first sequence for FPS measurement."
@@ -166,12 +169,14 @@ LIMIT_SCENES=""  # Limit number of scenes for NuScenes dataset (optional, e.g., 
 BEST_FIGURE="false"  # Export best_frame ±4 frames (9 total) as individual images/depth maps
 FRAME=""  # Specific frame to export ±4 frames
 FGWISE_FLAG="false"  # Enable FG-wise (foreground-wise) evaluation using ViT attention masks
+SECTION=""  # Frame section for infer_avante (e.g., "450,480" for frames 450-480)
+MAX_DEPTH="70.0"  # Max valid depth threshold for infer_avante (meters)
 
 # Parse arguments
 USER_BATCH_SIZE=""  # Track if user explicitly set batch size
 while [[ $# -gt 0 ]]; do
     case $1 in
-        build|train|test|train_gear2|train_gear2_ddp|test_gear2|train_gear3|train_gear3_ddp|test_gear3|train_gear4|train_gear4_ddp|test_gear4|train_gear5|train_gear5_ddp|test_gear5|train_gear5_film|train_gear5_film_ddp|test_gear5_film|test_gear2_objwise|test_gear3_objwise|test_gear4_objwise|test_gear5_objwise|test_original_flashdepth|shell|clean|logs)
+        build|train|test|train_gear2|train_gear2_ddp|test_gear2|train_gear3|train_gear3_ddp|test_gear3|train_gear4|train_gear4_ddp|test_gear4|train_gear5|train_gear5_ddp|test_gear5|train_gear5_film|train_gear5_film_ddp|test_gear5_film|infer_avante|test_gear2_objwise|test_gear3_objwise|test_gear4_objwise|test_gear5_objwise|test_original_flashdepth|shell|clean|logs)
             COMMAND="$1"
             shift
             ;;
@@ -306,6 +311,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --frame)
             FRAME="$2"
+            shift 2
+            ;;
+        --section)
+            SECTION="$2"
+            shift 2
+            ;;
+        --max-depth)
+            MAX_DEPTH="$2"
             shift 2
             ;;
         -h|--help)
@@ -1225,6 +1238,60 @@ case $COMMAND in
         fi
 
         eval $DOCKER_CMD
+        ;;
+
+    infer_avante)
+        # Use --gear-checkpoint if provided, otherwise use default
+        if [ -n "$GEAR_CHECKPOINT" ]; then
+            AVANTE_CHECKPOINT="$GEAR_CHECKPOINT"
+        else
+            # Default checkpoint for gear5
+            AVANTE_CHECKPOINT="train_results/results_21/gear_5/large/best.pth"
+        fi
+
+        echo "Running Gear5 inference on avante_images..."
+        echo "Configuration:"
+        echo "  - Input: /data/datasets/avante_images"
+        echo "  - Output: $RESULTS_DIR"
+        echo "  - GPU: $GPU_ID"
+        echo "  - Checkpoint: $AVANTE_CHECKPOINT"
+        echo "  - Config variant: $CONFIG_VARIANT"
+        echo "  - Focal length: 900 px (de-canon ratio: 0.5556)"
+        echo "  - Max depth: ${MAX_DEPTH}m"
+        echo "  - Colormap: 2-98 percentile"
+        echo "  - Temporal backend: $([ "$MAMBA" = "true" ] && echo "Mamba2" || echo "GRU")"
+        echo "  - CLS layers: $CLS_LAYERS"
+        if [ -n "$SECTION" ]; then
+            echo "  - Section: $SECTION (frames)"
+        fi
+        echo ""
+
+        # Build infer_avante command
+        # Note: focal-length 900 is default for avante_images (original size 1600x1100)
+        # De-canonicalization: pred_inverse_actual = pred_inverse_canonical * (500 / 900)
+        INFER_CMD="python infer_avante.py \
+            --input-dir /data/datasets/avante_images \
+            --output-dir /app/$RESULTS_DIR \
+            --checkpoint $AVANTE_CHECKPOINT \
+            --config-variant $CONFIG_VARIANT \
+            --gpu 0 \
+            --max-depth $MAX_DEPTH \
+            --focal-length 900.0 \
+            --canonical-fx 500.0 \
+            --cls-layers $CLS_LAYERS"
+
+        # Add mamba flag if requested
+        if [ "$MAMBA" = "true" ]; then
+            INFER_CMD="$INFER_CMD --mamba"
+        fi
+
+        # Add section filter if specified
+        if [ -n "$SECTION" ]; then
+            INFER_CMD="$INFER_CMD --section $SECTION"
+        fi
+
+        # Run inference
+        CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm flashdepth $INFER_CMD
         ;;
 
     test_gear5)

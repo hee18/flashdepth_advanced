@@ -1160,6 +1160,13 @@ class ComparisonTester:
             # For ETH3D/Waymo, try to use completed depth for visualization
             gt_depth_sparse = gt_depths[t, 0].cpu().numpy()  # [H, W] in meters (sparse)
             target_size = (gt_depth_sparse.shape[0], gt_depth_sparse.shape[1])
+            pred_depth = pred_depths[t, 0].cpu().numpy()  # [H, W] in meters
+
+            # Compute gt_valid mask and determine sparse/dense FIRST
+            MAX_DEPTH = 70.0
+            gt_valid = (gt_depth_sparse > 0) & (gt_depth_sparse < MAX_DEPTH)
+            gt_density = gt_valid.sum() / gt_valid.size
+            is_sparse = gt_density < 0.5
 
             completed_depth_loaded = False
             if use_completed_depth and t < len(depth_paths):
@@ -1187,14 +1194,15 @@ class ComparisonTester:
                         gt_vmin, gt_vmax = None, None
 
             if not completed_depth_loaded:
-                # Fallback to sparse GT depth
-                gt_depth_vis = self._depth_to_colormap(gt_depth_sparse)
+                # For both sparse and dense datasets:
+                # - Use gt_valid mask for GT visualization (exclude invalid and far depth)
+                # - Compute vmin/vmax from gt_valid pixels
+                gt_depth_vis = self._depth_to_colormap(gt_depth_sparse, external_mask=gt_valid)
 
-                # Get vmin/vmax from GT for pred normalization
-                gt_valid_mask = np.isfinite(gt_depth_sparse) & (gt_depth_sparse > 0)
-                if gt_valid_mask.any():
-                    gt_vmin = np.nanpercentile(gt_depth_sparse[gt_valid_mask], 2)
-                    gt_vmax = np.nanpercentile(gt_depth_sparse[gt_valid_mask], 98)
+                # Get vmin/vmax from gt_valid pixels (not just depth > 0)
+                if gt_valid.any():
+                    gt_vmin = np.nanpercentile(gt_depth_sparse[gt_valid], 2)
+                    gt_vmax = np.nanpercentile(gt_depth_sparse[gt_valid], 98)
                 else:
                     gt_vmin, gt_vmax = None, None
 
@@ -1202,11 +1210,30 @@ class ComparisonTester:
             cv2.imwrite(str(gt_path), gt_depth_vis)
 
             # 3. Save pred depth (colormap) - use GT range for comparison
-            pred_depth = pred_depths[t, 0].cpu().numpy()  # [H, W] in meters
+            # Same logic as main visualization (sequence.png)
 
-            # Use external mask from sparse GT for pred visualization (shows same valid region)
-            gt_valid_mask = np.isfinite(gt_depth_sparse) & (gt_depth_sparse > 0)
-            pred_depth_vis = self._depth_to_colormap(pred_depth, vmin=gt_vmin, vmax=gt_vmax, external_mask=gt_valid_mask)
+            if is_sparse:
+                # Sparse dataset: use height mask (LiDAR scan range)
+                valid_pixels_per_row = gt_valid.sum(axis=1)
+                min_valid_pixels_threshold = 10
+                valid_rows = valid_pixels_per_row >= min_valid_pixels_threshold
+                valid_row_indices = np.where(valid_rows)[0]
+
+                if len(valid_row_indices) > 0:
+                    min_valid_row = valid_row_indices.min()
+                    max_valid_row = valid_row_indices.max()
+                    height_mask = np.zeros_like(pred_depth, dtype=bool)
+                    height_mask[min_valid_row:max_valid_row+1, :] = True
+                else:
+                    height_mask = np.ones_like(pred_depth, dtype=bool)
+
+                pred_valid_depth = (pred_depth > 0) & (pred_depth < MAX_DEPTH)
+                pred_show_mask = height_mask & pred_valid_depth  # Dense prediction within height range
+            else:
+                # Dense dataset: use GT valid mask (same as main visualization)
+                pred_show_mask = gt_valid
+
+            pred_depth_vis = self._depth_to_colormap(pred_depth, vmin=gt_vmin, vmax=gt_vmax, external_mask=pred_show_mask)
             pred_path = figures_dir / f"frame_{t:04d}_pred_depth.png"
             cv2.imwrite(str(pred_path), pred_depth_vis)
 

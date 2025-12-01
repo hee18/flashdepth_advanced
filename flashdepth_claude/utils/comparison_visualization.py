@@ -101,23 +101,25 @@ def visualize_sequence_simplified(images, pred_depths, gt_depths, valid_mask,
         is_sparse = gt_density < 0.5
 
         if is_sparse:
-            # Sparse: height mask + fill
-            valid_pixels_per_row = gt_exists.sum(axis=1)
+            # Sparse: height mask + dense prediction within range
+            valid_pixels_per_row = gt_valid.sum(axis=1)
             min_valid_pixels_threshold = 10
             valid_rows = valid_pixels_per_row >= min_valid_pixels_threshold
             valid_row_indices = np.where(valid_rows)[0]
 
             if len(valid_row_indices) > 0:
-                scan_top = valid_row_indices[0]
-                scan_bottom = valid_row_indices[-1]
+                min_valid_row = valid_row_indices.min()
+                max_valid_row = valid_row_indices.max()
                 height_mask = np.zeros_like(pred, dtype=bool)
-                height_mask[scan_top:scan_bottom+1, :] = True
-                pred_show_mask = height_mask & (pred > 0) & (pred < MAX_DEPTH)
+                height_mask[min_valid_row:max_valid_row+1, :] = True
             else:
-                pred_show_mask = (pred > 0) & (pred < MAX_DEPTH)
+                height_mask = np.ones_like(pred, dtype=bool)
+
+            pred_valid_depth = (pred > 0) & (pred < MAX_DEPTH)
+            pred_show_mask = height_mask & pred_valid_depth  # Dense prediction within height range
         else:
-            # Dense: simple valid mask
-            pred_show_mask = (pred > 0) & (pred < MAX_DEPTH)
+            # Dense: use GT valid mask (same as test_gear5.py)
+            pred_show_mask = gt_valid
 
         # Compute GT's percentile range
         if gt_valid.sum() > 0:
@@ -296,9 +298,34 @@ def visualize_best_frame_simplified(image, gt_depth, pred_depth, metrics,
     plt.colorbar(im_gt, ax=ax_gt, fraction=0.046, pad=0.04)
 
     # Row 0, Col 2: Predicted Depth
+    # Use same sparse/dense logic as sequence visualization
     ax_pred = fig.add_subplot(gs[0, 2])
-    pred_valid = (pred_depth > 0) & (pred_depth < MAX_DEPTH)
-    pred_display = np.where(pred_valid, pred_depth, np.nan)
+
+    gt_density = gt_valid.sum() / gt_valid.size
+    is_sparse = gt_density < 0.5
+
+    if is_sparse:
+        # Sparse: height mask + dense prediction within range
+        valid_pixels_per_row = gt_valid.sum(axis=1)
+        min_valid_pixels_threshold = 10
+        valid_rows = valid_pixels_per_row >= min_valid_pixels_threshold
+        valid_row_indices = np.where(valid_rows)[0]
+
+        if len(valid_row_indices) > 0:
+            min_valid_row = valid_row_indices.min()
+            max_valid_row = valid_row_indices.max()
+            height_mask = np.zeros_like(pred_depth, dtype=bool)
+            height_mask[min_valid_row:max_valid_row+1, :] = True
+        else:
+            height_mask = np.ones_like(pred_depth, dtype=bool)
+
+        pred_valid_depth = (pred_depth > 0) & (pred_depth < MAX_DEPTH)
+        pred_show_mask = height_mask & pred_valid_depth
+    else:
+        # Dense: use GT valid mask
+        pred_show_mask = gt_valid
+
+    pred_display = np.where(pred_show_mask, pred_depth, np.nan)
 
     cmap_pred = plt.cm.plasma_r.copy()
     cmap_pred.set_bad(color='black')

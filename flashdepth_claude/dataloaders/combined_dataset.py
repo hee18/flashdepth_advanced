@@ -24,7 +24,7 @@ from utils.dataset_intrinsics import (
 class CombinedDataset(Dataset):
     def __init__(self, root_dir, enable_dataset_flags, resolution=None, split='train',
                  video_length=8, seed=42, tmp_res=None, color_aug=False, strict_focal_length=True,
-                 unreal4k_seq=None, limit_scenes=None, seq_list=None):
+                 unreal4k_seq=None, limit_scenes=None, seq_list=None, skip_gt_canonicalization=False):
         '''
         enable_dataset_flags: list of datasets to use; e.g. ['spring', 'mvs-synth', 'urbansyn', 'eth3d', 'waymo', 'waymo_seg']
 
@@ -62,6 +62,10 @@ class CombinedDataset(Dataset):
         res > full hd
         spring, eth3d, unrealsstereo4k (3840x2160), waymo, ARKitScenes, mvs-synth, phonedepth, urbansyn, hoi4d
 
+        Args:
+            skip_gt_canonicalization: If True, skip GT canonicalization for test split.
+                                      GT will be returned in actual space (1/m).
+                                      Useful for testing where only pred needs de-canonicalization.
 
         '''
         np.random.seed(seed)
@@ -69,6 +73,9 @@ class CombinedDataset(Dataset):
 
         # Store unreal4k_seq parameter
         self.unreal4k_seq = unreal4k_seq
+        
+        # Store skip_gt_canonicalization flag
+        self.skip_gt_canonicalization = skip_gt_canonicalization
 
         cache_dir = './dataloaders/pairs_cache' if split != 'test' else None
 
@@ -472,7 +479,7 @@ class CombinedDataset(Dataset):
                 scene = scene[:self.video_length]
 
             images = []
-            depths_canonical = []
+            depths = []  # Renamed from depths_canonical (may be actual or canonical)
             focal_lengths_canonical = []
             focal_lengths_actual = []
             actual_valid_masks = []
@@ -492,24 +499,67 @@ class CombinedDataset(Dataset):
                 original_h, original_w = depth_inverse_actual.shape
                 fx_actual = self._get_focal_length(dataset_idx, pair, (original_h, original_w))
 
-                # Apply Metric3D-style canonical transformation (now returns 6 values)
-                depth_inverse_canonical, fx_canonical, fx_actual_returned, actual_valid_mask, fx_ratio, resize_ratio = self._apply_canonical_transform(
-                    depth_inverse_actual, fx_actual, original_h, original_w, target_resolution, resize_factor
-                )
+                if self.skip_gt_canonicalization:
+                    # Skip GT canonicalization: return GT in actual space (1/m)
+                    # Only pred needs de-canonicalization in test_gear5.py
 
-                images.append(image)
-                image_paths.append(pair['image'])  # Store image path for FG-wise eval
-                # Convert to torch.Tensor if numpy array (for validation/test consistency)
-                if isinstance(depth_inverse_canonical, np.ndarray):
-                    depth_inverse_canonical = torch.from_numpy(depth_inverse_canonical).float()
-                if isinstance(actual_valid_mask, np.ndarray):
+                    # Convert inverse depth to normal depth for valid mask computation
+                    is_torch = isinstance(depth_inverse_actual, torch.Tensor)
+                    if is_torch:
+                        depth_np = depth_inverse_actual.cpu().numpy()
+                    else:
+                        depth_np = depth_inverse_actual
+
+                    with np.errstate(divide='ignore', invalid='ignore'):
+                        depth_actual = np.where(depth_np > 1e-8, 1.0 / depth_np, 0.0)
+
+                    # Compute actual space valid mask: depth > 0 AND depth < 70m
+                    actual_valid_mask = (depth_actual > 0) & (depth_actual < ACTUAL_MAX_DEPTH)
+
+                    # Convert to tensors
+                    if isinstance(depth_inverse_actual, np.ndarray):
+                        depth_inverse_tensor = torch.from_numpy(depth_inverse_actual).float()
+                    else:
+                        depth_inverse_tensor = depth_inverse_actual.float()
                     actual_valid_mask = torch.from_numpy(actual_valid_mask).bool()
-                depths_canonical.append(depth_inverse_canonical) # Canonical inverse depth
-                focal_lengths_canonical.append(fx_canonical) # 500.0
-                focal_lengths_actual.append(fx_actual_returned) # Original fx for visualization
-                actual_valid_masks.append(actual_valid_mask) # Actual space mask (<70m)
-                fx_ratios.append(fx_ratio)  # NEW
-                resize_ratios.append(resize_ratio)  # NEW
+
+                    # Still need fx_actual for pred de-canonicalization
+                    # fx_ratio and resize_ratio are used for de-canonicalization
+                    # Compute these for pred de-canonicalization
+                    pre_h = int(original_h * resize_factor)
+                    pre_w = int(original_w * resize_factor)
+                    target_w, target_h = target_resolution
+                    small_resize_ratio = max(target_w / pre_w, target_h / pre_h)
+                    fx_ratio = CANONICAL_FOCAL_LENGTH / fx_actual
+                    total_resize_ratio = resize_factor * small_resize_ratio
+
+                    images.append(image)
+                    image_paths.append(pair['image'])
+                    depths.append(depth_inverse_tensor)  # Actual space inverse depth (1/m)
+                    focal_lengths_canonical.append(CANONICAL_FOCAL_LENGTH)  # Still 500.0 for consistency
+                    focal_lengths_actual.append(fx_actual)
+                    actual_valid_masks.append(actual_valid_mask)
+                    fx_ratios.append(fx_ratio)
+                    resize_ratios.append(total_resize_ratio)
+                else:
+                    # Apply Metric3D-style canonical transformation (now returns 6 values)
+                    depth_inverse_canonical, fx_canonical, fx_actual_returned, actual_valid_mask, fx_ratio, resize_ratio = self._apply_canonical_transform(
+                        depth_inverse_actual, fx_actual, original_h, original_w, target_resolution, resize_factor
+                    )
+
+                    images.append(image)
+                    image_paths.append(pair['image'])  # Store image path for FG-wise eval
+                    # Convert to torch.Tensor if numpy array (for validation/test consistency)
+                    if isinstance(depth_inverse_canonical, np.ndarray):
+                        depth_inverse_canonical = torch.from_numpy(depth_inverse_canonical).float()
+                    if isinstance(actual_valid_mask, np.ndarray):
+                        actual_valid_mask = torch.from_numpy(actual_valid_mask).bool()
+                    depths.append(depth_inverse_canonical)  # Canonical inverse depth
+                    focal_lengths_canonical.append(fx_canonical)  # 500.0
+                    focal_lengths_actual.append(fx_actual_returned)  # Original fx for visualization
+                    actual_valid_masks.append(actual_valid_mask)  # Actual space mask (<70m)
+                    fx_ratios.append(fx_ratio)
+                    resize_ratios.append(resize_ratio)
 
             return_name = os.path.join(dataset_idx, pair['scene_name'])
             focal_lengths_canonical_tensor = torch.tensor(focal_lengths_canonical, dtype=torch.float32)
@@ -517,7 +567,7 @@ class CombinedDataset(Dataset):
             fx_ratio_tensor = torch.tensor(fx_ratios, dtype=torch.float32)  # NEW
             resize_ratio_tensor = torch.tensor(resize_ratios, dtype=torch.float32)  # NEW
             return (torch.stack(images).float(),
-                    torch.stack(depths_canonical).float(),
+                    torch.stack(depths).float(),  # May be actual or canonical depending on skip_gt_canonicalization
                     focal_lengths_canonical_tensor,
                     focal_lengths_actual_tensor,
                     torch.stack(actual_valid_masks).bool(),

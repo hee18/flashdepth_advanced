@@ -600,7 +600,8 @@ class Gear5Tester:
                 split='test',  # Use 'test' split (full test dataset)
                 video_length=video_length,
                 limit_scenes=limit_scenes,
-                seq_list=seq_list
+                seq_list=seq_list,
+                skip_gt_canonicalization=True  # GT returned in actual space; only pred needs de-canon
             )
             collate_fn = self._collate_fn
 
@@ -1065,11 +1066,11 @@ class Gear5Tester:
         B, T = images.shape[:2]
         assert B == 1, "Batch size must be 1 for testing"
 
-        # Dataloader gives inverse depth (1/m) already in canonical space (fx=500), scale to 100/m
-        gt_depth_inverse_100 = gt_depth * 100.0  # [1, T, 1, H, W] in canonical 100/m
+        # Dataloader gives inverse depth (1/m) in actual space (skip_gt_canonicalization=True), scale to 100/m
+        gt_depth_inverse_100 = gt_depth * 100.0  # [1, T, 1, H, W] in actual 100/m
 
-        # NOTE: GT depth is already in canonical space (fx=500 at 518×518)
-        # Canonical transformation is now handled in the dataloader
+        # NOTE: GT depth is now in actual space (skip_gt_canonicalization=True)
+        # Only prediction needs de-canonicalization (pred is still in canonical space)
         CANONICAL_FX = get_canonical_focal_length(self.config)  # 500.0
 
         # Get fx_actual for de-canonical visualization
@@ -1357,15 +1358,10 @@ class Gear5Tester:
         torch.cuda.empty_cache()
 
         # Convert GT to metric depth for visualization
-        # GT is in canonical space (fx=500), de-canonicalize to actual space for visualization
+        # GT is already in actual space (skip_gt_canonicalization=True in dataloader)
         # Move to CPU first to avoid OOM for long sequences (urbansyn 1000 frames)
-        gt_depth_inverse_100_cpu = gt_depth_inverse_100[0]  # [T, 1, H, W] to CPU
-        gt_depth_canonical = 100.0 / (gt_depth_inverse_100_cpu + 1e-8)  # [T, 1, H, W] in canonical meters (CPU)
-
-        # De-canonicalize: depth_actual = depth_canonical × (fx_actual / fx_canonical)
-        # This converts from canonical space (fx=500) back to actual space for visualization
-        de_canonical_ratio = fx_actual_tensor[0].cpu() / CANONICAL_FX  # [T] (CPU)
-        gt_depth_metric = gt_depth_canonical * de_canonical_ratio.view(T, 1, 1, 1)  # [T, 1, H, W] in actual meters (CPU)
+        gt_depth_inverse_100_cpu = gt_depth_inverse_100[0]  # [T, 1, H, W] actual 100/m
+        gt_depth_metric = 100.0 / (gt_depth_inverse_100_cpu + 1e-8)  # [T, 1, H, W] actual meters directly
 
         # Compute metrics (both pred and GT are now in meters on CPU)
         # Already on CPU, no need to call .cpu() again
@@ -2374,6 +2370,13 @@ class Gear5Tester:
             # For ETH3D/Waymo, try to use completed depth for visualization
             gt_depth_sparse = gt_depths[t, 0].cpu().numpy()  # [H, W] in meters (sparse)
             target_size = (gt_depth_sparse.shape[0], gt_depth_sparse.shape[1])
+            pred_depth = pred_depths[t, 0].cpu().numpy()  # [H, W] in meters
+
+            # Compute gt_valid mask and determine sparse/dense FIRST
+            MAX_DEPTH = 70.0
+            gt_valid = (gt_depth_sparse > 0) & (gt_depth_sparse < MAX_DEPTH)
+            gt_density = gt_valid.sum() / gt_valid.size
+            is_sparse = gt_density < 0.5
 
             completed_depth_loaded = False
             if use_completed_depth and t < len(depth_paths):
@@ -2401,14 +2404,15 @@ class Gear5Tester:
                         gt_vmin, gt_vmax = None, None
 
             if not completed_depth_loaded:
-                # Fallback to sparse GT depth
-                gt_depth_vis = self._depth_to_colormap(gt_depth_sparse)
+                # For both sparse and dense datasets:
+                # - Use gt_valid mask for GT visualization (exclude invalid and far depth)
+                # - Compute vmin/vmax from gt_valid pixels
+                gt_depth_vis = self._depth_to_colormap(gt_depth_sparse, external_mask=gt_valid)
 
-                # Get vmin/vmax from GT for pred normalization
-                valid_mask = np.isfinite(gt_depth_sparse) & (gt_depth_sparse > 0)
-                if valid_mask.any():
-                    gt_vmin = np.nanpercentile(gt_depth_sparse[valid_mask], 2)
-                    gt_vmax = np.nanpercentile(gt_depth_sparse[valid_mask], 98)
+                # Get vmin/vmax from gt_valid pixels (not just depth > 0)
+                if gt_valid.any():
+                    gt_vmin = np.nanpercentile(gt_depth_sparse[gt_valid], 2)
+                    gt_vmax = np.nanpercentile(gt_depth_sparse[gt_valid], 98)
                 else:
                     gt_vmin, gt_vmax = None, None
 
@@ -2416,15 +2420,37 @@ class Gear5Tester:
             cv2.imwrite(str(gt_path), gt_depth_vis)
 
             # 3. Save pred depth (colormap) - use GT range for comparison
-            pred_depth = pred_depths[t, 0].cpu().numpy()  # [H, W] in meters
-            pred_depth_vis = self._depth_to_colormap(pred_depth, vmin=gt_vmin, vmax=gt_vmax)
+            # Same logic as main visualization (sequence.png)
+
+            if is_sparse:
+                # Sparse dataset: use height mask (LiDAR scan range)
+                valid_pixels_per_row = gt_valid.sum(axis=1)
+                min_valid_pixels_threshold = 10
+                valid_rows = valid_pixels_per_row >= min_valid_pixels_threshold
+                valid_row_indices = np.where(valid_rows)[0]
+
+                if len(valid_row_indices) > 0:
+                    min_valid_row = valid_row_indices.min()
+                    max_valid_row = valid_row_indices.max()
+                    height_mask = np.zeros_like(pred_depth, dtype=bool)
+                    height_mask[min_valid_row:max_valid_row+1, :] = True
+                else:
+                    height_mask = np.ones_like(pred_depth, dtype=bool)
+
+                pred_valid_depth = (pred_depth > 0) & (pred_depth < MAX_DEPTH)
+                pred_show_mask = height_mask & pred_valid_depth  # Dense prediction within height range
+            else:
+                # Dense dataset: use GT valid mask (same as main visualization)
+                pred_show_mask = gt_valid
+
+            pred_depth_vis = self._depth_to_colormap(pred_depth, vmin=gt_vmin, vmax=gt_vmax, external_mask=pred_show_mask)
             pred_path = figures_dir / f"frame_{t:04d}_pred_depth.png"
             cv2.imwrite(str(pred_path), pred_depth_vis)
 
         completed_info = " (using completed depth)" if use_completed_depth else ""
         logger.info(f"Exported {len(frame_indices)} frames × 3 types = {len(frame_indices) * 3} images to {figures_dir}{completed_info}")
 
-    def _depth_to_colormap(self, depth, vmin=None, vmax=None, percentile_range=(2, 98)):
+    def _depth_to_colormap(self, depth, vmin=None, vmax=None, percentile_range=(2, 98), external_mask=None):
         """
         Convert depth map to colormap visualization (matching gear5_visualization.py style).
 
@@ -2433,6 +2459,7 @@ class Gear5Tester:
             vmin: minimum depth for colormap (default: use 2nd percentile)
             vmax: maximum depth for colormap (default: use 98th percentile)
             percentile_range: tuple of (low, high) percentiles for auto-scaling
+            external_mask: [H, W] boolean mask to restrict valid region (e.g., height_mask for sparse datasets)
 
         Returns:
             [H, W, 3] BGR image (uint8)
@@ -2441,7 +2468,11 @@ class Gear5Tester:
         import cv2
 
         # Handle invalid values
-        valid_mask = np.isfinite(depth) & (depth > 0)
+        # If external_mask is provided, use it to restrict valid region
+        if external_mask is not None:
+            valid_mask = np.isfinite(depth) & (depth > 0) & external_mask
+        else:
+            valid_mask = np.isfinite(depth) & (depth > 0)
         if not valid_mask.any():
             return np.zeros((*depth.shape, 3), dtype=np.uint8)
 

@@ -1651,6 +1651,7 @@ def comparison_collate_fn(batch):
     result = {
         'images': item['images'].unsqueeze(0),  # [1, T, 3, H, W]
         'depths': item['depths'].unsqueeze(0),  # [1, T, H, W]
+        'depth_paths': item.get('depth_paths', None),  # List[str] - for completed depth loading
         'intrinsics': item['intrinsics'].unsqueeze(0),  # [1, T, 4]
         'focal_lengths': item['focal_lengths'].unsqueeze(0),  # [1, T] - actual fx
         'focal_lengths_actual': item['focal_lengths_actual'].unsqueeze(0),  # [1, T] - actual fx
