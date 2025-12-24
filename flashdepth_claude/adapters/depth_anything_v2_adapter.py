@@ -14,9 +14,10 @@ from .base_adapter import MethodAdapter
 class DepthAnythingV2Adapter(MethodAdapter):
     """Adapter for Depth-Anything-V2 with metric depth head"""
 
-    def __init__(self, indoor=False):
+    def __init__(self, indoor=False, encoder='vitl'):
         super().__init__()
         self.indoor = indoor
+        self.encoder = encoder
 
         # Add DA-V2 metric_depth path to sys.path
         dav2_path = Path(__file__).parent.parent / 'refer_test' / 'Depth-Anything-V2' / 'metric_depth'
@@ -27,7 +28,7 @@ class DepthAnythingV2Adapter(MethodAdapter):
         """Load Depth-Anything-V2 model"""
         from depth_anything_v2.dpt import DepthAnythingV2
 
-        # Model configuration for ViT-L
+        # Model configuration for different encoders
         model_configs = {
             'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
             'vitb': {'encoder': 'vitb', 'features': 128, 'out_channels': [96, 192, 384, 768]},
@@ -35,23 +36,22 @@ class DepthAnythingV2Adapter(MethodAdapter):
             'vitg': {'encoder': 'vitg', 'features': 384, 'out_channels': [1536, 1536, 1536, 1536]}
         }
 
-        # Choose checkpoint and max_depth based on indoor/outdoor
+        # Choose checkpoint and max_depth based on indoor/outdoor and encoder
         if checkpoint_path is None:
             base_path = Path(__file__).parent.parent / 'refer_test' / 'Depth-Anything-V2' / 'checkpoints'
             if self.indoor:
-                checkpoint_path = str(base_path / 'depth_anything_v2_metric_hypersim_vitl.pth')
+                checkpoint_path = str(base_path / f'depth_anything_v2_metric_hypersim_{self.encoder}.pth')
                 max_depth = 10.0  # Indoor: 10 meters
             else:
-                checkpoint_path = str(base_path / 'depth_anything_v2_metric_vkitti_vitl.pth')
+                checkpoint_path = str(base_path / f'depth_anything_v2_metric_vkitti_{self.encoder}.pth')
                 max_depth = 80.0  # Outdoor: 80 meters
         else:
             # If checkpoint is explicitly provided, use default max_depth
             max_depth = 10.0 if self.indoor else 80.0
 
-        # Create model
-        encoder_type = 'vitl'  # Use ViT-L by default
+        # Create model with specified encoder
         depth_anything = DepthAnythingV2(
-            **model_configs[encoder_type],
+            **model_configs[self.encoder],
             max_depth=max_depth
         )
 

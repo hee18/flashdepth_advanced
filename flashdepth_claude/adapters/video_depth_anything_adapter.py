@@ -197,17 +197,29 @@ class VideoDepthAnythingAdapter(MethodAdapter):
             fp32=False  # Use FP16 for speed
         )
 
-        # Debug: Check depth range (first inference only)
+        # Debug: Check raw output range (first inference only)
         if self._first_inference:
-            depth_min = depth_np.min()
-            depth_max = depth_np.max()
-            depth_mean = depth_np.mean()
-            print(f"[VDA Debug] Output depth range: min={depth_min:.3f}, max={depth_max:.3f}, mean={depth_mean:.3f}")
+            raw_min = depth_np.min()
+            raw_max = depth_np.max()
+            raw_mean = depth_np.mean()
+            print(f"[VDA Debug] Raw output range: min={raw_min:.3f}, max={raw_max:.3f}, mean={raw_mean:.3f}")
+
+        # VDA relative mode outputs DISPARITY (inverse depth), not depth!
+        # Convert disparity to depth: depth = 1 / disparity
+        # Note: metric mode outputs actual depth in meters, no conversion needed
+        if not self.metric:
+            eps = 1e-6
+            depth_np = 1.0 / (depth_np + eps)
+            if self._first_inference:
+                print(f"[VDA] Converted disparity to depth (1/disparity)")
+                print(f"[VDA Debug] After conversion: min={depth_np.min():.3f}, max={depth_np.max():.3f}, mean={depth_np.mean():.3f}")
+
+        if self._first_inference:
             if self.metric:
-                if depth_max < 10:
-                    print(f"[VDA WARNING] Metric mode but depth_max={depth_max:.3f} < 10m. This looks like RELATIVE depth!")
+                if depth_np.max() < 10:
+                    print(f"[VDA WARNING] Metric mode but depth_max={depth_np.max():.3f} < 10m. Check checkpoint!")
                 else:
-                    print(f"[VDA OK] Depth range looks like metric depth (max={depth_max:.1f}m)")
+                    print(f"[VDA OK] Depth range looks like metric depth (max={depth_np.max():.1f}m)")
             self._first_inference = False
 
         # Convert back to torch tensor

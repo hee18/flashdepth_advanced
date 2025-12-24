@@ -169,7 +169,8 @@ RUN for env in depthanythingv2 vda depthcrafter metric3d unidepth zoedepth depth
             h5py \
             pandas \
             tqdm \
-            nuscenes-devkit; \
+            nuscenes-devkit \
+            ultralytics; \
     done
 # Set working directory
 WORKDIR /workspace

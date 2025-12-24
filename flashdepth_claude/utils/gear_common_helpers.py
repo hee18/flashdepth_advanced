@@ -22,6 +22,7 @@ def depth_to_colored_frame(depth, valid_mask=None):
         depth: Numpy array of shape (H, W) containing depth values
         valid_mask: Optional boolean mask of shape (H, W) indicating valid pixels.
                    If None, uses (depth > 0) & (depth < 70) as default.
+                   If provided, will be combined with (depth < 70) constraint.
 
     Returns:
         Numpy array of shape (H, W, 3) with RGB values in range [0, 255]
@@ -36,6 +37,9 @@ def depth_to_colored_frame(depth, valid_mask=None):
     MAX_DEPTH = 70.0
     if valid_mask is None:
         valid_mask = (depth > 0) & (depth < MAX_DEPTH)
+    else:
+        # Always enforce MAX_DEPTH constraint even with external valid_mask
+        valid_mask = valid_mask & (depth > 0) & (depth < MAX_DEPTH)
 
     # Normalize using percentile for better contrast
     # Use NaN for invalid pixels so they map to black via set_bad

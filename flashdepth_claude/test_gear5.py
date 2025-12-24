@@ -864,10 +864,36 @@ class Gear5Tester:
                 # Save per-sequence metrics and clear cache to prevent OOM
                 seq_results_path = self.save_dir / f"sequence_{sequence_id:04d}_metrics.json"
                 with open(seq_results_path, 'w') as f:
-                    # Filter out non-serializable items like nested dicts for this summary file
-                    json_metrics = {k: v for k, v in metrics.items() if not isinstance(v, dict)}
+                    # Filter out non-serializable items like nested dicts and per-frame data for this summary file
+                    json_metrics = {k: v for k, v in metrics.items()
+                                    if not isinstance(v, dict) and not k.startswith('_per_frame')}
                     json.dump(json_metrics, f, indent=2)
                 logger.info(f"Saved metrics for sequence {sequence_id} to {seq_results_path}")
+
+                # Save per-frame scale/shift as separate JSON
+                if '_per_frame_scales' in metrics and '_per_frame_shifts' in metrics:
+                    scale_shift_path = self.save_dir / f"sequence_{sequence_id:04d}_scale_shift.json"
+                    scale_shift_data = {
+                        'sequence_id': sequence_id,
+                        'num_frames': len(metrics['_per_frame_scales']),
+                        'per_frame': [
+                            {'frame': i, 'scale': s, 'shift': sh}
+                            for i, (s, sh) in enumerate(zip(metrics['_per_frame_scales'], metrics['_per_frame_shifts']))
+                        ],
+                        'statistics': {
+                            'scale_mean': metrics.get('tsp_scale_mean', 0),
+                            'scale_std': metrics.get('tsp_scale_std', 0),
+                            'scale_max': metrics.get('tsp_scale_max', 0),
+                            'scale_min': metrics.get('tsp_scale_min', 0),
+                            'shift_mean': metrics.get('tsp_shift_mean', 0),
+                            'shift_std': metrics.get('tsp_shift_std', 0),
+                            'shift_max': metrics.get('tsp_shift_max', 0),
+                            'shift_min': metrics.get('tsp_shift_min', 0),
+                        }
+                    }
+                    with open(scale_shift_path, 'w') as f:
+                        json.dump(scale_shift_data, f, indent=2)
+                    logger.info(f"Saved per-frame scale/shift to {scale_shift_path}")
 
                 # Clear GPU cache to prevent memory accumulation between sequences
                 if torch.cuda.is_available():
@@ -898,7 +924,8 @@ class Gear5Tester:
 
             # Reorder per-sequence results
             metric_order = ['abs_rel', 'a1', 'a2', 'a3', 'fps', 'tae', 'boundary_f1', 'mae', 'rmse',
-                            'tsp_scale_mean', 'tsp_shift_mean', 'tsp_scale_std', 'tsp_shift_std']
+                            'tsp_scale_mean', 'tsp_shift_mean', 'tsp_scale_std', 'tsp_shift_std',
+                            'tsp_scale_max', 'tsp_scale_min', 'tsp_shift_max', 'tsp_shift_min']
             reordered_metrics = []
             for result in all_metrics:
                 reordered = {}
@@ -909,9 +936,9 @@ class Gear5Tester:
                 for key in metric_order:
                     if key in result:
                         reordered[key] = result[key]
-                # Add any remaining keys
+                # Add any remaining keys (exclude _per_frame data and nested dicts)
                 for key, value in result.items():
-                    if key not in reordered:
+                    if key not in reordered and not key.startswith('_per_frame') and not isinstance(value, dict):
                         reordered[key] = value
                 reordered_metrics.append(reordered)
 
@@ -1096,14 +1123,8 @@ class Gear5Tester:
             fx_actual_tensor = torch.full((1, T), fx_actual_first, device=self.device)  # [1, T]
             logger.warning(f"Using fallback typical_fx={fx_actual_first:.1f} (may be inaccurate for per-frame datasets!)")
 
-        # Compute de-canonical ratios (per-frame for accurate de-canonicalization)
-        de_canonical_ratio_inverse = CANONICAL_FX / fx_actual_tensor  # [1, T] - For inverse depth space: canonical → actual
-        de_canonical_ratio_metric = fx_actual_tensor / CANONICAL_FX   # [1, T] - For metric depth space: canonical → actual
-
-        # Log for first frame
-        logger.info(f"fx_actual (frame 0): {fx_actual_first:.1f} pixels")
-
         # Extract Metric3D canonicalization ratios from batch (if available)
+        # Must be done BEFORE computing de_canonical_ratio
         if 'fx_ratio' in batch and 'resize_ratio' in batch:
             fx_ratio = batch['fx_ratio'].to(self.device)  # [1, T] - focal length ratio (500 / fx_actual)
             resize_ratio = batch['resize_ratio'].to(self.device)  # [1, T] - total resize ratio
@@ -1111,6 +1132,27 @@ class Gear5Tester:
             # Fallback for datasets without Metric3D canonicalization
             fx_ratio = None
             resize_ratio = None
+
+        # Compute de-canonical ratios (per-frame for accurate de-canonicalization)
+        # De-canonicalization is the inverse of canonicalization:
+        #   Canonicalization: inverse_canonical = inverse_actual × (resize_ratio / fx_ratio)
+        #   De-canonicalization: inverse_actual = inverse_canonical × (fx_ratio / resize_ratio)
+        if fx_ratio is not None and resize_ratio is not None:
+            # Correct: use fx_ratio / resize_ratio
+            # fx_ratio = 500 / fx_actual (e.g., 0.147 for ETH3D)
+            # resize_ratio = total resize (e.g., 0.130 for ETH3D base resolution)
+            # de_canonical_ratio = 0.147 / 0.130 ≈ 1.13
+            de_canonical_ratio_inverse = fx_ratio / resize_ratio  # [1, T] - canonical → actual
+            logger.info(f"Using Metric3D de-canonicalization: fx_ratio={fx_ratio[0,0].item():.4f}, resize_ratio={resize_ratio[0,0].item():.4f}, ratio={de_canonical_ratio_inverse[0,0].item():.4f}")
+        else:
+            # Fallback: assume resize_ratio ≈ fx_ratio (no correction needed)
+            de_canonical_ratio_inverse = CANONICAL_FX / fx_actual_tensor  # [1, T]
+            logger.warning(f"Fallback de-canonicalization (no resize_ratio): 500 / {fx_actual_first:.1f} = {de_canonical_ratio_inverse[0,0].item():.4f}")
+
+        de_canonical_ratio_metric = 1.0 / de_canonical_ratio_inverse  # [1, T] - For metric depth space
+
+        # Log for first frame
+        logger.info(f"fx_actual (frame 0): {fx_actual_first:.1f} pixels")
 
         # Use actual space valid mask from dataloader if available
         # Otherwise fallback to computing from canonical depth
@@ -1439,6 +1481,12 @@ class Gear5Tester:
             values = [m[key] for m in frame_metrics]
             metrics[key] = np.mean(values)
 
+            # Add per-frame statistics for abs_rel and a1
+            if key in ['abs_rel', 'a1']:
+                metrics[f'{key}_min'] = float(np.min(values))
+                metrics[f'{key}_max'] = float(np.max(values))
+                metrics[f'{key}_std'] = float(np.std(values))
+
         # Compute TAE (Temporal Alignment Error) - sequence-level metric
         # TAE measures frame-to-frame consistency
         if len(pred_depths) > 1:
@@ -1476,6 +1524,14 @@ class Gear5Tester:
         metrics['tsp_shift_mean'] = float(shifts.mean().item())
         metrics['tsp_scale_std'] = float(scales.std().item())
         metrics['tsp_shift_std'] = float(shifts.std().item())
+        metrics['tsp_scale_max'] = float(scales.max().item())
+        metrics['tsp_scale_min'] = float(scales.min().item())
+        metrics['tsp_shift_max'] = float(shifts.max().item())
+        metrics['tsp_shift_min'] = float(shifts.min().item())
+
+        # Store per-frame scale/shift for JSON export
+        metrics['_per_frame_scales'] = [float(s.item()) for s in scales[:, 0]]
+        metrics['_per_frame_shifts'] = [float(s.item()) for s in shifts[:, 0]]
 
         # Object-wise evaluation: compute per-class metrics for all frames
         # Initialize variables

@@ -113,7 +113,7 @@ def load_gear5_model(checkpoint_path, device, config_variant='l', use_mamba=Fals
     return model, encoder_indices, target_blocks
 
 
-def depth_to_colormap(depth, max_depth=70.0, percentile_range=(2, 98)):
+def depth_to_colormap(depth, max_depth=70.0, percentile_range=(2, 98), return_range=False):
     """
     Convert depth map to colormap visualization.
     - Depth > max_depth is treated as invalid (black)
@@ -123,15 +123,20 @@ def depth_to_colormap(depth, max_depth=70.0, percentile_range=(2, 98)):
         depth: [H, W] numpy array in meters
         max_depth: Maximum valid depth (default: 70m)
         percentile_range: tuple of (low, high) percentiles for auto-scaling
+        return_range: If True, also return (vmin, vmax) for colorbar
 
     Returns:
         [H, W, 3] BGR image (uint8)
+        If return_range=True: (image, vmin, vmax)
     """
     # Create valid mask (depth <= max_depth and positive)
     valid_mask = np.isfinite(depth) & (depth > 0) & (depth <= max_depth)
 
     if not valid_mask.any():
-        return np.zeros((*depth.shape, 3), dtype=np.uint8)
+        result = np.zeros((*depth.shape, 3), dtype=np.uint8)
+        if return_range:
+            return result, 0, max_depth
+        return result
 
     valid_depth = depth[valid_mask]
 
@@ -154,7 +159,75 @@ def depth_to_colormap(depth, max_depth=70.0, percentile_range=(2, 98)):
     # Convert RGB to BGR for cv2
     depth_colored = cv2.cvtColor(depth_colored, cv2.COLOR_RGB2BGR)
 
+    if return_range:
+        return depth_colored, vmin, vmax
     return depth_colored
+
+
+def add_colorbar(image_bgr, vmin, vmax, gap=20, cbar_width_ratio=0.03):
+    """
+    Add a vertical colorbar to the right side of the image using matplotlib.
+    Similar style to test_gear5.py's best.png visualization.
+
+    Args:
+        image_bgr: [H, W, 3] BGR image (uint8)
+        vmin: Minimum value for colorbar
+        vmax: Maximum value for colorbar
+        gap: Gap between image and colorbar in pixels
+        cbar_width_ratio: Colorbar width as ratio of image width
+
+    Returns:
+        [H, W', 3] BGR image with colorbar
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import Normalize
+    from matplotlib.cm import ScalarMappable
+    import io
+
+    # Convert BGR to RGB
+    image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+    H, W = image_rgb.shape[:2]
+
+    # Calculate figure size to match image resolution
+    dpi = 100
+    fig_width = (W + gap + int(W * cbar_width_ratio) + 60) / dpi  # Extra space for colorbar labels
+    fig_height = H / dpi
+
+    # Create figure with white background
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height), dpi=dpi)
+    fig.patch.set_facecolor('white')
+
+    # Display image
+    ax.imshow(image_rgb)
+    ax.axis('off')
+    ax.set_position([0, 0, W / (fig_width * dpi), 1])  # Position image on left
+
+    # Create colorbar
+    cmap = plt.cm.plasma_r
+    norm = Normalize(vmin=vmin, vmax=vmax)
+    sm = ScalarMappable(cmap=cmap, norm=norm)
+    sm.set_array([])
+
+    # Add colorbar axis with gap
+    cbar_left = (W + gap) / (fig_width * dpi)
+    cbar_width = (W * cbar_width_ratio) / (fig_width * dpi)
+    cbar_ax = fig.add_axes([cbar_left, 0.05, cbar_width, 0.9])  # [left, bottom, width, height]
+
+    cbar = fig.colorbar(sm, cax=cbar_ax)
+    cbar.ax.tick_params(labelsize=10)
+    cbar.set_label('Depth (m)', fontsize=11)
+
+    # Render figure to numpy array
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', bbox_inches='tight', pad_inches=0.02, facecolor='white')
+    buf.seek(0)
+    plt.close(fig)
+
+    # Read back as image
+    result_rgb = np.array(Image.open(buf))[:, :, :3]  # Remove alpha if present
+    result_bgr = cv2.cvtColor(result_rgb, cv2.COLOR_RGB2BGR)
+
+    return result_bgr
 
 
 def preprocess_image(image_path, target_size=518):
@@ -326,6 +399,8 @@ def main():
                         help='Use Mamba2 for temporal modeling')
     parser.add_argument('--cls-layers', type=str, default='2,4',
                         help='CLS token extraction layers (comma-separated)')
+    parser.add_argument('--cbar', action='store_true',
+                        help='Show colorbar next to depth visualization')
     args = parser.parse_args()
 
     # Setup device
@@ -425,7 +500,11 @@ def main():
         depth_resized = cv2.resize(depth, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
 
         # Apply colormap with max depth threshold
-        depth_colored = depth_to_colormap(depth_resized, max_depth=args.max_depth)
+        if args.cbar:
+            depth_colored, vmin, vmax = depth_to_colormap(depth_resized, max_depth=args.max_depth, return_range=True)
+            depth_colored = add_colorbar(depth_colored, vmin, vmax)
+        else:
+            depth_colored = depth_to_colormap(depth_resized, max_depth=args.max_depth)
 
         # Output filename matches input (e.g., 00006.png -> 00006_depth.png)
         output_name = f"{img_path.stem}_depth.png"

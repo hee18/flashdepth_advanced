@@ -93,7 +93,8 @@ show_usage() {
     echo "  --max-depth METERS   Max valid depth threshold for infer_avante (default: 70.0)"
     echo ""
     echo "Note: Regularization losses are deprecated. Importance map now uses raw DINOv2 attention (frozen)."
-    echo "Note: test_original_flashdepth always tests only the first sequence for FPS measurement."
+    echo "Note: test_original_flashdepth now tests all sequences (use --limit-scenes N to limit)."
+    echo "      Supports --seq N (e.g., --seq 0,4) and --frame N for eval visualization."
     echo ""
     echo "Examples:"
     echo "  $0 build                              # Build the image"
@@ -171,6 +172,7 @@ FRAME=""  # Specific frame to export ±4 frames
 FGWISE_FLAG="false"  # Enable FG-wise (foreground-wise) evaluation using ViT attention masks
 SECTION=""  # Frame section for infer_avante (e.g., "450,480" for frames 450-480)
 MAX_DEPTH="70.0"  # Max valid depth threshold for infer_avante (meters)
+CBAR="false"  # Show colorbar next to depth visualization
 
 # Parse arguments
 USER_BATCH_SIZE=""  # Track if user explicitly set batch size
@@ -320,6 +322,10 @@ while [[ $# -gt 0 ]]; do
         --max-depth)
             MAX_DEPTH="$2"
             shift 2
+            ;;
+        --cbar)
+            CBAR="true"
+            shift
             ;;
         -h|--help)
             show_usage
@@ -1246,7 +1252,7 @@ case $COMMAND in
             AVANTE_CHECKPOINT="$GEAR_CHECKPOINT"
         else
             # Default checkpoint for gear5
-            AVANTE_CHECKPOINT="train_results/results_21/gear_5/large/best.pth"
+            AVANTE_CHECKPOINT="train_results/results_20/gear_5/large/best.pth"
         fi
 
         echo "Running Gear5 inference on avante_images..."
@@ -1290,6 +1296,11 @@ case $COMMAND in
             INFER_CMD="$INFER_CMD --section $SECTION"
         fi
 
+        # Add colorbar flag if requested
+        if [ "$CBAR" = "true" ]; then
+            INFER_CMD="$INFER_CMD --cbar"
+        fi
+
         # Run inference
         CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm flashdepth $INFER_CMD
         ;;
@@ -1303,6 +1314,7 @@ case $COMMAND in
         echo "  - Results directory: $RESULTS_DIR"
         echo "  - Checkpoint: $FLASHDEPTH_CHECKPOINT"
         echo "  - Config variant: $CONFIG_VARIANT"
+        echo "  - Resolution: $RESOLUTION"
         echo "  - Workers: $WORKERS"
         echo "  - Temporal backend: $([ "$MAMBA" = "true" ] && echo "Mamba2" || echo "GRU")"
         echo "  - CLS layers: $CLS_LAYERS"
@@ -1386,7 +1398,7 @@ case $COMMAND in
         ;;
 
     test_original_flashdepth)
-        
+
         # Initialize CHECKPOINT from FLASHDEPTH_CHECKPOINT or environment variable
         if [ -z "$CHECKPOINT" ]; then
             CHECKPOINT="$FLASHDEPTH_CHECKPOINT"
@@ -1400,19 +1412,19 @@ case $COMMAND in
         # Set default checkpoint based on config variant if using default
         if [ "$CHECKPOINT" = "/app/configs/flashdepth-l/iter_10001.pth" ]; then
             # User didn't specify checkpoint, use default for selected config
-            case "$CONFIG" in
-                flashdepth-l)
+            case "$CONFIG_VARIANT" in
+                l)
                     CHECKPOINT="/app/configs/flashdepth-l/iter_10001.pth"
                     ;;
-                flashdepth-s)
+                s)
                     CHECKPOINT="/app/configs/flashdepth-s/iter_14001.pth"
                     ;;
-                flashdepth)
+                hybrid)
                     CHECKPOINT="/app/configs/flashdepth/iter_43002.pth"
                     ;;
                 *)
-                    echo "Unknown config variant: $CONFIG"
-                    echo "Valid options: flashdepth, flashdepth-l, flashdepth-s"
+                    echo "Unknown config variant: $CONFIG_VARIANT"
+                    echo "Valid options: l, s, hybrid"
                     exit 1
                     ;;
             esac
@@ -1421,28 +1433,49 @@ case $COMMAND in
         # Use OBJWISE_DATASET if set, otherwise default to nuscenes
         TEST_DATASET="${OBJWISE_DATASET:-nuscenes}"
 
-        # Use custom results dir if provided, otherwise default to test_results/${TEST_DATASET}_original_${CONFIG}
+        # Map CONFIG_VARIANT to FlashDepth config path
+        case "$CONFIG_VARIANT" in
+            l)
+                FLASHDEPTH_CONFIG="flashdepth-l"
+                ;;
+            s)
+                FLASHDEPTH_CONFIG="flashdepth-s"
+                ;;
+            hybrid)
+                FLASHDEPTH_CONFIG="flashdepth"
+                ;;
+        esac
+
+        # Use custom results dir if provided, otherwise default to test_results/${TEST_DATASET}_original_${CONFIG_VARIANT}
+        # NOTE: FlashDepth automatically appends /${TEST_DATASET}/ to outfolder, so we need to handle this
         if [ "$RESULTS_DIR" = "train_results/results_1" ]; then
             # Default value not changed by user, use dataset and config specific default
-            OUTFOLDER="/app/test_results/${TEST_DATASET}_original_${CONFIG}"
+            # FlashDepth will create: test_results/original_${CONFIG_VARIANT}/${TEST_DATASET}/
+            OUTFOLDER="/app/test_results/original_${CONFIG_VARIANT}"
+            LOCAL_OUTFOLDER="test_results/original_${CONFIG_VARIANT}"
+            FINAL_RESULTS_DIR="${LOCAL_OUTFOLDER}/${TEST_DATASET}"
         else
             # User provided custom results dir
+            # Remove trailing slash and dataset name if present to avoid duplication
+            CLEAN_RESULTS_DIR="${RESULTS_DIR%/}"  # Remove trailing slash
+            CLEAN_RESULTS_DIR="${CLEAN_RESULTS_DIR%/$TEST_DATASET}"  # Remove dataset suffix if present
+
             # If it's a relative path, prefix with /app/ to save to host
-            if [[ "$RESULTS_DIR" != /* ]]; then
-                OUTFOLDER="/app/$RESULTS_DIR"
+            if [[ "$CLEAN_RESULTS_DIR" != /* ]]; then
+                OUTFOLDER="/app/$CLEAN_RESULTS_DIR"
             else
-                OUTFOLDER="$RESULTS_DIR"
+                OUTFOLDER="$CLEAN_RESULTS_DIR"
             fi
+            LOCAL_OUTFOLDER="${OUTFOLDER#/app/}"
+            FINAL_RESULTS_DIR="${LOCAL_OUTFOLDER}/${TEST_DATASET}"
         fi
 
-        # Extract results directory path for host (remove /app prefix for local path)
-        LOCAL_OUTFOLDER="${OUTFOLDER#/app/}"
-
         # Determine visualization settings based on NO_VIDEO flag
+        # --no-video: Disable MP4 generation but still save .npy depth files for eval_aligned
         if [ "$NO_VIDEO" = "true" ]; then
             OUT_VIDEO="false"
-            SAVE_DEPTH="false"
-            VIS_STATUS="DISABLED (--no-video)"
+            SAVE_DEPTH="true"  # Keep .npy saving for eval_aligned
+            VIS_STATUS="LIMITED (no MP4, .npy depth files saved for eval_aligned)"
         else
             OUT_VIDEO="true"
             SAVE_DEPTH="true"
@@ -1451,24 +1484,24 @@ case $COMMAND in
 
         echo "Testing Original FlashDepth (inference mode)..."
         echo "Configuration:"
-        echo "  - Config variant: $CONFIG"
-        echo "  - Dataset: $TEST_DATASET (first sequence only for FPS)"
+        echo "  - Config variant: $CONFIG_VARIANT ($FLASHDEPTH_CONFIG)"
+        echo "  - Dataset: $TEST_DATASET (all sequences)"
         echo "  - Resolution: $RESOLUTION"
         echo "  - GPU: $GPU_ID"
         echo "  - Checkpoint: $CHECKPOINT"
-        echo "  - Results directory: $OUTFOLDER"
+        echo "  - Results directory: $FINAL_RESULTS_DIR"
         echo "  - Inverse colormap: $INVERSE"
         echo "  - Visualization: $VIS_STATUS"
         echo "  - DataLoader workers: $WORKERS"
-        echo "  - Log file: ${LOCAL_OUTFOLDER}/test.log"
+        echo "  - Log file: ${FINAL_RESULTS_DIR}/test.log"
         echo ""
 
         # Create output directory on host
-        mkdir -p "$LOCAL_OUTFOLDER"
+        mkdir -p "$FINAL_RESULTS_DIR"
 
         # Build base command
         TEST_CMD="cd /FlashDepth && torchrun --nproc_per_node=1 train.py \
-          --config-path configs/$CONFIG \
+          --config-path configs/$FLASHDEPTH_CONFIG \
           inference=true \
           eval.test_datasets=[$TEST_DATASET] \
           eval.metrics=true \
@@ -1476,7 +1509,6 @@ case $COMMAND in
           eval.outfolder=$OUTFOLDER \
           load=$CHECKPOINT \
           +eval.inverse=$INVERSE \
-          eval.first_seq_only=true \
           eval.compile=false \
           eval.out_video=$OUT_VIDEO \
           eval.save_depth_npy=$SAVE_DEPTH \
@@ -1491,21 +1523,50 @@ case $COMMAND in
 
         # Run test and save log
         echo "Running FlashDepth inference on $TEST_DATASET..."
-        CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm flashdepth bash -c "$TEST_CMD" 2>&1 | tee "${LOCAL_OUTFOLDER}/test.log"
+        CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm flashdepth bash -c "$TEST_CMD" 2>&1 | tee "${FINAL_RESULTS_DIR}/test.log"
 
         # Parse log and save as JSON
         echo ""
         echo "Parsing results to JSON..."
-        python3 utils/parse_flashdepth_results.py "${LOCAL_OUTFOLDER}/test.log" "$LOCAL_OUTFOLDER"
+        python3 utils/parse_flashdepth_results.py "${FINAL_RESULTS_DIR}/test.log" "$FINAL_RESULTS_DIR"
+
+        # Run scale/shift alignment evaluation (.npy files are always saved now)
+        if [ -d "$FINAL_RESULTS_DIR" ]; then
+            echo ""
+            echo "Running scale/shift alignment evaluation..."
+
+            # Build eval command with optional --seq and --frame
+            EVAL_CMD="python3 scripts/eval_flashdepth_with_alignment.py \
+                --pred-dir \"$FINAL_RESULTS_DIR\" \
+                --dataset \"$TEST_DATASET\" \
+                --data-root /home/cvlab/hsy/Datasets \
+                --max-depth 70.0 \
+                --output-dir \"${FINAL_RESULTS_DIR}/eval_aligned\""
+
+            if [ -n "$SEQ" ]; then
+                EVAL_CMD="$EVAL_CMD --seq \"$SEQ\""
+            fi
+
+            if [ -n "$FRAME" ]; then
+                EVAL_CMD="$EVAL_CMD --frame $FRAME"
+            fi
+
+            eval "$EVAL_CMD" 2>&1 | tee -a "${FINAL_RESULTS_DIR}/eval_aligned.log" || echo "Warning: Alignment evaluation failed (GT may not be available for this dataset)"
+        else
+            echo "Warning: Results directory not found: $FINAL_RESULTS_DIR"
+        fi
 
         echo ""
         echo "✓ Test complete! Results saved to:"
-        echo "  - FPS Summary: ${LOCAL_OUTFOLDER}/fps_results.json"
-        echo "  - Per-sequence FPS: ${LOCAL_OUTFOLDER}/per_sequence_fps.json"
-        echo "  - Full log: ${LOCAL_OUTFOLDER}/test.log"
+        echo "  - FPS Summary: ${FINAL_RESULTS_DIR}/fps_results.json"
+        echo "  - Per-sequence FPS: ${FINAL_RESULTS_DIR}/per_sequence_fps.json"
+        echo "  - Full log: ${FINAL_RESULTS_DIR}/test.log"
+        echo "  - Depth files (.npy): ${FINAL_RESULTS_DIR}/*/*.npy"
+        echo "  - Aligned evaluation: ${FINAL_RESULTS_DIR}/eval_aligned/"
+        echo "    - eval_results.json (overall metrics with scale/shift)"
+        echo "    - per_sequence_scale_shift.json (per-sequence s,t values)"
         if [ "$NO_VIDEO" != "true" ]; then
-            echo "  - MP4 videos: ${LOCAL_OUTFOLDER}/*/*.mp4"
-            echo "  - Depth files (.npy): ${LOCAL_OUTFOLDER}/*/*.npy"
+            echo "  - MP4 videos: ${FINAL_RESULTS_DIR}/*/*.mp4"
         fi
         ;;
 

@@ -33,6 +33,9 @@ RUN pip install hydra-core
 RUN pip install opencv-python pillow pyarrow
 RUN pip install packaging wheel
 
+# Install ultralytics for YOLOv11 instance segmentation + tracking
+RUN pip install ultralytics>=8.0.0
+
 # Install ninja for faster compilation
 RUN pip install ninja
 
