@@ -861,40 +861,6 @@ class Gear5Tester:
                 if self.fgwise_enabled and 'fg_wise' in metrics:
                     all_fgwise_metrics.append(metrics['fg_wise'])
 
-                # Save per-sequence metrics and clear cache to prevent OOM
-                seq_results_path = self.save_dir / f"sequence_{sequence_id:04d}_metrics.json"
-                with open(seq_results_path, 'w') as f:
-                    # Filter out non-serializable items like nested dicts and per-frame data for this summary file
-                    json_metrics = {k: v for k, v in metrics.items()
-                                    if not isinstance(v, dict) and not k.startswith('_per_frame')}
-                    json.dump(json_metrics, f, indent=2)
-                logger.info(f"Saved metrics for sequence {sequence_id} to {seq_results_path}")
-
-                # Save per-frame scale/shift as separate JSON
-                if '_per_frame_scales' in metrics and '_per_frame_shifts' in metrics:
-                    scale_shift_path = self.save_dir / f"sequence_{sequence_id:04d}_scale_shift.json"
-                    scale_shift_data = {
-                        'sequence_id': sequence_id,
-                        'num_frames': len(metrics['_per_frame_scales']),
-                        'per_frame': [
-                            {'frame': i, 'scale': s, 'shift': sh}
-                            for i, (s, sh) in enumerate(zip(metrics['_per_frame_scales'], metrics['_per_frame_shifts']))
-                        ],
-                        'statistics': {
-                            'scale_mean': metrics.get('tsp_scale_mean', 0),
-                            'scale_std': metrics.get('tsp_scale_std', 0),
-                            'scale_max': metrics.get('tsp_scale_max', 0),
-                            'scale_min': metrics.get('tsp_scale_min', 0),
-                            'shift_mean': metrics.get('tsp_shift_mean', 0),
-                            'shift_std': metrics.get('tsp_shift_std', 0),
-                            'shift_max': metrics.get('tsp_shift_max', 0),
-                            'shift_min': metrics.get('tsp_shift_min', 0),
-                        }
-                    }
-                    with open(scale_shift_path, 'w') as f:
-                        json.dump(scale_shift_data, f, indent=2)
-                    logger.info(f"Saved per-frame scale/shift to {scale_shift_path}")
-
                 # Clear GPU cache to prevent memory accumulation between sequences
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
