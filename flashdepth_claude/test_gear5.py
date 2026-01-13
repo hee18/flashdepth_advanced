@@ -2337,17 +2337,41 @@ class Gear5Tester:
         T = images.shape[0]
 
         # Determine frame range with frame_interval support
-        # If frame_interval is set, expand range and use interval for sampling
-        # Example: frame=9, interval=2 → frames 1, 3, 5, 7, 9, 11, 13, 15, 17
+        # Goal: Get 9 frames (center ± 4 intervals) or as many as possible
+        # If one end is constrained, extend in the other direction
+        # Example: frame=193, interval=10, T=200 → frames 113,123,133,143,153,163,173,183,193
         frame_interval = self.frame_interval if self.frame_interval is not None else 1
-        frame_offset = 4 * frame_interval  # ±4 intervals
-        start_idx = max(0, best_frame_idx - frame_offset)
-        end_idx = min(T, best_frame_idx + frame_offset + 1)  # +1 for inclusive end
+        target_num_frames = 9  # We want 9 frames total (center ± 4)
+        half_count = (target_num_frames - 1) // 2  # 4 frames on each side
 
-        # Generate frame indices with interval
-        frame_indices = list(range(start_idx, end_idx, frame_interval))
+        # Generate candidate frame indices centered around best_frame_idx
+        frame_indices = []
+        for i in range(-half_count, half_count + 1):
+            idx = best_frame_idx + i * frame_interval
+            if 0 <= idx < T:
+                frame_indices.append(idx)
+
+        # If we don't have enough frames, extend in the available direction
+        while len(frame_indices) < target_num_frames:
+            # Try extending backward first (if back is constrained, extend forward)
+            first = frame_indices[0]
+            new_back = first - frame_interval
+            last = frame_indices[-1]
+            new_forward = last + frame_interval
+
+            extended = False
+            if new_back >= 0:
+                frame_indices.insert(0, new_back)
+                extended = True
+            elif new_forward < T:
+                frame_indices.append(new_forward)
+                extended = True
+
+            if not extended:
+                break  # Can't extend anymore
+
         # Ensure best_frame_idx is included even if not perfectly aligned
-        if best_frame_idx not in frame_indices:
+        if best_frame_idx not in frame_indices and best_frame_idx < T:
             frame_indices.append(best_frame_idx)
             frame_indices.sort()
 
