@@ -112,3 +112,30 @@ eval:
 object_wise:
   enabled: false  # Enable object-wise evaluation (set via CLI: object_wise.enabled=true)
   dataset: waymo_seg  # Dataset type for object-wise eval: waymo_seg, sintel
+
+# ========== BANKAI MODE ==========
+# Unified Mamba for temporal depth enhancement + metric scale/shift prediction
+# Replaces both FlashDepth Mamba (F-Mamba) and Gear5's TemporalScalePredictor (T-Mamba)
+# Reference: Gear5_bankai.md for architecture details
+
+# Enable Bankai mode (default: false for backward compatibility)
+use_bankai: false
+
+# Bankai training phase (Head-First Tuning):
+#   bankai_phase=1: Train Metric Head only (scale/shift MLPs) - ~0.5M params
+#   bankai_phase=2: Train UnifiedMamba + Metric Head + output_conv - ~1.8M params
+bankai_phase: 1
+
+# TGM Loss weight (Temporal Gradient Matching from Video Depth Anything)
+# L_total = L_depth + tgm_weight × L_TGM
+# Set to 0 to disable TGM loss (standard Log L1 only)
+tgm_weight: 0.3
+
+# Bankai architecture settings
+bankai_downsample: 0.05  # Small: 0.05 (148→7), Large: 0.1 (148→14)
+bankai_num_mamba_layers: 4  # Number of Mamba2 layers in UnifiedMamba
+
+# CLS layers for Bankai (uses 3rd and 4th intermediate layers)
+# ViT-S: [8, 11], ViT-L: [17, 23]
+# Default [3, 4] maps to these block indices via intermediate_layer_idx
+cls_layers: [3, 4]

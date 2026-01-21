@@ -44,6 +44,9 @@ show_usage() {
     echo "  train_gear5     Start Gear5 training - Two-stage Global + FG modulation"
     echo "  train_gear5_ddp Start Gear5 training with 2 GPUs (GPU 0,1) - Two-stage Global + FG modulation"
     echo "  test_gear5      Start Gear5 testing"
+    echo "  train_gear5_bankai      Start Gear5 Bankai training - Unified Mamba for temporal + metric"
+    echo "  train_gear5_bankai_ddp  Start Gear5 Bankai training with 2 GPUs (GPU 0,1)"
+    echo "  test_gear5_bankai       Start Gear5 Bankai testing"
     echo "  train_gear5_film     Start Gear5 FiLM training - Channel-wise FiLM modulation before Mamba"
     echo "  train_gear5_film_ddp Start Gear5 FiLM training with 2 GPUs (GPU 0,1)"
     echo "  test_gear5_film      Start Gear5 FiLM testing"
@@ -85,6 +88,9 @@ show_usage() {
     echo "  --mamba              Use Mamba2 instead of GRU for Gear5 TemporalScalePredictor (default: false/GRU)"
     echo "  --cls-layer LAYERS   Select CLS token extraction layers (1-4). Examples: '4' (single), '2,4' (default), '1,2,3,4' (all)"
     echo "  --tsp-mode MODE      TSP embed_dim mode: auto (default), l (1024-dim), s (384-dim). Use 'l' to force TSP-L in hybrid mode"
+    echo "  --bankai-phase PHASE Bankai training phase: 1 (metric head only), 2 (full training), auto (Phase 1→2 at auto-step). Default: auto"
+    echo "  --bankai-auto-step N Step at which to transition Phase 1→2 in auto mode (default: 5000)"
+    echo "  --tgm-weight WEIGHT  TGM loss weight for Bankai mode (default: 0.3, set 0 to disable)"
     echo "  --seq N              Sequence selection (e.g., --seq 0,4 for sequences 0 and 4)"
     echo "  --limit-scenes N     For NuScenes, limit the number of scenes to process (e.g., 50)"
     echo "  --best-figure        Export best_frame ±4 frames (9 total) as individual images/depth maps"
@@ -134,6 +140,13 @@ show_usage() {
     echo "  CHECKPOINT=/app/configs/flashdepth-s/iter_14001.pth $0 test_original_flashdepth --config flashdepth-s  # ViT-S with matching checkpoint"
     echo "  $0 train --results-dir train_results/results_2  # Custom results directory"
     echo "  $0 shell                              # Interactive development"
+    echo ""
+    echo "Bankai Mode Examples:"
+    echo "  $0 train_gear5_bankai_ddp --gpu 0  # Auto mode (default): Phase 1 until step 5000, then Phase 2"
+    echo "  $0 train_gear5_bankai --bankai-phase 1 --gpu 0  # Phase 1 only: Train metric head only"
+    echo "  $0 train_gear5_bankai --bankai-phase 2 --gear-checkpoint train_results/bankai_phase1/best.pth --gpu 0  # Phase 2 only"
+    echo "  $0 train_gear5_bankai_ddp --tgm-weight 0.3  # Auto mode with TGM loss"
+    echo "  $0 test_gear5_bankai --gear-checkpoint train_results/bankai/best.pth --gpu 0  # Test Bankai model"
 }
 
 # Parse command line arguments - optimized for RTX A6000 (2x 48GB)
@@ -173,12 +186,15 @@ FGWISE_FLAG="false"  # Enable FG-wise (foreground-wise) evaluation using ViT att
 SECTION=""  # Frame section for infer_avante (e.g., "450,480" for frames 450-480)
 MAX_DEPTH="70.0"  # Max valid depth threshold for infer_avante (meters)
 CBAR="false"  # Show colorbar next to depth visualization
+BANKAI_PHASE="auto"  # Bankai training phase: 1, 2, or "auto" (auto: Phase 1 until step 5000, then Phase 2)
+BANKAI_AUTO_STEP="5000"  # Step at which to transition from Phase 1 to Phase 2 in auto mode
+TGM_WEIGHT="0.3"  # TGM loss weight for Bankai mode
 
 # Parse arguments
 USER_BATCH_SIZE=""  # Track if user explicitly set batch size
 while [[ $# -gt 0 ]]; do
     case $1 in
-        build|train|test|train_gear2|train_gear2_ddp|test_gear2|train_gear3|train_gear3_ddp|test_gear3|train_gear4|train_gear4_ddp|test_gear4|train_gear5|train_gear5_ddp|test_gear5|train_gear5_film|train_gear5_film_ddp|test_gear5_film|infer_avante|test_gear2_objwise|test_gear3_objwise|test_gear4_objwise|test_gear5_objwise|test_original_flashdepth|shell|clean|logs)
+        build|train|test|train_gear2|train_gear2_ddp|test_gear2|train_gear3|train_gear3_ddp|test_gear3|train_gear4|train_gear4_ddp|test_gear4|train_gear5|train_gear5_ddp|test_gear5|train_gear5_bankai|train_gear5_bankai_ddp|test_gear5_bankai|train_gear5_film|train_gear5_film_ddp|test_gear5_film|infer_avante|test_gear2_objwise|test_gear3_objwise|test_gear4_objwise|test_gear5_objwise|test_original_flashdepth|shell|clean|logs)
             COMMAND="$1"
             shift
             ;;
@@ -326,6 +342,18 @@ while [[ $# -gt 0 ]]; do
         --cbar)
             CBAR="true"
             shift
+            ;;
+        --bankai-phase)
+            BANKAI_PHASE="$2"
+            shift 2
+            ;;
+        --bankai-auto-step)
+            BANKAI_AUTO_STEP="$2"
+            shift 2
+            ;;
+        --tgm-weight)
+            TGM_WEIGHT="$2"
+            shift 2
             ;;
         -h|--help)
             show_usage
@@ -1384,6 +1412,175 @@ case $COMMAND in
         # Add frame export if specified
         if [ -n "$FRAME" ]; then
             TEST_CMD="$TEST_CMD +frame=$FRAME"
+        fi
+
+        # Add resolution override
+        TEST_CMD="$TEST_CMD +resolution=$RESOLUTION"
+
+        # Add checkpoint
+        if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
+            TEST_CMD="$TEST_CMD load=$FLASHDEPTH_CHECKPOINT"
+        fi
+
+        CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm flashdepth $TEST_CMD
+        ;;
+
+    train_gear5_bankai)
+        echo "Starting Gear5 Bankai training (Single GPU)..."
+        echo "Configuration:"
+        echo "  - Config variant: $CONFIG_VARIANT"
+        echo "  - Bankai phase: $BANKAI_PHASE (auto step: $BANKAI_AUTO_STEP)"
+        echo "  - TGM weight: $TGM_WEIGHT"
+        echo "  - CLS layers: $CLS_LAYERS"
+        echo "  - Batch size: $BATCH_SIZE"
+        echo "  - Workers: $WORKERS"
+        echo "  - GPU: $GPU_ID"
+        echo "  - Results directory: $RESULTS_DIR"
+        echo ""
+
+        # Build train_gear5 bankai command
+        DOCKER_CMD="CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm -e WANDB_API_KEY=\${WANDB_API_KEY:-} flashdepth python train_gear5.py \
+            --config-path configs/gear5 \
+            --config-name config_$CONFIG_VARIANT \
+            dataset.data_root=/data/datasets \
+            training.batch_size=$BATCH_SIZE \
+            training.workers=$WORKERS \
+            training.iterations=$TOTAL_ITERS \
+            training.wandb=$WANDB \
+            use_bankai=true \
+            bankai_phase=$BANKAI_PHASE \
+            +bankai_auto_step=$BANKAI_AUTO_STEP \
+            tgm_weight=$TGM_WEIGHT \
+            use_canonical_space=$USE_CANONICAL \
+            +cls_layers='[$CLS_LAYERS]' \
+            +results_dir=$RESULTS_DIR"
+
+        # Add gear_checkpoint if specified (for Phase 2)
+        if [ -n "$GEAR_CHECKPOINT" ]; then
+            DOCKER_CMD="$DOCKER_CMD load=$GEAR_CHECKPOINT"
+        fi
+
+        # Add wandb name if specified
+        if [ -n "$WANDB_NAME" ]; then
+            DOCKER_CMD="$DOCKER_CMD training.wandb_name=$WANDB_NAME"
+        fi
+
+        eval $DOCKER_CMD
+        ;;
+
+    train_gear5_bankai_ddp)
+        # Auto-adjust for config variant
+        if [ "$CONFIG_VARIANT" = "hybrid" ]; then
+            ACTUAL_WORKERS=1
+            RES_NAME="2k"
+            VIDEO_LENGTH=2
+            if [ -z "$USER_BATCH_SIZE" ]; then
+                BATCH_SIZE=1
+                echo "  NOTE: Auto-adjusted batch size to $BATCH_SIZE for Hybrid (2K resolution)"
+            fi
+        else
+            ACTUAL_WORKERS=$WORKERS
+            RES_NAME="base"
+            VIDEO_LENGTH=5
+        fi
+
+        echo "Starting Gear5 Bankai training (Multi-GPU: 0,1)..."
+        echo "Configuration:"
+        echo "  - Config variant: $CONFIG_VARIANT"
+        echo "  - Bankai phase: $BANKAI_PHASE (auto step: $BANKAI_AUTO_STEP)"
+        echo "  - TGM weight: $TGM_WEIGHT"
+        echo "  - CLS layers: $CLS_LAYERS"
+        echo "  - Resolution: $RES_NAME"
+        echo "  - Batch size per GPU: $BATCH_SIZE"
+        echo "  - Effective batch size: $((BATCH_SIZE * 2))"
+        echo "  - Workers per GPU: $ACTUAL_WORKERS"
+        echo "  - Video length: $VIDEO_LENGTH frames"
+        echo "  - Total iterations: $TOTAL_ITERS"
+        echo "  - GPUs: 0,1"
+        echo "  - Results directory: $RESULTS_DIR"
+        echo ""
+
+        DOCKER_CMD="CUDA_VISIBLE_DEVICES=0,1 docker compose run --rm \
+            -e GLOO_SOCKET_IFNAME=eth0 \
+            -e NCCL_SOCKET_IFNAME=eth0 \
+            -e NCCL_P2P_DISABLE=1 \
+            -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+            -e WANDB_API_KEY=\${WANDB_API_KEY:-} \
+            flashdepth torchrun \
+            --standalone \
+            --nproc_per_node=2 \
+            train_gear5.py \
+            --config-path configs/gear5 \
+            --config-name config_$CONFIG_VARIANT \
+            dataset.data_root=/data/datasets \
+            dataset.video_length=$VIDEO_LENGTH \
+            training.batch_size=$BATCH_SIZE \
+            training.workers=$ACTUAL_WORKERS \
+            training.iterations=$TOTAL_ITERS \
+            training.measure_fps=$MEASURE_FPS \
+            training.wandb=$WANDB \
+            use_bankai=true \
+            bankai_phase=$BANKAI_PHASE \
+            +bankai_auto_step=$BANKAI_AUTO_STEP \
+            tgm_weight=$TGM_WEIGHT \
+            use_canonical_space=$USE_CANONICAL \
+            +cls_layers='[$CLS_LAYERS]' \
+            +results_dir=$RESULTS_DIR"
+
+        # Add gear_checkpoint if specified (for Phase 2)
+        if [ -n "$GEAR_CHECKPOINT" ]; then
+            DOCKER_CMD="$DOCKER_CMD load=$GEAR_CHECKPOINT"
+        fi
+
+        # Add wandb name if specified
+        if [ -n "$WANDB_NAME" ]; then
+            DOCKER_CMD="$DOCKER_CMD training.wandb_name=$WANDB_NAME"
+        fi
+
+        eval $DOCKER_CMD
+        ;;
+
+    test_gear5_bankai)
+        echo "Starting Gear5 Bankai testing..."
+        echo "Configuration:"
+        echo "  - Video length: $VID_LEN"
+        echo "  - Frame interval: $FRAME_INTERVAL"
+        echo "  - GPU: $GPU_ID"
+        echo "  - Results directory: $RESULTS_DIR"
+        echo "  - Checkpoint: $FLASHDEPTH_CHECKPOINT"
+        echo "  - Config variant: $CONFIG_VARIANT"
+        echo "  - Resolution: $RESOLUTION"
+        if [ -n "$OBJWISE_DATASET" ]; then
+            echo "  - Dataset: $OBJWISE_DATASET"
+        else
+            echo "  - Dataset: Using config defaults (all test datasets)"
+        fi
+        echo ""
+
+        # Build test_gear5 bankai command
+        TEST_CMD="python test_gear5.py \
+            --config-path configs/gear5 \
+            --config-name config_$CONFIG_VARIANT \
+            dataset.data_root=/data/datasets \
+            training.workers=$WORKERS \
+            use_bankai=true \
+            +results_dir=$RESULTS_DIR \
+            +gpu=$GPU_ID \
+            +vid_len=$VID_LEN \
+            +frame_interval=$FRAME_INTERVAL \
+            +visualization=$VISUALIZATION \
+            +config_dir=configs/gear5/$CONFIG_VARIANT"
+
+        # Add --objwise flag if requested
+        if [ "$OBJWISE_FLAG" == "true" ]; then
+            TEST_CMD="$TEST_CMD --objwise"
+        fi
+
+        # Add dataset override if specified
+        if [ -n "$OBJWISE_DATASET" ]; then
+            TEST_CMD="$TEST_CMD eval.test_datasets=[$OBJWISE_DATASET]"
+            OBJWISE_DATASET_BASE="${OBJWISE_DATASET/_seg/}"
+            TEST_CMD="$TEST_CMD object_wise.dataset=$OBJWISE_DATASET_BASE"
         fi
 
         # Add resolution override

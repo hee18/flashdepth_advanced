@@ -284,3 +284,275 @@ class ContrastiveFGBGLoss(nn.Module):
         # Maximize distance = minimize similarity
         # Add temperature scaling for numerical stability
         return avg_similarity / self.temperature
+
+
+# ==================== TGM Loss for Gear5 Bankai ====================
+
+class TGMTemporalLoss(nn.Module):
+    """
+    Temporal Gradient Matching (TGM) Loss for temporal consistency.
+    
+    Reference: Video Depth Anything (https://github.com/DepthAnything/Video-Depth-Anything)
+    
+    This loss encourages temporal consistency by matching the temporal gradients
+    (frame-to-frame changes) between predicted depth and ground truth depth.
+    
+    Key Features:
+        1. Multi-scale temporal gradients (stride=1, 2, 4, 8)
+        2. Validity masking (only compute on stable regions)
+        3. Trimmed MAE loss (robust to outliers)
+        4. Exponential decay for longer temporal distances
+    
+    Loss Formula:
+        TGM = Σ_{s=0}^{S-1} decay^s × TrimmedMAE(
+            diff(pred, stride=2^s),
+            diff(gt, stride=2^s),
+            valid_mask
+        )
+    
+    Valid Mask:
+        - Both frames have valid GT
+        - GT temporal gradient is below threshold (stable regions)
+    """
+    def __init__(self, 
+                 num_scales=4,
+                 decay=0.5,
+                 diff_threshold=0.05,
+                 trim_ratio=0.2,
+                 use_log_space=True):
+        """
+        Args:
+            num_scales: Number of temporal scales (default: 4 for stride=1,2,4,8)
+            decay: Weight decay factor for larger strides (default: 0.5)
+            diff_threshold: Threshold for GT temporal gradient as ratio of depth range
+            trim_ratio: Ratio of outliers to trim from loss computation
+            use_log_space: Whether to compute gradients in log space (better for depth)
+        """
+        super().__init__()
+        self.num_scales = num_scales
+        self.decay = decay
+        self.diff_threshold = diff_threshold
+        self.trim_ratio = trim_ratio
+        self.use_log_space = use_log_space
+    
+    def _compute_temporal_gradient(self, depth, stride=1):
+        """
+        Compute temporal gradient with given stride.
+        
+        Args:
+            depth: [B, T, H, W] or [B, T, 1, H, W] depth values
+            stride: Temporal stride for gradient computation
+        
+        Returns:
+            grad: [B, T-stride, H, W] temporal gradients
+        """
+        if depth.ndim == 5:
+            depth = depth.squeeze(2)  # [B, T, H, W]
+        
+        # Compute difference: depth[t+stride] - depth[t]
+        if self.use_log_space:
+            # Log space gradient: log(d2) - log(d1) = log(d2/d1)
+            epsilon = 1e-8
+            log_depth = torch.log(depth.clamp(min=epsilon))
+            grad = log_depth[:, stride:] - log_depth[:, :-stride]  # [B, T-stride, H, W]
+        else:
+            grad = depth[:, stride:] - depth[:, :-stride]  # [B, T-stride, H, W]
+        
+        return grad
+    
+    def _compute_valid_mask(self, gt_depth, gt_grad, pred_mask=None, stride=1):
+        """
+        Compute validity mask for temporal gradient loss.
+        
+        Valid regions:
+            1. Both frames have valid GT (> 0)
+            2. GT gradient is below threshold (stable regions)
+        
+        Args:
+            gt_depth: [B, T, H, W] GT depth
+            gt_grad: [B, T-stride, H, W] GT temporal gradient
+            pred_mask: [B, T, H, W] additional prediction validity mask
+            stride: Temporal stride used
+        
+        Returns:
+            valid: [B, T-stride, H, W] boolean mask
+        """
+        B, T, H, W = gt_depth.shape
+        
+        # 1. Both frames must have valid GT
+        valid_t1 = (gt_depth[:, :-stride] > 0)  # [B, T-stride, H, W]
+        valid_t2 = (gt_depth[:, stride:] > 0)   # [B, T-stride, H, W]
+        valid_temporal = valid_t1 & valid_t2
+        
+        # 2. GT gradient must be below threshold (stable regions)
+        # Compute depth range for threshold
+        if self.use_log_space:
+            # In log space, use absolute threshold
+            threshold = self.diff_threshold * 2.0  # Roughly corresponds to 5% change
+        else:
+            # In linear space, use relative threshold
+            depth_range = gt_depth.max() - gt_depth.min() + 1e-8
+            threshold = self.diff_threshold * depth_range
+        
+        valid_stable = (gt_grad.abs() < threshold)
+        
+        # Combine masks
+        valid = valid_temporal & valid_stable
+        
+        # Include prediction mask if provided
+        if pred_mask is not None:
+            if pred_mask.ndim == 5:
+                pred_mask = pred_mask.squeeze(2)
+            valid_pred_t1 = pred_mask[:, :-stride]
+            valid_pred_t2 = pred_mask[:, stride:]
+            valid = valid & valid_pred_t1 & valid_pred_t2
+        
+        return valid
+    
+    def _trimmed_mae(self, pred_grad, gt_grad, valid_mask):
+        """
+        Compute trimmed MAE loss (robust to outliers).
+        
+        Args:
+            pred_grad: [B, T-stride, H, W] predicted temporal gradient
+            gt_grad: [B, T-stride, H, W] GT temporal gradient
+            valid_mask: [B, T-stride, H, W] validity mask
+        
+        Returns:
+            loss: scalar
+        """
+        # Compute absolute error
+        error = (pred_grad - gt_grad).abs()
+        
+        # Apply valid mask
+        error_valid = error[valid_mask]
+        
+        if error_valid.numel() == 0:
+            return torch.tensor(0.0, device=pred_grad.device)
+        
+        # Trim top trim_ratio errors (robust to outliers)
+        if self.trim_ratio > 0:
+            num_valid = error_valid.numel()
+            num_keep = int(num_valid * (1.0 - self.trim_ratio))
+            if num_keep > 0:
+                # Sort and keep lowest errors
+                error_sorted, _ = torch.sort(error_valid)
+                error_trimmed = error_sorted[:num_keep]
+                return error_trimmed.mean()
+        
+        return error_valid.mean()
+    
+    def forward(self, pred_depth, gt_depth, valid_mask=None):
+        """
+        Compute TGM loss for temporal consistency.
+        
+        Args:
+            pred_depth: [B, T, H, W] or [B, T, 1, H, W] predicted depth
+            gt_depth: [B, T, H, W] or [B, T, 1, H, W] ground truth depth
+            valid_mask: [B, T, H, W] optional validity mask
+        
+        Returns:
+            loss: scalar TGM loss
+        """
+        # Handle 5D input
+        if pred_depth.ndim == 5:
+            pred_depth = pred_depth.squeeze(2)
+        if gt_depth.ndim == 5:
+            gt_depth = gt_depth.squeeze(2)
+        
+        B, T, H, W = pred_depth.shape
+        
+        # Need at least 2 frames for temporal gradient
+        if T < 2:
+            return torch.tensor(0.0, device=pred_depth.device)
+        
+        total_loss = 0.0
+        total_weight = 0.0
+        
+        # Multi-scale temporal gradients
+        for scale_idx in range(self.num_scales):
+            stride = 2 ** scale_idx
+            
+            # Skip if stride is too large for sequence length
+            if stride >= T:
+                break
+            
+            # Compute temporal gradients
+            pred_grad = self._compute_temporal_gradient(pred_depth, stride)
+            gt_grad = self._compute_temporal_gradient(gt_depth, stride)
+            
+            # Compute validity mask
+            scale_valid_mask = self._compute_valid_mask(
+                gt_depth, gt_grad, valid_mask, stride
+            )
+            
+            # Compute trimmed MAE
+            scale_loss = self._trimmed_mae(pred_grad, gt_grad, scale_valid_mask)
+            
+            # Apply decay weight
+            weight = self.decay ** scale_idx
+            total_loss = total_loss + weight * scale_loss
+            total_weight = total_weight + weight
+        
+        # Normalize by total weight
+        if total_weight > 0:
+            return total_loss / total_weight
+        else:
+            return torch.tensor(0.0, device=pred_depth.device)
+
+
+class CombinedBankaiLoss(nn.Module):
+    """
+    Combined loss for Gear5 Bankai training.
+    
+    L_total = L_depth + α × L_TGM
+    
+    Where:
+        - L_depth: Log L1 loss on inverse depth
+        - L_TGM: Temporal Gradient Matching loss for temporal consistency
+    
+    Note: TGM loss can be disabled by setting tgm_weight=0 for ablation.
+    """
+    def __init__(self, tgm_weight=0.3, **tgm_kwargs):
+        """
+        Args:
+            tgm_weight: Weight for TGM loss (α in the formula)
+            **tgm_kwargs: Arguments for TGMTemporalLoss
+        """
+        super().__init__()
+        self.depth_loss = LogL1Loss()
+        self.tgm_loss = TGMTemporalLoss(**tgm_kwargs)
+        self.tgm_weight = tgm_weight
+    
+    def forward(self, pred_depth, gt_depth, valid_mask=None, return_components=False):
+        """
+        Compute combined loss.
+        
+        Args:
+            pred_depth: [B, T, H, W] or [B, T, 1, H, W] predicted depth (inverse)
+            gt_depth: [B, T, H, W] or [B, T, 1, H, W] ground truth depth (inverse)
+            valid_mask: [B, T, H, W] validity mask
+            return_components: If True, return individual loss components
+        
+        Returns:
+            loss: Combined loss scalar
+            (optional) dict with 'depth_loss' and 'tgm_loss' if return_components=True
+        """
+        # Compute depth loss
+        l_depth = self.depth_loss(pred_depth, gt_depth, valid_mask)
+        
+        # Compute TGM loss
+        if self.tgm_weight > 0:
+            l_tgm = self.tgm_loss(pred_depth, gt_depth, valid_mask)
+        else:
+            l_tgm = torch.tensor(0.0, device=pred_depth.device)
+        
+        # Combined loss
+        total_loss = l_depth + self.tgm_weight * l_tgm
+        
+        if return_components:
+            return total_loss, {
+                'depth_loss': l_depth.item(),
+                'tgm_loss': l_tgm.item()
+            }
+        return total_loss

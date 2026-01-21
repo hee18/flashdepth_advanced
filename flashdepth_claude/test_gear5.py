@@ -33,7 +33,7 @@ project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
 
 from flashdepth.model import FlashDepth
-from flashdepth.gear5_modules import Gear5MetricHead
+from flashdepth.gear5_modules import Gear5MetricHead, BankaiMetricHead
 from dataloaders.combined_dataset import CombinedDataset
 from dataloaders.waymo_segmentation_dataset import WaymoSegmentationDataset, collate_fn as waymo_collate_fn
 from dataloaders.urbansyn_dataset import UrbanSynDepth
@@ -99,6 +99,13 @@ class Gear5Tester:
             self.phase = 2
         else:
             self.phase = 1
+
+        # Bankai mode detection
+        self.use_bankai = config.get('use_bankai', False)
+        if self.use_bankai:
+            self.bankai_phase = config.get('bankai_phase', 2)  # Default to phase 2 for testing
+            logger.info(f"=== BANKAI MODE ===")
+            logger.info(f"  Bankai Phase: {self.bankai_phase}")
 
         logger.info(f"Testing Phase {self.phase}")
 
@@ -188,12 +195,36 @@ class Gear5Tester:
             gsp_embed_dim = model_embed_dim
             logger.info(f"TSP mode 'auto': Using TSP with {gsp_embed_dim}-dim CLS tokens")
 
-        model.gear5_metric_head = Gear5MetricHead(
-            embed_dim=gsp_embed_dim,
-            feature_dim=256,
-            hidden_dim=128,
-            use_mamba=use_mamba_temporal  # Support Mamba2 option
-        )
+        # Create metric head based on mode
+        dpt_dim = 256 if model.encoder == 'vitl' else 64
+
+        if self.use_bankai:
+            # Bankai mode: Unified Mamba for temporal depth + metric prediction
+            bankai_downsample = self.config.get('bankai_downsample', 0.1 if model.encoder == 'vitl' else 0.05)
+            bankai_num_layers = self.config.get('bankai_num_mamba_layers', 4)
+            use_hybrid_cls_fusion = (self.phase == 2 and model.hybrid_configs is not None)
+
+            model.gear5_metric_head = BankaiMetricHead(
+                dpt_dim=dpt_dim,
+                cls_embed_dim=gsp_embed_dim,
+                num_mamba_layers=bankai_num_layers,
+                downsample_factor=bankai_downsample,
+                use_hybrid_cls_fusion=use_hybrid_cls_fusion,
+                teacher_cls_dim=1024 if use_hybrid_cls_fusion else gsp_embed_dim
+            )
+            logger.info(f"=== BANKAI MetricHead Created ===")
+            logger.info(f"  DPT dim: {dpt_dim}")
+            logger.info(f"  CLS embed dim: {gsp_embed_dim}")
+            logger.info(f"  Mamba layers: {bankai_num_layers}")
+            logger.info(f"  Downsample factor: {bankai_downsample}")
+        else:
+            # Standard Gear5 mode
+            model.gear5_metric_head = Gear5MetricHead(
+                embed_dim=gsp_embed_dim,
+                feature_dim=256,
+                hidden_dim=128,
+                use_mamba=use_mamba_temporal  # Support Mamba2 option
+            )
 
         # Enable attention weights storage
         # CLS layer selection: user can specify which intermediate layers to use (1-4)
@@ -1145,8 +1176,10 @@ class Gear5Tester:
         logger.info(f"Warmup run for FPS measurement...")
 
         # Initialize Mamba sequence for warmup
-        if hasattr(self.model, 'mamba'):
+        if hasattr(self.model, 'mamba') and not self.use_bankai:
+            # Standard Gear5: Use FlashDepth's original Mamba
             self.model.mamba.start_new_sequence()
+        # Note: Bankai's UnifiedMamba handles sequence initialization internally
 
         with torch.amp.autocast('cuda', dtype=torch.bfloat16):
             img_warmup = images[0, 0].unsqueeze(0)  # [1, 3, H, W]
@@ -1215,8 +1248,10 @@ class Gear5Tester:
         start_time = None  # Will start timing after warmup
 
         # Initialize Mamba sequence for actual test (critical for temporal processing!)
-        if hasattr(self.model, 'mamba'):
+        if hasattr(self.model, 'mamba') and not self.use_bankai:
+            # Standard Gear5: Use FlashDepth's original Mamba
             self.model.mamba.start_new_sequence()
+        # Note: Bankai's UnifiedMamba handles sequence initialization per call
 
         # Process each frame
         for t in range(T):
@@ -1260,29 +1295,52 @@ class Gear5Tester:
                 )
                 path_1 = dpt_features[-1]
 
-                # Apply Mamba temporal processing (frozen)
-                path_1_temporal = self.model.dpt_features_to_mamba(
-                    input_shape=(1, 1, None, h, w),
-                    dpt_features=path_1,
-                    in_dpt_layer=0
-                )
+                if self.use_bankai:
+                    # ========== BANKAI MODE ==========
+                    # UnifiedMamba processes path_1 + CLS for temporal depth + metric
 
-                # Get relative depth (frozen)
-                out = self.model.depth_head.scratch.output_conv1(path_1_temporal)
-                out = F.interpolate(out, (h, w), mode="bilinear", align_corners=True)
-                relative_depth = self.model.depth_head.scratch.output_conv2(out)  # [1, 1, H, W]
+                    # Call BankaiMetricHead with path_1 + CLS tokens
+                    gear5_outputs = self.model.gear5_metric_head(
+                        path_1=path_1,  # [1, dpt_dim, h, w]
+                        cls_tokens=cls_tokens,  # [1, 1, embed_dim]
+                        attention_weights_list=attention_weights_list,
+                        input_shape=(1, 1, 3, h, w)  # B=1, T=1
+                    )
 
-                # Get scale/shift/importance_map from Gear5MetricHead
-                gear5_outputs = self.model.gear5_metric_head(
-                    cls_tokens=cls_tokens,
-                    attention_weights_list=attention_weights_list,
-                    patch_h=patch_h,
-                    patch_w=patch_w
-                )
+                    scale = gear5_outputs['scale']  # [1, 1]
+                    shift = gear5_outputs['shift']  # [1, 1]
+                    importance_map = gear5_outputs['importance_map']  # [1, 1, patch_h, patch_w]
+                    path_1_temporal = gear5_outputs['spatial_out']  # [1, dpt_dim, h, w] - enhanced by UnifiedMamba
 
-                scale = gear5_outputs['scale']  # [1, 1]
-                shift = gear5_outputs['shift']  # [1, 1]
-                importance_map = gear5_outputs['importance_map']  # [1, 1, patch_h, patch_w]
+                    # Get relative depth through output_conv
+                    out = self.model.depth_head.scratch.output_conv1(path_1_temporal)
+                    out = F.interpolate(out, (h, w), mode="bilinear", align_corners=True)
+                    relative_depth = self.model.depth_head.scratch.output_conv2(out)  # [1, 1, H, W]
+                else:
+                    # ========== STANDARD GEAR5 MODE ==========
+                    # Apply Mamba temporal processing (frozen)
+                    path_1_temporal = self.model.dpt_features_to_mamba(
+                        input_shape=(1, 1, None, h, w),
+                        dpt_features=path_1,
+                        in_dpt_layer=0
+                    )
+
+                    # Get relative depth (frozen)
+                    out = self.model.depth_head.scratch.output_conv1(path_1_temporal)
+                    out = F.interpolate(out, (h, w), mode="bilinear", align_corners=True)
+                    relative_depth = self.model.depth_head.scratch.output_conv2(out)  # [1, 1, H, W]
+
+                    # Get scale/shift/importance_map from Gear5MetricHead
+                    gear5_outputs = self.model.gear5_metric_head(
+                        cls_tokens=cls_tokens,
+                        attention_weights_list=attention_weights_list,
+                        patch_h=patch_h,
+                        patch_w=patch_w
+                    )
+
+                    scale = gear5_outputs['scale']  # [1, 1]
+                    shift = gear5_outputs['shift']  # [1, 1]
+                    importance_map = gear5_outputs['importance_map']  # [1, 1, patch_h, patch_w]
 
                 # Apply scale/shift to relative depth
                 scale_expanded = scale.view(1, 1, 1, 1)  # [1, 1, 1, 1]

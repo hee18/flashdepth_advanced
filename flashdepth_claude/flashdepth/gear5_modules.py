@@ -319,3 +319,409 @@ class Gear5MetricHead(nn.Module):
             'shift': shift,
             'importance_map': importance_map
         }
+
+
+# ==================== Bankai Mode: Unified Mamba for Temporal Depth + Metric ====================
+
+class UnifiedMamba(nn.Module):
+    """
+    Unified Mamba for Gear5 Bankai mode.
+    
+    Processes spatial tokens (from DPT path_1) + CLS token through a single Mamba2,
+    achieving both temporal depth consistency and metric scale/shift prediction.
+    
+    Architecture:
+        Input: path_1 (148×148, C) + CLS token (1, C)
+            ↓ Downsample path_1 (e.g., 0.1 → 14×14 = 196 tokens)
+            ↓ Flatten → [h×w, C]
+            ↓ CLS projection → [1, C]
+            ↓ Concat → [h×w + 1, C] (CLS at END for aggregation)
+            ↓ Mamba2 (per-frame processing with hidden state propagation)
+            ↓ Split → Spatial [h×w, C], CLS [1, C]
+            ↓
+        Spatial output → Upsample + Residual → Relative Depth enhancement
+        CLS output → Scale/Shift MLP → Metric conversion
+    
+    Key Design Decisions:
+        - CLS at END: Receives full spatial context for scale/shift prediction
+        - Hidden state propagation: Ensures temporal consistency
+        - Residual connection: Preserves original DPT quality
+        - Zero-init output: Training stability
+    
+    Parameters (Large model):
+        - Mamba2: ~1.5M (d_model=256, expand=2, 4 layers)
+        - CLS projection: 1024 → 256 = 262K
+        - Scale/Shift heads: 256 × 2 = 512
+        - Total: ~1.76M parameters
+    """
+    def __init__(self, 
+                 dpt_dim=256, 
+                 cls_embed_dim=1024, 
+                 num_layers=4, 
+                 downsample_factor=0.1,
+                 d_state=64,
+                 d_conv=4,
+                 use_hydra=False):
+        super().__init__()
+        
+        self.dpt_dim = dpt_dim
+        self.cls_embed_dim = cls_embed_dim
+        self.num_layers = num_layers
+        self.downsample_factor = downsample_factor
+        
+        # Determine Mamba2 hyperparameters based on dpt_dim
+        if dpt_dim == 64:  # ViT-S / Hybrid
+            headdim = 32
+            expand = 4
+        else:  # ViT-L (dpt_dim=256)
+            headdim = 64
+            expand = 2
+        
+        self.headdim = headdim
+        self.expand = expand
+        
+        # 1. CLS projection: embed_dim → dpt_dim
+        self.cls_proj = nn.Sequential(
+            nn.Linear(cls_embed_dim, dpt_dim),
+            nn.ReLU(inplace=True)
+        )
+        
+        # 2. Mamba2 blocks for unified temporal processing
+        from .mamba import MambaBlock, InferenceParams
+        
+        self.blocks = nn.ModuleList([
+            MambaBlock(
+                d_model=dpt_dim,
+                layer_idx=layer_idx,
+                expand=expand,
+                d_state=d_state,
+                d_conv=d_conv,
+                headdim=headdim,
+                use_hydra=use_hydra
+            ) for layer_idx in range(num_layers)
+        ])
+        
+        # 3. Zero-init output projection for spatial features (training stability)
+        self.spatial_proj = nn.Sequential(
+            nn.GELU(),
+            nn.Linear(dpt_dim, dpt_dim)
+        )
+        nn.init.zeros_(self.spatial_proj[1].weight)
+        nn.init.zeros_(self.spatial_proj[1].bias)
+        
+        # 4. Scale/Shift heads for metric depth
+        self.scale_head = nn.Sequential(
+            nn.Linear(dpt_dim, dpt_dim // 2),
+            nn.ReLU(inplace=True),
+            nn.Linear(dpt_dim // 2, 1)
+        )
+        self.shift_head = nn.Sequential(
+            nn.Linear(dpt_dim, dpt_dim // 2),
+            nn.ReLU(inplace=True),
+            nn.Linear(dpt_dim // 2, 1)
+        )
+        
+        # 5. Inference params for hidden state tracking
+        self.max_seqlen = 60000
+        self.max_batch_size = 32  # Will be updated during forward
+        self.inference_params = None
+        
+        # Log parameter count
+        total_params = sum(p.numel() for p in self.parameters())
+        logging.info(f"UnifiedMamba (Bankai): {total_params:,} parameters")
+        logging.info(f"  CLS projection: {cls_embed_dim} → {dpt_dim}")
+        logging.info(f"  Mamba2: d_model={dpt_dim}, expand={expand}, headdim={headdim}, layers={num_layers}")
+        logging.info(f"  Downsample factor: {downsample_factor}")
+        logging.info(f"  Scale/Shift heads: {dpt_dim} → {dpt_dim//2} → 1")
+    
+    def start_new_sequence(self, batch_size=None):
+        """Reset hidden states for new video sequence"""
+        from .mamba import InferenceParams
+        
+        if batch_size is not None:
+            self.max_batch_size = batch_size
+        self.inference_params = InferenceParams(
+            max_seqlen=self.max_seqlen, 
+            max_batch_size=self.max_batch_size
+        )
+    
+    def forward_single_frame(self, spatial_tokens, cls_token):
+        """
+        Process a single frame with hidden state propagation.
+        
+        Args:
+            spatial_tokens: [B, h*w, dpt_dim] - Downsampled spatial features
+            cls_token: [B, cls_embed_dim] - CLS token from DINOv2
+        
+        Returns:
+            spatial_out: [B, h*w, dpt_dim] - Enhanced spatial features
+            scale: [B, 1] - Scale factor
+            shift: [B, 1] - Shift factor
+        """
+        B = spatial_tokens.shape[0]
+        
+        # 1. Project CLS token to dpt_dim
+        cls_proj = self.cls_proj(cls_token)  # [B, dpt_dim]
+        cls_proj = cls_proj.unsqueeze(1)  # [B, 1, dpt_dim]
+        
+        # 2. Concatenate spatial + CLS (CLS at END)
+        x = torch.cat([spatial_tokens, cls_proj], dim=1)  # [B, h*w + 1, dpt_dim]
+        
+        # 3. Process through Mamba2 blocks
+        for block in self.blocks:
+            x = block(x, inference_params=self.inference_params)
+        
+        # 4. Split spatial and CLS
+        spatial_out = x[:, :-1, :]  # [B, h*w, dpt_dim]
+        cls_out = x[:, -1, :]  # [B, dpt_dim]
+        
+        # 5. Apply zero-init projection to spatial features
+        spatial_out = self.spatial_proj(spatial_out)  # [B, h*w, dpt_dim]
+        
+        # 6. Predict scale and shift from CLS
+        scale_logits = self.scale_head(cls_out)  # [B, 1]
+        shift_logits = self.shift_head(cls_out)  # [B, 1]
+        
+        # Ensure positive scale with Softplus
+        scale = F.softplus(scale_logits)  # [B, 1]
+        shift = shift_logits  # [B, 1]
+        
+        # Update sequence length offset
+        if self.inference_params is not None:
+            self.inference_params.seqlen_offset += x.shape[1]
+        
+        return spatial_out, scale, shift
+    
+    def forward(self, path_1, cls_tokens, input_shape):
+        """
+        Process entire video sequence through unified Mamba.
+        
+        Args:
+            path_1: [B*T, dpt_dim, h, w] - DPT path_1 features
+            cls_tokens: [B, T, cls_embed_dim] - CLS tokens for all frames
+            input_shape: (B, T, C, H, W) - Original input shape
+        
+        Returns:
+            dict with:
+                - spatial_out: [B*T, dpt_dim, h, w] - Enhanced spatial features
+                - scale: [B, T] - Scale factors for each frame
+                - shift: [B, T] - Shift factors for each frame
+        """
+        B, T, C, H, W = input_shape
+        BT, dpt_dim, h, w = path_1.shape
+        assert BT == B * T, f"Expected {B*T}, got {BT}"
+        
+        # Start new sequence
+        self.start_new_sequence(batch_size=B)
+        
+        # Store original path_1 for residual
+        original_path_1 = path_1.clone()
+        original_path_1 = original_path_1.view(B, T, dpt_dim, h, w)
+        
+        # Apply downsampling
+        if self.downsample_factor != 1.0:
+            h_down = int(h * self.downsample_factor)
+            w_down = int(w * self.downsample_factor)
+            path_1_down = F.adaptive_avg_pool2d(path_1, (h_down, w_down))
+        else:
+            h_down, w_down = h, w
+            path_1_down = path_1
+        
+        # Reshape for per-frame processing
+        path_1_down = path_1_down.view(B, T, dpt_dim, h_down, w_down)
+        
+        # Process each frame
+        spatial_outs = []
+        scales = []
+        shifts = []
+        
+        for t in range(T):
+            # Get frame features
+            frame_spatial = path_1_down[:, t]  # [B, dpt_dim, h_down, w_down]
+            frame_cls = cls_tokens[:, t]  # [B, cls_embed_dim]
+            
+            # Flatten spatial features
+            frame_spatial_flat = frame_spatial.permute(0, 2, 3, 1).reshape(B, h_down * w_down, dpt_dim)
+            
+            # Process through unified Mamba
+            spatial_out, scale, shift = self.forward_single_frame(frame_spatial_flat, frame_cls)
+            
+            spatial_outs.append(spatial_out)
+            scales.append(scale)
+            shifts.append(shift)
+        
+        # Stack outputs
+        spatial_outs = torch.stack(spatial_outs, dim=1)  # [B, T, h_down*w_down, dpt_dim]
+        scales = torch.cat(scales, dim=1)  # [B, T]
+        shifts = torch.cat(shifts, dim=1)  # [B, T]
+        
+        # Reshape spatial outputs back to spatial format
+        spatial_outs = spatial_outs.view(B * T, h_down * w_down, dpt_dim)
+        spatial_outs = spatial_outs.permute(0, 2, 1).reshape(B * T, dpt_dim, h_down, w_down)
+        
+        # Upsample if downsampled
+        if self.downsample_factor != 1.0:
+            spatial_outs = F.interpolate(spatial_outs, (h, w), mode='bilinear', align_corners=True)
+        
+        # Add residual (1:1 ratio)
+        spatial_outs = spatial_outs + original_path_1.view(B * T, dpt_dim, h, w)
+        
+        return {
+            'spatial_out': spatial_outs,  # [B*T, dpt_dim, h, w]
+            'scale': scales,  # [B, T]
+            'shift': shifts  # [B, T]
+        }
+
+
+class BankaiMetricHead(nn.Module):
+    """
+    Unified Bankai metric head: combines temporal depth enhancement and metric prediction.
+    
+    This head replaces both the original FlashDepth Mamba (F-Mamba) and 
+    Gear5's TemporalScalePredictor (T-Mamba) with a single unified Mamba.
+    
+    Architecture (Bankai):
+        ┌─────────────────────────────────────────────────────────────────┐
+        │                        DINOv2 (Frozen)                          │
+        │  ViT-L: CLS tokens [17, 23] → avg → Fused CLS-L [1, 1024]      │
+        │  ViT-S: CLS tokens [8, 11]  → avg → Fused CLS-S [1, 384]       │
+        └─────────────────────────────────────────────────────────────────┘
+                                      ↓
+                [Hybrid only] CrossAttn(Q:CLS-S, KV:CLS-L)
+                                      ↓
+                      Fused CLS → Linear + ReLU → [1, C]
+        
+        ┌─────────────────────────────────────────────────────────────────┐
+        │                         DPT (Frozen)                            │
+        │  path_1 (148×148, C) → Downsample → Flatten → [h×w, C]         │
+        └─────────────────────────────────────────────────────────────────┘
+                                      ↓
+                            Concat → [h×w + 1, C]
+                            (Spatial tokens + CLS at END)
+                                      ↓
+        ┌─────────────────────────────────────────────────────────────────┐
+        │                    Unified Mamba (Trainable)                    │
+        │  - Per-frame processing + hidden state propagation              │
+        │  - Temporal consistency via hidden state                        │
+        └─────────────────────────────────────────────────────────────────┘
+                                      ↓
+                    ┌─────────────────┴─────────────────┐
+                    ↓                                   ↓
+            Spatial [h×w, C]                     CLS [1, C]
+                    ↓                                   ↓
+            Unflatten + Upsample                 MLP Head
+            + original_path_1 (residual)              ↓
+                    ↓                           Scale (Softplus)
+            output_conv (trainable)             Shift (Clamped)
+                    ↓
+              Relative Depth
+                    ↓
+            Metric Depth = Scale × Relative + Shift
+    
+    Model Variants:
+        - Large: dpt_dim=256, cls_embed_dim=1024, downsample=0.1
+        - Small: dpt_dim=64, cls_embed_dim=384, downsample=0.05
+        - Hybrid: dpt_dim=64, cls_embed_dim=384 (with CrossAttn), downsample=0.05
+    """
+    def __init__(self, 
+                 dpt_dim=256, 
+                 cls_embed_dim=1024, 
+                 num_mamba_layers=4,
+                 downsample_factor=0.1,
+                 use_hybrid_cls_fusion=False,
+                 teacher_cls_dim=1024):
+        super().__init__()
+        
+        self.dpt_dim = dpt_dim
+        self.cls_embed_dim = cls_embed_dim
+        self.use_hybrid_cls_fusion = use_hybrid_cls_fusion
+        self.teacher_cls_dim = teacher_cls_dim
+        
+        # Hybrid mode: CrossAttention for CLS fusion
+        if use_hybrid_cls_fusion:
+            self.cls_cross_attn = nn.MultiheadAttention(
+                embed_dim=cls_embed_dim,  # Query dim (student)
+                num_heads=4,
+                kdim=teacher_cls_dim,  # Key dim (teacher)
+                vdim=teacher_cls_dim,  # Value dim (teacher)
+                batch_first=True
+            )
+            logging.info(f"BankaiMetricHead: CrossAttn for CLS fusion (Q:{cls_embed_dim}, KV:{teacher_cls_dim})")
+        
+        # Unified Mamba for temporal processing
+        self.unified_mamba = UnifiedMamba(
+            dpt_dim=dpt_dim,
+            cls_embed_dim=cls_embed_dim,
+            num_layers=num_mamba_layers,
+            downsample_factor=downsample_factor
+        )
+        
+        # Importance map generator (reuse from original Gear5)
+        self.importance_map_generator = ImportanceMapGenerator(num_layers=2)
+        
+        # Log parameter count
+        total_params = sum(p.numel() for p in self.parameters())
+        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        logging.info(f"BankaiMetricHead: {trainable_params:,} / {total_params:,} trainable parameters")
+    
+    def forward(self, 
+                path_1,
+                cls_tokens, 
+                attention_weights_list, 
+                input_shape,
+                teacher_cls_tokens=None):
+        """
+        Args:
+            path_1: [B*T, dpt_dim, h, w] - DPT path_1 features (BEFORE Mamba in original)
+            cls_tokens: [B, T, cls_embed_dim] - Multi-layer averaged CLS tokens
+            attention_weights_list: List of [B*T, num_heads, N+1, N+1] from 2 layers
+            input_shape: (B, T, C, H, W) - Original input shape
+            teacher_cls_tokens: [B, T, teacher_cls_dim] - Teacher CLS tokens (Hybrid only)
+        
+        Returns:
+            dict with:
+                - spatial_out: [B*T, dpt_dim, h, w] - Enhanced spatial features (for output_conv)
+                - scale: [B, T] - Scale factors
+                - shift: [B, T] - Shift factors
+                - importance_map: [B, T, patch_h, patch_w]
+        """
+        B, T, C, H, W = input_shape
+        patch_h, patch_w = H // 14, W // 14  # Assuming patch_size=14
+        
+        # Hybrid mode: Fuse CLS tokens via CrossAttention
+        if self.use_hybrid_cls_fusion and teacher_cls_tokens is not None:
+            # cls_tokens: [B, T, cls_embed_dim] as Query
+            # teacher_cls_tokens: [B, T, teacher_cls_dim] as Key/Value
+            BT_cls = B * T
+            
+            # Reshape for attention: [B*T, 1, dim]
+            q = cls_tokens.reshape(BT_cls, 1, -1)  # [B*T, 1, cls_embed_dim]
+            kv = teacher_cls_tokens.reshape(BT_cls, 1, -1)  # [B*T, 1, teacher_cls_dim]
+            
+            # Cross-attention
+            fused_cls, _ = self.cls_cross_attn(q, kv, kv)  # [B*T, 1, cls_embed_dim]
+            
+            # Reshape back to [B, T, cls_embed_dim]
+            cls_tokens = fused_cls.reshape(B, T, -1)
+        
+        # Process through unified Mamba
+        mamba_outputs = self.unified_mamba(path_1, cls_tokens, input_shape)
+        
+        spatial_out = mamba_outputs['spatial_out']  # [B*T, dpt_dim, h, w]
+        scale = mamba_outputs['scale']  # [B, T]
+        shift = mamba_outputs['shift']  # [B, T]
+        
+        # Generate importance map
+        importance_map = self.importance_map_generator(
+            attention_weights_list, patch_h, patch_w
+        )  # [B*T, 1, patch_h, patch_w]
+        
+        # Reshape importance map to [B, T, patch_h, patch_w]
+        importance_map = importance_map.view(B, T, patch_h, patch_w)
+        
+        return {
+            'spatial_out': spatial_out,
+            'scale': scale,
+            'shift': shift,
+            'importance_map': importance_map
+        }

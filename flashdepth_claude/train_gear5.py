@@ -51,11 +51,11 @@ from datetime import timedelta
 
 from flashdepth.model import FlashDepth
 from utils.gear5_visualization import Gear5Visualizer
-from flashdepth.gear5_modules import Gear5MetricHead
+from flashdepth.gear5_modules import Gear5MetricHead, BankaiMetricHead
 from dataloaders.combined_dataset import CombinedDataset
 from utils.helpers import *
 from utils.metric_depth_metrics import MetricDepthMetrics
-from utils.gear_losses import LogL1Loss
+from utils.gear_losses import LogL1Loss, TGMTemporalLoss, CombinedBankaiLoss
 
 
 def init_distributed():
@@ -107,6 +107,38 @@ class Gear5Trainer:
         # Phase 2: 2K, config_hybrid
         config_variant = config.get('config_variant', 'l')
         self.phase = 2 if config_variant == 'hybrid' else 1
+
+        # ========== Bankai Mode Detection ==========
+        # Bankai mode: Unified Mamba for temporal depth + metric prediction
+        self.use_bankai = config.get('use_bankai', False)
+        if self.use_bankai:
+            # Bankai training phase (Head-First Tuning):
+            #   bankai_phase=1: Train Metric Head only (scale/shift MLPs)
+            #   bankai_phase=2: Train UnifiedMamba + Metric Head + output_conv
+            #   bankai_phase="auto" or 0: Auto transition (Phase 1 -> Phase 2 at auto_step)
+            raw_bankai_phase = config.get('bankai_phase', 1)
+            
+            # Check for auto mode
+            if raw_bankai_phase in ["auto", "Auto", "AUTO", 0, "0"]:
+                self.bankai_auto_mode = True
+                self.bankai_auto_transition_step = config.get('bankai_auto_step', 5000)
+                self.bankai_phase = 1  # Start with phase 1
+                if rank == 0:
+                    logging.info(f"=== BANKAI AUTO MODE ENABLED ===")
+                    logging.info(f"  Auto transition: Phase 1 -> Phase 2 at step {self.bankai_auto_transition_step}")
+            else:
+                self.bankai_auto_mode = False
+                self.bankai_auto_transition_step = None
+                self.bankai_phase = int(raw_bankai_phase)
+            
+            self.tgm_weight = config.get('tgm_weight', 0.3)
+            if rank == 0:
+                logging.info(f"=== BANKAI MODE ENABLED ===")
+                logging.info(f"  Bankai Phase: {self.bankai_phase}" + (" (auto mode)" if self.bankai_auto_mode else ""))
+                logging.info(f"  TGM Loss Weight: {self.tgm_weight}")
+        else:
+            self.bankai_auto_mode = False
+            self.bankai_auto_transition_step = None
 
         # Setup device
         self.device = f"cuda:{local_rank}"
@@ -171,7 +203,14 @@ class Gear5Trainer:
         # Setup optimizer and loss
         self.optimizer = self._setup_optimizer()
         self.scheduler = self._setup_scheduler()
-        self.loss_fn = LogL1Loss()
+
+        # Loss function: LogL1Loss for standard mode, CombinedBankaiLoss for Bankai mode
+        if self.use_bankai and self.tgm_weight > 0:
+            self.loss_fn = CombinedBankaiLoss(tgm_weight=self.tgm_weight)
+            if rank == 0:
+                self.logger.info(f"Using CombinedBankaiLoss with TGM weight: {self.tgm_weight}")
+        else:
+            self.loss_fn = LogL1Loss()
 
         # Loss type: 'log_l1' (default) or 'importance' (importance-weighted)
         self.loss_type = config.get('loss_type', 'log_l1')
@@ -290,13 +329,6 @@ class Gear5Trainer:
             else:
                 self.logger.warning(f"Checkpoint {checkpoint_path} not found")
 
-        # Add Gear5 metric head (unified single-stage)
-        # Uses multi-layer CLS tokens (configurable) and GRU/Mamba2 for temporal modeling
-        use_mamba_temporal = self.config.model.get('use_mamba_temporal', False)
-        self.logger.info(f"Gear5 TemporalScalePredictor backend: {'Mamba2' if use_mamba_temporal else 'GRU'}")
-        if use_mamba_temporal:
-            self.logger.warning("NOTE: FlashDepth's original Mamba modules will be FROZEN. Only TemporalScalePredictor's Mamba2 is trainable.")
-
         # Determine GSP embed_dim based on tsp_mode
         # tsp_mode options:
         #   - "auto": Phase 1→model's embed_dim, Phase 2→Student's embed_dim (default behavior)
@@ -316,12 +348,41 @@ class Gear5Trainer:
             else:
                 self.logger.info(f"TSP mode 'auto' (Phase 1): Using TSP with {gsp_embed_dim}-dim CLS tokens")
 
-        model.gear5_metric_head = Gear5MetricHead(
-            embed_dim=gsp_embed_dim,
-            feature_dim=256,
-            hidden_dim=128,
-            use_mamba=use_mamba_temporal  # NEW: Support Mamba2 option
-        )
+        # Add metric head based on mode
+        if self.use_bankai:
+            # Bankai mode: Unified Mamba for temporal depth + metric prediction
+            # This replaces both FlashDepth Mamba and Gear5's TemporalScalePredictor
+            bankai_downsample = self.config.get('bankai_downsample', 0.1 if model.encoder == 'vitl' else 0.05)
+            bankai_num_layers = self.config.get('bankai_num_mamba_layers', 4)
+            use_hybrid_cls_fusion = (self.phase == 2 and model.hybrid_configs is not None)
+
+            model.gear5_metric_head = BankaiMetricHead(
+                dpt_dim=dpt_dim,
+                cls_embed_dim=gsp_embed_dim,
+                num_mamba_layers=bankai_num_layers,
+                downsample_factor=bankai_downsample,
+                use_hybrid_cls_fusion=use_hybrid_cls_fusion,
+                teacher_cls_dim=1024 if use_hybrid_cls_fusion else gsp_embed_dim
+            )
+            self.logger.info(f"=== BANKAI MetricHead Created ===")
+            self.logger.info(f"  DPT dim: {dpt_dim}")
+            self.logger.info(f"  CLS embed dim: {gsp_embed_dim}")
+            self.logger.info(f"  Mamba layers: {bankai_num_layers}")
+            self.logger.info(f"  Downsample factor: {bankai_downsample}")
+            self.logger.info(f"  Hybrid CLS fusion: {use_hybrid_cls_fusion}")
+        else:
+            # Standard Gear5 mode: GRU/Mamba2-based TemporalScalePredictor
+            use_mamba_temporal = self.config.model.get('use_mamba_temporal', False)
+            self.logger.info(f"Gear5 TemporalScalePredictor backend: {'Mamba2' if use_mamba_temporal else 'GRU'}")
+            if use_mamba_temporal:
+                self.logger.warning("NOTE: FlashDepth's original Mamba modules will be FROZEN. Only TemporalScalePredictor's Mamba2 is trainable.")
+
+            model.gear5_metric_head = Gear5MetricHead(
+                embed_dim=gsp_embed_dim,
+                feature_dim=256,
+                hidden_dim=128,
+                use_mamba=use_mamba_temporal
+            )
 
         # Phase 2: Load FlashDepth-hybrid, then load GSP from gear_checkpoint
         if self.phase == 2:
@@ -490,50 +551,153 @@ class Gear5Trainer:
 
     def _configure_parameters(self, model):
         """
-        Unified single-stage freezing strategy:
+        Configure parameter freeze/unfreeze strategy.
+
+        Standard Gear5 Mode:
             Frozen: ViT encoder, DPT decoder, Mamba modules, output_conv
             Trainable: Only Gear5MetricHead (~132K parameters)
+
+        Bankai Mode (Head-First Tuning):
+            Phase 1: Metric Head only (scale/shift MLPs) - ~0.5M params
+            Phase 2: UnifiedMamba + Metric Head + output_conv - ~1.8M params
         """
         frozen_vit_dpt = 0
         frozen_mamba = 0
         frozen_output_conv = 0
         trainable_gear5 = 0
+        trainable_mamba_bankai = 0
+        trainable_output_conv = 0
 
         for name, param in model.named_parameters():
-            # Gear5 metric head: always trainable
-            if 'gear5_metric_head' in name:
-                param.requires_grad = True
-                trainable_gear5 += param.numel()
-                self.logger.info(f"Trainable (Gear5): {name} - {param.shape}")
+            if self.use_bankai:
+                # ========== BANKAI MODE ==========
+                # Bankai Phase 1: Only Metric Head (scale/shift) trainable
+                # Bankai Phase 2: UnifiedMamba + Metric Head + output_conv trainable
 
-            # Mamba: frozen
-            elif 'mamba' in name:
-                param.requires_grad = False
-                frozen_mamba += param.numel()
+                if 'gear5_metric_head' in name:
+                    if self.bankai_phase == 1:
+                        # Phase 1: Only scale/shift heads trainable
+                        if 'scale_head' in name or 'shift_head' in name:
+                            param.requires_grad = True
+                            trainable_gear5 += param.numel()
+                            self.logger.info(f"Trainable (Bankai P1 - Metric Head): {name}")
+                        else:
+                            # Freeze unified_mamba and other parts
+                            param.requires_grad = False
+                            frozen_mamba += param.numel()
+                    else:
+                        # Phase 2: All of gear5_metric_head (incl. UnifiedMamba) trainable
+                        param.requires_grad = True
+                        if 'unified_mamba' in name:
+                            trainable_mamba_bankai += param.numel()
+                        else:
+                            trainable_gear5 += param.numel()
+                        self.logger.info(f"Trainable (Bankai P2): {name}")
 
-            # DPT output head: frozen
-            elif 'output_conv' in name:
-                param.requires_grad = False
-                frozen_output_conv += param.numel()
+                # Original FlashDepth Mamba: always frozen in Bankai mode
+                elif 'mamba' in name and 'gear5_metric_head' not in name:
+                    param.requires_grad = False
+                    frozen_mamba += param.numel()
 
-            # Everything else (ViT encoder, DPT decoder): frozen
+                # output_conv: Phase 2 only
+                elif 'output_conv' in name:
+                    if self.bankai_phase >= 2:
+                        param.requires_grad = True
+                        trainable_output_conv += param.numel()
+                        self.logger.info(f"Trainable (Bankai P2 - output_conv): {name}")
+                    else:
+                        param.requires_grad = False
+                        frozen_output_conv += param.numel()
+
+                # Everything else (ViT encoder, DPT decoder): frozen
+                else:
+                    param.requires_grad = False
+                    frozen_vit_dpt += param.numel()
+
             else:
-                param.requires_grad = False
-                frozen_vit_dpt += param.numel()
+                # ========== STANDARD GEAR5 MODE ==========
+                # Gear5 metric head: always trainable
+                if 'gear5_metric_head' in name:
+                    param.requires_grad = True
+                    trainable_gear5 += param.numel()
+                    self.logger.info(f"Trainable (Gear5): {name} - {param.shape}")
+
+                # Mamba: frozen
+                elif 'mamba' in name:
+                    param.requires_grad = False
+                    frozen_mamba += param.numel()
+
+                # DPT output head: frozen
+                elif 'output_conv' in name:
+                    param.requires_grad = False
+                    frozen_output_conv += param.numel()
+
+                # Everything else (ViT encoder, DPT decoder): frozen
+                else:
+                    param.requires_grad = False
+                    frozen_vit_dpt += param.numel()
 
         # Log summary
-        self.logger.info(f"=== Parameter Configuration (Phase {self.phase}) ===")
+        if self.use_bankai:
+            self.logger.info(f"=== Parameter Configuration (BANKAI Phase {self.bankai_phase}) ===")
+        else:
+            self.logger.info(f"=== Parameter Configuration (Phase {self.phase}) ===")
+
         self.logger.info(f"Frozen:")
         self.logger.info(f"  - ViT + DPT: {frozen_vit_dpt:,}")
-        self.logger.info(f"  - Mamba: {frozen_mamba:,}")
+        self.logger.info(f"  - Original Mamba: {frozen_mamba:,}")
         self.logger.info(f"  - output_conv: {frozen_output_conv:,}")
 
         self.logger.info(f"Trainable:")
-        self.logger.info(f"  - Gear5MetricHead: {trainable_gear5:,}")
+        self.logger.info(f"  - Gear5 Metric Head: {trainable_gear5:,}")
+        if self.use_bankai:
+            self.logger.info(f"  - Bankai UnifiedMamba: {trainable_mamba_bankai:,}")
+            self.logger.info(f"  - output_conv: {trainable_output_conv:,}")
 
         total_frozen = frozen_vit_dpt + frozen_mamba + frozen_output_conv
+        total_trainable = trainable_gear5 + trainable_mamba_bankai + trainable_output_conv
         self.logger.info(f"Total frozen: {total_frozen:,}")
-        self.logger.info(f"Total trainable: {trainable_gear5:,}")
+        self.logger.info(f"Total trainable: {total_trainable:,}")
+
+    def _transition_to_bankai_phase2(self):
+        """
+        Transition from Bankai Phase 1 to Phase 2 during training.
+        
+        This is called automatically when bankai_auto_mode is enabled and
+        the step reaches bankai_auto_transition_step.
+        
+        Phase 1 -> Phase 2 changes:
+            - Unfreeze UnifiedMamba in gear5_metric_head
+            - Unfreeze output_conv
+            - Rebuild optimizer with new trainable parameters
+            - Rebuild scheduler
+        """
+        if self.rank == 0:
+            self.logger.info("=" * 60)
+            self.logger.info("=== BANKAI AUTO TRANSITION: Phase 1 -> Phase 2 ===")
+            self.logger.info("=" * 60)
+        
+        # Update phase
+        self.bankai_phase = 2
+        
+        # Unwrap DDP model for parameter configuration
+        model = self.model.module if isinstance(self.model, DDP) else self.model
+        
+        # Reconfigure parameters for Phase 2
+        self._configure_parameters(model)
+        
+        # Rebuild optimizer with new trainable parameters
+        self.optimizer = self._setup_optimizer()
+        
+        # Rebuild scheduler (continues from current step)
+        self.scheduler = self._setup_scheduler()
+        
+        # Reset train mode with new configuration
+        self._set_train_mode()
+        
+        if self.rank == 0:
+            self.logger.info(f"Phase transition complete at step {self.global_step}")
+            self.logger.info("=" * 60)
 
     def _set_train_mode(self):
         """
@@ -737,6 +901,12 @@ class Gear5Trainer:
         for step in pbar:
             self.global_step = step
 
+            # ========== Bankai Auto Phase Transition ==========
+            # Check if we need to transition from Phase 1 to Phase 2
+            if (self.use_bankai and self.bankai_auto_mode and
+                self.bankai_phase == 1 and step == self.bankai_auto_transition_step):
+                self._transition_to_bankai_phase2()
+
             # Get batch
             try:
                 batch = next(train_iterator)
@@ -851,28 +1021,48 @@ class Gear5Trainer:
                             for block_idx in self.target_blocks
                         ]
 
-                        # Apply Gear5 metric head (no feature modulation, just scale/shift/importance prediction)
-                        gear5_outputs = model.gear5_metric_head(
-                            cls_tokens=cls_tokens,
-                            attention_weights_list=attention_weights_list,
-                            patch_h=patch_h,
-                            patch_w=patch_w
-                        )
+                        # Apply Gear5/Bankai metric head
+                        if self.use_bankai:
+                            # Bankai mode: BankaiMetricHead handles spatial + scale/shift together
+                            gear5_outputs = model.gear5_metric_head(
+                                path_1=path_1,
+                                cls_tokens=cls_tokens,
+                                attention_weights_list=attention_weights_list,
+                                input_shape=(B_orig, T_orig, C, H, W)
+                            )
 
-                        scale = gear5_outputs['scale']  # [B, T]
-                        shift = gear5_outputs['shift']  # [B, T]
-                        importance_map = gear5_outputs['importance_map']  # [B, T, patch_h, patch_w]
+                            scale = gear5_outputs['scale']  # [B, T]
+                            shift = gear5_outputs['shift']  # [B, T]
+                            importance_map = gear5_outputs['importance_map']  # [B, T, patch_h, patch_w]
+                            spatial_out = gear5_outputs['spatial_out']  # [B*T, dpt_dim, h, w]
 
-                        # Apply Mamba temporal modeling to path_1 (no modulation in Gear5)
-                        path_1_temporal = model.dpt_features_to_mamba(
-                            input_shape=(B_orig, T_orig, None, H, W),
-                            dpt_features=path_1,
-                            in_dpt_layer=0
-                        )
+                            # Bankai: spatial_out goes directly to output_conv
+                            out = model.depth_head.scratch.output_conv1(spatial_out)
+                            out = F.interpolate(out, (H, W), mode="bilinear", align_corners=True)
+                            relative_depth = model.depth_head.scratch.output_conv2(out)  # [B*T, 1, H, W]
+                        else:
+                            # Standard Gear5 mode
+                            gear5_outputs = model.gear5_metric_head(
+                                cls_tokens=cls_tokens,
+                                attention_weights_list=attention_weights_list,
+                                patch_h=patch_h,
+                                patch_w=patch_w
+                            )
 
-                        out = model.depth_head.scratch.output_conv1(path_1_temporal)
-                        out = F.interpolate(out, (H, W), mode="bilinear", align_corners=True)
-                        relative_depth = model.depth_head.scratch.output_conv2(out)  # [B*T, 1, H, W]
+                            scale = gear5_outputs['scale']  # [B, T]
+                            shift = gear5_outputs['shift']  # [B, T]
+                            importance_map = gear5_outputs['importance_map']  # [B, T, patch_h, patch_w]
+
+                            # Apply Mamba temporal modeling to path_1 (no modulation in Gear5)
+                            path_1_temporal = model.dpt_features_to_mamba(
+                                input_shape=(B_orig, T_orig, None, H, W),
+                                dpt_features=path_1,
+                                in_dpt_layer=0
+                            )
+
+                            out = model.depth_head.scratch.output_conv1(path_1_temporal)
+                            out = F.interpolate(out, (H, W), mode="bilinear", align_corners=True)
+                            relative_depth = model.depth_head.scratch.output_conv2(out)  # [B*T, 1, H, W]
 
                         # Apply scale/shift to relative depth (inverse depth space: 100/m)
                         scale_flat = scale.view(B_orig * T_orig, 1, 1, 1)  # [B*T, 1, 1, 1]
@@ -1016,8 +1206,10 @@ class Gear5Trainer:
         model = self.model.module if isinstance(self.model, DDP) else self.model
 
         # Initialize Mamba sequence (critical for temporal processing!)
-        if hasattr(model, 'mamba'):
+        if hasattr(model, 'mamba') and not self.use_bankai:
+            # Standard Gear5: Use FlashDepth's original Mamba
             model.mamba.start_new_sequence()
+        # Note: Bankai's UnifiedMamba handles sequence initialization internally
 
         # Forward pass with BFloat16 autocast
         with torch.amp.autocast('cuda', dtype=torch.bfloat16):
@@ -1060,44 +1252,81 @@ class Gear5Trainer:
             # Reshape to [B, T, embed_dim]
             cls_tokens = cls_tokens_avg.view(B_orig, T_orig, -1)
 
-            # Get DPT features and relative depth (frozen, no grad)
+            # Get DPT features (frozen, no grad)
             with torch.no_grad():
                 dpt_features = model.depth_head.get_forward_features(
                     encoder_features, patch_h, patch_w
                 )  # Returns [path_4, path_3, path_2, path_1]
                 path_1 = dpt_features[-1]  # Extract path_1: (B*T, dpt_dim, h, w)
 
-            # Call Gear5MetricHead to get scale, shift, importance_map
-            gear5_outputs = model.gear5_metric_head(
-                cls_tokens,  # [B, T, embed_dim]
-                attention_weights_list,  # List of [B*T, num_heads, N+1, N+1]
-                patch_h,
-                patch_w
-            )
+            if self.use_bankai:
+                # ========== BANKAI MODE ==========
+                # UnifiedMamba processes spatial tokens + CLS for temporal depth + metric
+                # Replaces both FlashDepth Mamba and Gear5's TemporalScalePredictor
 
-            scale = gear5_outputs['scale']  # [B, T]
-            shift = gear5_outputs['shift']  # [B, T]
-            importance_map = gear5_outputs['importance_map']  # [B, T, patch_h, patch_w]
+                # Call BankaiMetricHead with path_1 + CLS tokens
+                gear5_outputs = model.gear5_metric_head(
+                    path_1=path_1,  # [B*T, dpt_dim, h, w]
+                    cls_tokens=cls_tokens,  # [B, T, embed_dim]
+                    attention_weights_list=attention_weights_list,  # List of [B*T, num_heads, N+1, N+1]
+                    input_shape=(B_orig, T_orig, C, H, W)
+                )
 
-            # Apply Mamba temporal modeling to DPT features (frozen, no grad needed)
-            with torch.no_grad():
-                path_1_temporal = model.dpt_features_to_mamba(
-                    input_shape=(B_orig, T_orig, None, H, W),
-                    dpt_features=path_1,
-                    in_dpt_layer=0
-                )  # Returns (B*T, dpt_dim, h, w) with temporal consistency
+                scale = gear5_outputs['scale']  # [B, T]
+                shift = gear5_outputs['shift']  # [B, T]
+                importance_map = gear5_outputs['importance_map']  # [B, T, patch_h, patch_w]
+                path_1_temporal = gear5_outputs['spatial_out']  # [B*T, dpt_dim, h, w] - enhanced by UnifiedMamba
 
-                # Pass through DPT output head (frozen)
-                out = model.depth_head.scratch.output_conv1(path_1_temporal)
-                out = F.interpolate(out, (H, W), mode="bilinear", align_corners=True)
-                out = model.depth_head.scratch.output_conv2(out)
+                # Pass through DPT output head
+                # In Bankai Phase 2, output_conv is trainable
+                if self.bankai_phase >= 2:
+                    # Trainable output_conv
+                    out = model.depth_head.scratch.output_conv1(path_1_temporal)
+                    out = F.interpolate(out, (H, W), mode="bilinear", align_corners=True)
+                    out = model.depth_head.scratch.output_conv2(out)
+                else:
+                    # Frozen output_conv (Phase 1)
+                    with torch.no_grad():
+                        out = model.depth_head.scratch.output_conv1(path_1_temporal)
+                        out = F.interpolate(out, (H, W), mode="bilinear", align_corners=True)
+                        out = model.depth_head.scratch.output_conv2(out)
 
                 # Prediction is relative depth (inverse), already positive (Softplus activation)
-                # Shape: (B*T, 1, H, W)
-                pred_relative_inverse = out
+                pred_relative_inverse = out.view(B_orig, T_orig, 1, H, W)
 
-                # Reshape to [B, T, 1, H, W]
-                pred_relative_inverse = pred_relative_inverse.view(B_orig, T_orig, 1, H, W)
+            else:
+                # ========== STANDARD GEAR5 MODE ==========
+                # Call Gear5MetricHead to get scale, shift, importance_map
+                gear5_outputs = model.gear5_metric_head(
+                    cls_tokens,  # [B, T, embed_dim]
+                    attention_weights_list,  # List of [B*T, num_heads, N+1, N+1]
+                    patch_h,
+                    patch_w
+                )
+
+                scale = gear5_outputs['scale']  # [B, T]
+                shift = gear5_outputs['shift']  # [B, T]
+                importance_map = gear5_outputs['importance_map']  # [B, T, patch_h, patch_w]
+
+                # Apply Mamba temporal modeling to DPT features (frozen, no grad needed)
+                with torch.no_grad():
+                    path_1_temporal = model.dpt_features_to_mamba(
+                        input_shape=(B_orig, T_orig, None, H, W),
+                        dpt_features=path_1,
+                        in_dpt_layer=0
+                    )  # Returns (B*T, dpt_dim, h, w) with temporal consistency
+
+                    # Pass through DPT output head (frozen)
+                    out = model.depth_head.scratch.output_conv1(path_1_temporal)
+                    out = F.interpolate(out, (H, W), mode="bilinear", align_corners=True)
+                    out = model.depth_head.scratch.output_conv2(out)
+
+                    # Prediction is relative depth (inverse), already positive (Softplus activation)
+                    # Shape: (B*T, 1, H, W)
+                    pred_relative_inverse = out
+
+                    # Reshape to [B, T, 1, H, W]
+                    pred_relative_inverse = pred_relative_inverse.view(B_orig, T_orig, 1, H, W)
 
             # Apply scale and shift to convert relative depth to metric depth
             # D_metric_inverse = scale * D_relative_inverse + shift
@@ -1165,11 +1394,26 @@ class Gear5Trainer:
 
                 # Apply importance weighting - gradient flows through importance_flat
                 weights = 1.0 + fg_ratio * importance_flat
-                final_loss = (loss[valid_mask] * weights[valid_mask]).sum() / valid_mask.float().sum()
+                depth_loss = (loss[valid_mask] * weights[valid_mask]).sum() / valid_mask.float().sum()
             else:
                 # Regular Log L1 Loss (no importance weighting)
-                final_loss = loss[valid_mask].mean()
+                depth_loss = loss[valid_mask].mean()
                 fg_ratio = torch.tensor(0.0, device=self.device)
+
+            # Add TGM loss for Bankai mode (temporal consistency)
+            tgm_loss_value = 0.0
+            if self.use_bankai and self.tgm_weight > 0 and T_orig >= 2:
+                # Reshape for TGM loss: need [B, T, H, W] format
+                pred_for_tgm = pred_metric_inverse.squeeze(2).float()  # [B, T, H, W]
+                gt_for_tgm = gt_depth_inverse_100.squeeze(2).float()  # [B, T, H, W]
+                valid_for_tgm = gt_valid.squeeze(2)  # [B, T, H, W]
+
+                # Compute TGM loss
+                tgm_loss = TGMTemporalLoss()(pred_for_tgm, gt_for_tgm, valid_for_tgm)
+                final_loss = depth_loss + self.tgm_weight * tgm_loss
+                tgm_loss_value = tgm_loss.item()
+            else:
+                final_loss = depth_loss
 
         # Backward pass (outside autocast for numerical stability)
         self.optimizer.zero_grad()
@@ -1177,10 +1421,14 @@ class Gear5Trainer:
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
         self.optimizer.step()
 
-        return {
+        result = {
             'loss': final_loss.item(),
             'fg_ratio': fg_ratio.item() if self.loss_type == 'importance' else 0.0
         }
+        if self.use_bankai and self.tgm_weight > 0:
+            result['tgm_loss'] = tgm_loss_value
+            result['depth_loss'] = depth_loss.item()
+        return result
 
     @torch.no_grad()
     def validate(self):
@@ -1194,10 +1442,14 @@ class Gear5Trainer:
         model = self.model.module if isinstance(self.model, DDP) else self.model
 
         total_loss = 0
+        total_depth_loss = 0
+        total_tgm_loss = 0
         num_batches = 0
 
         # Track per-dataset losses for detailed analysis
         dataset_losses = {}  # {dataset_name: [loss1, loss2, ...]}
+        dataset_depth_losses = {}  # {dataset_name: [depth_loss1, ...]}
+        dataset_tgm_losses = {}  # {dataset_name: [tgm_loss1, ...]}
         dataset_sequence_counts = {}  # {dataset_name: num_sequences_evaluated}
 
         # Reset visualization tracking for this validation run
@@ -1321,29 +1573,50 @@ class Gear5Trainer:
                 cls_tokens_avg = torch.stack(cls_tokens_list, dim=0).mean(dim=0)  # [B*T, embed_dim]
                 cls_tokens = rearrange(cls_tokens_avg, '(b t) d -> b t d', b=B_orig, t=T_orig)  # [B, T, embed_dim]
 
-                # Apply Mamba temporal modeling (frozen)
-                path_1_temporal = model.dpt_features_to_mamba(
-                    input_shape=(B_orig, T_orig, None, H, W),
-                    dpt_features=path_1,
-                    in_dpt_layer=0
-                )  # [B*T, dpt_dim, h, w]
+                if self.use_bankai:
+                    # ========== BANKAI MODE ==========
+                    # BankaiMetricHead handles spatial + scale/shift together
+                    gear5_outputs = model.gear5_metric_head(
+                        path_1=path_1,
+                        cls_tokens=cls_tokens,
+                        attention_weights_list=attention_weights_list,
+                        input_shape=(B_orig, T_orig, C, H, W)
+                    )
 
-                # Get relative depth from frozen output_conv
-                out = model.depth_head.scratch.output_conv1(path_1_temporal)
-                out = F.interpolate(out, (H, W), mode="bilinear", align_corners=True)
-                relative_depth = model.depth_head.scratch.output_conv2(out)  # [B*T, 1, H, W]
+                    scale = gear5_outputs['scale']  # [B, T]
+                    shift = gear5_outputs['shift']  # [B, T]
+                    importance_map = gear5_outputs['importance_map']  # [B, T, patch_h, patch_w]
+                    path_1_temporal = gear5_outputs['spatial_out']  # [B*T, dpt_dim, h, w]
 
-                # Get scale/shift/importance_map from Gear5MetricHead
-                gear5_outputs = model.gear5_metric_head(
-                    cls_tokens=cls_tokens,  # [B, T, 1024]
-                    attention_weights_list=attention_weights_list,  # List of 2 attention weights
-                    patch_h=patch_h,
-                    patch_w=patch_w
-                )
+                    # Get relative depth from output_conv
+                    out = model.depth_head.scratch.output_conv1(path_1_temporal)
+                    out = F.interpolate(out, (H, W), mode="bilinear", align_corners=True)
+                    relative_depth = model.depth_head.scratch.output_conv2(out)  # [B*T, 1, H, W]
+                else:
+                    # ========== STANDARD GEAR5 MODE ==========
+                    # Apply Mamba temporal modeling (frozen)
+                    path_1_temporal = model.dpt_features_to_mamba(
+                        input_shape=(B_orig, T_orig, None, H, W),
+                        dpt_features=path_1,
+                        in_dpt_layer=0
+                    )  # [B*T, dpt_dim, h, w]
 
-                scale = gear5_outputs['scale']  # [B, T]
-                shift = gear5_outputs['shift']  # [B, T]
-                importance_map = gear5_outputs['importance_map']  # [B, T, patch_h, patch_w]
+                    # Get relative depth from frozen output_conv
+                    out = model.depth_head.scratch.output_conv1(path_1_temporal)
+                    out = F.interpolate(out, (H, W), mode="bilinear", align_corners=True)
+                    relative_depth = model.depth_head.scratch.output_conv2(out)  # [B*T, 1, H, W]
+
+                    # Get scale/shift/importance_map from Gear5MetricHead
+                    gear5_outputs = model.gear5_metric_head(
+                        cls_tokens=cls_tokens,  # [B, T, 1024]
+                        attention_weights_list=attention_weights_list,  # List of 2 attention weights
+                        patch_h=patch_h,
+                        patch_w=patch_w
+                    )
+
+                    scale = gear5_outputs['scale']  # [B, T]
+                    shift = gear5_outputs['shift']  # [B, T]
+                    importance_map = gear5_outputs['importance_map']  # [B, T, patch_h, patch_w]
 
                 # Apply shift lower bound constraint (Option 1)
                 GLOBAL_MIN_INVERSE = 100.0 / 300.0  # 0.333 (300m max depth assumption)
@@ -1453,16 +1726,29 @@ class Gear5Trainer:
                             # Regular Log L1 Loss (no importance weighting)
                             loss_batch = loss.mean()
 
+                        # Compute TGM loss for Bankai mode
+                        tgm_loss_batch = torch.tensor(0.0, device=self.device)
+                        if self.use_bankai and self.tgm_weight > 0 and T_orig >= 2:
+                            # Reshape for TGM loss: need [B, T, H, W] format
+                            pred_for_tgm = pred_depth_inverse.view(B_orig, T_orig, H_gt, W_gt).float()
+                            gt_for_tgm = gt_depth_inverse_flat.view(B_orig, T_orig, H_gt, W_gt).float()
+                            valid_for_tgm = (gt_for_tgm > 0)
+
+                            tgm_loss_batch = TGMTemporalLoss()(pred_for_tgm, gt_for_tgm, valid_for_tgm)
+
                         # Check for NaN
                         if torch.isnan(loss_batch):
                             self.logger.error(f"VALIDATION Step {self.global_step} - NaN loss detected!")
                             self.logger.error(f"  pred_positive range: [{pred_positive.min():.4f}, {pred_positive.max():.4f}]")
                             self.logger.error(f"  gt_positive range: [{gt_positive.min():.4f}, {gt_positive.max():.4f}]")
                             frame_losses = []
+                            frame_tgm_losses = []
                         else:
                             frame_losses = [loss_batch.float()]
+                            frame_tgm_losses = [tgm_loss_batch.float()]
                 else:
                     frame_losses = []
+                    frame_tgm_losses = []
 
                 # Validation visualization: save multiple sequences per dataset (rank 0 only)
                 # Reshape predictions back to (B, T, 1, H, W) for visualization
@@ -1544,6 +1830,10 @@ class Gear5Trainer:
                                 val_loss_dict = {
                                     'val_loss': loss_batch.item() if len(frame_losses) > 0 else 0.0
                                 }
+                                # Add breakdown for Bankai mode
+                                if self.use_bankai and self.tgm_weight > 0 and len(frame_losses) > 0:
+                                    val_loss_dict['depth_loss'] = loss_batch.item()  # Log L1 component
+                                    val_loss_dict['tgm_loss'] = tgm_loss_batch.item() if torch.is_tensor(tgm_loss_batch) else 0.0
 
                                 # No layer_weights in unified Gear5 (GRU-based, not multi-layer fusion)
                                 # Save with dataset and sequence-specific name
@@ -1569,14 +1859,28 @@ class Gear5Trainer:
 
                 # Track loss only if valid pixels exist
                 if len(frame_losses) > 0:
-                    avg_loss = sum(frame_losses) / len(frame_losses)
+                    avg_depth_loss = sum(frame_losses) / len(frame_losses)
+                    avg_tgm_loss_batch = sum(frame_tgm_losses) / len(frame_tgm_losses) if len(frame_tgm_losses) > 0 else torch.tensor(0.0)
+
+                    # Combined loss (like training)
+                    if self.use_bankai and self.tgm_weight > 0:
+                        avg_loss = avg_depth_loss + self.tgm_weight * avg_tgm_loss_batch
+                    else:
+                        avg_loss = avg_depth_loss
+
                     total_loss += avg_loss.item()
+                    total_depth_loss += avg_depth_loss.item()
+                    total_tgm_loss += avg_tgm_loss_batch.item() if torch.is_tensor(avg_tgm_loss_batch) else avg_tgm_loss_batch
                     num_batches += 1
 
                     # Track per-dataset loss
                     if current_dataset not in dataset_losses:
                         dataset_losses[current_dataset] = []
+                        dataset_depth_losses[current_dataset] = []
+                        dataset_tgm_losses[current_dataset] = []
                     dataset_losses[current_dataset].append(avg_loss.item())
+                    dataset_depth_losses[current_dataset].append(avg_depth_loss.item())
+                    dataset_tgm_losses[current_dataset].append(avg_tgm_loss_batch.item() if torch.is_tensor(avg_tgm_loss_batch) else avg_tgm_loss_batch)
 
             # Increment sequence counter for this dataset
             if current_dataset in dataset_sequence_counters:
@@ -1590,6 +1894,8 @@ class Gear5Trainer:
             torch.cuda.empty_cache()
 
         avg_loss = total_loss / num_batches if num_batches > 0 else float('inf')
+        avg_depth_loss = total_depth_loss / num_batches if num_batches > 0 else float('inf')
+        avg_tgm_loss = total_tgm_loss / num_batches if num_batches > 0 else 0.0
 
         # Log detailed per-dataset statistics (rank 0 only)
         if self.rank == 0:
@@ -1603,20 +1909,36 @@ class Gear5Trainer:
                 total_seqs = dataset_sequence_counts[dataset_name]
                 if dataset_name in dataset_losses:
                     losses = dataset_losses[dataset_name]
+                    depth_losses = dataset_depth_losses.get(dataset_name, [])
+                    tgm_losses = dataset_tgm_losses.get(dataset_name, [])
                     dataset_avg = np.mean(losses)
                     dataset_std = np.std(losses)
                     valid_seqs = len(losses)
-                    self.logger.info(
-                        f"  [{dataset_name}] {valid_seqs}/{total_seqs} sequences with valid pixels | "
-                        f"Loss: {dataset_avg:.4f} ± {dataset_std:.4f}"
-                    )
+
+                    # Show breakdown for Bankai mode
+                    if self.use_bankai and self.tgm_weight > 0 and len(depth_losses) > 0:
+                        depth_avg = np.mean(depth_losses)
+                        tgm_avg = np.mean(tgm_losses) if len(tgm_losses) > 0 else 0.0
+                        self.logger.info(
+                            f"  [{dataset_name}] {valid_seqs}/{total_seqs} sequences | "
+                            f"Loss: {dataset_avg:.4f} (LogL1: {depth_avg:.4f}, TGM: {tgm_avg:.4f})"
+                        )
+                    else:
+                        self.logger.info(
+                            f"  [{dataset_name}] {valid_seqs}/{total_seqs} sequences with valid pixels | "
+                            f"Loss: {dataset_avg:.4f} ± {dataset_std:.4f}"
+                        )
                 else:
                     self.logger.info(
                         f"  [{dataset_name}] 0/{total_seqs} sequences with valid pixels | "
                         f"Loss: N/A (no valid pixels)"
                     )
 
-            self.logger.info(f"Overall Average Loss: {avg_loss:.4f} (from {num_batches} sequences)")
+            # Show overall loss with breakdown for Bankai mode
+            if self.use_bankai and self.tgm_weight > 0:
+                self.logger.info(f"Overall Average Loss: {avg_loss:.4f} (LogL1: {avg_depth_loss:.4f}, TGM: {avg_tgm_loss:.4f})")
+            else:
+                self.logger.info(f"Overall Average Loss: {avg_loss:.4f} (from {num_batches} sequences)")
 
             # WARNING: Check if validation set is too small (Phase 2)
             if self.phase >= 2 and num_batches < 20:
@@ -1633,11 +1955,18 @@ class Gear5Trainer:
         # Back to training mode
         self.model.train()
 
-        return {
+        result = {
             'loss': avg_loss,
             'dataset_losses': {k: float(np.mean(v)) for k, v in dataset_losses.items()},
             'num_sequences': {k: v for k, v in dataset_sequence_counts.items()}
         }
+
+        # Add breakdown for Bankai mode
+        if self.use_bankai and self.tgm_weight > 0:
+            result['depth_loss'] = avg_depth_loss
+            result['tgm_loss'] = avg_tgm_loss
+
+        return result
 
     def save_checkpoint(self, filename):
         """Save model checkpoint (only rank 0)"""

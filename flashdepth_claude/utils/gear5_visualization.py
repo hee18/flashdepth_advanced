@@ -465,16 +465,28 @@ class Gear5Visualizer:
 
             # Loss values if available
             if loss_dict is not None:
-                # Validation loss (for validation visualization)
+                # Validation loss (for validation visualization) - combined loss
                 if 'val_loss' in loss_dict:
                     ax9.text(0.05, y_pos, f'Val Loss: {loss_dict["val_loss"]:.4f}', fontsize=9,
                             transform=ax9.transAxes, bbox=dict(boxstyle="round", facecolor='lightcoral'))
                     y_pos -= 0.08
 
-                # Depth loss (for training visualization)
+                # Training total loss (for training visualization)
+                if 'loss' in loss_dict and 'val_loss' not in loss_dict:
+                    ax9.text(0.05, y_pos, f'Total Loss: {loss_dict["loss"]:.4f}', fontsize=9,
+                            transform=ax9.transAxes, bbox=dict(boxstyle="round", facecolor='lightcoral'))
+                    y_pos -= 0.08
+
+                # Depth loss (Log L1) - separate component
                 if 'depth_loss' in loss_dict:
                     ax9.text(0.05, y_pos, f'Log L1: {loss_dict["depth_loss"]:.4f}', fontsize=9,
-                            transform=ax9.transAxes, bbox=dict(boxstyle="round", facecolor='lightcoral'))
+                            transform=ax9.transAxes, bbox=dict(boxstyle="round", facecolor='lightsalmon'))
+                    y_pos -= 0.08
+
+                # TGM loss (Temporal Gradient Matching) - separate component
+                if 'tgm_loss' in loss_dict and loss_dict['tgm_loss'] > 0:
+                    ax9.text(0.05, y_pos, f'TGM: {loss_dict["tgm_loss"]:.4f}', fontsize=9,
+                            transform=ax9.transAxes, bbox=dict(boxstyle="round", facecolor='lightskyblue'))
                     y_pos -= 0.08
 
                 # Variance loss (if enabled)
