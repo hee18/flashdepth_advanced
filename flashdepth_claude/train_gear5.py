@@ -132,13 +132,16 @@ class Gear5Trainer:
                 self.bankai_phase = int(raw_bankai_phase)
             
             self.tgm_weight = config.get('tgm_weight', 0.3)
+            self.use_log_space = config.get('use_log_space', True)
             if rank == 0:
                 logging.info(f"=== BANKAI MODE ENABLED ===")
                 logging.info(f"  Bankai Phase: {self.bankai_phase}" + (" (auto mode)" if self.bankai_auto_mode else ""))
                 logging.info(f"  TGM Loss Weight: {self.tgm_weight}")
+                logging.info(f"  Log Space: {self.use_log_space}")
         else:
             self.bankai_auto_mode = False
             self.bankai_auto_transition_step = None
+            self.use_log_space = config.get('use_log_space', True)
 
         # Setup device
         self.device = f"cuda:{local_rank}"
@@ -206,11 +209,11 @@ class Gear5Trainer:
 
         # Loss function: LogL1Loss for standard mode, CombinedBankaiLoss for Bankai mode
         if self.use_bankai and self.tgm_weight > 0:
-            self.loss_fn = CombinedBankaiLoss(tgm_weight=self.tgm_weight)
+            self.loss_fn = CombinedBankaiLoss(tgm_weight=self.tgm_weight, use_log_space=self.use_log_space)
             if rank == 0:
-                self.logger.info(f"Using CombinedBankaiLoss with TGM weight: {self.tgm_weight}")
+                self.logger.info(f"Using CombinedBankaiLoss with TGM weight: {self.tgm_weight}, log_space: {self.use_log_space}")
         else:
-            self.loss_fn = LogL1Loss()
+            self.loss_fn = LogL1Loss(use_log_space=self.use_log_space)
 
         # Loss type: 'log_l1' (default) or 'importance' (importance-weighted)
         self.loss_type = config.get('loss_type', 'log_l1')
@@ -1409,7 +1412,7 @@ class Gear5Trainer:
                 valid_for_tgm = gt_valid.squeeze(2)  # [B, T, H, W]
 
                 # Compute TGM loss
-                tgm_loss = TGMTemporalLoss()(pred_for_tgm, gt_for_tgm, valid_for_tgm)
+                tgm_loss = TGMTemporalLoss(use_log_space=self.use_log_space)(pred_for_tgm, gt_for_tgm, valid_for_tgm)
                 final_loss = depth_loss + self.tgm_weight * tgm_loss
                 tgm_loss_value = tgm_loss.item()
             else:
@@ -1734,7 +1737,7 @@ class Gear5Trainer:
                             gt_for_tgm = gt_depth_inverse_flat.view(B_orig, T_orig, H_gt, W_gt).float()
                             valid_for_tgm = (gt_for_tgm > 0)
 
-                            tgm_loss_batch = TGMTemporalLoss()(pred_for_tgm, gt_for_tgm, valid_for_tgm)
+                            tgm_loss_batch = TGMTemporalLoss(use_log_space=self.use_log_space)(pred_for_tgm, gt_for_tgm, valid_for_tgm)
 
                         # Check for NaN
                         if torch.isnan(loss_batch):

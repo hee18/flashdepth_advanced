@@ -18,13 +18,18 @@ import torch.nn.functional as F
 
 class LogL1Loss(nn.Module):
     """
-    Log L1 loss for inverse depth learning.
+    L1 loss for inverse depth learning.
 
-    Loss = L1(log(pred_inverse), log(gt_inverse))
+    When use_log_space=True (default):
+        Loss = L1(log(pred_inverse), log(gt_inverse))
+    When use_log_space=False:
+        Loss = L1(pred_inverse, gt_inverse)
+    
     Works directly with inverse depth values (100/m)
     """
-    def __init__(self):
+    def __init__(self, use_log_space=True):
         super().__init__()
+        self.use_log_space = use_log_space
 
     def forward(self, pred_inverse, gt_inverse, valid_mask=None):
         """
@@ -45,28 +50,33 @@ class LogL1Loss(nn.Module):
             if len(pred_valid) == 0:
                 return torch.tensor(0.0, device=pred_inverse.device)
 
-            # Clamp to positive values to prevent NaN from log(negative) or log(0)
-            # Critical: shift in Gear5 can be negative, making predictions negative
-            epsilon = 1e-8
-            pred_valid = torch.clamp(pred_valid, min=epsilon)
-            gt_valid = torch.clamp(gt_valid, min=epsilon)
-
-            # Log L1 loss on valid pixels only
-            loss = F.l1_loss(
-                torch.log(pred_valid + epsilon),
-                torch.log(gt_valid + epsilon),
-                reduction='mean'
-            )
+            if self.use_log_space:
+                # Log L1 loss on valid pixels only
+                # Clamp to positive values to prevent NaN from log(negative) or log(0)
+                epsilon = 1e-8
+                pred_valid = torch.clamp(pred_valid, min=epsilon)
+                gt_valid = torch.clamp(gt_valid, min=epsilon)
+                loss = F.l1_loss(
+                    torch.log(pred_valid + epsilon),
+                    torch.log(gt_valid + epsilon),
+                    reduction='mean'
+                )
+            else:
+                # Linear L1 loss (suitable for inverse depth)
+                loss = F.l1_loss(pred_valid, gt_valid, reduction='mean')
         else:
             # Fallback: compute on all pixels
-            epsilon = 1e-8
-            pred_clamped = torch.clamp(pred_inverse, min=epsilon)
-            gt_clamped = torch.clamp(gt_inverse, min=epsilon)
-            loss = F.l1_loss(
-                torch.log(pred_clamped + epsilon),
-                torch.log(gt_clamped + epsilon),
-                reduction='mean'
-            )
+            if self.use_log_space:
+                epsilon = 1e-8
+                pred_clamped = torch.clamp(pred_inverse, min=epsilon)
+                gt_clamped = torch.clamp(gt_inverse, min=epsilon)
+                loss = F.l1_loss(
+                    torch.log(pred_clamped + epsilon),
+                    torch.log(gt_clamped + epsilon),
+                    reduction='mean'
+                )
+            else:
+                loss = F.l1_loss(pred_inverse, gt_inverse, reduction='mean')
 
         return loss
 
@@ -385,14 +395,27 @@ class TGMTemporalLoss(nn.Module):
         valid_temporal = valid_t1 & valid_t2
         
         # 2. GT gradient must be below threshold (stable regions)
-        # Compute depth range for threshold
-        if self.use_log_space:
-            # In log space, use absolute threshold
-            threshold = self.diff_threshold * 2.0  # Roughly corresponds to 5% change
-        else:
-            # In linear space, use relative threshold
-            depth_range = gt_depth.max() - gt_depth.min() + 1e-8
-            threshold = self.diff_threshold * depth_range
+        # VDA-style dynamic threshold: per-batch depth range * diff_threshold
+        # Reference: Video Depth Anything (https://github.com/DepthAnything/Video-Depth-Anything)
+        
+        # Create validity mask for depth range computation
+        valid_depth_mask = (gt_depth > 0)  # [B, T, H, W]
+        
+        # Compute per-batch min/max depth (across T, H, W)
+        # Use inf/-inf for invalid pixels so they don't affect min/max
+        masked_depth_for_min = torch.where(valid_depth_mask, gt_depth, torch.tensor(float('inf'), device=gt_depth.device))
+        masked_depth_for_max = torch.where(valid_depth_mask, gt_depth, torch.tensor(float('-inf'), device=gt_depth.device))
+        
+        # [B] - per-batch min/max
+        min_depth = masked_depth_for_min.view(B, -1).min(dim=1).values  # [B]
+        max_depth = masked_depth_for_max.view(B, -1).max(dim=1).values  # [B]
+        
+        # Dynamic threshold: depth_range * diff_threshold
+        depth_range = max_depth - min_depth  # [B]
+        threshold = depth_range * self.diff_threshold  # [B]
+        
+        # Expand threshold to match gt_grad shape [B, T-stride, H, W]
+        threshold = threshold.view(B, 1, 1, 1).expand_as(gt_grad)
         
         valid_stable = (gt_grad.abs() < threshold)
         
@@ -508,21 +531,23 @@ class CombinedBankaiLoss(nn.Module):
     L_total = L_depth + α × L_TGM
     
     Where:
-        - L_depth: Log L1 loss on inverse depth
+        - L_depth: Log L1 loss (or L1 if use_log_space=False) on inverse depth
         - L_TGM: Temporal Gradient Matching loss for temporal consistency
     
     Note: TGM loss can be disabled by setting tgm_weight=0 for ablation.
     """
-    def __init__(self, tgm_weight=0.3, **tgm_kwargs):
+    def __init__(self, tgm_weight=0.3, use_log_space=True, **tgm_kwargs):
         """
         Args:
             tgm_weight: Weight for TGM loss (α in the formula)
-            **tgm_kwargs: Arguments for TGMTemporalLoss
+            use_log_space: Whether to use log space for depth loss and TGM
+            **tgm_kwargs: Additional arguments for TGMTemporalLoss
         """
         super().__init__()
-        self.depth_loss = LogL1Loss()
-        self.tgm_loss = TGMTemporalLoss(**tgm_kwargs)
+        self.depth_loss = LogL1Loss(use_log_space=use_log_space)
+        self.tgm_loss = TGMTemporalLoss(use_log_space=use_log_space, **tgm_kwargs)
         self.tgm_weight = tgm_weight
+        self.use_log_space = use_log_space
     
     def forward(self, pred_depth, gt_depth, valid_mask=None, return_components=False):
         """

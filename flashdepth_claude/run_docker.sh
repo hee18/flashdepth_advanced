@@ -189,6 +189,7 @@ CBAR="false"  # Show colorbar next to depth visualization
 BANKAI_PHASE="auto"  # Bankai training phase: 1, 2, or "auto" (auto: Phase 1 until step 5000, then Phase 2)
 BANKAI_AUTO_STEP="5000"  # Step at which to transition from Phase 1 to Phase 2 in auto mode
 TGM_WEIGHT="0.3"  # TGM loss weight for Bankai mode
+USE_LOG_SPACE="true"  # Use log space for depth/TGM loss (--no-log-space to disable)
 
 # Parse arguments
 USER_BATCH_SIZE=""  # Track if user explicitly set batch size
@@ -354,6 +355,10 @@ while [[ $# -gt 0 ]]; do
         --tgm-weight)
             TGM_WEIGHT="$2"
             shift 2
+            ;;
+        --no-log-space)
+            USE_LOG_SPACE="false"
+            shift
             ;;
         -h|--help)
             show_usage
@@ -1431,6 +1436,7 @@ case $COMMAND in
         echo "  - Config variant: $CONFIG_VARIANT"
         echo "  - Bankai phase: $BANKAI_PHASE (auto step: $BANKAI_AUTO_STEP)"
         echo "  - TGM weight: $TGM_WEIGHT"
+        echo "  - Log space: $USE_LOG_SPACE"
         echo "  - CLS layers: $CLS_LAYERS"
         echo "  - Batch size: $BATCH_SIZE"
         echo "  - Workers: $WORKERS"
@@ -1451,6 +1457,7 @@ case $COMMAND in
             bankai_phase=$BANKAI_PHASE \
             +bankai_auto_step=$BANKAI_AUTO_STEP \
             tgm_weight=$TGM_WEIGHT \
+            use_log_space=$USE_LOG_SPACE \
             use_canonical_space=$USE_CANONICAL \
             +cls_layers='[$CLS_LAYERS]' \
             +results_dir=$RESULTS_DIR"
@@ -1489,6 +1496,7 @@ case $COMMAND in
         echo "  - Config variant: $CONFIG_VARIANT"
         echo "  - Bankai phase: $BANKAI_PHASE (auto step: $BANKAI_AUTO_STEP)"
         echo "  - TGM weight: $TGM_WEIGHT"
+        echo "  - Log space: $USE_LOG_SPACE"
         echo "  - CLS layers: $CLS_LAYERS"
         echo "  - Resolution: $RES_NAME"
         echo "  - Batch size per GPU: $BATCH_SIZE"
@@ -1523,6 +1531,7 @@ case $COMMAND in
             bankai_phase=$BANKAI_PHASE \
             +bankai_auto_step=$BANKAI_AUTO_STEP \
             tgm_weight=$TGM_WEIGHT \
+            use_log_space=$USE_LOG_SPACE \
             use_canonical_space=$USE_CANONICAL \
             +cls_layers='[$CLS_LAYERS]' \
             +results_dir=$RESULTS_DIR"
