@@ -926,7 +926,7 @@ class Gear5Tester:
             logger.info(f"Results saved to {results_path}")
 
             # Reorder per-sequence results
-            metric_order = ['abs_rel', 'a1', 'a2', 'a3', 'fps', 'tae', 'tae_reproj', 'mae', 'rmse',
+            metric_order = ['abs_rel', 'a1', 'a2', 'a3', 'fps', 'tae', 'tae_reproj', 'tae_reproj_gt', 'mae', 'rmse',
                             'tsp_scale_mean', 'tsp_shift_mean', 'tsp_scale_std', 'tsp_shift_std',
                             'tsp_scale_max', 'tsp_scale_min', 'tsp_shift_max', 'tsp_shift_min']
             reordered_metrics = []
@@ -2660,7 +2660,7 @@ class Gear5Tester:
                     aggregated_raw[key] = np.mean(values)
 
         # Reorder metrics: abs_rel, a1, a2, a3, fps, tae, tae_reproj, mae, rmse, then TSP stats
-        metric_order = ['abs_rel', 'a1', 'a2', 'a3', 'fps', 'tae', 'tae_reproj', 'mae', 'rmse',
+        metric_order = ['abs_rel', 'a1', 'a2', 'a3', 'fps', 'tae', 'tae_reproj', 'tae_reproj_gt', 'mae', 'rmse',
                         'tsp_scale_mean', 'tsp_shift_mean', 'tsp_scale_std', 'tsp_shift_std']
         aggregated = {}
         for key in metric_order:

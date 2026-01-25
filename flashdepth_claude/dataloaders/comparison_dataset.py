@@ -990,20 +990,23 @@ class ComparisonDataset(Dataset):
         """
         Load Bonn RGB-D depth (uint16 PNG)
 
-        Bonn depth is stored as uint16 PNG in millimeters.
-        Convert to meters for metric depth evaluation.
+        Bonn RGB-D follows TUM RGB-D format:
+        - Depth stored as uint16 PNG with factor 5000
+        - pixel_value / 5000.0 = depth in meters
+        - pixel_value 0 = invalid/missing
 
         Returns:
             torch.Tensor: Depth in meters [H, W]
         """
-        # Load uint16 depth in millimeters
-        depth_mm = cv2.imread(path, cv2.IMREAD_ANYDEPTH)
+        # Load uint16 depth
+        depth_raw = cv2.imread(path, cv2.IMREAD_ANYDEPTH)
 
-        if depth_mm is None:
+        if depth_raw is None:
             raise ValueError(f"Failed to load Bonn depth from {path}")
 
-        # Convert millimeters to meters
-        depth_meters = depth_mm.astype(np.float32) / 1000.0
+        # Convert to meters using TUM RGB-D factor (5000, not 1000!)
+        # Reference: https://cvg.cit.tum.de/data/datasets/rgbd-dataset/file_formats
+        depth_meters = depth_raw.astype(np.float32) / 5000.0
 
         # Handle invalid values (depth == 0 means no measurement)
         invalid_mask = (depth_meters <= 0) | np.isinf(depth_meters) | np.isnan(depth_meters)

@@ -25,10 +25,14 @@ import numpy as np
 import cv2
 import matplotlib.pyplot as plt
 from tqdm import tqdm
+import torch
 
 # Add project root to path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
+
+# Import reprojection TAE calculator
+from utils.reprojection_tae import ReprojectionTAECalculator, compute_reprojection_tae
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -193,11 +197,16 @@ class FlashDepthEvaluator:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.max_depth = max_depth
 
+        # Initialize reprojection TAE calculator
+        self.reproj_tae_calculator = ReprojectionTAECalculator(str(data_root))
+        self.tae_supported = self.reproj_tae_calculator.is_supported(dataset)
+
         logger.info(f"Prediction directory: {self.pred_dir}")
         logger.info(f"Dataset: {self.dataset}")
         logger.info(f"Data root: {self.data_root}")
         logger.info(f"Output directory: {self.output_dir}")
         logger.info(f"Max depth: {self.max_depth}m")
+        logger.info(f"Reprojection TAE supported: {self.tae_supported}")
 
     def find_sequences(self) -> List[Path]:
         """Find all sequence directories with depth_npy_files (recursive search)."""
@@ -608,6 +617,92 @@ class FlashDepthEvaluator:
                                 return np.stack(gts, axis=0)
         return None
 
+    def _get_image_paths(self, seq_dir: Path, num_frames: int) -> Optional[List[str]]:
+        """Get image paths for a sequence (needed for reprojection TAE computation).
+
+        Args:
+            seq_dir: Path to sequence directory (from predictions)
+            num_frames: Number of frames to get paths for
+
+        Returns:
+            List of image paths or None if not available
+        """
+        seq_name = seq_dir.name
+
+        if self.dataset == 'sintel':
+            # Sintel: sintel/images/training/clean/{scene}/frame_XXXX.png
+            img_dir = self.data_root / 'sintel' / 'images' / 'training' / 'clean'
+            for scene_dir in img_dir.iterdir() if img_dir.exists() else []:
+                if scene_dir.is_dir() and scene_dir.name in seq_name:
+                    img_files = sorted(scene_dir.glob('*.png'))
+                    if len(img_files) >= num_frames:
+                        return [str(f) for f in img_files[:num_frames]]
+            return None
+
+        elif self.dataset == 'eth3d':
+            # ETH3D: eth3d/{scene}/images/dslr_images/*.JPG
+            for scene_dir in (self.data_root / 'eth3d').iterdir() if (self.data_root / 'eth3d').exists() else []:
+                if scene_dir.is_dir() and scene_dir.name in seq_name:
+                    img_dir = scene_dir / 'images' / 'dslr_images'
+                    if not img_dir.exists():
+                        img_dir = scene_dir / 'dslr_images'
+                    if img_dir.exists():
+                        img_files = sorted(img_dir.glob('*.JPG'))
+                        if len(img_files) >= num_frames:
+                            return [str(f) for f in img_files[:num_frames]]
+            return None
+
+        elif self.dataset == 'bonn':
+            # Bonn: bonn/rgbd_bonn_{name}/rgb/{timestamp}.png
+            bonn_dir = self.data_root / 'bonn'
+            for scene_dir in bonn_dir.iterdir() if bonn_dir.exists() else []:
+                if scene_dir.is_dir() and scene_dir.name.startswith('rgbd_bonn_') and scene_dir.name in seq_name:
+                    rgb_dir = scene_dir / 'rgb'
+                    if rgb_dir.exists():
+                        img_files = sorted(rgb_dir.glob('*.png'))
+                        if len(img_files) >= num_frames:
+                            return [str(f) for f in img_files[:num_frames]]
+            return None
+
+        elif self.dataset == 'vkitti':
+            # VKitti: vkitti/{scene}/{variant}/frames/rgb/Camera_0/rgb_XXXXX.jpg
+            parts = seq_dir.parts
+            scene_name = None
+            variant_name = None
+            for i, part in enumerate(parts):
+                if part.startswith('Scene'):
+                    scene_name = part
+                    if i + 1 < len(parts):
+                        variant_name = parts[i + 1]
+                    break
+
+            if scene_name is None:
+                return None
+
+            vkitti_dir = self.data_root / 'vkitti'
+            if not vkitti_dir.exists():
+                vkitti_dir = self.data_root / 'vkitti2'
+
+            if variant_name:
+                rgb_dir = vkitti_dir / scene_name / variant_name / 'frames' / 'rgb' / 'Camera_0'
+            else:
+                # Search for first variant with rgb
+                scene_gt_dir = vkitti_dir / scene_name
+                rgb_dir = None
+                for variant_dir in scene_gt_dir.iterdir() if scene_gt_dir.exists() else []:
+                    test_dir = variant_dir / 'frames' / 'rgb' / 'Camera_0'
+                    if test_dir.exists():
+                        rgb_dir = test_dir
+                        break
+
+            if rgb_dir and rgb_dir.exists():
+                img_files = sorted(rgb_dir.glob('*.jpg')) + sorted(rgb_dir.glob('*.png'))
+                if len(img_files) >= num_frames:
+                    return [str(f) for f in img_files[:num_frames]]
+            return None
+
+        return None
+
     def _get_display_name(self, seq_dir: Path) -> str:
         """Get a meaningful display name for a sequence directory."""
         # For nested structures like vkitti (Scene01/clone/frames), use parent names
@@ -685,6 +780,35 @@ class FlashDepthEvaluator:
         logger.info(f"  Results: AbsRel={avg_metrics['abs_rel']:.4f}, MAE={avg_metrics['mae']:.2f}, "
                    f"δ1={avg_metrics['a1']:.4f}")
 
+        # Compute Reprojection TAE (for datasets with camera poses)
+        tae_reproj = 0.0
+        tae_reproj_gt = 0.0
+        if self.tae_supported and preds.shape[0] > 1:
+            try:
+                # Build image paths for TAE computation
+                image_paths = self._get_image_paths(seq_dir, preds.shape[0])
+                if image_paths is not None and len(image_paths) == preds.shape[0]:
+                    # Convert to torch tensors
+                    pred_tensor = torch.from_numpy(aligned_preds).float()
+                    gt_tensor = torch.from_numpy(gts).float()
+
+                    tae_result = self.reproj_tae_calculator.compute_tae(
+                        pred_tensor,
+                        gt_tensor,
+                        self.dataset,
+                        image_paths
+                    )
+                    tae_reproj = tae_result.get('tae_reproj', 0.0)
+                    tae_reproj_gt = tae_result.get('tae_reproj_gt', 0.0)
+                    logger.info(f"  TAE_reproj: {tae_reproj:.4f} (GT ref: {tae_reproj_gt:.4f})")
+                else:
+                    logger.warning(f"  Could not build image paths for TAE computation")
+            except Exception as e:
+                logger.warning(f"  Failed to compute reprojection TAE: {e}")
+
+        avg_metrics['tae_reproj'] = tae_reproj
+        avg_metrics['tae_reproj_gt'] = tae_reproj_gt
+
         # Create visualization
         self._visualize_sequence(seq_name, preds, aligned_preds, gts, scale, shift, avg_metrics)
 
@@ -698,7 +822,9 @@ class FlashDepthEvaluator:
             'scale': scale,
             'shift': shift,
             'metrics': avg_metrics,
-            'per_frame_metrics': frame_metrics
+            'per_frame_metrics': frame_metrics,
+            'tae_reproj': tae_reproj,
+            'tae_reproj_gt': tae_reproj_gt
         }
 
     def _visualize_sequence(
@@ -844,12 +970,15 @@ class FlashDepthEvaluator:
             result = self.evaluate_sequence(seq_dir, frame_export=frame_export)
             if result is not None:
                 all_results.append(result)
-                all_scale_shift.append({
+                seq_result = {
                     'sequence_name': result['sequence_name'],
                     'scale': result['scale'],
                     'shift': result['shift'],
-                    'abs_rel': result['metrics']['abs_rel']
-                })
+                    'abs_rel': result['metrics']['abs_rel'],
+                    'tae_reproj': result.get('tae_reproj', 0.0),
+                    'tae_reproj_gt': result.get('tae_reproj_gt', 0.0)
+                }
+                all_scale_shift.append(seq_result)
 
         if len(all_results) == 0:
             logger.error("No sequences were successfully evaluated!")
@@ -864,6 +993,16 @@ class FlashDepthEvaluator:
             'a2': np.mean([r['metrics']['a2'] for r in all_results]),
             'a3': np.mean([r['metrics']['a3'] for r in all_results]),
         }
+
+        # Aggregate TAE metrics (if computed)
+        tae_reproj_values = [r.get('tae_reproj', 0.0) for r in all_results if r.get('tae_reproj', 0.0) > 0]
+        tae_reproj_gt_values = [r.get('tae_reproj_gt', 0.0) for r in all_results if r.get('tae_reproj_gt', 0.0) > 0]
+        if tae_reproj_values:
+            overall_metrics['tae_reproj'] = float(np.mean(tae_reproj_values))
+            overall_metrics['tae_reproj_gt'] = float(np.mean(tae_reproj_gt_values)) if tae_reproj_gt_values else 0.0
+        else:
+            overall_metrics['tae_reproj'] = 0.0
+            overall_metrics['tae_reproj_gt'] = 0.0
 
         # Scale/shift statistics
         scales = [r['scale'] for r in all_results]
@@ -888,6 +1027,8 @@ class FlashDepthEvaluator:
         logger.info(f"δ1: {overall_metrics['a1']:.4f}")
         logger.info(f"δ2: {overall_metrics['a2']:.4f}")
         logger.info(f"δ3: {overall_metrics['a3']:.4f}")
+        if overall_metrics['tae_reproj'] > 0:
+            logger.info(f"TAE_reproj: {overall_metrics['tae_reproj']:.4f} (GT ref: {overall_metrics['tae_reproj_gt']:.4f})")
         logger.info(f"\nScale/Shift Statistics:")
         logger.info(f"  Scale: mean={scale_shift_stats['scale_mean']:.4f}, std={scale_shift_stats['scale_std']:.4f}")
         logger.info(f"  Shift: mean={scale_shift_stats['shift_mean']:.4f}, std={scale_shift_stats['shift_std']:.4f}")

@@ -149,8 +149,10 @@ class BonnDepth(BaseDatasetPairs):
         """
         Read depth from uint16 PNG file.
 
-        Bonn depth is stored in millimeters as uint16.
-        Convert to meters, then optionally to inverse depth.
+        Bonn RGB-D follows TUM RGB-D format:
+        - Depth stored as uint16 PNG with factor 5000
+        - pixel_value / 5000.0 = depth in meters
+        - pixel_value 0 = invalid/missing
 
         Args:
             path: Path to depth PNG file
@@ -170,8 +172,9 @@ class BonnDepth(BaseDatasetPairs):
                 depth = torch.from_numpy(depth).float()
             return depth
 
-        # Convert to float32 and mm -> meters
-        depth = depth_uint16.astype(np.float32) / 1000.0
+        # Convert to float32 using TUM RGB-D factor (5000, not 1000!)
+        # Reference: https://cvg.cit.tum.de/data/datasets/rgbd-dataset/file_formats
+        depth = depth_uint16.astype(np.float32) / 5000.0
 
         # Invalid mask: depth == 0 means no measurement
         invalid_mask = depth == 0

@@ -627,21 +627,13 @@ class ComparisonTester:
                     valid_t_next = (gt_t_next > 0) & (gt_t_next < MAX_DEPTH) & (pred_t_next > 0) & (pred_t_next < MAX_DEPTH)
 
                     if valid_t.sum() > 0 and valid_t_next.sum() > 0:
-                        if self.depth_mode == 'metric':
-                            # Metric depth: direct frame-to-frame comparison
-                            valid_both = valid_t & valid_t_next
-                            if valid_both.sum() > 0:
-                                pred_change = pred_t_next - pred_t
-                                gt_change = gt_t_next - gt_t
-                                tae = torch.abs(pred_change[valid_both] - gt_change[valid_both]).mean()
-                                tae_errors.append(tae.item())
-                        else:  # relative
-                            # Relative depth: scale-invariant TAE
-                            tae_si = self.relative_metrics.compute_tae_scale_invariant(
-                                pred_t, pred_t_next, gt_t, gt_t_next, valid_t, valid_t_next
-                            )
-                            if tae_si < float('inf'):
-                                tae_errors.append(tae_si)
+                        # Metric depth: direct frame-to-frame comparison
+                        valid_both = valid_t & valid_t_next
+                        if valid_both.sum() > 0:
+                            pred_change = pred_t_next - pred_t
+                            gt_change = gt_t_next - gt_t
+                            tae = torch.abs(pred_change[valid_both] - gt_change[valid_both]).mean()
+                            tae_errors.append(tae.item())
 
                 metrics['tae'] = np.mean(tae_errors) if len(tae_errors) > 0 else 0.0
             else:
@@ -972,13 +964,13 @@ class ComparisonTester:
 
         # Compute average metrics
         avg_metrics_raw = {}
-        for key in ['mae', 'rmse', 'abs_rel', 'sq_rel', 'rmse_log', 'a1', 'a2', 'a3', 'tae', 'fps']:
+        for key in ['mae', 'rmse', 'abs_rel', 'sq_rel', 'rmse_log', 'a1', 'a2', 'a3', 'tae', 'tae_reproj', 'tae_reproj_gt', 'fps']:
             values = [r[key] for r in self.all_results if key in r]
             if len(values) > 0:
                 avg_metrics_raw[key] = float(np.mean(values))
 
         # Reorder metrics according to desired order: abs_rel, a1, a2, a3, fps, tae, tae_reproj, mae, rmse
-        metric_order = ['abs_rel', 'a1', 'a2', 'a3', 'fps', 'tae', 'tae_reproj', 'mae', 'rmse']
+        metric_order = ['abs_rel', 'a1', 'a2', 'a3', 'fps', 'tae', 'tae_reproj', 'tae_reproj_gt', 'mae', 'rmse']
         avg_metrics = {}
         for key in metric_order:
             if key in avg_metrics_raw:
@@ -1506,7 +1498,11 @@ def main():
             adapter = VideoDepthAnythingAdapter(metric=args.metric)
         elif args.method == 'depthanythingv2':
             from adapters.depth_anything_v2_adapter import DepthAnythingV2Adapter
-            adapter = DepthAnythingV2Adapter(indoor=args.indoor)
+            # Auto-detect indoor datasets (bonn is indoor RGB-D dataset)
+            use_indoor = args.indoor or args.dataset == 'bonn'
+            adapter = DepthAnythingV2Adapter(indoor=use_indoor)
+            if use_indoor and not args.indoor:
+                print(f"[Auto] Using indoor (hypersim) model for indoor dataset: {args.dataset}")
         elif args.method == 'depthcrafter':
             from adapters.depthcrafter_adapter import DepthCrafterAdapter
             adapter = DepthCrafterAdapter()
