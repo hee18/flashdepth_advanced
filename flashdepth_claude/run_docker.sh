@@ -1179,7 +1179,7 @@ case $COMMAND in
             model.tsp_mode=$TSP_MODE \
             use_canonical_space=$USE_CANONICAL \
             loss_type=$LOSS_TYPE \
-            +cls_layers='[$CLS_LAYERS]' \
+            cls_layers='[$CLS_LAYERS]' \
             +results_dir=$RESULTS_DIR"
 
         # Add gear_checkpoint if specified (required for Phase 2 hybrid)
@@ -1263,7 +1263,7 @@ case $COMMAND in
             model.tsp_mode=$TSP_MODE \
             use_canonical_space=$USE_CANONICAL \
             loss_type=$LOSS_TYPE \
-            +cls_layers='[$CLS_LAYERS]' \
+            cls_layers='[$CLS_LAYERS]' \
             +results_dir=$RESULTS_DIR"
 
         # Add gear_checkpoint if specified (required for Phase 2 hybrid)
@@ -1378,7 +1378,7 @@ case $COMMAND in
             +vid_len=$VID_LEN \
             +frame_interval=$FRAME_INTERVAL \
             +visualization=$VISUALIZATION \
-            +cls_layers='[$CLS_LAYERS]' \
+            cls_layers='[$CLS_LAYERS]' \
             +config_dir=configs/gear5/$CONFIG_VARIANT"
 
         # Add --objwise flag if requested
@@ -1459,7 +1459,7 @@ case $COMMAND in
             tgm_weight=$TGM_WEIGHT \
             +use_log_space=$USE_LOG_SPACE \
             use_canonical_space=$USE_CANONICAL \
-            +cls_layers='[$CLS_LAYERS]' \
+            cls_layers='[$CLS_LAYERS]' \
             +results_dir=$RESULTS_DIR"
 
         # Add gear_checkpoint if specified (for Phase 2)
@@ -1533,7 +1533,7 @@ case $COMMAND in
             tgm_weight=$TGM_WEIGHT \
             +use_log_space=$USE_LOG_SPACE \
             use_canonical_space=$USE_CANONICAL \
-            +cls_layers='[$CLS_LAYERS]' \
+            cls_layers='[$CLS_LAYERS]' \
             +results_dir=$RESULTS_DIR"
 
         # Add gear_checkpoint if specified (for Phase 2)

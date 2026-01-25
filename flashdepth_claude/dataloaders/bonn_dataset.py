@@ -30,13 +30,12 @@ class BonnDepth(BaseDatasetPairs):
 
     def __init__(self, root_dir, split, load_cache=None):
         self.root_dir = os.path.join(root_dir, 'bonn')
+        # Cache for timestamp matching (must be initialized before super().__init__ which calls _build_pairs)
+        self._timestamp_cache = {}
         super().__init__(dataset_name='bonn', root_dir=self.root_dir, split=split, load_cache=load_cache)
         # Set default parameters
         self.reshape_list['resolution'] = (640, 480)
         self.reshape_list['stride'] = 1
-
-        # Cache for timestamp matching
-        self._timestamp_cache = {}
 
     def get_cache_path(self, cache_dir):
         return os.path.join(cache_dir, 'bonn_pairs.pkl')
