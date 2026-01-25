@@ -40,6 +40,7 @@ from utils.fgwise_evaluation import (
     save_fgwise_visualization, draw_fg_contours, create_depth_with_fg_overlay
 )
 from utils.comparison_visualization import visualize_sequence_simplified, visualize_best_frame_simplified
+from utils.reprojection_tae import ReprojectionTAECalculator
 
 # Setup logging
 logging.basicConfig(
@@ -128,6 +129,11 @@ class VideoComparisonTester:
         # Metrics calculators
         self.metrics = MetricDepthMetrics()
         self.relative_metrics = RelativeDepthMetrics()
+
+        # Setup reprojection TAE calculator
+        data_root = config.get('data_root', '/data/datasets')
+        self.reproj_tae_calculator = ReprojectionTAECalculator(data_root)
+        logger.info(f"Reprojection TAE calculator initialized (supported: {self.reproj_tae_calculator.SUPPORTED_DATASETS})")
 
         # Load model
         self.model = self._setup_model()
@@ -323,8 +329,7 @@ class VideoComparisonTester:
                 logger.info(f"Sequence {sequence_id}: "
                            f"AbsRel={metrics['abs_rel']:.4f}, "
                            f"δ1={metrics['a1']:.4f}, "
-                           f"TAE={metrics['tae']:.4f}, "
-                           f"F1={metrics.get('boundary_f1', 0):.3f}")
+                           f"TAE={metrics['tae']:.4f}")
 
             except Exception as e:
                 logger.error(f"Error processing sequence {sequence_id}: {e}")
@@ -517,10 +522,6 @@ class VideoComparisonTester:
         # Define MAX_DEPTH for valid mask creation (used in both regular and TAE computation)
         MAX_DEPTH = 70.0
 
-        # Track best frame (criteria differs by depth mode)
-        if self.depth_mode == 'relative':
-            best_frame_f1 = 0.0  # For relative: maximize F1
-
         # Compute regular metrics if:
         # 1. Object-wise mode is disabled, OR
         # 2. Object-wise mode is enabled but no segmentations available (fallback)
@@ -541,24 +542,20 @@ class VideoComparisonTester:
                 if valid_mask.sum() > 0:
                     # Compute metrics based on depth mode
                     if self.depth_mode == 'metric':
-                        # Skip boundary F1 for ETH3D (too slow at 6048x4032 resolution)
-                        skip_f1 = (self.config.get('dataset', '') == 'eth3d')
                         frame_metric = self.metrics.compute_metric_depth_metrics(
-                            pred_frame, gt_frame, valid_mask, skip_boundary_f1=skip_f1
+                            pred_frame, gt_frame, valid_mask
                         )
                         # Track best frame (lowest AbsRel for metric)
                         if frame_metric['abs_rel'] < best_frame_abs_rel:
                             best_frame_abs_rel = frame_metric['abs_rel']
                             best_frame_idx = t
                     else:  # relative
-                        # Skip boundary F1 for ETH3D (too slow at 6048x4032 resolution)
-                        skip_f1 = (self.config.get('dataset', '') == 'eth3d')
                         frame_metric = self.relative_metrics.compute_relative_depth_metrics(
-                            pred_frame, gt_frame, valid_mask, skip_boundary_f1=skip_f1
+                            pred_frame, gt_frame, valid_mask
                         )
-                        # Track best frame (highest F1 for relative)
-                        if frame_metric['boundary_f1'] > best_frame_f1:
-                            best_frame_f1 = frame_metric['boundary_f1']
+                        # Track best frame (lowest AbsRel for relative)
+                        if frame_metric['abs_rel_si'] < best_frame_abs_rel:
+                            best_frame_abs_rel = frame_metric['abs_rel_si']
                             best_frame_idx = t
 
                     frame_metrics.append(frame_metric)
@@ -566,7 +563,7 @@ class VideoComparisonTester:
             # Average metrics
             if len(frame_metrics) == 0:
                 logger.warning(f"No valid frames for sequence {sequence_id}")
-                return {k: 0.0 for k in ["mae", "rmse", "abs_rel", "a1", "tae", "fps", "boundary_f1"]}
+                return {k: 0.0 for k in ["mae", "rmse", "abs_rel", "a1", "tae", "fps"]}
 
             metrics = {}
             for key in frame_metrics[0].keys():
@@ -605,6 +602,34 @@ class VideoComparisonTester:
                 metrics['tae'] = np.mean(tae_errors) if len(tae_errors) > 0 else 0.0
             else:
                 metrics['tae'] = 0.0
+
+            # Compute Reprojection-based TAE (for datasets with camera poses)
+            # Supported: sintel, eth3d, bonn, vkitti
+            dataset_name_for_tae = batch.get('dataset_name', 'unknown')
+            if isinstance(dataset_name_for_tae, (list, tuple)):
+                dataset_name_for_tae = dataset_name_for_tae[0]
+            dataset_name_for_tae = dataset_name_for_tae.lower() if isinstance(dataset_name_for_tae, str) else 'unknown'
+
+            if len(pred_depths) > 1 and 'image_paths' in batch and self.reproj_tae_calculator.is_supported(dataset_name_for_tae):
+                try:
+                    image_paths_for_tae = batch['image_paths'][0]  # batch size is 1
+                    reproj_tae_result = self.reproj_tae_calculator.compute_tae(
+                        pred_depths_cpu[:, 0],  # [T, H, W]
+                        gt_depth_processed_cpu[:, 0],  # [T, H, W]
+                        dataset_name_for_tae,
+                        image_paths_for_tae
+                    )
+                    metrics['tae_reproj'] = reproj_tae_result.get('tae_reproj', 0.0)
+                    metrics['tae_reproj_gt'] = reproj_tae_result.get('tae_reproj_gt', 0.0)
+                    if reproj_tae_result.get('tae_reproj_supported', False):
+                        logger.info(f"Reprojection TAE: {metrics['tae_reproj']:.4f} (GT ref: {metrics['tae_reproj_gt']:.4f})")
+                except Exception as e:
+                    logger.warning(f"Failed to compute reprojection TAE: {e}")
+                    metrics['tae_reproj'] = 0.0
+                    metrics['tae_reproj_gt'] = 0.0
+            else:
+                metrics['tae_reproj'] = 0.0
+                metrics['tae_reproj_gt'] = 0.0
 
             metrics['fps'] = fps
 
@@ -812,8 +837,8 @@ class VideoComparisonTester:
                 logger.info(f"Best frame for sequence {sequence_id}: Frame {best_frame_idx} (AbsRel={best_frame_abs_rel:.4f})")
                 best_metric_value = best_frame_abs_rel
             else:  # relative
-                logger.info(f"Best frame for sequence {sequence_id}: Frame {best_frame_idx} (F1={best_frame_f1:.4f})")
-                best_metric_value = best_frame_f1
+                logger.info(f"Best frame for sequence {sequence_id}: Frame {best_frame_idx} (AbsRel={best_frame_abs_rel:.4f})")
+                best_metric_value = best_frame_abs_rel
 
             # Extract dataset name from batch (handle both string and list)
             dataset_name_raw = batch.get('dataset_name', 'unknown')
@@ -904,13 +929,13 @@ class VideoComparisonTester:
 
         # Compute average metrics
         avg_metrics_raw = {}
-        for key in ['mae', 'rmse', 'abs_rel', 'sq_rel', 'rmse_log', 'a1', 'a2', 'a3', 'tae', 'boundary_f1', 'fps']:
+        for key in ['mae', 'rmse', 'abs_rel', 'sq_rel', 'rmse_log', 'a1', 'a2', 'a3', 'tae', 'fps']:
             values = [r[key] for r in self.all_results if key in r]
             if len(values) > 0:
                 avg_metrics_raw[key] = float(np.mean(values))
 
-        # Reorder metrics according to desired order: abs_rel, a1, a2, a3, fps, tae, f1, mae, rmse
-        metric_order = ['abs_rel', 'a1', 'a2', 'a3', 'fps', 'tae', 'boundary_f1', 'mae', 'rmse']
+        # Reorder metrics according to desired order: abs_rel, a1, a2, a3, fps, tae, tae_reproj, mae, rmse
+        metric_order = ['abs_rel', 'a1', 'a2', 'a3', 'fps', 'tae', 'tae_reproj', 'mae', 'rmse']
         avg_metrics = {}
         for key in metric_order:
             if key in avg_metrics_raw:
@@ -967,7 +992,6 @@ class VideoComparisonTester:
         logger.info(f"  AbsRel: {avg_metrics.get('abs_rel', 0):.4f}")
         logger.info(f"  δ1: {avg_metrics.get('a1', 0):.4f}")
         logger.info(f"  TAE: {avg_metrics.get('tae', 0):.4f}")
-        logger.info(f"  F1: {avg_metrics.get('boundary_f1', 0):.3f}")
         logger.info(f"  FPS: {avg_metrics.get('fps', 0):.2f}")
         logger.info(f"Results saved to {results_path}")
 

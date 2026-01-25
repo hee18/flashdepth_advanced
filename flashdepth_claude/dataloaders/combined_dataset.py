@@ -160,8 +160,10 @@ class CombinedDataset(Dataset):
                         self.reshape_list[dataset]['resolution'] = (924,518)
                     elif dataset in ['vkitti']:
                         self.reshape_list[dataset]['resolution'] = (1246, 378) # 3.296 ratio, near original, 14x divisible
-                    elif dataset in ['nuscenes']: 
+                    elif dataset in ['nuscenes']:
                         self.reshape_list[dataset]['resolution'] = (924, 518)
+                    elif dataset in ['bonn']:
+                        self.reshape_list[dataset]['resolution'] = (630, 476)  # 4:3 ratio, 14x divisible, original 640x480
 
 
         elif resolution == '2k':
@@ -183,8 +185,10 @@ class CombinedDataset(Dataset):
                         self.reshape_list[dataset]['resolution'] = (2044,1148)
                     if dataset in ['vkitti']:
                         self.reshape_list[dataset]['resolution'] = (1246, 378)  # 3.296 ratio, near original, 14x divisible
-                    elif dataset in ['nuscenes']: # Add NuScenes resolution
+                    elif dataset in ['nuscenes']:  # Add NuScenes resolution
                         self.reshape_list[dataset]['resolution'] = (1596, 896)
+                    elif dataset in ['bonn']:
+                        self.reshape_list[dataset]['resolution'] = (630, 476)  # 4:3 ratio, 14x divisible, original 640x480
 
         else:
             raise ValueError(f"Resolution should be 'base' or '2k' for training")

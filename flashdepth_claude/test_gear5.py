@@ -49,6 +49,7 @@ from utils.fgwise_evaluation import (
 from utils.helpers import save_gifs_as_grid, save_grid_to_mp4, depth_to_np_arr, torch_batch_to_np_arr
 from utils.gear_common_helpers import depth_to_colored_frame
 from utils.gear_video_utils import save_video as save_video_util
+from utils.reprojection_tae import ReprojectionTAECalculator
 
 
 
@@ -153,6 +154,11 @@ class Gear5Tester:
 
         # Setup metrics
         self.metrics = MetricDepthMetrics()
+
+        # Setup reprojection TAE calculator
+        data_root = config.dataset.get('data_root', '/data/datasets')
+        self.reproj_tae_calculator = ReprojectionTAECalculator(data_root)
+        logger.info(f"Reprojection TAE calculator initialized (supported: {self.reproj_tae_calculator.SUPPORTED_DATASETS})")
 
     def _setup_model(self):
         """Load trained Gear5 model with phase/step-specific configuration"""
@@ -920,7 +926,7 @@ class Gear5Tester:
             logger.info(f"Results saved to {results_path}")
 
             # Reorder per-sequence results
-            metric_order = ['abs_rel', 'a1', 'a2', 'a3', 'fps', 'tae', 'boundary_f1', 'mae', 'rmse',
+            metric_order = ['abs_rel', 'a1', 'a2', 'a3', 'fps', 'tae', 'tae_reproj', 'mae', 'rmse',
                             'tsp_scale_mean', 'tsp_shift_mean', 'tsp_scale_std', 'tsp_shift_std',
                             'tsp_scale_max', 'tsp_scale_min', 'tsp_shift_max', 'tsp_shift_min']
             reordered_metrics = []
@@ -1213,25 +1219,41 @@ class Gear5Tester:
             )
             path_1_warmup = dpt_features_warmup[-1]
 
-            # Apply Mamba temporal processing (frozen)
-            path_1_temporal_warmup = self.model.dpt_features_to_mamba(
-                input_shape=(1, 1, None, h_warmup, w_warmup),
-                dpt_features=path_1_warmup,
-                in_dpt_layer=0
-            )
+            if self.use_bankai:
+                # ========== BANKAI MODE WARMUP ==========
+                gear5_outputs_warmup = self.model.gear5_metric_head(
+                    path_1=path_1_warmup,
+                    cls_tokens=cls_tokens_warmup,
+                    attention_weights_list=attention_weights_list_warmup,
+                    input_shape=(1, 1, 3, h_warmup, w_warmup)
+                )
+                path_1_temporal_warmup = gear5_outputs_warmup['spatial_out']
 
-            # Get relative depth (frozen)
-            out_warmup = self.model.depth_head.scratch.output_conv1(path_1_temporal_warmup)
-            out_warmup = F.interpolate(out_warmup, (h_warmup, w_warmup), mode="bilinear", align_corners=True)
-            relative_depth_warmup = self.model.depth_head.scratch.output_conv2(out_warmup)
+                # Get relative depth
+                out_warmup = self.model.depth_head.scratch.output_conv1(path_1_temporal_warmup)
+                out_warmup = F.interpolate(out_warmup, (h_warmup, w_warmup), mode="bilinear", align_corners=True)
+                relative_depth_warmup = self.model.depth_head.scratch.output_conv2(out_warmup)
+            else:
+                # ========== STANDARD GEAR5 WARMUP ==========
+                # Apply Mamba temporal processing (frozen)
+                path_1_temporal_warmup = self.model.dpt_features_to_mamba(
+                    input_shape=(1, 1, None, h_warmup, w_warmup),
+                    dpt_features=path_1_warmup,
+                    in_dpt_layer=0
+                )
 
-            # Get scale/shift from Gear5MetricHead
-            gear5_outputs_warmup = self.model.gear5_metric_head(
-                cls_tokens=cls_tokens_warmup,
-                attention_weights_list=attention_weights_list_warmup,
-                patch_h=patch_h_warmup,
-                patch_w=patch_w_warmup
-            )
+                # Get relative depth (frozen)
+                out_warmup = self.model.depth_head.scratch.output_conv1(path_1_temporal_warmup)
+                out_warmup = F.interpolate(out_warmup, (h_warmup, w_warmup), mode="bilinear", align_corners=True)
+                relative_depth_warmup = self.model.depth_head.scratch.output_conv2(out_warmup)
+
+                # Get scale/shift from Gear5MetricHead
+                gear5_outputs_warmup = self.model.gear5_metric_head(
+                    cls_tokens=cls_tokens_warmup,
+                    attention_weights_list=attention_weights_list_warmup,
+                    patch_h=patch_h_warmup,
+                    patch_w=patch_w_warmup
+                )
 
         del encoder_features_warmup, cls_tokens_list_warmup, attention_weights_list_warmup
         del dpt_features_warmup, path_1_warmup, path_1_temporal_warmup
@@ -1539,6 +1561,29 @@ class Gear5Tester:
             metrics['tae'] = np.mean(tae_errors) if len(tae_errors) > 0 else 0.0
         else:
             metrics['tae'] = 0.0
+
+        # Compute Reprojection-based TAE (for datasets with camera poses)
+        # Supported: sintel, eth3d, bonn, vkitti
+        if len(pred_depths) > 1 and 'image_paths' in batch and self.reproj_tae_calculator.is_supported(dataset_name):
+            try:
+                image_paths_for_tae = batch['image_paths'][0]  # batch size is 1
+                reproj_tae_result = self.reproj_tae_calculator.compute_tae(
+                    pred_depths[:, 0],  # [T, H, W]
+                    gt_depth_metric[:, 0],  # [T, H, W]
+                    dataset_name,
+                    image_paths_for_tae
+                )
+                metrics['tae_reproj'] = reproj_tae_result.get('tae_reproj', 0.0)
+                metrics['tae_reproj_gt'] = reproj_tae_result.get('tae_reproj_gt', 0.0)
+                if reproj_tae_result.get('tae_reproj_supported', False):
+                    logger.info(f"Reprojection TAE: {metrics['tae_reproj']:.4f} (GT ref: {metrics['tae_reproj_gt']:.4f})")
+            except Exception as e:
+                logger.warning(f"Failed to compute reprojection TAE: {e}")
+                metrics['tae_reproj'] = 0.0
+                metrics['tae_reproj_gt'] = 0.0
+        else:
+            metrics['tae_reproj'] = 0.0
+            metrics['tae_reproj_gt'] = 0.0
 
         # Add FPS to metrics
         metrics['fps'] = fps
@@ -1913,8 +1958,7 @@ class Gear5Tester:
             f"Sequence {sequence_id} | "
             f"TAE: {metrics.get('tae', 0):.4f} | "
             f"AbsRel: {metrics.get('abs_rel', 0):.4f} | "
-            f"δ1: {metrics.get('a1', 0):.4f} | "
-            f"F1: {metrics.get('boundary_f1', 0):.3f}"
+            f"δ1: {metrics.get('a1', 0):.4f}"
         )
         if fps is not None:
             title_str += f" | FPS: {fps:.1f}"
@@ -2306,13 +2350,6 @@ class Gear5Tester:
                     transform=ax9.transAxes, bbox=dict(boxstyle="round", facecolor='lightblue'))
             y_pos -= 0.08
 
-            # Add boundary F1 score if available
-            if frame_metrics is not None and 'boundary_f1' in frame_metrics:
-                boundary_f1 = frame_metrics['boundary_f1']
-                ax9.text(0.05, y_pos, f'F1: {boundary_f1:.3f}', fontsize=9,
-                        transform=ax9.transAxes, bbox=dict(boxstyle="round", facecolor='lavender'))
-                y_pos -= 0.08
-
         ax9.set_title('Depth Metrics', fontsize=14, fontweight='bold')
         ax9.axis('off')
 
@@ -2622,8 +2659,8 @@ class Gear5Tester:
                 if all(isinstance(v, (int, float, np.number)) for v in values):
                     aggregated_raw[key] = np.mean(values)
 
-        # Reorder metrics: abs_rel, a1, a2, a3, fps, tae, f1, mae, rmse, then TSP stats
-        metric_order = ['abs_rel', 'a1', 'a2', 'a3', 'fps', 'tae', 'boundary_f1', 'mae', 'rmse',
+        # Reorder metrics: abs_rel, a1, a2, a3, fps, tae, tae_reproj, mae, rmse, then TSP stats
+        metric_order = ['abs_rel', 'a1', 'a2', 'a3', 'fps', 'tae', 'tae_reproj', 'mae', 'rmse',
                         'tsp_scale_mean', 'tsp_shift_mean', 'tsp_scale_std', 'tsp_shift_std']
         aggregated = {}
         for key in metric_order:

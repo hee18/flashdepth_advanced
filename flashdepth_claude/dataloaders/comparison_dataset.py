@@ -291,9 +291,11 @@ class ComparisonDataset(Dataset):
             logger.warning(f"Bonn root not found: {bonn_root}")
             return sequences
 
-        # Get all sequence directories
+        # Get all sequence directories (exclude static scenes - no camera motion)
+        excluded_scenes = ['rgbd_bonn_static']
         seq_dirs = sorted([d for d in os.listdir(bonn_root)
-                          if os.path.isdir(os.path.join(bonn_root, d)) and d.startswith('rgbd_bonn_')])
+                          if os.path.isdir(os.path.join(bonn_root, d)) and d.startswith('rgbd_bonn_')
+                          and d not in excluded_scenes])
 
         for seq_name in seq_dirs:
             seq_path = os.path.join(bonn_root, seq_name)
@@ -338,16 +340,14 @@ class ComparisonDataset(Dataset):
 
                     if os.path.exists(rgb_path) and os.path.exists(depth_path):
                         frames.append({
-                            'rgb': rgb_path,
+                            'image': rgb_path,
                             'depth': depth_path,
-                            'timestamp': rgb_ts
+                            'timestamp': rgb_ts,
+                            'scene_name': seq_name
                         })
 
             if len(frames) > 0:
-                sequences.append({
-                    'name': seq_name,
-                    'frames': frames
-                })
+                sequences.append(frames)  # Append list of frames, not dict
                 logger.info(f"Bonn: {seq_name} - {len(frames)} frames")
 
         logger.info(f"Built {len(sequences)} Bonn sequences")
@@ -732,10 +732,15 @@ class ComparisonDataset(Dataset):
         """
         sequence = self.sequences[idx]
 
-        # Apply chunk_size to limit memory usage
+        # Determine max frames to load
+        # Priority: chunk_size (if set) overrides video_length
+        # video_length is the user-specified limit via --vid-len
         if self.chunk_size and self.chunk_size < len(sequence):
             max_frames = self.chunk_size
             logger.info(f"Applying chunk_size: loading {max_frames}/{len(sequence)} frames from sequence {idx}")
+        elif self.video_length and self.video_length < len(sequence):
+            max_frames = self.video_length
+            logger.info(f"Applying video_length: loading {max_frames}/{len(sequence)} frames from sequence {idx}")
         else:
             max_frames = len(sequence)
 
@@ -751,7 +756,7 @@ class ComparisonDataset(Dataset):
         intrinsics_list = []
         segmentations = [] if self.objwise_enabled else None
 
-        # First pass: load frames (respecting chunk_size)
+        # First pass: load frames (respecting video_length/chunk_size)
         loaded_frames = []
         for frame_idx, frame in enumerate(sequence[:max_frames]):
             # Progress indicator for large sequences

@@ -44,9 +44,11 @@ class BonnDepth(BaseDatasetPairs):
     def get_all_scenes(self, scenes_path):
         """Get all Bonn sequence directories."""
         scene_names = []
+        # Exclude static scenes (no camera motion, not suitable for temporal evaluation)
+        excluded_scenes = ['rgbd_bonn_static']
         for s in os.listdir(scenes_path):
             scene_path = os.path.join(scenes_path, s)
-            if os.path.isdir(scene_path) and s.startswith('rgbd_bonn_'):
+            if os.path.isdir(scene_path) and s.startswith('rgbd_bonn_') and s not in excluded_scenes:
                 # Check if rgb and depth directories exist
                 if os.path.isdir(os.path.join(scene_path, 'rgb')) and \
                    os.path.isdir(os.path.join(scene_path, 'depth')):

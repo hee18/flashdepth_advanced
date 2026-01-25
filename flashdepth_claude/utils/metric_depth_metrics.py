@@ -3,9 +3,6 @@ import numpy as np
 from typing import Dict, Tuple, Optional
 import logging
 
-# Import boundary metrics for F1 score computation
-from utils.eval_metrics.boundary_metrics import SI_boundary_F1
-
 
 class MetricDepthMetrics:
     """
@@ -88,7 +85,7 @@ class MetricDepthMetrics:
             pred: Predicted depth in meters [H, W] or [N, H, W]
             gt: Ground truth depth in meters [H, W] or [N, H, W]
             valid_mask: Valid pixels mask [H, W] or [N, H, W]
-            skip_boundary_f1: Skip boundary F1 computation (for high-res datasets like ETH3D)
+            skip_boundary_f1: Deprecated, kept for backward compatibility
 
         Returns:
             Dictionary of metrics
@@ -114,8 +111,6 @@ class MetricDepthMetrics:
         # Squared Relative Error
         sq_rel = torch.mean(((pred_valid - gt_valid) ** 2) / gt_valid)
 
-        # print(f"@@@@@Pred Max {torch.max(pred_valid)} Min {torch.min(pred_valid)} Mean {torch.mean(pred_valid)}@@@@@")
-
         # Log RMSE
         pred_log = torch.log(torch.clamp(pred_valid, min=1e-8))
         gt_log = torch.log(torch.clamp(gt_valid, min=1e-8))
@@ -134,23 +129,6 @@ class MetricDepthMetrics:
         mre = torch.mean((pred_valid - gt_valid) / gt_valid)  # Mean Relative Error (signed)
         log_mae = torch.mean(torch.abs(pred_log - gt_log))
 
-        # Boundary F1 score (edge accuracy / depth discontinuity detection)
-        # Skip for high-resolution datasets (too slow)
-        if skip_boundary_f1:
-            boundary_f1 = 0.0
-        else:
-            # Convert to numpy for boundary_metrics computation
-            pred_np = pred.cpu().numpy() if isinstance(pred, torch.Tensor) else pred
-            gt_np = gt.cpu().numpy() if isinstance(gt, torch.Tensor) else gt
-
-            # Compute scale-invariant boundary F1 score
-            # (weighted average across thresholds from 5% to 25% depth changes)
-            try:
-                boundary_f1 = SI_boundary_F1(pred_np, gt_np, t_min=1.05, t_max=1.25, N=10)
-            except Exception as e:
-                # Fallback if computation fails
-                boundary_f1 = 0.0
-
         return {
             "mae": mae.item(),
             "rmse": rmse.item(),
@@ -162,7 +140,6 @@ class MetricDepthMetrics:
             "a1": a1.item(),
             "a2": a2.item(),
             "a3": a3.item(),
-            "boundary_f1": float(boundary_f1),  # Edge accuracy (depth discontinuity F1 score)
         }
 
     @staticmethod
@@ -431,18 +408,16 @@ class RelativeDepthMetrics:
         Compute metrics for relative depth estimation
 
         For relative depth, only scale-invariant metrics are meaningful:
-        - Boundary F1: Edge-aware metric (scale-invariant)
-        - Scale-invariant AbsRel and δ1 (optional, for comparison)
+        - Scale-invariant AbsRel and δ1
 
         Args:
             pred: Predicted relative depth [H, W] or [N, H, W]
             gt: Ground truth depth [H, W] or [N, H, W]
             valid_mask: Valid pixels mask [H, W] or [N, H, W]
-            skip_boundary_f1: Skip boundary F1 computation (for high-res datasets like ETH3D)
+            skip_boundary_f1: Deprecated, kept for backward compatibility
 
         Returns:
             Dictionary containing:
-            - boundary_f1: Scale-invariant boundary F1 score (0.0 if skipped)
             - abs_rel_si: Scale-invariant absolute relative error
             - a1: Scale-invariant δ1 threshold accuracy
         """
@@ -454,21 +429,7 @@ class RelativeDepthMetrics:
             pred, gt, valid_mask
         )
 
-        # Compute scale-invariant boundary F1 score (skip for high-res datasets)
-        if skip_boundary_f1:
-            boundary_f1 = 0.0
-        else:
-            # Convert to numpy for boundary F1 computation
-            pred_np = pred.cpu().numpy() if isinstance(pred, torch.Tensor) else pred
-            gt_np = gt.cpu().numpy() if isinstance(gt, torch.Tensor) else gt
-
-            try:
-                boundary_f1 = SI_boundary_F1(pred_np, gt_np, t_min=1.05, t_max=1.25, N=10)
-            except Exception as e:
-                boundary_f1 = 0.0
-
         return {
-            "boundary_f1": float(boundary_f1),
             "abs_rel_si": si_metrics["abs_rel"],  # Scale-invariant AbsRel
             "a1": si_metrics["a1"],  # Scale-invariant δ1
         }

@@ -1457,7 +1457,7 @@ case $COMMAND in
             bankai_phase=$BANKAI_PHASE \
             +bankai_auto_step=$BANKAI_AUTO_STEP \
             tgm_weight=$TGM_WEIGHT \
-            use_log_space=$USE_LOG_SPACE \
+            +use_log_space=$USE_LOG_SPACE \
             use_canonical_space=$USE_CANONICAL \
             +cls_layers='[$CLS_LAYERS]' \
             +results_dir=$RESULTS_DIR"
@@ -1531,7 +1531,7 @@ case $COMMAND in
             bankai_phase=$BANKAI_PHASE \
             +bankai_auto_step=$BANKAI_AUTO_STEP \
             tgm_weight=$TGM_WEIGHT \
-            use_log_space=$USE_LOG_SPACE \
+            +use_log_space=$USE_LOG_SPACE \
             use_canonical_space=$USE_CANONICAL \
             +cls_layers='[$CLS_LAYERS]' \
             +results_dir=$RESULTS_DIR"
@@ -1555,14 +1555,19 @@ case $COMMAND in
         echo "  - Video length: $VID_LEN"
         echo "  - Frame interval: $FRAME_INTERVAL"
         echo "  - GPU: $GPU_ID"
+        echo "  - Workers: $WORKERS"
         echo "  - Results directory: $RESULTS_DIR"
         echo "  - Checkpoint: $FLASHDEPTH_CHECKPOINT"
         echo "  - Config variant: $CONFIG_VARIANT"
         echo "  - Resolution: $RESOLUTION"
+        echo "  - Visualization: $VISUALIZATION"
         if [ -n "$OBJWISE_DATASET" ]; then
             echo "  - Dataset: $OBJWISE_DATASET"
         else
             echo "  - Dataset: Using config defaults (all test datasets)"
+        fi
+        if [ "$OBJWISE_FLAG" == "true" ]; then
+            echo "  - Object-wise evaluation: ENABLED"
         fi
         echo ""
 

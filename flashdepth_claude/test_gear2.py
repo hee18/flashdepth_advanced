@@ -546,7 +546,7 @@ class Gear2Tester:
             logger.info(f"Results saved to {results_path}")
 
             # Reorder per-sequence results
-            metric_order = ['abs_rel', 'a1', 'a2', 'a3', 'fps', 'tae', 'boundary_f1', 'mae', 'rmse']
+            metric_order = ['abs_rel', 'a1', 'a2', 'a3', 'fps', 'tae', 'mae', 'rmse']
             reordered_metrics = []
             for result in all_metrics:
                 reordered = {}
@@ -1230,8 +1230,7 @@ class Gear2Tester:
             f"Sequence {sequence_id} | "
             f"TAE: {metrics.get('tae', 0):.4f} | "
             f"AbsRel: {metrics.get('abs_rel', 0):.4f} | "
-            f"δ1: {metrics.get('a1', 0):.4f} | "
-            f"F1: {metrics.get('boundary_f1', 0):.3f}"
+            f"δ1: {metrics.get('a1', 0):.4f}"
         )
         if fps is not None:
             title_str += f" | FPS: {fps:.1f}"
@@ -1534,13 +1533,6 @@ class Gear2Tester:
                     transform=ax9.transAxes, bbox=dict(boxstyle="round", facecolor='lightblue'))
             y_pos -= 0.08
 
-            # Add boundary F1 score if available
-            if frame_metrics is not None and 'boundary_f1' in frame_metrics:
-                boundary_f1 = frame_metrics['boundary_f1']
-                ax9.text(0.05, y_pos, f'F1: {boundary_f1:.3f}', fontsize=9,
-                        transform=ax9.transAxes, bbox=dict(boxstyle="round", facecolor='lavender'))
-                y_pos -= 0.08
-
         # Per-class pixel counts (if available)
         if class_metrics is not None and len(class_metrics) > 0:
             # Add separator
@@ -1631,8 +1623,8 @@ class Gear2Tester:
             if values:
                 aggregated_raw[key] = np.mean(values)
 
-        # Reorder metrics: abs_rel, a1, a2, a3, fps, tae, f1, mae, rmse
-        metric_order = ['abs_rel', 'a1', 'a2', 'a3', 'fps', 'tae', 'boundary_f1', 'mae', 'rmse']
+        # Reorder metrics: abs_rel, a1, a2, a3, fps, tae, mae, rmse
+        metric_order = ['abs_rel', 'a1', 'a2', 'a3', 'fps', 'tae', 'mae', 'rmse']
         aggregated = {}
         for key in metric_order:
             if key in aggregated_raw:

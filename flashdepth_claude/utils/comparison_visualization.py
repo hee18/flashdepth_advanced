@@ -174,8 +174,7 @@ def visualize_sequence_simplified(images, pred_depths, gt_depths, valid_mask,
         f"Sequence {sequence_id} | "
         f"TAE: {metrics.get('tae', 0):.4f} | "
         f"AbsRel: {metrics.get('abs_rel', 0):.4f} | "
-        f"δ1: {metrics.get('a1', 0):.4f} | "
-        f"F1: {metrics.get('boundary_f1', 0):.3f}"
+        f"δ1: {metrics.get('a1', 0):.4f}"
     )
     if fps is not None:
         title_str += f" | FPS: {fps:.1f}"
@@ -257,6 +256,7 @@ def visualize_best_frame_simplified(image, gt_depth, pred_depth, metrics,
     # Row 0, Col 1: GT Depth (use completed depth for ETH3D/Waymo visualization)
     ax_gt = fig.add_subplot(gs[0, 1])
     gt_valid = (gt_depth > 0) & (gt_depth < MAX_DEPTH)  # Keep original for error calculation
+    pred_valid = (pred_depth > 0) & (pred_depth < MAX_DEPTH)  # Valid prediction mask
 
     # Try to load completed depth for visualization
     gt_for_display = gt_depth  # Default to sparse GT
@@ -411,7 +411,6 @@ def visualize_best_frame_simplified(image, gt_depth, pred_depth, metrics,
     text_lines.append(f"δ1:     {metrics.get('a1', 0):.3f}")
     text_lines.append(f"δ2:     {metrics.get('a2', 0):.3f}")
     text_lines.append(f"δ3:     {metrics.get('a3', 0):.3f}")
-    text_lines.append(f"F1:     {metrics.get('boundary_f1', 0):.3f}")
 
     # Add focal length if available
     if focal_length is not None:

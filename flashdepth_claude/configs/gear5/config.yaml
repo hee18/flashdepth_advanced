@@ -14,6 +14,7 @@ use_canonical_space: true  # ENABLED - all training data normalized to canonical
 
 # Loss configuration
 loss_type: log_l1  # Loss type: log_l1 (default), importance (importance-weighted)
+use_log_space: true  # Use log space for depth/TGM loss (--no-log-space to disable)
 
 # ========== Gear5 Specific Settings ==========
 # Unified Architecture:
