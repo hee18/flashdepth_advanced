@@ -139,7 +139,7 @@ class Gear5Tester:
         # FGwise evaluation configuration
         self.fgwise_enabled = config.get('fg_wise', {}).get('enabled', False)
         if self.fgwise_enabled:
-            data_root = config.dataset.get('data_root', '/data/datasets')
+            data_root = config.dataset.get('data_root', '/home/cvlab/hsy/Datasets')
             logger.info(f"FG-wise evaluation ENABLED (data_root: {data_root})")
             # FGWiseMetrics will be created per-dataset in test method
             self.fgwise_data_root = data_root
@@ -156,7 +156,7 @@ class Gear5Tester:
         self.metrics = MetricDepthMetrics()
 
         # Setup reprojection TAE calculator
-        data_root = config.dataset.get('data_root', '/data/datasets')
+        data_root = config.dataset.get('data_root', '/home/cvlab/hsy/Datasets')
         self.reproj_tae_calculator = ReprojectionTAECalculator(data_root)
         logger.info(f"Reprojection TAE calculator initialized (supported: {self.reproj_tae_calculator.SUPPORTED_DATASETS})")
 

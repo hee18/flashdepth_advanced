@@ -120,7 +120,7 @@ class VideoComparisonTester:
         # FG-wise evaluation setup
         self.fgwise_enabled = config.get('fg_wise', {}).get('enabled', False)
         if self.fgwise_enabled:
-            data_root = config.dataset.get('data_root', '/data/datasets')
+            data_root = config.dataset.get('data_root', '/home/cvlab/hsy/Datasets')
             logger.info(f"FG-wise evaluation ENABLED (data_root: {data_root})")
             self.fgwise_data_root = data_root
         else:
@@ -131,7 +131,7 @@ class VideoComparisonTester:
         self.relative_metrics = RelativeDepthMetrics()
 
         # Setup reprojection TAE calculator
-        data_root = config.get('data_root', '/data/datasets')
+        data_root = config.get('data_root', '/home/cvlab/hsy/Datasets')
         self.reproj_tae_calculator = ReprojectionTAECalculator(data_root)
         logger.info(f"Reprojection TAE calculator initialized (supported: {self.reproj_tae_calculator.SUPPORTED_DATASETS})")
 

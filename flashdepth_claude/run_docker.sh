@@ -190,6 +190,7 @@ BANKAI_PHASE="auto"  # Bankai training phase: 1, 2, or "auto" (auto: Phase 1 unt
 BANKAI_AUTO_STEP="5000"  # Step at which to transition from Phase 1 to Phase 2 in auto mode
 TGM_WEIGHT="0.3"  # TGM loss weight for Bankai mode
 USE_LOG_SPACE="true"  # Use log space for depth/TGM loss (--no-log-space to disable)
+DDP_GPUS="0,1"  # GPU IDs for DDP training (e.g., "0,1" or "1,2")
 
 # Parse arguments
 USER_BATCH_SIZE=""  # Track if user explicitly set batch size
@@ -359,6 +360,10 @@ while [[ $# -gt 0 ]]; do
         --no-log-space)
             USE_LOG_SPACE="false"
             shift
+            ;;
+        --ddp-gpus)
+            DDP_GPUS="$2"
+            shift 2
             ;;
         -h|--help)
             show_usage
@@ -1491,7 +1496,7 @@ case $COMMAND in
             VIDEO_LENGTH=5
         fi
 
-        echo "Starting Gear5 Bankai training (Multi-GPU: 0,1)..."
+        echo "Starting Gear5 Bankai training (Multi-GPU: $DDP_GPUS)..."
         echo "Configuration:"
         echo "  - Config variant: $CONFIG_VARIANT"
         echo "  - Bankai phase: $BANKAI_PHASE (auto step: $BANKAI_AUTO_STEP)"
@@ -1504,11 +1509,11 @@ case $COMMAND in
         echo "  - Workers per GPU: $ACTUAL_WORKERS"
         echo "  - Video length: $VIDEO_LENGTH frames"
         echo "  - Total iterations: $TOTAL_ITERS"
-        echo "  - GPUs: 0,1"
+        echo "  - GPUs: $DDP_GPUS"
         echo "  - Results directory: $RESULTS_DIR"
         echo ""
 
-        DOCKER_CMD="CUDA_VISIBLE_DEVICES=0,1 docker compose run --rm \
+        DOCKER_CMD="CUDA_VISIBLE_DEVICES=$DDP_GPUS docker compose run --rm \
             -e GLOO_SOCKET_IFNAME=eth0 \
             -e NCCL_SOCKET_IFNAME=eth0 \
             -e NCCL_P2P_DISABLE=1 \
