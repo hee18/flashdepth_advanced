@@ -371,6 +371,7 @@ class WaymoSegmentationDataset(Dataset):
             segmentations = []
             focal_lengths = []  # Track focal lengths for each frame
             valid_frame_indices = []  # Track which frames have valid segmentation
+            image_paths = []  # Track image paths for reprojection TAE
 
             for frame_idx in frame_indices:
                 # Load segmentation (objwise_mode determines if we skip frames without it)
@@ -473,6 +474,7 @@ class WaymoSegmentationDataset(Dataset):
                 segmentations.append(seg_mask)
                 focal_lengths.append(fx)
                 valid_frame_indices.append(frame_idx)
+                image_paths.append(str(rgb_path))  # Store path for reprojection TAE
 
             # Check if we have any valid frames
             if len(images) == 0:
@@ -498,7 +500,8 @@ class WaymoSegmentationDataset(Dataset):
                 'focal_lengths_actual': focal_lengths_tensor,  # Focal lengths for each frame (match CombinedDataset naming)
                 'sequence_name': sequence_name,
                 'frame_indices': valid_frame_indices,  # Actual frame numbers
-                'dataset_name': 'waymo_seg'  # For intrinsics lookup
+                'dataset_name': 'waymo_seg',  # For intrinsics lookup
+                'image_paths': image_paths  # For reprojection TAE calculation
             }
 
         except Exception as e:
@@ -526,5 +529,6 @@ def collate_fn(batch):
         'segmentations': torch.stack([item['segmentations'] for item in batch]),  # Per-frame segmentations
         'focal_lengths_actual': torch.stack([item['focal_lengths_actual'] for item in batch]),  # Match CombinedDataset naming
         'sequence_name': [item['sequence_name'] for item in batch],
-        'frame_indices': [item['frame_indices'] for item in batch]  # Actual frame numbers
+        'frame_indices': [item['frame_indices'] for item in batch],  # Actual frame numbers
+        'image_paths': [item['image_paths'] for item in batch]  # For reprojection TAE
     }

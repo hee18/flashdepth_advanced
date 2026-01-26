@@ -18,6 +18,12 @@ from typing import Dict, List, Optional, Tuple, Union
 from pathlib import Path
 import struct
 
+try:
+    import pandas as pd
+    HAS_PANDAS = True
+except ImportError:
+    HAS_PANDAS = False
+
 logger = logging.getLogger(__name__)
 
 
@@ -573,6 +579,96 @@ def quat_to_rotation_matrix(qw: float, qx: float, qy: float, qz: float) -> np.nd
     return R
 
 
+def load_waymo_seg_cameras(
+    segment_name: str,
+    camera_name: str = 'FRONT',
+    waymo_seg_root: str = None
+) -> Tuple[np.ndarray, Dict[int, np.ndarray]]:
+    """
+    Load Waymo Segmentation dataset camera intrinsics and poses.
+
+    Waymo data sources:
+    - camera_image/*.parquet: Frame-by-frame pose (vehicle_to_world)
+    - camera_calibration/*.parquet: Camera intrinsics and extrinsic (camera_to_vehicle)
+
+    Camera-to-world pose = vehicle_to_world @ camera_to_vehicle
+
+    Args:
+        segment_name: Segment name (e.g., '10017090168044687777_6380_000_6400_000')
+                     Can include 'segment-' prefix
+        camera_name: Camera name ('FRONT' = 1, 'FRONT_LEFT' = 2, etc.)
+        waymo_seg_root: Root directory containing waymo_seg/
+
+    Returns:
+        K: [3, 3] intrinsic matrix (for original 1920×1280 resolution)
+        poses: Dict mapping frame_index to [4, 4] camera-to-world pose
+    """
+    if not HAS_PANDAS:
+        raise ImportError("pandas is required for Waymo dataset support. Install with: pip install pandas pyarrow")
+
+    # Remove 'segment-' prefix if present
+    if segment_name.startswith('segment-'):
+        segment_name = segment_name[len('segment-'):]
+
+    # Camera name to ID mapping
+    camera_name_to_id = {
+        'FRONT': 1,
+        'FRONT_LEFT': 2,
+        'FRONT_RIGHT': 3,
+        'SIDE_LEFT': 4,
+        'SIDE_RIGHT': 5
+    }
+    camera_id = camera_name_to_id.get(camera_name, 1)
+
+    # Find parquet files
+    waymo_seg_root = Path(waymo_seg_root) if waymo_seg_root else Path('.')
+    camera_image_path = waymo_seg_root / 'waymo_seg' / 'camera_image' / f'{segment_name}.parquet'
+    camera_calib_path = waymo_seg_root / 'waymo_seg' / 'camera_calibration' / f'{segment_name}.parquet'
+
+    if not camera_image_path.exists():
+        raise FileNotFoundError(f"Camera image parquet not found: {camera_image_path}")
+    if not camera_calib_path.exists():
+        raise FileNotFoundError(f"Camera calibration parquet not found: {camera_calib_path}")
+
+    # Load camera calibration
+    calib_df = pd.read_parquet(camera_calib_path)
+    camera_calib = calib_df[calib_df['key.camera_name'] == camera_id].iloc[0]
+
+    # Extract intrinsics
+    fx = camera_calib['[CameraCalibrationComponent].intrinsic.f_u']
+    fy = camera_calib['[CameraCalibrationComponent].intrinsic.f_v']
+    cx = camera_calib['[CameraCalibrationComponent].intrinsic.c_u']
+    cy = camera_calib['[CameraCalibrationComponent].intrinsic.c_v']
+
+    K = np.array([
+        [fx, 0, cx],
+        [0, fy, cy],
+        [0, 0, 1]
+    ], dtype=np.float64)
+
+    # Extract camera-to-vehicle extrinsic
+    camera_to_vehicle = np.array(
+        camera_calib['[CameraCalibrationComponent].extrinsic.transform']
+    ).reshape(4, 4)
+
+    # Load camera images (for poses)
+    image_df = pd.read_parquet(camera_image_path)
+    camera_df = image_df[image_df['key.camera_name'] == camera_id].sort_values('key.frame_timestamp_micros')
+
+    # Build frame_index -> pose mapping
+    # Frame index corresponds to sorted timestamp order (0, 1, 2, ...)
+    poses = {}
+    for frame_idx, (_, row) in enumerate(camera_df.iterrows()):
+        # Vehicle-to-world pose
+        vehicle_to_world = np.array(row['[CameraImageComponent].pose.transform']).reshape(4, 4)
+
+        # Camera-to-world = vehicle_to_world @ camera_to_vehicle
+        camera_to_world = vehicle_to_world @ camera_to_vehicle
+        poses[frame_idx] = camera_to_world
+
+    return K, poses
+
+
 # ============================================================================
 # High-level interface for test_gear5.py
 # ============================================================================
@@ -582,7 +678,7 @@ class ReprojectionTAECalculator:
     Calculator for reprojection-based TAE that handles different datasets.
     """
 
-    SUPPORTED_DATASETS = ['sintel', 'eth3d', 'bonn', 'vkitti']
+    SUPPORTED_DATASETS = ['sintel', 'eth3d', 'bonn', 'vkitti', 'waymo_seg']
 
     def __init__(self, data_root: str):
         """
@@ -771,6 +867,53 @@ class ReprojectionTAECalculator:
 
             return intrinsics[frame_num], extrinsics[frame_num]
 
+        elif dataset_name == 'waymo_seg':
+            # Path format: .../waymo_seg/val/segment-{segment_name}/{camera}/rgb/original/{frame:04d}.jpg
+            # Or: .../waymo_seg/val/segment-{segment_name}/{camera}/rgb/{frame:04d}.jpg
+            path = Path(img_path)
+            parts = path.parts
+
+            # Find segment name (starts with 'segment-')
+            segment_name = None
+            camera_name = None
+            for i, part in enumerate(parts):
+                if part.startswith('segment-'):
+                    segment_name = part
+                    # Camera name is next directory
+                    if i + 1 < len(parts):
+                        camera_name = parts[i + 1]
+                    break
+
+            if segment_name is None:
+                logger.warning(f"Could not find segment name in path: {img_path}")
+                return None, None
+
+            if camera_name is None:
+                camera_name = 'FRONT'
+
+            # Get frame index from filename (e.g., 0000.jpg -> 0)
+            frame_idx = int(path.stem)
+
+            # Load camera data (cached per segment)
+            cache_key = f"waymo_seg_{segment_name}_{camera_name}"
+            if cache_key not in self._cache:
+                try:
+                    K, poses_dict = load_waymo_seg_cameras(
+                        segment_name, camera_name, str(self.data_root)
+                    )
+                    self._cache[cache_key] = (K, poses_dict)
+                except Exception as e:
+                    logger.error(f"Failed to load Waymo cameras for {segment_name}: {e}")
+                    return None, None
+
+            K, poses_dict = self._cache[cache_key]
+
+            if frame_idx not in poses_dict:
+                logger.warning(f"Frame {frame_idx} not found in poses for {segment_name}")
+                return None, None
+
+            return K.copy(), poses_dict[frame_idx].copy()
+
         return None, None
 
     def _scale_intrinsics(
@@ -794,6 +937,8 @@ class ReprojectionTAECalculator:
             W_orig, H_orig = 640, 480
         elif dataset_name == 'vkitti':
             W_orig, H_orig = 1242, 375
+        elif dataset_name == 'waymo_seg':
+            W_orig, H_orig = 1920, 1280  # Waymo original resolution
         else:
             return intrinsics
 
