@@ -118,7 +118,7 @@ class Gear5Tester:
         self.enable_visualization = config.get('visualization', True)
         logger.info(f"Visualization: {'ENABLED' if self.enable_visualization else 'DISABLED (only JSON results)'}")
 
-        # Frame interval for visualization (only applies to sequence.png, not video)
+        # Frame interval for visualization (only applies to scene.png, not video)
         # Can be overridden via command line: frame_interval=X
         self.frame_interval = self.config.get('frame_interval', None)
 
@@ -530,7 +530,7 @@ class Gear5Tester:
                     video_length = 20
                     logger.info(f"Auto-setting video_length=20 for waymo_seg objwise mode (frames with annotation)")
 
-                # Set frame_interval to 2 for waymo_seg objwise (show every 2nd frame in sequence.png)
+                # Set frame_interval to 2 for waymo_seg objwise (show every 2nd frame in scene.png)
                 if self.frame_interval is None:
                     self.frame_interval = 2
                     logger.info(f"Auto-setting frame_interval=2 for waymo_seg objwise mode")
@@ -974,6 +974,125 @@ class Gear5Tester:
             logger.info(f"  δ1: {best_seq['a1']:.4f}")
             logger.info(f"Best sequence saved to {best_seq_path}")
 
+            # Find and save worst sequence (highest abs_rel)
+            worst_seq_raw = max(all_metrics, key=lambda x: x['abs_rel'])
+            worst_seq = {}
+            if 'sequence_id' in worst_seq_raw:
+                worst_seq['sequence_id'] = worst_seq_raw['sequence_id']
+            for key in metric_order:
+                if key in worst_seq_raw:
+                    worst_seq[key] = worst_seq_raw[key]
+            for key, value in worst_seq_raw.items():
+                if key not in worst_seq:
+                    worst_seq[key] = value
+
+            worst_seq_path = self.save_dir / "worst_sequence.json"
+            with open(worst_seq_path, 'w') as f:
+                json.dump(worst_seq, f, indent=2)
+            logger.info(f"\nWorst sequence (highest AbsRel): Sequence {worst_seq['sequence_id']}")
+            logger.info(f"  AbsRel: {worst_seq['abs_rel']:.4f}")
+            logger.info(f"  MAE: {worst_seq['mae']:.4f}")
+            logger.info(f"  RMSE: {worst_seq['rmse']:.4f}")
+            logger.info(f"  δ1: {worst_seq['a1']:.4f}")
+            logger.info(f"Worst sequence saved to {worst_seq_path}")
+
+            # Save scale/shift comparison JSON (TSP predictions vs optimal oracle)
+            scale_shift_comparison = []
+            for result in all_metrics:
+                seq_id = result.get('sequence_id', -1)
+                comparison_entry = {
+                    'sequence_id': seq_id,
+                    'abs_rel': result.get('abs_rel', 0.0),
+                    'tsp_scale_mean': result.get('tsp_scale_mean', 1.0),
+                    'tsp_shift_mean': result.get('tsp_shift_mean', 0.0),
+                    'optimal_scale': result.get('optimal_scale', 1.0),
+                    'optimal_shift': result.get('optimal_shift', 0.0),
+                    'scale_error': abs(result.get('tsp_scale_mean', 1.0) - result.get('optimal_scale', 1.0)),
+                    'shift_error': abs(result.get('tsp_shift_mean', 0.0) - result.get('optimal_shift', 0.0)),
+                }
+                # Add per-frame details if available
+                if '_per_frame_scales' in result:
+                    comparison_entry['per_frame_scales'] = result['_per_frame_scales']
+                    # Scale drift analysis: how scale changes over time
+                    scales = result['_per_frame_scales']
+                    if len(scales) > 1:
+                        scale_diffs = [abs(scales[i+1] - scales[i]) for i in range(len(scales)-1)]
+                        comparison_entry['scale_drift'] = {
+                            'mean_frame_change': float(np.mean(scale_diffs)),
+                            'max_frame_change': float(np.max(scale_diffs)),
+                            'total_drift': float(abs(scales[-1] - scales[0])),
+                            'optimal_gap_mean': float(np.mean([abs(s - result.get('optimal_scale', 1.0)) for s in scales]))
+                        }
+                if '_per_frame_shifts' in result:
+                    comparison_entry['per_frame_shifts'] = result['_per_frame_shifts']
+                    # Shift drift analysis
+                    shifts = result['_per_frame_shifts']
+                    if len(shifts) > 1:
+                        shift_diffs = [abs(shifts[i+1] - shifts[i]) for i in range(len(shifts)-1)]
+                        comparison_entry['shift_drift'] = {
+                            'mean_frame_change': float(np.mean(shift_diffs)),
+                            'max_frame_change': float(np.max(shift_diffs)),
+                            'total_drift': float(abs(shifts[-1] - shifts[0])),
+                            'optimal_gap_mean': float(np.mean([abs(s - result.get('optimal_shift', 0.0)) for s in shifts]))
+                        }
+                scale_shift_comparison.append(comparison_entry)
+
+            scale_shift_path = self.save_dir / "scale_shift_comparison.json"
+            with open(scale_shift_path, 'w') as f:
+                json.dump(scale_shift_comparison, f, indent=2)
+            logger.info(f"Scale/shift comparison saved to {scale_shift_path}")
+
+            # Save depth range analysis JSON
+            depth_range_analysis = []
+            for result in all_metrics:
+                if '_depth_range_analysis' in result:
+                    entry = {
+                        'sequence_id': result.get('sequence_id', -1),
+                        'abs_rel': result.get('abs_rel', 0.0),
+                        'depth_ranges': result['_depth_range_analysis']
+                    }
+                    depth_range_analysis.append(entry)
+
+            if depth_range_analysis:
+                # Aggregate across sequences
+                aggregated_ranges = {}
+                for range_name in ['0-5m', '5-15m', '15-30m', '30-70m']:
+                    range_abs_rels = [e['depth_ranges'].get(range_name, {}).get('abs_rel', 0) for e in depth_range_analysis]
+                    range_a1s = [e['depth_ranges'].get(range_name, {}).get('a1', 0) for e in depth_range_analysis]
+                    range_pixels = [e['depth_ranges'].get(range_name, {}).get('pixel_count', 0) for e in depth_range_analysis]
+                    aggregated_ranges[range_name] = {
+                        'abs_rel': float(np.mean(range_abs_rels)) if range_abs_rels else 0.0,
+                        'a1': float(np.mean(range_a1s)) if range_a1s else 0.0,
+                        'total_pixels': int(np.sum(range_pixels))
+                    }
+
+                depth_range_result = {
+                    'aggregated': aggregated_ranges,
+                    'per_sequence': depth_range_analysis
+                }
+                depth_range_path = self.save_dir / "depth_range_analysis.json"
+                with open(depth_range_path, 'w') as f:
+                    json.dump(depth_range_result, f, indent=2)
+                logger.info(f"Depth range analysis saved to {depth_range_path}")
+
+            # Save temporal analysis JSON
+            temporal_analysis = []
+            for result in all_metrics:
+                entry = {
+                    'sequence_id': result.get('sequence_id', -1),
+                    'tae': result.get('tae', 0.0),
+                    'per_frame_tae': result.get('_per_frame_tae', []),
+                    'tae_spike_frames': result.get('_tae_spike_frames', []),
+                    'tae_spike_count': len(result.get('_tae_spike_frames', []))
+                }
+                temporal_analysis.append(entry)
+
+            if temporal_analysis:
+                temporal_path = self.save_dir / "temporal_analysis.json"
+                with open(temporal_path, 'w') as f:
+                    json.dump(temporal_analysis, f, indent=2)
+                logger.info(f"Temporal analysis saved to {temporal_path}")
+
             # Aggregate and save object-wise metrics
             logger.info(f"DEBUG: object_wise_enabled={self.object_wise_enabled}, all_object_wise_metrics count={len(all_object_wise_metrics)}")
             if self.object_wise_enabled and len(all_object_wise_metrics) == 0:
@@ -1174,9 +1293,11 @@ class Gear5Tester:
         shifts_gpu = []
         canonical_pred_valid_gpu = []  # Store canonical pred masks (on GPU)
 
-        # Best frame tracking
+        # Best/Worst frame tracking
         best_frame_idx = 0
         best_frame_abs_rel = float('inf')
+        worst_frame_idx = 0
+        worst_frame_abs_rel = 0.0
 
         # Warmup run for FPS measurement
         logger.info(f"Warmup run for FPS measurement...")
@@ -1516,6 +1637,10 @@ class Gear5Tester:
                 if frame_metric['abs_rel'] < best_frame_abs_rel:
                     best_frame_abs_rel = frame_metric['abs_rel']
                     best_frame_idx = t
+                # Track worst frame (highest abs_rel)
+                if frame_metric['abs_rel'] > worst_frame_abs_rel:
+                    worst_frame_abs_rel = frame_metric['abs_rel']
+                    worst_frame_idx = t
 
         # Average metrics across frames
         if len(frame_metrics) == 0:
@@ -1527,11 +1652,10 @@ class Gear5Tester:
             values = [m[key] for m in frame_metrics]
             metrics[key] = np.mean(values)
 
-            # Add per-frame statistics for abs_rel and a1
+            # Add per-frame statistics for abs_rel and a1 (min/max only, no std)
             if key in ['abs_rel', 'a1']:
                 metrics[f'{key}_min'] = float(np.min(values))
                 metrics[f'{key}_max'] = float(np.max(values))
-                metrics[f'{key}_std'] = float(np.std(values))
 
         # Compute TAE (Temporal Alignment Error) - sequence-level metric
         # TAE measures frame-to-frame consistency
@@ -1559,8 +1683,56 @@ class Gear5Tester:
                     tae_errors.append(tae.item())
 
             metrics['tae'] = np.mean(tae_errors) if len(tae_errors) > 0 else 0.0
+            # Store per-frame TAE for temporal analysis
+            metrics['_per_frame_tae'] = tae_errors
+            # Identify TAE spike frames (TAE > 2x mean)
+            if len(tae_errors) > 0:
+                tae_mean = np.mean(tae_errors)
+                tae_spikes = [i for i, tae in enumerate(tae_errors) if tae > 2 * tae_mean]
+                metrics['_tae_spike_frames'] = tae_spikes
+            else:
+                metrics['_tae_spike_frames'] = []
         else:
             metrics['tae'] = 0.0
+            metrics['_per_frame_tae'] = []
+            metrics['_tae_spike_frames'] = []
+
+        # Compute depth range analysis
+        depth_ranges = [(0, 5), (5, 15), (15, 30), (30, 70)]
+        depth_range_metrics = {}
+        for depth_min, depth_max in depth_ranges:
+            range_name = f"{depth_min}-{depth_max}m"
+            range_abs_rels = []
+            range_a1s = []
+            range_pixel_counts = []
+
+            for t in range(pred_depths_cpu.shape[0]):
+                pred_frame = pred_depths_cpu[t, 0]
+                gt_frame = gt_depth_metric_cpu[t, 0]
+                # Range mask
+                range_mask = (gt_frame >= depth_min) & (gt_frame < depth_max) & (gt_frame > 0)
+                if range_mask.sum() > 0:
+                    pred_valid = pred_frame[range_mask]
+                    gt_valid = gt_frame[range_mask]
+                    # AbsRel
+                    abs_rel = torch.abs(pred_valid - gt_valid) / gt_valid
+                    range_abs_rels.append(abs_rel.mean().item())
+                    # δ1
+                    thresh = torch.maximum(gt_valid / (pred_valid + 1e-8), pred_valid / (gt_valid + 1e-8))
+                    a1 = (thresh < 1.25).float().mean().item()
+                    range_a1s.append(a1)
+                    range_pixel_counts.append(range_mask.sum().item())
+
+            if range_abs_rels:
+                depth_range_metrics[range_name] = {
+                    'abs_rel': float(np.mean(range_abs_rels)),
+                    'a1': float(np.mean(range_a1s)),
+                    'pixel_count': int(np.sum(range_pixel_counts))
+                }
+            else:
+                depth_range_metrics[range_name] = {'abs_rel': 0.0, 'a1': 0.0, 'pixel_count': 0}
+
+        metrics['_depth_range_analysis'] = depth_range_metrics
 
         # Compute Reprojection-based TAE (for datasets with camera poses)
         # Supported: sintel, eth3d, bonn, vkitti
@@ -1601,6 +1773,39 @@ class Gear5Tester:
         # Store per-frame scale/shift for JSON export
         metrics['_per_frame_scales'] = [float(s.item()) for s in scales[:, 0]]
         metrics['_per_frame_shifts'] = [float(s.item()) for s in shifts[:, 0]]
+
+        # Compute optimal scale/shift that minimizes AbsRel (least squares in depth space)
+        # This serves as the "oracle" reference for comparing with TSP predictions
+        MAX_DEPTH = 70.0
+        all_pred_valid = []
+        all_gt_valid = []
+        for t in range(pred_depths_cpu.shape[0]):
+            pred_frame = pred_depths_cpu[t, 0]
+            gt_frame = gt_depth_metric_cpu[t, 0]
+            valid_mask = (gt_frame > 0) & (gt_frame < MAX_DEPTH) & (pred_frame > 0) & (pred_frame < MAX_DEPTH)
+            if valid_mask.sum() > 0:
+                all_pred_valid.append(pred_frame[valid_mask])
+                all_gt_valid.append(gt_frame[valid_mask])
+
+        if all_pred_valid:
+            pred_concat = torch.cat(all_pred_valid)
+            gt_concat = torch.cat(all_gt_valid)
+            # Least squares: gt = scale * pred + shift
+            A = torch.stack([pred_concat, torch.ones_like(pred_concat)], dim=1)
+            try:
+                solution = torch.linalg.lstsq(A, gt_concat, rcond=None).solution
+                optimal_scale = float(solution[0].item())
+                optimal_shift = float(solution[1].item())
+            except:
+                # Fallback: median scaling
+                optimal_scale = float(torch.median(gt_concat / (pred_concat + 1e-8)).item())
+                optimal_shift = 0.0
+        else:
+            optimal_scale = 1.0
+            optimal_shift = 0.0
+
+        metrics['optimal_scale'] = optimal_scale
+        metrics['optimal_shift'] = optimal_shift
 
         # Object-wise evaluation: compute per-class metrics for all frames
         # Initialize variables
@@ -1738,6 +1943,11 @@ class Gear5Tester:
                 valid_mask, sequence_id, metrics, fps, focal_lengths[0]
             )
 
+            # Save error heatmaps (only when visualization enabled)
+            self._save_error_heatmaps(
+                pred_depths_cpu, gt_depth_metric_cpu, sequence_id
+            )
+
         # Save video (GIF or MP4)
         # Note: frame_interval is NOT applied to video - use all frames
         # Skip video for long sequences (urbansyn, unreal4k) to save time and disk space
@@ -1811,6 +2021,43 @@ class Gear5Tester:
                 dataset_name  # Add dataset name for object class mapping
             )
 
+            # Save worst frame visualization
+            logger.info(f"Worst frame for sequence {sequence_id}: Frame {worst_frame_idx} (AbsRel={worst_frame_abs_rel:.4f})")
+
+            # Get segmentation for worst frame
+            if self.object_wise_enabled and seg_masks_np is not None and worst_frame_idx < len(seg_masks_np):
+                worst_seg_mask = seg_masks_np[worst_frame_idx]
+                worst_class_metrics = per_frame_class_metrics[worst_frame_idx] if worst_frame_idx < len(per_frame_class_metrics) else None
+                worst_actual_frame = batch['frame_indices'][0][worst_frame_idx] if 'frame_indices' in batch else worst_frame_idx
+            else:
+                worst_seg_mask = None
+                worst_class_metrics = None
+                worst_actual_frame = worst_frame_idx
+
+            worst_model_outputs = {
+                'pred_depth': pred_depths[worst_frame_idx, 0],
+                'importance_map': importance_maps[worst_frame_idx, 0],
+                'scale': scales[worst_frame_idx, 0],
+                'shift': shifts[worst_frame_idx, 0],
+                'fx_ratio': fx_ratio[0, worst_frame_idx].item() if fx_ratio is not None else None,
+                'resize_ratio': resize_ratio[0, worst_frame_idx].item() if resize_ratio is not None else None,
+            }
+
+            self._save_worst_frame_visualizations(
+                images[0, worst_frame_idx],
+                gt_depth_metric[worst_frame_idx, 0],
+                worst_model_outputs,
+                sequence_id,
+                worst_actual_frame,
+                worst_frame_abs_rel,
+                fps,
+                worst_seg_mask,
+                worst_class_metrics,
+                layer_weights,
+                frame_metrics[worst_frame_idx] if worst_frame_idx < len(frame_metrics) else None,
+                dataset_name
+            )
+
         # Export individual frames if --best-figure or --frame option is enabled
         # NOTE: This is independent of --visualization flag
         export_frame_idx = None
@@ -1843,169 +2090,167 @@ class Gear5Tester:
     def _visualize_sequence(self, images, pred_depths, gt_depths, importance_maps,
                            valid_mask, sequence_id, metrics, fps=None, focal_lengths=None):
         """
-        Create visualization grid for a sequence.
+        Save individual frame PNGs for a sequence.
 
-        Rows: Image, Metric Depth (Prediction), Metric Depth (GT), Importance Map
+        Each frame is saved as: frames/seq{sequence_id:04d}/frame_{t:04d}.png
+        Layout per frame: 1x3 (Image, GT Depth, Pred Depth) - same as GIF format
         """
         T = images.shape[0]
-        frames_to_show = min(10, T)  # Show up to 10 frames
+        MAX_DEPTH = 70.0
 
-        # Use frame_interval if set (for waymo_seg objwise), otherwise auto-calculate
+        # Create sequence directory
+        seq_dir = self.save_dir / "frames" / f"seq{sequence_id:04d}"
+        seq_dir.mkdir(parents=True, exist_ok=True)
+
+        # Use frame_interval if set, otherwise save all frames
         if self.frame_interval is not None:
             interval = self.frame_interval
-            logger.info(f"Using frame_interval={interval} for sequence.png visualization")
+            frame_indices = list(range(0, T, interval))
         else:
-            interval = max(1, T // frames_to_show)
+            frame_indices = list(range(T))
 
-        frame_indices = list(range(0, T, interval))[:frames_to_show]
+        logger.info(f"Saving {len(frame_indices)} individual frame PNGs for sequence {sequence_id}")
 
-        # Create figure with actual number of frames (not frames_to_show)
-        actual_frames = len(frame_indices)
-        fig, axes = plt.subplots(4, actual_frames, figsize=(actual_frames * 3, 12))
-        if actual_frames == 1:
-            axes = axes.reshape(-1, 1)
+        for t in frame_indices:
+            # Create 1x3 figure for this frame (Image, GT, Pred)
+            fig, axes = plt.subplots(1, 3, figsize=(15, 5))
 
-        for col, t in enumerate(frame_indices):
-            # Row 0: Image (denormalize ImageNet normalization)
-            # Convert BFloat16 to Float32 before numpy conversion
+            # Image (denormalize)
             img = images[t].permute(1, 2, 0).cpu().float().numpy()
-            # Min-Max normalization (FlashDepth original method)
             img = (img - img.min()) / (img.max() - img.min() + 1e-8)
             img = np.clip(img, 0, 1)
             img = (img * 255).astype(np.uint8)
-            axes[0, col].imshow(img)
-            axes[0, col].set_title(f'Frame {t}')
-            axes[0, col].axis('off')
+            axes[0].imshow(img)
+            axes[0].set_title(f'Image (Frame {t})')
+            axes[0].axis('off')
 
-            # Row 1: Predicted metric depth (invalid pixels = black)
-            MAX_DEPTH = 70.0
-            # Convert BFloat16 to Float32 before numpy conversion
+            # Get pred and GT
             pred = pred_depths[t, 0].cpu().float().numpy()
             gt = gt_depths[t, 0].cpu().float().numpy()
 
-            # Check if dataset is sparse (< 50% valid GT pixels)
-            gt_exists = (gt > 0)
-            gt_density = gt_exists.sum() / gt_exists.size
-            is_sparse = gt_density < 0.5
-
-            # GT valid mask (canonical 70m)
+            # Compute GT valid mask and display range
             gt_valid = (gt > 0) & (gt < MAX_DEPTH)
-
-            if is_sparse:
-                # Sparse dataset (waymo_seg): Show pred dense, GT sparse
-                # 1. Find valid scan height range from GT
-                valid_pixels_per_row = gt_exists.sum(axis=1)  # [H]
-                min_valid_pixels_threshold = 10  # At least 10 GT pixels per row
-                valid_rows = valid_pixels_per_row >= min_valid_pixels_threshold
-                valid_row_indices = np.where(valid_rows)[0]
-
-                if len(valid_row_indices) > 0:
-                    min_valid_row = valid_row_indices.min()
-                    max_valid_row = valid_row_indices.max()
-                    height_mask = np.zeros_like(gt, dtype=bool)
-                    height_mask[min_valid_row:max_valid_row+1, :] = True
-                else:
-                    height_mask = np.ones_like(gt, dtype=bool)
-
-                # 2. Pred valid mask (canonical 70m) - DENSE
-                pred_valid_depth = (pred > 0) & (pred < MAX_DEPTH)
-
-                # 3. Show pred DENSE (all valid pixels within height range)
-                pred_show_mask = height_mask & pred_valid_depth  # Dense prediction
-            else:
-                # Dense dataset (sintel): Just use GT valid mask
-                pred_show_mask = gt_valid
-
-            # Row 2: GT metric depth (invalid pixels = black)
-            # IMPORTANT: Compute GT's vmin/vmax FIRST, then use for both Pred and GT
-            # Convert BFloat16 to Float32 before numpy conversion
-            gt = gt_depths[t, 0].cpu().float().numpy()
-            gt_valid = (gt > 0) & (gt < MAX_DEPTH)  # Only <70m
-            gt_display = np.where(gt_valid, gt, np.nan)  # Invalid = NaN
-
-            # Compute GT's percentile range (will be used for both Pred and GT)
+            gt_display = np.where(gt_valid, gt, np.nan)
             if gt_valid.sum() > 0:
                 gt_vmin = np.nanpercentile(gt_display, 2)
                 gt_vmax = np.nanpercentile(gt_display, 98)
             else:
                 gt_vmin, gt_vmax = 0, 1
 
-            # Row 1: Predicted metric depth (use GT's vmin/vmax for consistent normalization)
-            pred_display = np.where(pred_show_mask, pred, np.nan)  # Invalid = NaN (will be black)
-            cmap_pred = plt.cm.plasma_r.copy()
-            cmap_pred.set_bad(color='black')  # NaN pixels = black
-            axes[1, col].imshow(pred_display, cmap=cmap_pred, vmin=gt_vmin, vmax=gt_vmax)  # Use GT's range!
-            axes[1, col].set_title(f'Pred (m)')
-            axes[1, col].axis('off')
+            # Check if sparse dataset
+            gt_exists = (gt > 0)
+            gt_density = gt_exists.sum() / gt_exists.size
+            is_sparse = gt_density < 0.5
 
-            # Display GT with its own range
-            cmap_gt = plt.cm.plasma_r.copy()
-            cmap_gt.set_bad(color='black')  # NaN pixels = black
-            axes[2, col].imshow(gt_display, cmap=cmap_gt, vmin=gt_vmin, vmax=gt_vmax)  # plasma_r: near=bright, far=dark
-            axes[2, col].set_title(f'GT (m)')
-            axes[2, col].axis('off')
-
-            # Row 3: Importance map (already upsampled to image resolution in test_sequence)
-            importance_resized = importance_maps[t]  # [1, H, W] already at image resolution
-            # Convert BFloat16 to Float32 before numpy conversion
-            importance_display = importance_resized.squeeze().cpu().float().numpy()  # [H, W]
-            axes[3, col].imshow(importance_display, cmap='jet', vmin=0, vmax=1)
-            axes[3, col].set_title(f'Importance')
-            axes[3, col].axis('off')
-
-        # Add overall title with metrics
-        title_str = (
-            f"Sequence {sequence_id} | "
-            f"TAE: {metrics.get('tae', 0):.4f} | "
-            f"AbsRel: {metrics.get('abs_rel', 0):.4f} | "
-            f"δ1: {metrics.get('a1', 0):.4f}"
-        )
-        if fps is not None:
-            title_str += f" | FPS: {fps:.1f}"
-
-        # Add focal length and max depth info
-        if focal_lengths is not None:
-            # Use first frame's focal length (resized)
-            fx_value = focal_lengths[0].item()
-            # Calculate max GT depth from valid region
-            gt_max = 0.0
-            if valid_mask.sum() > 0:
-                # gt_depths: [T, 1, H, W], valid_mask: [T, 1, H, W]
-                # Remove channel dimension from both and apply mask
-                valid_mask_no_channel = valid_mask[:, 0] if valid_mask.ndim == 4 else valid_mask
-                gt_depths_no_channel = gt_depths[:, 0] if gt_depths.ndim == 4 else gt_depths
-                gt_valid_depths = gt_depths_no_channel[valid_mask_no_channel]  # Extract valid depths
-                if len(gt_valid_depths) > 0:
-                    gt_max = gt_valid_depths.max().item()
-
-            # Show valid GT range (canonical 70m in actual space)
-            use_canonical = self.config.get('use_canonical_space', False)
-            if use_canonical:
-                CANONICAL_FX = get_canonical_focal_length(self.config)
-                # depth_canonical = depth_actual * (CANONICAL_FX / fx_actual) = 70
-                # Therefore: depth_actual = 70 * (fx_actual / CANONICAL_FX)
-                valid_gt_max = 70.0 * (fx_value / CANONICAL_FX)
-                title_str += f"\nresized_fx: {fx_value:.1f}, valid_gt_max: {valid_gt_max:.3f}m"
+            if is_sparse:
+                valid_pixels_per_row = gt_exists.sum(axis=1)
+                valid_rows = valid_pixels_per_row >= 10
+                valid_row_indices = np.where(valid_rows)[0]
+                if len(valid_row_indices) > 0:
+                    height_mask = np.zeros_like(gt, dtype=bool)
+                    height_mask[valid_row_indices.min():valid_row_indices.max()+1, :] = True
+                else:
+                    height_mask = np.ones_like(gt, dtype=bool)
+                pred_valid_depth = (pred > 0) & (pred < MAX_DEPTH)
+                pred_show_mask = height_mask & pred_valid_depth
             else:
-                title_str += f"\nresized_fx: {fx_value:.1f}, valid_gt_max: {gt_max:.3f}m"
+                pred_show_mask = gt_valid
 
-        fig.suptitle(title_str, fontsize=14)
+            # GT depth (middle)
+            cmap_gt = plt.cm.plasma_r.copy()
+            cmap_gt.set_bad(color='black')
+            axes[1].imshow(gt_display, cmap=cmap_gt, vmin=gt_vmin, vmax=gt_vmax)
+            axes[1].set_title('GT Depth (m)')
+            axes[1].axis('off')
 
-        plt.tight_layout()
-        save_path = self.save_dir / f"sequence_{sequence_id:04d}.png"
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        plt.close(fig)
+            # Predicted depth (right)
+            pred_display = np.where(pred_show_mask, pred, np.nan)
+            cmap_pred = plt.cm.plasma_r.copy()
+            cmap_pred.set_bad(color='black')
+            axes[2].imshow(pred_display, cmap=cmap_pred, vmin=gt_vmin, vmax=gt_vmax)
+            axes[2].set_title('Pred Depth (m)')
+            axes[2].axis('off')
 
-        logger.info(f"Saved visualization: {save_path}")
+            plt.tight_layout()
+            save_path = seq_dir / f"frame_{t:04d}.png"
+            plt.savefig(save_path, dpi=100, bbox_inches='tight')
+            plt.close(fig)
+
+        logger.info(f"Saved {len(frame_indices)} frame PNGs to {seq_dir}")
+
+    def _save_error_heatmaps(self, pred_depths, gt_depths, sequence_id):
+        """
+        Save error heatmaps for each frame showing |pred - gt| / gt.
+        Only called when visualization is enabled.
+        """
+        T = pred_depths.shape[0]
+        MAX_DEPTH = 70.0
+
+        # Create heatmaps directory
+        heatmap_dir = self.save_dir / "error_heatmaps" / f"seq{sequence_id:04d}"
+        heatmap_dir.mkdir(parents=True, exist_ok=True)
+
+        # Use frame_interval if set
+        if self.frame_interval is not None:
+            frame_indices = list(range(0, T, self.frame_interval))
+        else:
+            frame_indices = list(range(T))
+
+        for t in frame_indices:
+            pred = pred_depths[t, 0].numpy()
+            gt = gt_depths[t, 0].numpy()
+
+            # Valid mask
+            valid = (gt > 0) & (gt < MAX_DEPTH) & (pred > 0) & (pred < MAX_DEPTH)
+
+            if valid.sum() > 0:
+                # Compute relative error
+                error = np.abs(pred - gt) / (gt + 1e-8)
+                error_display = np.where(valid, error, np.nan)
+
+                fig, ax = plt.subplots(figsize=(8, 6))
+                cmap = plt.cm.hot.copy()
+                cmap.set_bad(color='black')
+                im = ax.imshow(error_display, cmap=cmap, vmin=0, vmax=1)
+                plt.colorbar(im, ax=ax, label='AbsRel Error')
+                ax.set_title(f'Error Heatmap - Seq {sequence_id} Frame {t}')
+                ax.axis('off')
+
+                save_path = heatmap_dir / f"error_{t:04d}.png"
+                plt.savefig(save_path, dpi=100, bbox_inches='tight')
+                plt.close(fig)
+
+        logger.info(f"Saved error heatmaps to {heatmap_dir}")
+
+    def _save_worst_frame_visualizations(self, image, gt_depth, model_outputs,
+                                         sequence_id, frame_idx, abs_rel, fps=None,
+                                         seg_mask=None, class_metrics=None, layer_weights=None, frame_metrics=None, dataset_name='unknown'):
+        """Save worst frame visualization (wrapper for _save_frame_visualizations)"""
+        self._save_frame_visualizations(
+            image, gt_depth, model_outputs, sequence_id, frame_idx, abs_rel,
+            fps, seg_mask, class_metrics, layer_weights, frame_metrics, dataset_name,
+            frame_type='worst'
+        )
 
     def _save_best_frame_visualizations(self, image, gt_depth, model_outputs,
                                         sequence_id, frame_idx, abs_rel, fps=None,
                                         seg_mask=None, class_metrics=None, layer_weights=None, frame_metrics=None, dataset_name='unknown'):
+        """Save best frame visualization (wrapper for _save_frame_visualizations)"""
+        self._save_frame_visualizations(
+            image, gt_depth, model_outputs, sequence_id, frame_idx, abs_rel,
+            fps, seg_mask, class_metrics, layer_weights, frame_metrics, dataset_name,
+            frame_type='best'
+        )
+
+    def _save_frame_visualizations(self, image, gt_depth, model_outputs,
+                                   sequence_id, frame_idx, abs_rel, fps=None,
+                                   seg_mask=None, class_metrics=None, layer_weights=None, frame_metrics=None, dataset_name='unknown',
+                                   frame_type='best'):
         """
-        Save best frame visualization for Gear5 unified model
+        Save frame visualization for Gear5 unified model
 
         Creates a comprehensive grid visualization with format:
-            best_frame_seq{N}_{frame_idx}_absrel_{abs_rel:.4f}.png
+            {frame_type}_frame_seq{N}_{frame_idx}_absrel_{abs_rel:.4f}.png
 
         Layout:
             Row 1: Input Image | GT Depth | Pred Depth
@@ -2400,15 +2645,16 @@ class Gear5Tester:
         ax11.grid(True, alpha=0.3)
 
         # Overall title
-        plt.suptitle(f'Gear5: Sequence {sequence_id} Best Frame {frame_idx}',
+        frame_type_label = frame_type.capitalize()
+        plt.suptitle(f'Gear5: Sequence {sequence_id} {frame_type_label} Frame {frame_idx}',
                     fontsize=16, fontweight='bold')
 
         # Save with same naming convention
-        save_path = self.save_dir / f"best_frame_seq{sequence_id}_{frame_idx}_absrel_{abs_rel:.4f}.png"
+        save_path = self.save_dir / f"{frame_type}_frame_seq{sequence_id}_{frame_idx}_absrel_{abs_rel:.4f}.png"
         plt.savefig(save_path, dpi=150, bbox_inches='tight', facecolor='white')
         plt.close(fig)
 
-        logger.info(f"Saved Gear5 best frame visualization: {save_path}")
+        logger.info(f"Saved Gear5 {frame_type} frame visualization: {save_path}")
 
     def _export_figure_frames(self, images, pred_depths, gt_depths, best_frame_idx, sequence_id, dataset_name, depth_paths=None):
         """
@@ -2561,7 +2807,7 @@ class Gear5Tester:
             cv2.imwrite(str(gt_path), gt_depth_vis)
 
             # 3. Save pred depth (colormap) - use GT range for comparison
-            # Same logic as main visualization (sequence.png)
+            # Same logic as main visualization (scene.png)
 
             if is_sparse:
                 # Sparse dataset: use height mask (LiDAR scan range)

@@ -994,6 +994,23 @@ class VideoComparisonTester:
 
         logger.info(f"Per-sequence results saved to {per_seq_path}")
 
+        # Find and save best/worst sequences (by AbsRel)
+        if len(self.all_results) > 0:
+            best_seq = min(self.all_results, key=lambda x: x.get('abs_rel', float('inf')))
+            worst_seq = max(self.all_results, key=lambda x: x.get('abs_rel', 0))
+
+            best_seq_path = self.save_dir / 'best_sequence.json'
+            with open(best_seq_path, 'w') as f:
+                json.dump(best_seq, f, indent=2)
+            logger.info(f"\nBest sequence (lowest AbsRel): {best_seq.get('sequence_id', 'N/A')}")
+            logger.info(f"  AbsRel: {best_seq.get('abs_rel', 0):.4f}, δ1: {best_seq.get('a1', 0):.4f}")
+
+            worst_seq_path = self.save_dir / 'worst_sequence.json'
+            with open(worst_seq_path, 'w') as f:
+                json.dump(worst_seq, f, indent=2)
+            logger.info(f"Worst sequence (highest AbsRel): {worst_seq.get('sequence_id', 'N/A')}")
+            logger.info(f"  AbsRel: {worst_seq.get('abs_rel', 0):.4f}, δ1: {worst_seq.get('a1', 0):.4f}")
+
         # Aggregate and save object-wise metrics
         if self.object_wise_enabled:
             # Collect all object-wise metrics from sequences
