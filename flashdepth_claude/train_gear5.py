@@ -359,13 +359,19 @@ class Gear5Trainer:
             bankai_num_layers = self.config.get('bankai_num_mamba_layers', 4)
             use_hybrid_cls_fusion = (self.phase == 2 and model.hybrid_configs is not None)
 
+            # Get d_state from config (must match FlashDepth for weight loading)
+            bankai_d_state = self.config.model.get('mamba_d_state', 256)
+            bankai_d_conv = self.config.model.get('mamba_d_conv', 4)
+
             model.gear5_metric_head = BankaiMetricHead(
                 dpt_dim=dpt_dim,
                 cls_embed_dim=gsp_embed_dim,
                 num_mamba_layers=bankai_num_layers,
                 downsample_factor=bankai_downsample,
                 use_hybrid_cls_fusion=use_hybrid_cls_fusion,
-                teacher_cls_dim=1024 if use_hybrid_cls_fusion else gsp_embed_dim
+                teacher_cls_dim=1024 if use_hybrid_cls_fusion else gsp_embed_dim,
+                d_state=bankai_d_state,
+                d_conv=bankai_d_conv
             )
             self.logger.info(f"=== BANKAI MetricHead Created ===")
             self.logger.info(f"  DPT dim: {dpt_dim}")
@@ -373,6 +379,18 @@ class Gear5Trainer:
             self.logger.info(f"  Mamba layers: {bankai_num_layers}")
             self.logger.info(f"  Downsample factor: {bankai_downsample}")
             self.logger.info(f"  Hybrid CLS fusion: {use_hybrid_cls_fusion}")
+            self.logger.info(f"  d_state: {bankai_d_state}, d_conv: {bankai_d_conv}")
+
+            # Copy FlashDepth Mamba weights to UnifiedMamba BEFORE deleting original
+            if hasattr(model, 'mamba'):
+                self._copy_mamba_weights_to_unified(model)
+
+            # Remove Original Mamba to save memory (Bankai's UnifiedMamba replaces it)
+            if hasattr(model, 'mamba'):
+                original_mamba_params = sum(p.numel() for p in model.mamba.parameters())
+                del model.mamba
+                model.use_mamba = False  # Prevent forward from using mamba
+                self.logger.info(f"  Original Mamba REMOVED: {original_mamba_params:,} params freed")
         else:
             # Standard Gear5 mode: GRU/Mamba2-based TemporalScalePredictor
             use_mamba_temporal = self.config.model.get('use_mamba_temporal', False)
@@ -552,6 +570,72 @@ class Gear5Trainer:
 
         return model
 
+    def _copy_mamba_weights_to_unified(self, model):
+        """
+        Copy FlashDepth Mamba weights to UnifiedMamba in BankaiMetricHead.
+
+        Weight mapping:
+            mamba.blocks.0.X.* → gear5_metric_head.unified_mamba.blocks.0.X.*
+            mamba.final_layer.* → gear5_metric_head.unified_mamba.final_layer.*
+
+        New components (random init, not copied):
+            gear5_metric_head.unified_mamba.cls_proj.*
+            gear5_metric_head.unified_mamba.scale_head.*
+            gear5_metric_head.unified_mamba.shift_head.*
+        """
+        if not hasattr(model, 'mamba') or not hasattr(model, 'gear5_metric_head'):
+            self.logger.warning("Cannot copy Mamba weights: model.mamba or gear5_metric_head not found")
+            return
+
+        unified_mamba = model.gear5_metric_head.unified_mamba
+        original_mamba = model.mamba
+
+        copied_count = 0
+        skipped_count = 0
+
+        # Copy blocks weights
+        # FlashDepth: mamba.blocks[0][layer_idx] → UnifiedMamba: blocks[0][layer_idx]
+        if hasattr(original_mamba, 'blocks') and len(original_mamba.blocks) > 0:
+            src_blocks = original_mamba.blocks[0]  # First (and usually only) block group
+            dst_blocks = unified_mamba.blocks[0]
+
+            if len(src_blocks) == len(dst_blocks):
+                for layer_idx in range(len(src_blocks)):
+                    src_block = src_blocks[layer_idx]
+                    dst_block = dst_blocks[layer_idx]
+
+                    for (src_name, src_param), (dst_name, dst_param) in zip(
+                        src_block.named_parameters(), dst_block.named_parameters()
+                    ):
+                        if src_param.shape == dst_param.shape:
+                            dst_param.data.copy_(src_param.data)
+                            copied_count += 1
+                        else:
+                            self.logger.warning(f"Shape mismatch: blocks.0.{layer_idx}.{src_name} "
+                                              f"{src_param.shape} vs {dst_param.shape}")
+                            skipped_count += 1
+            else:
+                self.logger.warning(f"Block count mismatch: {len(src_blocks)} vs {len(dst_blocks)}")
+
+        # Copy final_layer weights
+        if hasattr(original_mamba, 'final_layer') and hasattr(unified_mamba, 'final_layer'):
+            for (src_name, src_param), (dst_name, dst_param) in zip(
+                original_mamba.final_layer.named_parameters(),
+                unified_mamba.final_layer.named_parameters()
+            ):
+                if src_param.shape == dst_param.shape:
+                    dst_param.data.copy_(src_param.data)
+                    copied_count += 1
+                else:
+                    self.logger.warning(f"Shape mismatch: final_layer.{src_name} "
+                                      f"{src_param.shape} vs {dst_param.shape}")
+                    skipped_count += 1
+
+        self.logger.info(f"=== FlashDepth Mamba → UnifiedMamba Weight Copy ===")
+        self.logger.info(f"  Copied: {copied_count} parameter tensors")
+        self.logger.info(f"  Skipped (shape mismatch): {skipped_count}")
+        self.logger.info(f"  New components (random init): cls_proj, scale_head, shift_head")
+
     def _configure_parameters(self, model):
         """
         Configure parameter freeze/unfreeze strategy.
@@ -648,14 +732,26 @@ class Gear5Trainer:
 
         self.logger.info(f"Frozen:")
         self.logger.info(f"  - ViT + DPT: {frozen_vit_dpt:,}")
-        self.logger.info(f"  - Original Mamba: {frozen_mamba:,}")
+        if self.use_bankai:
+            # In Bankai mode, frozen_mamba contains UnifiedMamba's frozen parts (Phase 1)
+            # Original Mamba is removed entirely
+            if self.bankai_phase == 1:
+                self.logger.info(f"  - UnifiedMamba (frozen in P1): {frozen_mamba:,}")
+            else:
+                self.logger.info(f"  - Original Mamba: REMOVED (not loaded)")
+        else:
+            self.logger.info(f"  - Original Mamba: {frozen_mamba:,}")
         self.logger.info(f"  - output_conv: {frozen_output_conv:,}")
 
         self.logger.info(f"Trainable:")
-        self.logger.info(f"  - Gear5 Metric Head: {trainable_gear5:,}")
         if self.use_bankai:
-            self.logger.info(f"  - Bankai UnifiedMamba: {trainable_mamba_bankai:,}")
+            # In Bankai, trainable_gear5 is CLS cross-attn & importance map (usually 0)
+            # Main trainable params are in UnifiedMamba (includes scale/shift heads)
+            self.logger.info(f"  - UnifiedMamba (incl. scale/shift): {trainable_mamba_bankai:,}")
+            self.logger.info(f"  - Other (CLS fusion, etc.): {trainable_gear5:,}")
             self.logger.info(f"  - output_conv: {trainable_output_conv:,}")
+        else:
+            self.logger.info(f"  - Gear5 Metric Head: {trainable_gear5:,}")
 
         total_frozen = frozen_vit_dpt + frozen_mamba + frozen_output_conv
         total_trainable = trainable_gear5 + trainable_mamba_bankai + trainable_output_conv

@@ -7,10 +7,11 @@ Gear5 Bankai is an advanced metric depth estimation system that unifies temporal
 ### Key Features
 
 1. **Unified Architecture**: Single Mamba2 replaces both F-Mamba (FlashDepth temporal) and T-Mamba (Gear5 scale predictor)
-2. **Temporal Consistency**: Enhanced TAE (Temporal Alignment Error) through unified temporal processing
-3. **Relative Depth Quality**: Preserves DAv2's DINOv2-DPT structure strength
-4. **TGM Loss**: Temporal Gradient Matching loss from Video Depth Anything for improved temporal consistency
-5. **Head-First Tuning**: Two-phase training strategy for stable optimization
+2. **Weight Compatibility**: UnifiedMamba structure matches FlashDepth MambaModel for pretrained weight loading
+3. **Memory Efficiency**: Original Mamba removed after weight copy (~4.3M params freed)
+4. **Temporal Consistency**: Enhanced TAE through unified temporal processing
+5. **TGM Loss**: Temporal Gradient Matching loss from Video Depth Anything
+6. **Head-First Tuning**: Two-phase training strategy for stable optimization
 
 ---
 
@@ -46,18 +47,21 @@ Gear5 Bankai is an advanced metric depth estimation system that unifies temporal
                               ↓
 ┌─────────────────────────────────────────────────────────────────┐
 │                    Unified Mamba (Trainable)                    │
+│  - Structure matches FlashDepth MambaModel (weight compatible)  │
 │  - Per-frame processing + hidden state propagation              │
-│  - Temporal consistency via hidden state                        │
+│  - Causal: CLS receives spatial info, but does NOT affect it   │
 └─────────────────────────────────────────────────────────────────┘
                               ↓
             ┌─────────────────┴─────────────────┐
             ↓                                   ↓
     Spatial [h×w, C]                     CLS [1, C]
             ↓                                   ↓
-    Unflatten + Upsample                 MLP Head
-    (Large: ×10, Small/Hybrid: ×20)          ↓
-            ↓                           Scale (Softplus)
-    + original_path_1                   Shift (Clamped)
+    final_layer (from FlashDepth)        MLP Head (new)
+            ↓                                   ↓
+    Unflatten + Upsample                 Scale (Softplus)
+    (Large: ×10, Small/Hybrid: ×20)      Shift
+            ↓
+    + original_path_1 (residual)
             ↓
     output_conv (Head-First Tuning)
             ↓
@@ -66,164 +70,137 @@ Gear5 Bankai is an advanced metric depth estimation system that unifies temporal
     Metric Depth = Scale × Relative + Shift
 ```
 
-### 2.2 CLS Fusion Module (Hybrid Mode)
+### 2.2 Mamba2 Causal Property
 
-Hybrid 모드에서 Teacher(CLS-L)의 rich semantic information을 Student(CLS-S)에 전달하기 위한 fusion 모듈.
-
-#### 왜 CrossAttention이 아닌가?
-
-CLS 토큰끼리의 CrossAttention은 비효율적:
-- N_k=1 (Key가 1개)일 때 `softmax([x]) = 1.0` (항상 고정)
-- Query(CLS-S)가 무시되고 단순 Linear transformation으로 퇴화
-- 파라미터 낭비 (~1.08M 중 W_q가 무의미)
+**Important**: Mamba2 is a **causal** model (SSM part).
 
 ```
-CrossAttn with N_k=1:
-    Attention_weights = softmax(Q @ K^T / √d) = [1.0]  # Query 무관
-    Output = [1.0] @ V = V
-    ≈ Linear(CLS-L)  # Query(CLS-S) 완전 무시
+Token order: [spatial_0, spatial_1, ..., spatial_N, CLS]
+                                                    ↑
+                                              CLS at END
+
+Information flow:
+  spatial tokens → CLS: ✓ (CLS receives full spatial context)
+  CLS → spatial tokens: ✗ (Causal - CLS does NOT affect spatial output)
 ```
 
-#### FiLM Fusion (Primary - 권장)
+This design ensures:
+- CLS aggregates all spatial information for scale/shift prediction
+- Spatial output quality is preserved (not contaminated by CLS)
 
-**Feature-wise Linear Modulation**: Teacher가 Student를 channel-wise로 modulate
+### 2.3 UnifiedMamba Structure (FlashDepth Compatible)
 
 ```python
-class FiLMFusion(nn.Module):
-    """
-    CLS-L이 CLS-S의 각 dimension을 개별적으로 조절.
-    γ: scaling (feature 강조/억제)
-    β: shifting (bias 조정)
-    """
-    def __init__(self, student_dim=384, teacher_dim=1024, hidden_dim=512):
-        super().__init__()
-        self.film_generator = nn.Sequential(
-            nn.Linear(teacher_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, student_dim * 2)  # γ, β
+class UnifiedMamba(nn.Module):
+    def __init__(self, dpt_dim=256, cls_embed_dim=1024, num_layers=4,
+                 d_state=256, d_conv=4, ...):
+
+        # NEW: CLS projection (random init)
+        self.cls_proj = nn.Sequential(
+            nn.Linear(cls_embed_dim, dpt_dim),
+            nn.ReLU()
         )
-        # Identity initialization (γ=1, β=0에서 시작)
-        nn.init.zeros_(self.film_generator[-1].weight)
-        nn.init.zeros_(self.film_generator[-1].bias)
-        self.film_generator[-1].bias.data[:student_dim] = 1.0  # γ = 1
 
-    def forward(self, cls_s, cls_l):
-        # cls_s: [B, 384], cls_l: [B, 1024]
-        film_params = self.film_generator(cls_l)     # [B, 768]
-        gamma, beta = film_params.chunk(2, dim=-1)   # [B, 384] each
+        # FROM FLASHDEPTH: Mamba2 blocks (weight loaded)
+        # Structure: blocks[0][0..3] - matches FlashDepth MambaModel
+        self.blocks = nn.ModuleList([
+            nn.ModuleList([
+                MambaBlock(d_model=dpt_dim, d_state=d_state, d_conv=d_conv, ...)
+                for layer_idx in range(num_layers)
+            ])
+        ])
 
-        fused = gamma * cls_s + beta  # Channel-wise affine transform
-        return fused
+        # FROM FLASHDEPTH: final_layer (weight loaded)
+        self.final_layer = nn.Sequential(
+            nn.GELU(),
+            nn.Linear(dpt_dim, dpt_dim)
+        )
+
+        # NEW: Scale/Shift heads (random init)
+        self.scale_head = nn.Sequential(...)
+        self.shift_head = nn.Sequential(...)
 ```
 
-**특징:**
-- Teacher가 Student를 "가이드" (일방향 정보 흐름)
-- Student identity 구조적 보존 (γx + β 형태)
-- Identity mapping에서 시작 → 학습 안정성
-- 파라미터: ~655K (1024×512 + 512×768)
-- 검증된 방식: VQA, Visual Reasoning, Conditional Generation
+### 2.4 Mamba2 Hyperparameters
 
-#### Bilinear Fusion (Alternative - 선택 옵션)
+| Parameter | Description | Value |
+|-----------|-------------|-------|
+| `d_state` | SSM hidden state dimension (temporal memory capacity) | 256 |
+| `d_conv` | Local convolution kernel size | 4 |
+| `expand` | MLP expansion factor | 2 (ViT-L) / 4 (ViT-S) |
+| `headdim` | Attention head dimension | 64 (ViT-L) / 32 (ViT-S) |
+| `num_layers` | Number of MambaBlock layers | 4 |
 
-**Low-rank Bilinear Pooling**: 두 feature 간 second-order interaction 캡처
+### 2.5 Model Variants
+
+| Variant | DPT Dim | CLS Dim | d_state | Downsample | Mamba Tokens |
+|---------|---------|---------|---------|------------|--------------|
+| Large | 256 | 1024 | 256 | 0.1 | 196 + 1 |
+| Small | 64 | 384 | 256 | 0.05 | 49 + 1 |
+| Hybrid | 64 | 384 (fused) | 256 | 0.05 | 49 + 1 |
+
+---
+
+## 3. Weight Loading Strategy
+
+### 3.1 Weight Mapping
+
+| Source (FlashDepth) | Target (UnifiedMamba) | Status |
+|---------------------|----------------------|--------|
+| `mamba.blocks.0.X.*` | `gear5_metric_head.unified_mamba.blocks.0.X.*` | **Copied** |
+| `mamba.final_layer.*` | `gear5_metric_head.unified_mamba.final_layer.*` | **Copied** |
+| - | `gear5_metric_head.unified_mamba.cls_proj.*` | Random init |
+| - | `gear5_metric_head.unified_mamba.scale_head.*` | Random init |
+| - | `gear5_metric_head.unified_mamba.shift_head.*` | Random init |
+
+### 3.2 Parameter Count
+
+```
+FlashDepth Original Mamba: ~4.3M params
+  └─ blocks.0.[0-3]: ~4.0M (4 MambaBlock layers)
+  └─ final_layer: ~0.3M
+
+UnifiedMamba Total: ~4.7M params
+  ├─ FROM FlashDepth (~4.3M):
+  │   └─ blocks.0.[0-3]: ~4.0M (copied from FlashDepth)
+  │   └─ final_layer: ~0.3M (copied from FlashDepth)
+  │
+  └─ NEW Components (~0.4M):
+      └─ cls_proj: ~262K (1024→256 projection)
+      └─ scale_head: ~33K (256→128→1)
+      └─ shift_head: ~33K (256→128→1)
+
+Memory Savings:
+  - Original Mamba REMOVED after weight copy
+  - Net change: +0.4M new params (scale/shift heads)
+```
+
+### 3.3 Loading Process
 
 ```python
-class BilinearFusion(nn.Module):
-    """
-    CLS-S와 CLS-L의 multiplicative interaction.
-    cls_s[i] × cls_l[j] 형태의 cross-dimension 관계 학습.
-    """
-    def __init__(self, student_dim=384, teacher_dim=1024, out_dim=384, rank=64):
-        super().__init__()
-        self.U = nn.Linear(student_dim, rank, bias=False)   # Student → shared space
-        self.V = nn.Linear(teacher_dim, rank, bias=False)   # Teacher → shared space
-        self.P = nn.Linear(rank, out_dim)                   # Output projection
+# 1. Create BankaiMetricHead with UnifiedMamba
+model.gear5_metric_head = BankaiMetricHead(
+    dpt_dim=dpt_dim,
+    d_state=config.model.mamba_d_state,  # Must match FlashDepth (256)
+    d_conv=config.model.mamba_d_conv,    # Must match FlashDepth (4)
+    ...
+)
 
-    def forward(self, cls_s, cls_l):
-        # Project to shared low-rank space
-        u = self.U(cls_s)  # [B, rank]
-        v = self.V(cls_l)  # [B, rank]
+# 2. Copy FlashDepth Mamba weights to UnifiedMamba
+_copy_mamba_weights_to_unified(model)
+# - blocks.0.X.* → unified_mamba.blocks.0.X.*
+# - final_layer.* → unified_mamba.final_layer.*
 
-        # Hadamard product = low-rank bilinear interaction
-        z = u * v  # [B, rank]
-
-        # Optional: signed sqrt + L2 norm
-        z = torch.sign(z) * torch.sqrt(torch.abs(z) + 1e-8)
-        z = F.normalize(z, p=2, dim=-1)
-
-        fused = self.P(z)  # [B, out_dim]
-        return fused
-```
-
-**특징:**
-- 대칭적 정보 결합 (Student ↔ Teacher)
-- Cross-dimension interaction 학습 가능
-- 파라미터: ~450K (384×64 + 1024×64 + 64×384)
-- Student identity가 섞여 사라질 수 있음
-- 검증된 방식: VQA, Fine-grained Recognition
-
-#### FiLM vs Bilinear 비교
-
-| 측면 | FiLM | Bilinear |
-|------|------|----------|
-| **정보 흐름** | Teacher → Student (일방향) | 대칭적 융합 |
-| **Student 보존** | ✅ 구조적 보존 (γx+β) | ⚠️ 섞임 |
-| **Interaction** | Affine (1st order) | Multiplicative (2nd order) |
-| **표현력** | 중간 | 높음 |
-| **학습 안정성** | ✅ 높음 | ⚠️ 중간 |
-| **파라미터** | ~655K | ~450K |
-| **권장 상황** | Knowledge transfer | Information fusion |
-
-#### 설정 방법
-
-```yaml
-# configs/gear5/config.yaml
-
-# CLS Fusion 설정 (Hybrid mode에서만 사용)
-cls_fusion_type: "film"    # "film" (default) or "bilinear"
-cls_fusion_hidden: 512     # FiLM hidden dimension
-cls_fusion_rank: 64        # Bilinear low-rank dimension
+# 3. Remove Original Mamba to free memory
+del model.mamba
+model.use_mamba = False
 ```
 
 ---
 
-### 2.3 Key Components
+## 4. Training Strategy
 
-#### UnifiedMamba
-
-- Processes spatial tokens + CLS token through Mamba2
-- CLS at END position to aggregate spatial information
-- Hidden state propagation for temporal consistency
-- Zero-init output projection for training stability
-
-```python
-# Key parameters (Large model)
-- dpt_dim: 256
-- cls_embed_dim: 1024
-- num_mamba_layers: 4
-- downsample_factor: 0.1
-- Parameters: ~1.76M
-```
-
-#### BankaiMetricHead
-
-- Wrapper for UnifiedMamba + Importance Map Generator
-- Optional CLS Fusion (FiLM/Bilinear) for Hybrid mode
-- Outputs: spatial_out, scale, shift, importance_map
-
-### 2.4 Model Variants
-
-| Variant | DPT Dim | CLS Dim | Downsample | Mamba Tokens |
-|---------|---------|---------|------------|--------------|
-| Large | 256 | 1024 | 0.1 | 196 + 1 |
-| Small | 64 | 384 | 0.05 | 49 + 1 |
-| Hybrid | 64 | 384 (fused) | 0.05 | 49 + 1 |
-
----
-
-## 3. Training Strategy
-
-### 3.1 Loss Function
+### 4.1 Loss Function
 
 ```
 L_total = L_depth + α × L_TGM
@@ -234,51 +211,106 @@ Where:
 - α: TGM weight (default: 0.3)
 ```
 
-#### TGM Loss Details
-
-- Multi-scale temporal gradients (stride=1, 2, 4, 8)
-- Validity masking for stable regions
-- Trimmed MAE for outlier robustness
-- Exponential decay for longer temporal distances
-
-### 3.2 Head-First Tuning (Two-Phase Training)
+### 4.2 Head-First Tuning (Two-Phase Training)
 
 | Component | Phase 1 | Phase 2 |
 |-----------|---------|---------|
 | DINOv2 (encoder) | Frozen | Frozen |
 | DPT (decoder) | Frozen | Frozen |
-| UnifiedMamba | **Frozen** | **Trainable** |
-| Metric Head (MLP) | **Trainable** | **Trainable** |
+| UnifiedMamba (blocks + final_layer) | **Frozen** | **Trainable** |
+| Scale/Shift heads | **Trainable** | **Trainable** |
 | output_conv | Frozen | **Trainable** |
 
-**Phase 1**: ~5,000 steps
-- Train only scale/shift MLPs
-- UnifiedMamba uses FlashDepth pretrained weights
-- Goal: Initialize scale/shift to reasonable range
+**Phase 1** (~5,000 steps):
+- Train only scale/shift MLPs (~66K params)
+- UnifiedMamba uses FlashDepth pretrained weights (frozen)
+- Goal: Initialize scale/shift to reasonable metric range
+- CLS receives spatial info through frozen Mamba → meaningful scale/shift learning
 
-**Phase 2**: ~35,000 steps
-- Train UnifiedMamba + Metric Head + output_conv
+**Phase 2** (~35,000 steps):
+- Train UnifiedMamba + Scale/Shift + output_conv (~4.6M params)
 - Learning rate: 0.1× of Phase 1
-- Goal: Joint optimization for temporal consistency
+- Goal: Joint optimization for temporal consistency + metric accuracy
 
-### 3.3 Pretrained Weights
+### 4.3 Phase 1 Expected Log
 
-| Component | Source |
-|-----------|--------|
-| DINOv2 | FlashDepth pretrained |
-| DPT | FlashDepth pretrained |
-| UnifiedMamba | FlashDepth Mamba (F-Mamba) |
-| Metric Head | Random init |
-| output_conv | FlashDepth pretrained |
+```
+=== BANKAI Phase 1 ===
+Frozen:
+  - ViT + DPT: 334,983,680
+  - UnifiedMamba (frozen in P1): ~4,200,000
+  - output_conv: 331,969
+Trainable:
+  - UnifiedMamba (incl. scale/shift): 0
+  - Other (scale/shift heads): ~66,000
+  - output_conv: 0
+Total frozen: ~339,500,000
+Total trainable: ~66,000
+```
+
+### 4.4 Phase 2 Expected Log
+
+```
+=== BANKAI Phase 2 ===
+Frozen:
+  - ViT + DPT: 334,983,680
+  - Original Mamba: REMOVED (not loaded)
+  - output_conv: 0
+Trainable:
+  - UnifiedMamba (incl. scale/shift): ~4,300,000
+  - Other (CLS fusion, etc.): 0
+  - output_conv: 331,969
+Total frozen: 334,983,680
+Total trainable: ~4,600,000
+```
 
 ---
 
-## 4. Usage
+## 5. CLS Fusion Module (Hybrid Mode)
 
-### 4.1 Training
+### 5.1 FiLM Fusion (Recommended)
+
+**Feature-wise Linear Modulation**: Teacher가 Student를 channel-wise로 modulate
+
+```python
+class FiLMFusion(nn.Module):
+    def __init__(self, student_dim=384, teacher_dim=1024, hidden_dim=512):
+        self.film_generator = nn.Sequential(
+            nn.Linear(teacher_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, student_dim * 2)  # γ, β
+        )
+
+    def forward(self, cls_s, cls_l):
+        film_params = self.film_generator(cls_l)
+        gamma, beta = film_params.chunk(2, dim=-1)
+        return gamma * cls_s + beta
+```
+
+### 5.2 Bilinear Fusion (Alternative)
+
+**Low-rank Bilinear Pooling**: 두 feature 간 second-order interaction
+
+```python
+class BilinearFusion(nn.Module):
+    def __init__(self, student_dim=384, teacher_dim=1024, rank=64):
+        self.U = nn.Linear(student_dim, rank, bias=False)
+        self.V = nn.Linear(teacher_dim, rank, bias=False)
+        self.P = nn.Linear(rank, student_dim)
+
+    def forward(self, cls_s, cls_l):
+        z = self.U(cls_s) * self.V(cls_l)  # Hadamard product
+        return self.P(z)
+```
+
+---
+
+## 6. Usage
+
+### 6.1 Training
 
 ```bash
-# Phase 1: Train Metric Head only
+# Phase 1: Train Scale/Shift heads only
 torchrun --nproc_per_node=2 train_gear5.py \
     --config-path configs/gear5 \
     use_bankai=true \
@@ -296,7 +328,7 @@ torchrun --nproc_per_node=2 train_gear5.py \
     dataset.data_root=<path_to_data>
 ```
 
-### 4.2 Testing
+### 6.2 Testing
 
 ```bash
 python test_gear5.py \
@@ -306,10 +338,10 @@ python test_gear5.py \
     results_dir=test_results/bankai
 ```
 
-### 4.3 Configuration Options
+### 6.3 Configuration Options
 
 ```yaml
-# configs/gear5/config_l.yaml (or config_s.yaml)
+# configs/gear5/config_l.yaml
 
 # Enable Bankai mode
 use_bankai: true
@@ -324,20 +356,47 @@ tgm_weight: 0.3
 bankai_downsample: 0.1  # Large: 0.1, Small: 0.05
 bankai_num_mamba_layers: 4
 
+# Mamba hyperparameters (MUST match FlashDepth for weight loading!)
+mamba_d_state: 256
+mamba_d_conv: 4
+
 # CLS layers (3rd and 4th intermediate)
 cls_layers: [3, 4]
 
 # CLS Fusion settings (Hybrid mode only)
-cls_fusion_type: "film"    # "film" (recommended) or "bilinear"
-cls_fusion_hidden: 512     # FiLM: hidden dimension for γ,β generator
-cls_fusion_rank: 64        # Bilinear: low-rank dimension
+cls_fusion_type: "film"
+cls_fusion_hidden: 512
 ```
 
 ---
 
-## 5. Evaluation
+## 7. Implementation Files
 
-### 5.1 Metrics
+### Modified Files
+
+```
+flashdepth/gear5_modules.py     # UnifiedMamba, BankaiMetricHead
+flashdepth/mamba.py             # MambaBlock, MambaModel (reference)
+utils/gear_losses.py            # TGMTemporalLoss, CombinedBankaiLoss
+train_gear5.py                  # Bankai mode training, weight copy logic
+test_gear5.py                   # Bankai mode testing
+configs/gear5/config_l.yaml     # Bankai config options
+configs/gear5/config_s.yaml     # Bankai config options
+```
+
+### Key Classes
+
+- `UnifiedMamba`: FlashDepth-compatible Mamba with CLS + scale/shift heads
+- `BankaiMetricHead`: Full metric head wrapper
+- `FiLMFusion` / `BilinearFusion`: CLS fusion modules (Hybrid mode)
+- `TGMTemporalLoss`: Temporal Gradient Matching loss
+- `_copy_mamba_weights_to_unified()`: Weight transfer utility
+
+---
+
+## 8. Evaluation
+
+### 8.1 Metrics
 
 | Category | Metric | Target |
 |----------|--------|--------|
@@ -346,7 +405,7 @@ cls_fusion_rank: 64        # Bilinear: low-rank dimension
 | Temporal | **TAE** | **20%+ improvement** |
 | Efficiency | FPS | <10% drop |
 
-### 5.2 Datasets
+### 8.2 Datasets
 
 - **Training**: TartanAir, MVS-Synth, DynamicReplica, PointOdyssey, Spring
 - **Validation**: Sintel, Waymo_seg
@@ -354,31 +413,7 @@ cls_fusion_rank: 64        # Bilinear: low-rank dimension
 
 ---
 
-## 6. Implementation Files
-
-### Modified Files
-
-```
-flashdepth/gear5_modules.py     # UnifiedMamba, BankaiMetricHead
-utils/gear_losses.py            # TGMTemporalLoss, CombinedBankaiLoss
-train_gear5.py                  # Bankai mode training
-test_gear5.py                   # Bankai mode testing
-configs/gear5/config_l.yaml     # Bankai config options
-configs/gear5/config_s.yaml     # Bankai config options
-```
-
-### Key Classes
-
-- `UnifiedMamba`: Unified temporal processing for spatial + CLS tokens
-- `BankaiMetricHead`: Full metric head with UnifiedMamba
-- `FiLMFusion`: CLS fusion via feature-wise linear modulation (primary)
-- `BilinearFusion`: CLS fusion via low-rank bilinear pooling (alternative)
-- `TGMTemporalLoss`: Temporal Gradient Matching loss
-- `CombinedBankaiLoss`: Depth loss + TGM loss
-
----
-
-## 7. References
+## 9. References
 
 - [Video Depth Anything](https://github.com/DepthAnything/Video-Depth-Anything) - TGM Loss
 - [FlashDepth](https://github.com/xxx/FlashDepth) - Base architecture
@@ -390,5 +425,6 @@ configs/gear5/config_s.yaml     # Bankai config options
 
 | Date | Version | Changes |
 |------|---------|---------|
-| 2025-01-22 | v1.1 | CLS Fusion Module 추가 (FiLM primary, Bilinear alternative) |
+| 2025-01-26 | v1.2 | UnifiedMamba structure aligned with FlashDepth MambaModel for weight loading; Original Mamba removed for memory efficiency; Added weight copy logic; Clarified Mamba2 causal property |
+| 2025-01-22 | v1.1 | CLS Fusion Module added (FiLM primary, Bilinear alternative) |
 | 2025-01-20 | v1.0 | Initial implementation |

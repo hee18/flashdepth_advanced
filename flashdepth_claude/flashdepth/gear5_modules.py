@@ -326,10 +326,10 @@ class Gear5MetricHead(nn.Module):
 class UnifiedMamba(nn.Module):
     """
     Unified Mamba for Gear5 Bankai mode.
-    
+
     Processes spatial tokens (from DPT path_1) + CLS token through a single Mamba2,
     achieving both temporal depth consistency and metric scale/shift prediction.
-    
+
     Architecture:
         Input: path_1 (148×148, C) + CLS token (1, C)
             ↓ Downsample path_1 (e.g., 0.1 → 14×14 = 196 tokens)
@@ -339,36 +339,38 @@ class UnifiedMamba(nn.Module):
             ↓ Mamba2 (per-frame processing with hidden state propagation)
             ↓ Split → Spatial [h×w, C], CLS [1, C]
             ↓
-        Spatial output → Upsample + Residual → Relative Depth enhancement
+        Spatial output → final_layer + Upsample + Residual → Relative Depth enhancement
         CLS output → Scale/Shift MLP → Metric conversion
-    
+
     Key Design Decisions:
         - CLS at END: Receives full spatial context for scale/shift prediction
+          (Mamba2 is causal, so CLS does NOT affect spatial tokens)
         - Hidden state propagation: Ensures temporal consistency
         - Residual connection: Preserves original DPT quality
-        - Zero-init output: Training stability
-    
-    Parameters (Large model):
-        - Mamba2: ~1.5M (d_model=256, expand=2, 4 layers)
-        - CLS projection: 1024 → 256 = 262K
-        - Scale/Shift heads: 256 × 2 = 512
-        - Total: ~1.76M parameters
+        - Compatible with FlashDepth MambaModel: blocks structure matches for weight loading
+
+    Weight Loading:
+        - blocks[0][0..3]: Loaded from FlashDepth pretrained Mamba (mamba.blocks.0.*)
+        - final_layer: Loaded from FlashDepth pretrained Mamba (mamba.final_layer.*)
+        - cls_proj, scale_head, shift_head: Random init (new components)
     """
-    def __init__(self, 
-                 dpt_dim=256, 
-                 cls_embed_dim=1024, 
-                 num_layers=4, 
+    def __init__(self,
+                 dpt_dim=256,
+                 cls_embed_dim=1024,
+                 num_layers=4,
                  downsample_factor=0.1,
-                 d_state=64,
-                 d_conv=4,
+                 d_state=256,  # Match FlashDepth default
+                 d_conv=4,     # Match FlashDepth config
                  use_hydra=False):
         super().__init__()
-        
+
         self.dpt_dim = dpt_dim
         self.cls_embed_dim = cls_embed_dim
         self.num_layers = num_layers
         self.downsample_factor = downsample_factor
-        
+        self.d_state = d_state
+        self.d_conv = d_conv
+
         # Determine Mamba2 hyperparameters based on dpt_dim
         if dpt_dim == 64:  # ViT-S / Hybrid
             headdim = 32
@@ -376,40 +378,46 @@ class UnifiedMamba(nn.Module):
         else:  # ViT-L (dpt_dim=256)
             headdim = 64
             expand = 2
-        
+
         self.headdim = headdim
         self.expand = expand
-        
-        # 1. CLS projection: embed_dim → dpt_dim
+
+        # 1. CLS projection: embed_dim → dpt_dim (NEW - not from FlashDepth)
         self.cls_proj = nn.Sequential(
             nn.Linear(cls_embed_dim, dpt_dim),
             nn.ReLU(inplace=True)
         )
-        
-        # 2. Mamba2 blocks for unified temporal processing
+
+        # 2. Mamba2 blocks - MATCHING FlashDepth MambaModel structure for weight loading
+        # FlashDepth: self.blocks = nn.ModuleList([nn.ModuleList([MambaBlock(...)])])
+        # We use blocks[0] to match FlashDepth's mamba.blocks.0.*
         from .mamba import MambaBlock, InferenceParams
-        
+
         self.blocks = nn.ModuleList([
-            MambaBlock(
-                d_model=dpt_dim,
-                layer_idx=layer_idx,
-                expand=expand,
-                d_state=d_state,
-                d_conv=d_conv,
-                headdim=headdim,
-                use_hydra=use_hydra
-            ) for layer_idx in range(num_layers)
+            nn.ModuleList([
+                MambaBlock(
+                    d_model=dpt_dim,
+                    layer_idx=layer_idx,
+                    expand=expand,
+                    d_state=d_state,
+                    d_conv=d_conv,
+                    headdim=headdim,
+                    use_hydra=use_hydra
+                ) for layer_idx in range(num_layers)
+            ])
         ])
-        
-        # 3. Zero-init output projection for spatial features (training stability)
-        self.spatial_proj = nn.Sequential(
+
+        # 3. final_layer - MATCHING FlashDepth MambaModel (mamba_type='add')
+        # This is loaded from FlashDepth pretrained weights
+        self.final_layer = nn.Sequential(
             nn.GELU(),
             nn.Linear(dpt_dim, dpt_dim)
         )
-        nn.init.zeros_(self.spatial_proj[1].weight)
-        nn.init.zeros_(self.spatial_proj[1].bias)
-        
-        # 4. Scale/Shift heads for metric depth
+        # Zero-init for training stability (same as FlashDepth)
+        nn.init.zeros_(self.final_layer[1].weight)
+        nn.init.zeros_(self.final_layer[1].bias)
+
+        # 4. Scale/Shift heads for metric depth (NEW - not from FlashDepth)
         self.scale_head = nn.Sequential(
             nn.Linear(dpt_dim, dpt_dim // 2),
             nn.ReLU(inplace=True),
@@ -420,19 +428,21 @@ class UnifiedMamba(nn.Module):
             nn.ReLU(inplace=True),
             nn.Linear(dpt_dim // 2, 1)
         )
-        
+
         # 5. Inference params for hidden state tracking
         self.max_seqlen = 60000
         self.max_batch_size = 32  # Will be updated during forward
         self.inference_params = None
-        
+
         # Log parameter count
         total_params = sum(p.numel() for p in self.parameters())
+        blocks_params = sum(p.numel() for p in self.blocks.parameters())
+        final_layer_params = sum(p.numel() for p in self.final_layer.parameters())
+        new_params = total_params - blocks_params - final_layer_params
         logging.info(f"UnifiedMamba (Bankai): {total_params:,} parameters")
-        logging.info(f"  CLS projection: {cls_embed_dim} → {dpt_dim}")
-        logging.info(f"  Mamba2: d_model={dpt_dim}, expand={expand}, headdim={headdim}, layers={num_layers}")
-        logging.info(f"  Downsample factor: {downsample_factor}")
-        logging.info(f"  Scale/Shift heads: {dpt_dim} → {dpt_dim//2} → 1")
+        logging.info(f"  From FlashDepth (blocks + final_layer): {blocks_params + final_layer_params:,}")
+        logging.info(f"  New components (cls_proj, scale/shift): {new_params:,}")
+        logging.info(f"  Mamba2: d_model={dpt_dim}, d_state={d_state}, d_conv={d_conv}, expand={expand}, headdim={headdim}, layers={num_layers}")
     
     def start_new_sequence(self, batch_size=None):
         """Reset hidden states for new video sequence"""
@@ -448,48 +458,48 @@ class UnifiedMamba(nn.Module):
     def forward_single_frame(self, spatial_tokens, cls_token):
         """
         Process a single frame with hidden state propagation.
-        
+
         Args:
             spatial_tokens: [B, h*w, dpt_dim] - Downsampled spatial features
             cls_token: [B, cls_embed_dim] - CLS token from DINOv2
-        
+
         Returns:
             spatial_out: [B, h*w, dpt_dim] - Enhanced spatial features
             scale: [B, 1] - Scale factor
             shift: [B, 1] - Shift factor
         """
         B = spatial_tokens.shape[0]
-        
+
         # 1. Project CLS token to dpt_dim
         cls_proj = self.cls_proj(cls_token)  # [B, dpt_dim]
         cls_proj = cls_proj.unsqueeze(1)  # [B, 1, dpt_dim]
-        
+
         # 2. Concatenate spatial + CLS (CLS at END)
         x = torch.cat([spatial_tokens, cls_proj], dim=1)  # [B, h*w + 1, dpt_dim]
-        
-        # 3. Process through Mamba2 blocks
-        for block in self.blocks:
+
+        # 3. Process through Mamba2 blocks (blocks[0] to match FlashDepth structure)
+        for block in self.blocks[0]:
             x = block(x, inference_params=self.inference_params)
-        
+
         # 4. Split spatial and CLS
         spatial_out = x[:, :-1, :]  # [B, h*w, dpt_dim]
         cls_out = x[:, -1, :]  # [B, dpt_dim]
-        
-        # 5. Apply zero-init projection to spatial features
-        spatial_out = self.spatial_proj(spatial_out)  # [B, h*w, dpt_dim]
-        
+
+        # 5. Apply final_layer to spatial features (loaded from FlashDepth)
+        spatial_out = self.final_layer(spatial_out)  # [B, h*w, dpt_dim]
+
         # 6. Predict scale and shift from CLS
         scale_logits = self.scale_head(cls_out)  # [B, 1]
         shift_logits = self.shift_head(cls_out)  # [B, 1]
-        
+
         # Ensure positive scale with Softplus
         scale = F.softplus(scale_logits)  # [B, 1]
         shift = shift_logits  # [B, 1]
-        
+
         # Update sequence length offset
         if self.inference_params is not None:
             self.inference_params.seqlen_offset += x.shape[1]
-        
+
         return spatial_out, scale, shift
     
     def forward(self, path_1, cls_tokens, input_shape):
@@ -623,20 +633,22 @@ class BankaiMetricHead(nn.Module):
         - Small: dpt_dim=64, cls_embed_dim=384, downsample=0.05
         - Hybrid: dpt_dim=64, cls_embed_dim=384 (with CrossAttn), downsample=0.05
     """
-    def __init__(self, 
-                 dpt_dim=256, 
-                 cls_embed_dim=1024, 
+    def __init__(self,
+                 dpt_dim=256,
+                 cls_embed_dim=1024,
                  num_mamba_layers=4,
                  downsample_factor=0.1,
                  use_hybrid_cls_fusion=False,
-                 teacher_cls_dim=1024):
+                 teacher_cls_dim=1024,
+                 d_state=256,  # Must match FlashDepth for weight loading
+                 d_conv=4):    # Must match FlashDepth for weight loading
         super().__init__()
-        
+
         self.dpt_dim = dpt_dim
         self.cls_embed_dim = cls_embed_dim
         self.use_hybrid_cls_fusion = use_hybrid_cls_fusion
         self.teacher_cls_dim = teacher_cls_dim
-        
+
         # Hybrid mode: CrossAttention for CLS fusion
         if use_hybrid_cls_fusion:
             self.cls_cross_attn = nn.MultiheadAttention(
@@ -647,13 +659,16 @@ class BankaiMetricHead(nn.Module):
                 batch_first=True
             )
             logging.info(f"BankaiMetricHead: CrossAttn for CLS fusion (Q:{cls_embed_dim}, KV:{teacher_cls_dim})")
-        
+
         # Unified Mamba for temporal processing
+        # Structure matches FlashDepth MambaModel for weight loading compatibility
         self.unified_mamba = UnifiedMamba(
             dpt_dim=dpt_dim,
             cls_embed_dim=cls_embed_dim,
             num_layers=num_mamba_layers,
-            downsample_factor=downsample_factor
+            downsample_factor=downsample_factor,
+            d_state=d_state,
+            d_conv=d_conv
         )
         
         # Importance map generator (reuse from original Gear5)
