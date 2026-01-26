@@ -1432,6 +1432,11 @@ case $COMMAND in
             TEST_CMD="$TEST_CMD load=$FLASHDEPTH_CHECKPOINT"
         fi
 
+        # Disable video (GIF) generation if --no-video flag is set
+        if [ "$NO_VIDEO" == "true" ]; then
+            TEST_CMD="$TEST_CMD eval.out_video=false"
+        fi
+
         CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm flashdepth $TEST_CMD
         ;;
 
@@ -1608,6 +1613,11 @@ case $COMMAND in
         # Add checkpoint
         if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
             TEST_CMD="$TEST_CMD load=$FLASHDEPTH_CHECKPOINT"
+        fi
+
+        # Disable video (GIF) generation if --no-video flag is set
+        if [ "$NO_VIDEO" == "true" ]; then
+            TEST_CMD="$TEST_CMD eval.out_video=false"
         fi
 
         CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm flashdepth $TEST_CMD

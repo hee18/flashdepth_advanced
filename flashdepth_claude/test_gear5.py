@@ -1080,45 +1080,65 @@ class Gear5Tester:
             logger.info(f"  δ1: {worst_seq['a1']:.4f}")
             logger.info(f"Worst sequence saved to {worst_seq_path}")
 
-            # Save scale/shift comparison JSON (TSP predictions vs optimal oracle)
+            # Save scale/shift comparison JSON (TSP predictions vs per-frame optimal oracle)
             scale_shift_comparison = []
             for result in all_metrics:
                 seq_id = result.get('sequence_id', -1)
+
+                # Get per-frame values
+                pred_scales = result.get('_per_frame_scales', [])
+                pred_shifts = result.get('_per_frame_shifts', [])
+                opt_scales = result.get('_per_frame_optimal_scales', [])
+                opt_shifts = result.get('_per_frame_optimal_shifts', [])
+
+                # Compute per-frame errors (TSP prediction vs per-frame optimal)
+                per_frame_scale_errors = []
+                per_frame_shift_errors = []
+                if len(pred_scales) == len(opt_scales) and len(pred_scales) > 0:
+                    per_frame_scale_errors = [abs(p - o) for p, o in zip(pred_scales, opt_scales)]
+                    per_frame_shift_errors = [abs(p - o) for p, o in zip(pred_shifts, opt_shifts)]
+
                 comparison_entry = {
                     'sequence_id': seq_id,
                     'abs_rel': result.get('abs_rel', 0.0),
                     'tsp_scale_mean': result.get('tsp_scale_mean', 1.0),
                     'tsp_shift_mean': result.get('tsp_shift_mean', 0.0),
-                    'optimal_scale': result.get('optimal_scale', 1.0),
-                    'optimal_shift': result.get('optimal_shift', 0.0),
-                    'scale_error': abs(result.get('tsp_scale_mean', 1.0) - result.get('optimal_scale', 1.0)),
-                    'shift_error': abs(result.get('tsp_shift_mean', 0.0) - result.get('optimal_shift', 0.0)),
+                    'optimal_scale_mean': result.get('optimal_scale', 1.0),  # mean of per-frame optimal
+                    'optimal_shift_mean': result.get('optimal_shift', 0.0),
+                    # Per-frame error statistics
+                    'scale_error_mean': float(np.mean(per_frame_scale_errors)) if per_frame_scale_errors else 0.0,
+                    'scale_error_max': float(np.max(per_frame_scale_errors)) if per_frame_scale_errors else 0.0,
+                    'shift_error_mean': float(np.mean(per_frame_shift_errors)) if per_frame_shift_errors else 0.0,
+                    'shift_error_max': float(np.max(per_frame_shift_errors)) if per_frame_shift_errors else 0.0,
                 }
-                # Add per-frame details if available
-                if '_per_frame_scales' in result:
-                    comparison_entry['per_frame_scales'] = result['_per_frame_scales']
-                    # Scale drift analysis: how scale changes over time
-                    scales = result['_per_frame_scales']
-                    if len(scales) > 1:
-                        scale_diffs = [abs(scales[i+1] - scales[i]) for i in range(len(scales)-1)]
+
+                # Add per-frame details
+                if pred_scales:
+                    comparison_entry['per_frame_tsp_scales'] = pred_scales
+                    comparison_entry['per_frame_optimal_scales'] = opt_scales
+                    comparison_entry['per_frame_scale_errors'] = per_frame_scale_errors
+                    # Scale drift analysis
+                    if len(pred_scales) > 1:
+                        scale_diffs = [abs(pred_scales[i+1] - pred_scales[i]) for i in range(len(pred_scales)-1)]
                         comparison_entry['scale_drift'] = {
                             'mean_frame_change': float(np.mean(scale_diffs)),
                             'max_frame_change': float(np.max(scale_diffs)),
-                            'total_drift': float(abs(scales[-1] - scales[0])),
-                            'optimal_gap_mean': float(np.mean([abs(s - result.get('optimal_scale', 1.0)) for s in scales]))
+                            'total_drift': float(abs(pred_scales[-1] - pred_scales[0]))
                         }
-                if '_per_frame_shifts' in result:
-                    comparison_entry['per_frame_shifts'] = result['_per_frame_shifts']
+
+                if pred_shifts:
+                    comparison_entry['per_frame_tsp_shifts'] = pred_shifts
+                    comparison_entry['per_frame_optimal_shifts'] = opt_shifts
+                    comparison_entry['per_frame_shift_errors'] = per_frame_shift_errors
                     # Shift drift analysis
-                    shifts = result['_per_frame_shifts']
-                    if len(shifts) > 1:
-                        shift_diffs = [abs(shifts[i+1] - shifts[i]) for i in range(len(shifts)-1)]
+                    if len(pred_shifts) > 1:
+                        shift_diffs = [abs(pred_shifts[i+1] - pred_shifts[i]) for i in range(len(pred_shifts)-1)]
                         comparison_entry['shift_drift'] = {
                             'mean_frame_change': float(np.mean(shift_diffs)),
                             'max_frame_change': float(np.max(shift_diffs)),
-                            'total_drift': float(abs(shifts[-1] - shifts[0])),
-                            'optimal_gap_mean': float(np.mean([abs(s - result.get('optimal_shift', 0.0)) for s in shifts]))
+                            'total_drift': float(abs(pred_shifts[-1] - pred_shifts[0]))
                         }
+
                 scale_shift_comparison.append(comparison_entry)
 
             scale_shift_path = self.save_dir / "scale_shift_comparison.json"
@@ -1140,7 +1160,7 @@ class Gear5Tester:
             if depth_range_analysis:
                 # Aggregate across sequences
                 aggregated_ranges = {}
-                for range_name in ['0-5m', '5-15m', '15-30m', '30-70m']:
+                for range_name in ['0-10m', '10-30m', '30-70m']:
                     range_abs_rels = [e['depth_ranges'].get(range_name, {}).get('abs_rel', 0) for e in depth_range_analysis]
                     range_a1s = [e['depth_ranges'].get(range_name, {}).get('a1', 0) for e in depth_range_analysis]
                     range_pixels = [e['depth_ranges'].get(range_name, {}).get('pixel_count', 0) for e in depth_range_analysis]
@@ -1159,12 +1179,14 @@ class Gear5Tester:
                     json.dump(depth_range_result, f, indent=2)
                 logger.info(f"Depth range analysis saved to {depth_range_path}")
 
-            # Save temporal analysis JSON
+            # Save temporal analysis JSON (using reprojection TAE)
             temporal_analysis = []
             for result in all_metrics:
                 entry = {
                     'sequence_id': result.get('sequence_id', -1),
-                    'tae': result.get('tae', 0.0),
+                    'tae_reproj': result.get('tae_reproj', 0.0),
+                    'tae_reproj_gt': result.get('tae_reproj_gt', 0.0),
+                    'tae_simple': result.get('tae', 0.0),  # Keep simple TAE for reference
                     'per_frame_tae': result.get('_per_frame_tae', []),
                     'tae_spike_frames': result.get('_tae_spike_frames', []),
                     'tae_spike_count': len(result.get('_tae_spike_frames', []))
@@ -1782,7 +1804,7 @@ class Gear5Tester:
             metrics['_tae_spike_frames'] = []
 
         # Compute depth range analysis
-        depth_ranges = [(0, 5), (5, 15), (15, 30), (30, 70)]
+        depth_ranges = [(0, 10), (10, 30), (30, 70)]
         depth_range_metrics = {}
         for depth_min, depth_max in depth_ranges:
             range_name = f"{depth_min}-{depth_max}m"
@@ -1858,38 +1880,43 @@ class Gear5Tester:
         metrics['_per_frame_scales'] = [float(s.item()) for s in scales[:, 0]]
         metrics['_per_frame_shifts'] = [float(s.item()) for s in shifts[:, 0]]
 
-        # Compute optimal scale/shift that minimizes AbsRel (least squares in depth space)
+        # Compute per-frame optimal scale/shift that minimizes AbsRel (least squares in depth space)
         # This serves as the "oracle" reference for comparing with TSP predictions
         MAX_DEPTH = 70.0
-        all_pred_valid = []
-        all_gt_valid = []
+        per_frame_optimal_scales = []
+        per_frame_optimal_shifts = []
+
         for t in range(pred_depths_cpu.shape[0]):
             pred_frame = pred_depths_cpu[t, 0]
             gt_frame = gt_depth_metric_cpu[t, 0]
             valid_mask = (gt_frame > 0) & (gt_frame < MAX_DEPTH) & (pred_frame > 0) & (pred_frame < MAX_DEPTH)
-            if valid_mask.sum() > 0:
-                all_pred_valid.append(pred_frame[valid_mask])
-                all_gt_valid.append(gt_frame[valid_mask])
 
-        if all_pred_valid:
-            pred_concat = torch.cat(all_pred_valid)
-            gt_concat = torch.cat(all_gt_valid)
-            # Least squares: gt = scale * pred + shift
-            A = torch.stack([pred_concat, torch.ones_like(pred_concat)], dim=1)
-            try:
-                solution = torch.linalg.lstsq(A, gt_concat, rcond=None).solution
-                optimal_scale = float(solution[0].item())
-                optimal_shift = float(solution[1].item())
-            except:
-                # Fallback: median scaling
-                optimal_scale = float(torch.median(gt_concat / (pred_concat + 1e-8)).item())
-                optimal_shift = 0.0
-        else:
-            optimal_scale = 1.0
-            optimal_shift = 0.0
+            if valid_mask.sum() > 100:  # Need sufficient pixels for stable estimation
+                pred_valid = pred_frame[valid_mask]
+                gt_valid = gt_frame[valid_mask]
+                # Least squares: gt = scale * pred + shift
+                A = torch.stack([pred_valid, torch.ones_like(pred_valid)], dim=1)
+                try:
+                    solution = torch.linalg.lstsq(A, gt_valid, rcond=None).solution
+                    opt_scale = float(solution[0].item())
+                    opt_shift = float(solution[1].item())
+                except:
+                    # Fallback: median scaling
+                    opt_scale = float(torch.median(gt_valid / (pred_valid + 1e-8)).item())
+                    opt_shift = 0.0
+            else:
+                opt_scale = 1.0
+                opt_shift = 0.0
 
-        metrics['optimal_scale'] = optimal_scale
-        metrics['optimal_shift'] = optimal_shift
+            per_frame_optimal_scales.append(opt_scale)
+            per_frame_optimal_shifts.append(opt_shift)
+
+        # Store per-frame optimal values
+        metrics['_per_frame_optimal_scales'] = per_frame_optimal_scales
+        metrics['_per_frame_optimal_shifts'] = per_frame_optimal_shifts
+        # Sequence-level summary (mean of per-frame optmals)
+        metrics['optimal_scale'] = float(np.mean(per_frame_optimal_scales))
+        metrics['optimal_shift'] = float(np.mean(per_frame_optimal_shifts))
 
         # Object-wise evaluation: compute per-class metrics for all frames
         # Initialize variables
