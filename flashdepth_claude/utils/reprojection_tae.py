@@ -33,6 +33,7 @@ def tae_torch(
     R_2_1: torch.Tensor,
     t_2_1: torch.Tensor,
     K: torch.Tensor,
+    valid_mask1: Optional[torch.Tensor] = None,
     valid_mask2: Optional[torch.Tensor] = None,
     min_depth: float = 0.1,
     max_depth: float = 70.0
@@ -40,11 +41,12 @@ def tae_torch(
     """
     Compute TAE between two frames using 3D reprojection.
 
-    Steps:
-    1. Backproject depth1 to 3D points in frame1's coordinate system
-    2. Transform 3D points from frame1 to frame2 using relative pose
-    3. Project 3D points to frame2's image plane
-    4. Compare projected depth with depth2 using AbsRel metric
+    Follows DepthAnyVideo's sparse projection approach:
+    1. Only backproject VALID pixels from frame1
+    2. Create sparse projected depth map in frame2
+    3. Compare only where projection exists AND frame2 depth is valid
+
+    This naturally handles occlusion by not comparing occluded regions.
 
     Args:
         depth1: [H, W] depth map of frame 1 (meters)
@@ -52,7 +54,8 @@ def tae_torch(
         R_2_1: [3, 3] rotation matrix from frame1 to frame2
         t_2_1: [3, 1] translation vector from frame1 to frame2
         K: [3, 3] camera intrinsic matrix
-        valid_mask2: [H, W] valid mask for frame 2
+        valid_mask1: [H, W] valid mask for frame 1 (optional)
+        valid_mask2: [H, W] valid mask for frame 2 (optional)
         min_depth: minimum valid depth (meters)
         max_depth: maximum valid depth (meters)
 
@@ -63,10 +66,10 @@ def tae_torch(
     device = depth1.device
     dtype = depth1.dtype
 
-    # Create pixel grid
+    # Create pixel grid with 0.5 offset (pixel center convention, like DepthAnyVideo)
     y_coords, x_coords = torch.meshgrid(
-        torch.arange(H, device=device, dtype=dtype),
-        torch.arange(W, device=device, dtype=dtype),
+        torch.linspace(0.5, H - 0.5, H, device=device, dtype=dtype),
+        torch.linspace(0.5, W - 0.5, W, device=device, dtype=dtype),
         indexing='ij'
     )
 
@@ -76,71 +79,81 @@ def tae_torch(
     cx = K[0, 2]
     cy = K[1, 2]
 
-    # Backproject to 3D (frame1 coordinates)
-    X = (x_coords - cx) * depth1 / fx
-    Y = (y_coords - cy) * depth1 / fy
-    Z = depth1
+    # Create valid mask for source frame
+    mask1 = (depth1 > min_depth) & (depth1 < max_depth)
+    if valid_mask1 is not None:
+        mask1 = mask1 & valid_mask1
 
-    # Stack as [3, H*W]
-    points3d = torch.stack([X.flatten(), Y.flatten(), Z.flatten()], dim=0)  # [3, H*W]
+    # Extract only valid pixels (sparse)
+    valid_indices = mask1.flatten()
+    x_valid = x_coords.flatten()[valid_indices]
+    y_valid = y_coords.flatten()[valid_indices]
+    d_valid = depth1.flatten()[valid_indices]
+
+    if d_valid.numel() == 0:
+        return float('nan')
+
+    # Backproject valid pixels to 3D (frame1 coordinates)
+    X = (x_valid - cx) * d_valid / fx
+    Y = (y_valid - cy) * d_valid / fy
+    Z = d_valid
+    points3d = torch.stack([X, Y, Z], dim=0)  # [3, N_valid]
 
     # Transform to frame2 coordinates
-    # points3d_transformed = R_2_1 @ points3d + t_2_1
-    points3d_transformed = R_2_1 @ points3d + t_2_1  # [3, H*W]
+    points3d_transformed = R_2_1 @ points3d + t_2_1  # [3, N_valid]
 
-    # Project to frame2 image plane
     X_proj = points3d_transformed[0]
     Y_proj = points3d_transformed[1]
     Z_proj = points3d_transformed[2]
 
-    # Projected pixel coordinates
-    x_proj = (X_proj * fx) / Z_proj + cx
-    y_proj = (Y_proj * fy) / Z_proj + cy
+    # Project to frame2 image plane
+    eps = 1e-6
+    valid_z = Z_proj > eps
+    x_proj = torch.zeros_like(X_proj)
+    y_proj = torch.zeros_like(Y_proj)
+    x_proj[valid_z] = (X_proj[valid_z] * fx) / Z_proj[valid_z] + cx
+    y_proj[valid_z] = (Y_proj[valid_z] * fy) / Z_proj[valid_z] + cy
 
-    # Projected depth
-    depth_proj = Z_proj.reshape(H, W)
-    x_proj = x_proj.reshape(H, W)
-    y_proj = y_proj.reshape(H, W)
+    # Round to integer pixel coordinates (nearest neighbor)
+    x_int = torch.round(x_proj).long()
+    y_int = torch.round(y_proj).long()
 
-    # Create validity mask
-    # 1. Projected points within image bounds
-    valid_proj = (x_proj >= 0) & (x_proj < W) & (y_proj >= 0) & (y_proj < H)
-    # 2. Positive projected depth
-    valid_proj = valid_proj & (depth_proj > min_depth) & (depth_proj < max_depth)
-    # 3. Valid depth in frame1
-    valid_depth1 = (depth1 > min_depth) & (depth1 < max_depth)
-    # 4. Valid depth in frame2
-    valid_depth2 = (depth2 > min_depth) & (depth2 < max_depth)
+    # Create validity mask for projected points
+    valid_proj = (
+        valid_z &
+        (x_int >= 0) & (x_int < W) &
+        (y_int >= 0) & (y_int < H) &
+        (Z_proj > min_depth) & (Z_proj < max_depth)
+    )
 
-    # Combined mask
-    valid_mask = valid_proj & valid_depth1 & valid_depth2
-    if valid_mask2 is not None:
-        valid_mask = valid_mask & valid_mask2
-
-    if valid_mask.sum() == 0:
+    if valid_proj.sum() == 0:
         return float('nan')
 
-    # Sample depth2 at projected locations using bilinear interpolation
-    # Normalize coordinates to [-1, 1] for grid_sample
-    x_norm = 2.0 * x_proj / (W - 1) - 1.0
-    y_norm = 2.0 * y_proj / (H - 1) - 1.0
-    grid = torch.stack([x_norm, y_norm], dim=-1).unsqueeze(0)  # [1, H, W, 2]
+    # Extract valid projections
+    x_int_valid = x_int[valid_proj]
+    y_int_valid = y_int[valid_proj]
+    depth_proj_valid = Z_proj[valid_proj]
 
-    depth2_sampled = torch.nn.functional.grid_sample(
-        depth2.unsqueeze(0).unsqueeze(0),  # [1, 1, H, W]
-        grid,
-        mode='bilinear',
-        padding_mode='zeros',
-        align_corners=True
-    ).squeeze()  # [H, W]
+    # Create sparse projected depth map (like DepthAnyVideo's point2depth)
+    # Note: If multiple points project to same pixel, last one wins (same as DepthAnyVideo)
+    projected_depth = torch.zeros((H, W), device=device, dtype=dtype)
+    projected_depth[y_int_valid, x_int_valid] = depth_proj_valid
+
+    # Create mask for valid frame2 depth
+    mask2 = (depth2 > min_depth) & (depth2 < max_depth)
+    if valid_mask2 is not None:
+        mask2 = mask2 & valid_mask2
+
+    # Final comparison mask: where projection exists AND frame2 depth is valid
+    compare_mask = (projected_depth > eps) & mask2
+
+    if compare_mask.sum() == 0:
+        return float('nan')
 
     # Compute AbsRel error
-    abs_rel = torch.abs(depth2_sampled - depth_proj) / depth2_sampled
+    abs_rel = torch.abs(depth2[compare_mask] - projected_depth[compare_mask]) / depth2[compare_mask]
 
-    # Apply mask and compute mean
-    abs_rel_masked = abs_rel[valid_mask]
-
-    return abs_rel_masked.mean().item()
+    return abs_rel.mean().item()
 
 
 def compute_reprojection_tae(
@@ -150,17 +163,16 @@ def compute_reprojection_tae(
     poses: List[torch.Tensor],
     valid_masks: Optional[List[torch.Tensor]] = None,
     min_depth: float = 0.1,
-    max_depth: float = 70.0
+    max_depth: float = 70.0,
+    align_to_gt: bool = False
 ) -> Dict[str, float]:
     """
     Compute reprojection-based TAE for a sequence.
 
-    Follows Video Depth Anything's approach:
-    1. Scale-shift align predictions to GT (in disparity space)
-    2. For each consecutive frame pair:
+    For each consecutive frame pair:
        - Forward: project frame t to frame t+1, compare
        - Backward: project frame t+1 to frame t, compare
-    3. Average all errors
+    Average all errors.
 
     Args:
         pred_depths: [T, H, W] predicted depth sequence (meters)
@@ -170,15 +182,17 @@ def compute_reprojection_tae(
         valid_masks: Optional list of [H, W] valid masks
         min_depth: minimum valid depth
         max_depth: maximum valid depth
+        align_to_gt: If True, align predictions to GT in disparity space (for relative depth models).
+                     If False, use predictions directly (for metric depth models like Gear5).
 
     Returns:
-        Dict with 'tae_reproj' (reprojection TAE) and 'tae_reproj_pred' (pred-only TAE)
+        Dict with 'tae_reproj' (reprojection TAE) and 'tae_reproj_gt' (GT reference TAE)
     """
     T = pred_depths.shape[0]
     device = pred_depths.device
 
     if T < 2:
-        return {'tae_reproj': 0.0, 'tae_reproj_pred': 0.0}
+        return {'tae_reproj': 0.0, 'tae_reproj_gt': 0.0}
 
     # Ensure poses are tensors
     poses = [p.to(device) if isinstance(p, torch.Tensor) else torch.tensor(p, device=device, dtype=torch.float32) for p in poses]
@@ -188,40 +202,41 @@ def compute_reprojection_tae(
         intrinsics = intrinsics * T
     intrinsics = [K.to(device) if isinstance(K, torch.Tensor) else torch.tensor(K, device=device, dtype=torch.float32) for K in intrinsics]
 
-    # Scale-shift alignment in disparity space (like Video Depth Anything)
-    # Convert to disparity
-    pred_disp = 1.0 / (pred_depths.clamp(min=1e-3) + 1e-8)
-    gt_disp = 1.0 / (gt_depths.clamp(min=1e-3) + 1e-8)
+    # Optionally align predictions to GT (for relative depth models)
+    if align_to_gt:
+        # Scale-shift alignment in disparity space (like Video Depth Anything)
+        pred_disp = 1.0 / (pred_depths.clamp(min=1e-3) + 1e-8)
+        gt_disp = 1.0 / (gt_depths.clamp(min=1e-3) + 1e-8)
 
-    # Create valid mask for alignment
-    valid_for_align = (gt_depths > min_depth) & (gt_depths < max_depth) & (pred_depths > min_depth) & (pred_depths < max_depth)
+        valid_for_align = (gt_depths > min_depth) & (gt_depths < max_depth) & (pred_depths > min_depth) & (pred_depths < max_depth)
+        pred_disp_flat = pred_disp[valid_for_align].flatten()
+        gt_disp_flat = gt_disp[valid_for_align].flatten()
 
-    # Least squares alignment: gt_disp ≈ scale * pred_disp + shift
-    pred_disp_flat = pred_disp[valid_for_align].flatten()
-    gt_disp_flat = gt_disp[valid_for_align].flatten()
-
-    if len(pred_disp_flat) > 100:
-        # Solve least squares: [pred_disp, 1] @ [scale, shift]^T = gt_disp
-        A = torch.stack([pred_disp_flat, torch.ones_like(pred_disp_flat)], dim=1)
-        b = gt_disp_flat
-        # Normal equations: (A^T A) x = A^T b
-        ATA = A.T @ A
-        ATb = A.T @ b
-        try:
-            params = torch.linalg.solve(ATA, ATb)
-            scale, shift = params[0].item(), params[1].item()
-        except:
+        if len(pred_disp_flat) > 100:
+            A = torch.stack([pred_disp_flat, torch.ones_like(pred_disp_flat)], dim=1)
+            b = gt_disp_flat
+            ATA = A.T @ A
+            ATb = A.T @ b
+            try:
+                params = torch.linalg.solve(ATA, ATb)
+                scale, shift = params[0].item(), params[1].item()
+            except:
+                scale, shift = 1.0, 0.0
+        else:
             scale, shift = 1.0, 0.0
-    else:
-        scale, shift = 1.0, 0.0
 
-    # Apply alignment
-    pred_disp_aligned = scale * pred_disp + shift
-    pred_depths_aligned = 1.0 / (pred_disp_aligned.clamp(min=1e-8))
+        pred_disp_aligned = scale * pred_disp + shift
+        pred_depths_aligned = 1.0 / (pred_disp_aligned.clamp(min=1e-8))
+    else:
+        # For metric depth models: use predictions directly without alignment
+        pred_depths_aligned = pred_depths
 
     # Compute TAE for consecutive frame pairs
     tae_errors_gt = []
     tae_errors_pred = []
+    nan_count_gt = 0
+    nan_count_pred = 0
+    small_translation_count = 0
 
     for t in range(T - 1):
         # Get intrinsics (use frame t's intrinsics)
@@ -239,6 +254,11 @@ def compute_reprojection_tae(
         R_2_1 = T_2_1[:3, :3]  # [3, 3]
         t_2_1 = T_2_1[:3, 3:4]  # [3, 1]
 
+        # Check for small translation (pure rotation case)
+        translation_magnitude = torch.norm(t_2_1).item()
+        if translation_magnitude < 0.01:  # Less than 1cm
+            small_translation_count += 1
+
         # Inverse: T_1_2 = T_1^{-1} @ T_2
         T_1_inv = torch.linalg.inv(T_1)
         T_1_2 = T_1_inv @ T_2
@@ -252,48 +272,104 @@ def compute_reprojection_tae(
         # Forward TAE (frame t → frame t+1) using GT depth
         error_fwd_gt = tae_torch(
             gt_depths[t], gt_depths[t + 1],
-            R_2_1, t_2_1, K, mask_t1,
-            min_depth, max_depth
+            R_2_1, t_2_1, K,
+            valid_mask1=mask_t, valid_mask2=mask_t1,
+            min_depth=min_depth, max_depth=max_depth
         )
 
         # Backward TAE (frame t+1 → frame t) using GT depth
         error_bwd_gt = tae_torch(
             gt_depths[t + 1], gt_depths[t],
-            R_1_2, t_1_2, K, mask_t,
-            min_depth, max_depth
+            R_1_2, t_1_2, K,
+            valid_mask1=mask_t1, valid_mask2=mask_t,
+            min_depth=min_depth, max_depth=max_depth
         )
 
-        # Forward TAE using aligned predictions
+        # Forward TAE using predictions (no alignment for metric depth models)
         error_fwd_pred = tae_torch(
             pred_depths_aligned[t], pred_depths_aligned[t + 1],
-            R_2_1, t_2_1, K, mask_t1,
-            min_depth, max_depth
+            R_2_1, t_2_1, K,
+            valid_mask1=mask_t, valid_mask2=mask_t1,
+            min_depth=min_depth, max_depth=max_depth
         )
 
-        # Backward TAE using aligned predictions
+        # Backward TAE using predictions
         error_bwd_pred = tae_torch(
             pred_depths_aligned[t + 1], pred_depths_aligned[t],
-            R_1_2, t_1_2, K, mask_t,
-            min_depth, max_depth
+            R_1_2, t_1_2, K,
+            valid_mask1=mask_t1, valid_mask2=mask_t,
+            min_depth=min_depth, max_depth=max_depth
         )
 
-        # Collect errors
-        if not np.isnan(error_fwd_gt):
-            tae_errors_gt.append(error_fwd_gt)
-        if not np.isnan(error_bwd_gt):
-            tae_errors_gt.append(error_bwd_gt)
-        if not np.isnan(error_fwd_pred):
-            tae_errors_pred.append(error_fwd_pred)
-        if not np.isnan(error_bwd_pred):
-            tae_errors_pred.append(error_bwd_pred)
+        # Compute per-frame-pair TAE (average of forward and backward)
+        # GT TAE for this frame pair
+        if not np.isnan(error_fwd_gt) and not np.isnan(error_bwd_gt):
+            pair_tae_gt = 0.5 * (error_fwd_gt + error_bwd_gt)
+        elif not np.isnan(error_fwd_gt):
+            pair_tae_gt = error_fwd_gt
+        elif not np.isnan(error_bwd_gt):
+            pair_tae_gt = error_bwd_gt
+        else:
+            pair_tae_gt = float('nan')
+            nan_count_gt += 1
 
-    # Compute final TAE (×100 for percentage)
-    tae_gt = np.mean(tae_errors_gt) * 100 if tae_errors_gt else 0.0
-    tae_pred = np.mean(tae_errors_pred) * 100 if tae_errors_pred else 0.0
+        # Pred TAE for this frame pair
+        if not np.isnan(error_fwd_pred) and not np.isnan(error_bwd_pred):
+            pair_tae_pred = 0.5 * (error_fwd_pred + error_bwd_pred)
+        elif not np.isnan(error_fwd_pred):
+            pair_tae_pred = error_fwd_pred
+        elif not np.isnan(error_bwd_pred):
+            pair_tae_pred = error_bwd_pred
+        else:
+            pair_tae_pred = float('nan')
+            nan_count_pred += 1
+
+        tae_errors_gt.append(pair_tae_gt)
+        tae_errors_pred.append(pair_tae_pred)
+
+    # Log statistics
+    valid_gt = sum(1 for x in tae_errors_gt if not np.isnan(x))
+    valid_pred = sum(1 for x in tae_errors_pred if not np.isnan(x))
+    logger.debug(f"Reprojection TAE stats: {valid_gt}/{T-1} valid GT pairs, "
+                 f"{valid_pred}/{T-1} valid pred pairs")
+
+    # Warn about pure rotation (small translation) sequences
+    if small_translation_count > 0:
+        logger.debug(f"TAE warning: {small_translation_count}/{T-1} frame pairs have small translation (<1cm). "
+                     f"TAE may be inflated due to pure rotation sensitivity.")
+
+    # Convert to percentage (×100)
+    per_frame_tae_gt = [x * 100 if not np.isnan(x) else float('nan') for x in tae_errors_gt]
+    per_frame_tae_pred = [x * 100 if not np.isnan(x) else float('nan') for x in tae_errors_pred]
+
+    # Compute per-frame TAE difference (pred - gt) = pure prediction error
+    per_frame_tae_diff = []
+    for pred_val, gt_val in zip(per_frame_tae_pred, per_frame_tae_gt):
+        if not np.isnan(pred_val) and not np.isnan(gt_val):
+            per_frame_tae_diff.append(pred_val - gt_val)
+        else:
+            per_frame_tae_diff.append(float('nan'))
+
+    # Compute mean TAE (excluding NaN)
+    valid_gt_vals = [x for x in per_frame_tae_gt if not np.isnan(x)]
+    valid_pred_vals = [x for x in per_frame_tae_pred if not np.isnan(x)]
+    valid_diff_vals = [x for x in per_frame_tae_diff if not np.isnan(x)]
+
+    tae_gt = np.mean(valid_gt_vals) if valid_gt_vals else 0.0
+    tae_pred = np.mean(valid_pred_vals) if valid_pred_vals else 0.0
+    tae_diff = np.mean(valid_diff_vals) if valid_diff_vals else 0.0
+
+    # Warn if all errors are NaN
+    if len(valid_gt_vals) == 0 and len(valid_pred_vals) == 0:
+        logger.warning(f"All {T-1} TAE computations returned NaN - check camera poses and depth ranges")
 
     return {
-        'tae_reproj': tae_pred,  # Main TAE metric (on predictions)
-        'tae_reproj_gt': tae_gt,  # Reference TAE on GT (should be ~0 for perfect poses)
+        'tae_reproj': tae_pred,  # TAE on predictions (includes occlusion baseline)
+        'tae_reproj_gt': tae_gt,  # TAE on GT (occlusion baseline)
+        'tae': tae_diff,  # Pure prediction error = pred - gt
+        'per_frame_tae': per_frame_tae_diff,  # Per-frame-pair TAE difference
+        'per_frame_tae_pred': per_frame_tae_pred,  # Per-frame-pair pred TAE (for reference)
+        'per_frame_tae_gt': per_frame_tae_gt,  # Per-frame-pair GT TAE (for reference)
     }
 
 
@@ -691,8 +767,14 @@ class ReprojectionTAECalculator:
         self._cache = {}  # Cache for loaded camera data
 
     def is_supported(self, dataset_name: str) -> bool:
-        """Check if dataset supports reprojection TAE."""
-        return dataset_name.lower() in self.SUPPORTED_DATASETS
+        """Check if dataset supports reprojection TAE.
+
+        Handles both simple names (e.g., 'sintel') and path-style names
+        (e.g., 'sintel/alley_1') by extracting the base dataset name.
+        """
+        # Extract base dataset name (first part before '/')
+        base_name = dataset_name.lower().split('/')[0]
+        return base_name in self.SUPPORTED_DATASETS
 
     def compute_tae(
         self,
@@ -718,6 +800,7 @@ class ReprojectionTAECalculator:
         dataset_name = dataset_name.lower()
 
         if not self.is_supported(dataset_name):
+            logger.debug(f"Dataset {dataset_name} not supported for reprojection TAE")
             return {'tae_reproj': 0.0, 'tae_reproj_gt': 0.0, 'tae_reproj_supported': False}
 
         try:
@@ -725,10 +808,10 @@ class ReprojectionTAECalculator:
             intrinsics = []
             poses = []
 
-            for img_path in image_paths:
+            for idx, img_path in enumerate(image_paths):
                 K, pose = self._get_camera_data(dataset_name, img_path)
                 if K is None or pose is None:
-                    logger.warning(f"Failed to get camera data for {img_path}")
+                    logger.warning(f"Failed to get camera data for frame {idx}: {img_path}")
                     return {'tae_reproj': 0.0, 'tae_reproj_gt': 0.0, 'tae_reproj_supported': False}
 
                 intrinsics.append(torch.tensor(K, dtype=torch.float32))
@@ -738,6 +821,8 @@ class ReprojectionTAECalculator:
             H, W = pred_depths.shape[1:]
             intrinsics = self._scale_intrinsics(intrinsics, dataset_name, image_paths[0], (H, W))
 
+            logger.debug(f"Reprojection TAE: loaded {len(intrinsics)} cameras, depth shape {pred_depths.shape}")
+
             # Compute TAE
             result = compute_reprojection_tae(
                 pred_depths, gt_depths,
@@ -745,6 +830,10 @@ class ReprojectionTAECalculator:
                 valid_masks
             )
             result['tae_reproj_supported'] = True
+
+            # Log if result is zero (indicates potential issue)
+            if result['tae_reproj'] == 0.0 and result['tae_reproj_gt'] == 0.0:
+                logger.warning(f"Reprojection TAE returned 0.0 for {dataset_name} - all frame pairs may have invalid projections")
 
             return result
 
@@ -756,8 +845,11 @@ class ReprojectionTAECalculator:
 
     def _get_camera_data(self, dataset_name: str, img_path: str) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
         """Get intrinsics and pose for a single frame."""
+        # Extract base dataset name (first part before '/')
+        # e.g., 'sintel/alley_1' -> 'sintel'
+        base_name = dataset_name.lower().split('/')[0]
 
-        if dataset_name == 'sintel':
+        if base_name == 'sintel':
             # Convert image path to camera path
             cam_path = img_path.replace('images/training/clean', 'cam_data/training/camdata_left').replace('.png', '.cam')
 
@@ -769,7 +861,7 @@ class ReprojectionTAECalculator:
             pose = np.linalg.inv(extrinsic)
             return K, pose
 
-        elif dataset_name == 'eth3d':
+        elif base_name == 'eth3d':
             # Get scene directory and image name
             # Path format: .../eth3d/{scene}/images/{image}.jpg
             parts = Path(img_path).parts
@@ -800,7 +892,7 @@ class ReprojectionTAECalculator:
 
             return None, None
 
-        elif dataset_name == 'bonn':
+        elif base_name == 'bonn':
             # Get scene directory
             # Path format: .../bonn/rgbd_bonn_{name}/rgb/{timestamp}.png
             parts = Path(img_path).parts
@@ -831,7 +923,7 @@ class ReprojectionTAECalculator:
 
             return K, pose
 
-        elif dataset_name == 'vkitti':
+        elif base_name == 'vkitti':
             # Get scene and variation
             # Path format: .../vkitti/{scene}/{variation}/frames/rgb/Camera_0/rgb_{frame}.jpg
             parts = Path(img_path).parts
@@ -867,7 +959,7 @@ class ReprojectionTAECalculator:
 
             return intrinsics[frame_num], extrinsics[frame_num]
 
-        elif dataset_name == 'waymo_seg':
+        elif base_name == 'waymo_seg':
             # Path format: .../waymo_seg/val/segment-{segment_name}/{camera}/rgb/original/{frame:04d}.jpg
             # Or: .../waymo_seg/val/segment-{segment_name}/{camera}/rgb/{frame:04d}.jpg
             path = Path(img_path)
@@ -925,19 +1017,22 @@ class ReprojectionTAECalculator:
     ) -> List[torch.Tensor]:
         """Scale intrinsics to match current image resolution."""
         H_curr, W_curr = current_shape
+        # Extract base dataset name (first part before '/')
+        base_name = dataset_name.lower().split('/')[0]
 
         # Get original resolution for each dataset
-        if dataset_name == 'sintel':
-            W_orig, H_orig = 1024, 436
-        elif dataset_name == 'eth3d':
+        # Note: These are the ORIGINAL dataset resolutions before any resizing
+        if base_name == 'sintel':
+            W_orig, H_orig = 1024, 436  # Original Sintel resolution
+        elif base_name == 'eth3d':
             # ETH3D has variable resolution, get from intrinsics
             # Assume intrinsics are already for original resolution
             W_orig, H_orig = 6048, 4032  # Typical ETH3D resolution
-        elif dataset_name == 'bonn':
+        elif base_name == 'bonn':
             W_orig, H_orig = 640, 480
-        elif dataset_name == 'vkitti':
+        elif base_name == 'vkitti':
             W_orig, H_orig = 1242, 375
-        elif dataset_name == 'waymo_seg':
+        elif base_name == 'waymo_seg':
             W_orig, H_orig = 1920, 1280  # Waymo original resolution
         else:
             return intrinsics

@@ -1101,10 +1101,20 @@ class Gear5Tester:
                 comparison_entry = {
                     'sequence_id': seq_id,
                     'abs_rel': result.get('abs_rel', 0.0),
+                    # TSP (predicted) scale/shift statistics
                     'tsp_scale_mean': result.get('tsp_scale_mean', 1.0),
+                    'tsp_scale_min': float(np.min(pred_scales)) if pred_scales else 1.0,
+                    'tsp_scale_max': float(np.max(pred_scales)) if pred_scales else 1.0,
                     'tsp_shift_mean': result.get('tsp_shift_mean', 0.0),
+                    'tsp_shift_min': float(np.min(pred_shifts)) if pred_shifts else 0.0,
+                    'tsp_shift_max': float(np.max(pred_shifts)) if pred_shifts else 0.0,
+                    # Optimal scale/shift statistics
                     'optimal_scale_mean': result.get('optimal_scale', 1.0),  # mean of per-frame optimal
+                    'optimal_scale_min': float(np.min(opt_scales)) if opt_scales else 1.0,
+                    'optimal_scale_max': float(np.max(opt_scales)) if opt_scales else 1.0,
                     'optimal_shift_mean': result.get('optimal_shift', 0.0),
+                    'optimal_shift_min': float(np.min(opt_shifts)) if opt_shifts else 0.0,
+                    'optimal_shift_max': float(np.max(opt_shifts)) if opt_shifts else 0.0,
                     # Per-frame error statistics
                     'scale_error_mean': float(np.mean(per_frame_scale_errors)) if per_frame_scale_errors else 0.0,
                     'scale_error_max': float(np.max(per_frame_scale_errors)) if per_frame_scale_errors else 0.0,
@@ -1186,8 +1196,8 @@ class Gear5Tester:
                     'sequence_id': result.get('sequence_id', -1),
                     'tae_reproj': result.get('tae_reproj', 0.0),
                     'tae_reproj_gt': result.get('tae_reproj_gt', 0.0),
-                    'tae_simple': result.get('tae', 0.0),  # Keep simple TAE for reference
-                    'per_frame_tae': result.get('_per_frame_tae', []),
+                    'tae': result.get('tae', 0.0),  # tae_reproj - tae_reproj_gt (pure prediction error)
+                    'per_frame_tae': result.get('_per_frame_tae', []),  # per-frame differences
                     'tae_spike_frames': result.get('_tae_spike_frames', []),
                     'tae_spike_count': len(result.get('_tae_spike_frames', []))
                 }
@@ -1763,45 +1773,11 @@ class Gear5Tester:
                 metrics[f'{key}_min'] = float(np.min(values))
                 metrics[f'{key}_max'] = float(np.max(values))
 
-        # Compute TAE (Temporal Alignment Error) - sequence-level metric
-        # TAE measures frame-to-frame consistency
-        if len(pred_depths) > 1:
-            tae_errors = []
-            for t in range(len(pred_depths) - 1):
-                pred_t = pred_depths_cpu[t, 0]  # [H, W]
-                pred_t_next = pred_depths_cpu[t + 1, 0]  # [H, W]
-                gt_t = gt_depth_metric_cpu[t, 0]  # [H, W]
-                gt_t_next = gt_depth_metric_cpu[t + 1, 0]  # [H, W]
-
-                # Valid mask for both frames
-                MAX_DEPTH = 70.0
-                valid_t = (gt_t > 0) & (gt_t < MAX_DEPTH) & (pred_t > 0) & (pred_t < MAX_DEPTH)
-                valid_t_next = (gt_t_next > 0) & (gt_t_next < MAX_DEPTH) & (pred_t_next > 0) & (pred_t_next < MAX_DEPTH)
-                valid_both = valid_t & valid_t_next  # [H, W]
-
-                if valid_both.sum() > 0:
-                    # Compute depth change (temporal derivative)
-                    pred_change = pred_t_next - pred_t  # [H, W]
-                    gt_change = gt_t_next - gt_t  # [H, W]
-
-                    # TAE: mean absolute error in temporal change
-                    tae = torch.abs(pred_change[valid_both] - gt_change[valid_both]).mean()
-                    tae_errors.append(tae.item())
-
-            metrics['tae'] = np.mean(tae_errors) if len(tae_errors) > 0 else 0.0
-            # Store per-frame TAE for temporal analysis
-            metrics['_per_frame_tae'] = tae_errors
-            # Identify TAE spike frames (TAE > 2x mean)
-            if len(tae_errors) > 0:
-                tae_mean = np.mean(tae_errors)
-                tae_spikes = [i for i, tae in enumerate(tae_errors) if tae > 2 * tae_mean]
-                metrics['_tae_spike_frames'] = tae_spikes
-            else:
-                metrics['_tae_spike_frames'] = []
-        else:
-            metrics['tae'] = 0.0
-            metrics['_per_frame_tae'] = []
-            metrics['_tae_spike_frames'] = []
+        # TAE will be computed from Reprojection TAE (see below)
+        # Initialize with zeros, will be overwritten if reprojection TAE is supported
+        metrics['tae'] = 0.0
+        metrics['_per_frame_tae'] = []
+        metrics['_tae_spike_frames'] = []
 
         # Compute depth range analysis
         depth_ranges = [(0, 10), (10, 30), (30, 70)]
@@ -1841,7 +1817,8 @@ class Gear5Tester:
         metrics['_depth_range_analysis'] = depth_range_metrics
 
         # Compute Reprojection-based TAE (for datasets with camera poses)
-        # Supported: sintel, eth3d, bonn, vkitti
+        # Supported: sintel, eth3d, bonn, vkitti, waymo_seg
+        # TAE = tae_reproj - tae_reproj_gt (pure prediction error, excluding occlusion baseline)
         if len(pred_depths) > 1 and 'image_paths' in batch and self.reproj_tae_calculator.is_supported(dataset_name):
             try:
                 image_paths_for_tae = batch['image_paths'][0]  # batch size is 1
@@ -1853,15 +1830,35 @@ class Gear5Tester:
                 )
                 metrics['tae_reproj'] = reproj_tae_result.get('tae_reproj', 0.0)
                 metrics['tae_reproj_gt'] = reproj_tae_result.get('tae_reproj_gt', 0.0)
-                if reproj_tae_result.get('tae_reproj_supported', False):
-                    logger.info(f"Reprojection TAE: {metrics['tae_reproj']:.4f} (GT ref: {metrics['tae_reproj_gt']:.4f})")
+                metrics['tae'] = reproj_tae_result.get('tae', 0.0)  # pred - gt
+                metrics['_per_frame_tae'] = reproj_tae_result.get('per_frame_tae', [])
+
+                # Identify TAE spike frames (TAE > 2x mean)
+                per_frame_tae = metrics['_per_frame_tae']
+                valid_tae = [x for x in per_frame_tae if not np.isnan(x)]
+                if len(valid_tae) > 0:
+                    tae_mean = np.mean(valid_tae)
+                    tae_spikes = [i for i, t in enumerate(per_frame_tae) if not np.isnan(t) and t > 2 * tae_mean]
+                    metrics['_tae_spike_frames'] = tae_spikes
+                else:
+                    metrics['_tae_spike_frames'] = []
+
+                logger.info(f"Reprojection TAE: pred={metrics['tae_reproj']:.4f}%, gt={metrics['tae_reproj_gt']:.4f}%, diff={metrics['tae']:.4f}%")
             except Exception as e:
                 logger.warning(f"Failed to compute reprojection TAE: {e}")
+                import traceback
+                traceback.print_exc()
                 metrics['tae_reproj'] = 0.0
                 metrics['tae_reproj_gt'] = 0.0
+                metrics['tae'] = 0.0
+                metrics['_per_frame_tae'] = []
+                metrics['_tae_spike_frames'] = []
         else:
             metrics['tae_reproj'] = 0.0
             metrics['tae_reproj_gt'] = 0.0
+            metrics['tae'] = 0.0
+            metrics['_per_frame_tae'] = []
+            metrics['_tae_spike_frames'] = []
 
         # Add FPS to metrics
         metrics['fps'] = fps
@@ -2056,7 +2053,7 @@ class Gear5Tester:
 
             # Save error heatmaps (only when visualization enabled)
             self._save_error_heatmaps(
-                pred_depths_cpu, gt_depth_metric_cpu, sequence_id
+                pred_depths_cpu, gt_depth_metric_cpu, sequence_id, metrics
             )
 
         # Save video (GIF or MP4)
@@ -2289,10 +2286,16 @@ class Gear5Tester:
 
         logger.info(f"Saved {len(frame_indices)} frame PNGs to {seq_dir}")
 
-    def _save_error_heatmaps(self, pred_depths, gt_depths, sequence_id):
+    def _save_error_heatmaps(self, pred_depths, gt_depths, sequence_id, metrics=None):
         """
         Save error heatmaps for each frame showing |pred - gt| / gt.
         Only called when visualization is enabled.
+
+        Args:
+            pred_depths: Predicted depth maps [T, 1, H, W]
+            gt_depths: Ground truth depth maps [T, 1, H, W]
+            sequence_id: Sequence identifier
+            metrics: Dict containing per-frame scale/shift data (optional)
         """
         T = pred_depths.shape[0]
         MAX_DEPTH = 70.0
@@ -2300,6 +2303,12 @@ class Gear5Tester:
         # Create heatmaps directory
         heatmap_dir = self.save_dir / "error_heatmaps" / f"seq{sequence_id:04d}"
         heatmap_dir.mkdir(parents=True, exist_ok=True)
+
+        # Get per-frame scale/shift data if available
+        tsp_scales = metrics.get('_per_frame_scales', []) if metrics else []
+        tsp_shifts = metrics.get('_per_frame_shifts', []) if metrics else []
+        opt_scales = metrics.get('_per_frame_optimal_scales', []) if metrics else []
+        opt_shifts = metrics.get('_per_frame_optimal_shifts', []) if metrics else []
 
         # Use frame_interval if set
         if self.frame_interval is not None:
@@ -2319,14 +2328,30 @@ class Gear5Tester:
                 error = np.abs(pred - gt) / (gt + 1e-8)
                 error_display = np.where(valid, error, np.nan)
 
-                fig, ax = plt.subplots(figsize=(8, 6))
+                # Compute mean AbsRel for this frame
+                abs_rel = np.mean(error[valid])
+
+                # Create figure with extra space at bottom for text
+                fig, ax = plt.subplots(figsize=(8, 6.8))
                 cmap = plt.cm.hot.copy()
                 cmap.set_bad(color='black')
                 im = ax.imshow(error_display, cmap=cmap, vmin=0, vmax=1)
                 plt.colorbar(im, ax=ax, label='AbsRel Error')
-                ax.set_title(f'Error Heatmap - Seq {sequence_id} Frame {t}')
+                ax.set_title(f'Seq {sequence_id} Frame {t} | AbsRel: {abs_rel:.3f}')
                 ax.axis('off')
 
+                # Add scale/shift info at the bottom
+                if t < len(tsp_scales) and t < len(opt_scales):
+                    tsp_s = tsp_scales[t]
+                    tsp_sh = tsp_shifts[t] if t < len(tsp_shifts) else 0.0
+                    opt_s = opt_scales[t]
+                    opt_sh = opt_shifts[t] if t < len(opt_shifts) else 0.0
+
+                    info_text = f'TSP: scale={tsp_s:.3f}, shift={tsp_sh:.3f}  |  Optimal: scale={opt_s:.3f}, shift={opt_sh:.3f}'
+                    fig.text(0.5, 0.02, info_text, ha='center', va='bottom', fontsize=9,
+                             bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8))
+
+                plt.tight_layout(rect=[0, 0.05, 1, 1])  # Leave space at bottom
                 save_path = heatmap_dir / f"error_{t:04d}.png"
                 plt.savefig(save_path, dpi=100, bbox_inches='tight')
                 plt.close(fig)

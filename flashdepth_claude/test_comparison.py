@@ -614,33 +614,8 @@ class ComparisonTester:
                 values = [m[key] for m in frame_metrics]
                 metrics[key] = np.mean(values)
 
-            # Compute TAE (Temporal Alignment Error) for regular metrics mode
-            if len(pred_depths) > 1:
-                tae_errors = []
-                for t in range(len(pred_depths) - 1):
-                    pred_t = pred_depths_cpu[t, 0]
-                    pred_t_next = pred_depths_cpu[t + 1, 0]
-                    gt_t = gt_depth_processed_cpu[t, 0]
-                    gt_t_next = gt_depth_processed_cpu[t + 1, 0]
-
-                    valid_t = (gt_t > 0) & (gt_t < MAX_DEPTH) & (pred_t > 0) & (pred_t < MAX_DEPTH)
-                    valid_t_next = (gt_t_next > 0) & (gt_t_next < MAX_DEPTH) & (pred_t_next > 0) & (pred_t_next < MAX_DEPTH)
-
-                    if valid_t.sum() > 0 and valid_t_next.sum() > 0:
-                        # Metric depth: direct frame-to-frame comparison
-                        valid_both = valid_t & valid_t_next
-                        if valid_both.sum() > 0:
-                            pred_change = pred_t_next - pred_t
-                            gt_change = gt_t_next - gt_t
-                            tae = torch.abs(pred_change[valid_both] - gt_change[valid_both]).mean()
-                            tae_errors.append(tae.item())
-
-                metrics['tae'] = np.mean(tae_errors) if len(tae_errors) > 0 else 0.0
-            else:
-                metrics['tae'] = 0.0
-
             # Compute Reprojection-based TAE (for datasets with camera poses)
-            # Supported: sintel, eth3d, bonn, vkitti
+            # tae = tae_reproj - tae_reproj_gt (pure prediction error, removing occlusion effects)
             dataset_name_for_tae = batch.get('dataset_name', 'unknown')
             if isinstance(dataset_name_for_tae, (list, tuple)):
                 dataset_name_for_tae = dataset_name_for_tae[0]
@@ -657,15 +632,18 @@ class ComparisonTester:
                     )
                     metrics['tae_reproj'] = reproj_tae_result.get('tae_reproj', 0.0)
                     metrics['tae_reproj_gt'] = reproj_tae_result.get('tae_reproj_gt', 0.0)
+                    metrics['tae'] = reproj_tae_result.get('tae', 0.0)  # tae_reproj - tae_reproj_gt
                     if reproj_tae_result.get('tae_reproj_supported', False):
-                        logger.info(f"Reprojection TAE: {metrics['tae_reproj']:.4f} (GT ref: {metrics['tae_reproj_gt']:.4f})")
+                        logger.info(f"Reprojection TAE: {metrics['tae_reproj']:.4f} (GT ref: {metrics['tae_reproj_gt']:.4f}), TAE diff: {metrics['tae']:.4f}")
                 except Exception as e:
                     logger.warning(f"Failed to compute reprojection TAE: {e}")
                     metrics['tae_reproj'] = 0.0
                     metrics['tae_reproj_gt'] = 0.0
+                    metrics['tae'] = 0.0
             else:
                 metrics['tae_reproj'] = 0.0
                 metrics['tae_reproj_gt'] = 0.0
+                metrics['tae'] = 0.0
 
             metrics['fps'] = fps
 
