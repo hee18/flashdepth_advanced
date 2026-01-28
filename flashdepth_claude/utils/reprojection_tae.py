@@ -697,9 +697,10 @@ def load_waymo_seg_cameras(
     camera_id = camera_name_to_id.get(camera_name, 1)
 
     # Find parquet files
+    # Note: waymo_seg has nested structure: waymo_seg/waymo_seg/camera_image/
     waymo_seg_root = Path(waymo_seg_root) if waymo_seg_root else Path('.')
-    camera_image_path = waymo_seg_root / 'waymo_seg' / 'camera_image' / f'{segment_name}.parquet'
-    camera_calib_path = waymo_seg_root / 'waymo_seg' / 'camera_calibration' / f'{segment_name}.parquet'
+    camera_image_path = waymo_seg_root / 'waymo_seg' / 'waymo_seg' / 'camera_image' / f'{segment_name}.parquet'
+    camera_calib_path = waymo_seg_root / 'waymo_seg' / 'waymo_seg' / 'camera_calibration' / f'{segment_name}.parquet'
 
     if not camera_image_path.exists():
         raise FileNotFoundError(f"Camera image parquet not found: {camera_image_path}")

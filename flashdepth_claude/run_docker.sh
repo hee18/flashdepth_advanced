@@ -1588,6 +1588,8 @@ case $COMMAND in
             dataset.data_root=/data/datasets \
             training.workers=$WORKERS \
             use_bankai=true \
+            bankai_phase=$BANKAI_PHASE \
+            +bankai_auto_step=$BANKAI_AUTO_STEP \
             +results_dir=$RESULTS_DIR \
             +gpu=$GPU_ID \
             +vid_len=$VID_LEN \

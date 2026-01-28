@@ -1466,11 +1466,16 @@ class Gear5Tester:
         # Warmup run for FPS measurement
         logger.info(f"Warmup run for FPS measurement...")
 
-        # Initialize Mamba sequence for warmup
-        if hasattr(self.model, 'mamba') and not self.use_bankai:
-            # Standard Gear5: Use FlashDepth's original Mamba
-            self.model.mamba.start_new_sequence()
-        # Note: Bankai's UnifiedMamba handles sequence initialization internally
+        # Initialize Mamba/GRU sequence for warmup
+        if self.use_bankai:
+            # Bankai: Initialize UnifiedMamba's hidden state for warmup
+            self.model.gear5_metric_head.start_new_sequence(batch_size=1)
+        else:
+            # Standard Gear5: Initialize both FlashDepth Mamba and Gear5MetricHead (TSP)
+            if hasattr(self.model, 'mamba'):
+                self.model.mamba.start_new_sequence()
+            # Initialize TSP's GRU/Mamba hidden state
+            self.model.gear5_metric_head.start_new_sequence(batch_size=1)
 
         with torch.amp.autocast('cuda', dtype=torch.bfloat16):
             img_warmup = images[0, 0].unsqueeze(0)  # [1, 3, H, W]
@@ -1506,11 +1511,12 @@ class Gear5Tester:
 
             if self.use_bankai:
                 # ========== BANKAI MODE WARMUP ==========
-                gear5_outputs_warmup = self.model.gear5_metric_head(
+                # Use forward_single_frame() for consistency with actual testing
+                gear5_outputs_warmup = self.model.gear5_metric_head.forward_single_frame(
                     path_1=path_1_warmup,
                     cls_tokens=cls_tokens_warmup,
                     attention_weights_list=attention_weights_list_warmup,
-                    input_shape=(1, 1, 3, h_warmup, w_warmup)
+                    h=h_warmup, w=w_warmup
                 )
                 path_1_temporal_warmup = gear5_outputs_warmup['spatial_out']
 
@@ -1532,9 +1538,10 @@ class Gear5Tester:
                 out_warmup = F.interpolate(out_warmup, (h_warmup, w_warmup), mode="bilinear", align_corners=True)
                 relative_depth_warmup = self.model.depth_head.scratch.output_conv2(out_warmup)
 
-                # Get scale/shift from Gear5MetricHead
-                gear5_outputs_warmup = self.model.gear5_metric_head(
-                    cls_tokens=cls_tokens_warmup,
+                # Get scale/shift from Gear5MetricHead (stateful per-frame processing)
+                cls_token_warmup_single = cls_tokens_averaged_warmup  # [1, embed_dim]
+                gear5_outputs_warmup = self.model.gear5_metric_head.forward_single_frame(
+                    cls_token=cls_token_warmup_single,
                     attention_weights_list=attention_weights_list_warmup,
                     patch_h=patch_h_warmup,
                     patch_w=patch_w_warmup
@@ -1548,17 +1555,24 @@ class Gear5Tester:
         # FPS measurement (like original FlashDepth)
         # ETH3D: shorter sequences (30 frames) → use 5 warmup frames
         # Other datasets: longer sequences → use 10 warmup frames
-        if dataset_name == 'eth3d':
+        # NOTE: dataset_name can be 'eth3d/scene_name', so check with startswith
+        base_dataset_name = dataset_name.split('/')[0] if isinstance(dataset_name, str) else 'unknown'
+        if base_dataset_name == 'eth3d':
             warmup_frames = min(5, T)
         else:
             warmup_frames = min(10, T)
         start_time = None  # Will start timing after warmup
 
-        # Initialize Mamba sequence for actual test (critical for temporal processing!)
-        if hasattr(self.model, 'mamba') and not self.use_bankai:
-            # Standard Gear5: Use FlashDepth's original Mamba
-            self.model.mamba.start_new_sequence()
-        # Note: Bankai's UnifiedMamba handles sequence initialization per call
+        # Initialize Mamba/GRU sequence for actual test (critical for temporal processing!)
+        if self.use_bankai:
+            # Bankai: Initialize UnifiedMamba's hidden state ONCE per sequence
+            self.model.gear5_metric_head.start_new_sequence(batch_size=1)
+        else:
+            # Standard Gear5: Initialize both FlashDepth Mamba and Gear5MetricHead (TSP)
+            if hasattr(self.model, 'mamba'):
+                self.model.mamba.start_new_sequence()
+            # Initialize TSP's GRU/Mamba hidden state
+            self.model.gear5_metric_head.start_new_sequence(batch_size=1)
 
         # Process each frame
         for t in range(T):
@@ -1605,13 +1619,15 @@ class Gear5Tester:
                 if self.use_bankai:
                     # ========== BANKAI MODE ==========
                     # UnifiedMamba processes path_1 + CLS for temporal depth + metric
+                    # NOTE: start_new_sequence() is called ONCE before the loop,
+                    #       forward_single_frame() maintains hidden state across frames
 
-                    # Call BankaiMetricHead with path_1 + CLS tokens
-                    gear5_outputs = self.model.gear5_metric_head(
+                    # Call BankaiMetricHead.forward_single_frame() for per-frame processing
+                    gear5_outputs = self.model.gear5_metric_head.forward_single_frame(
                         path_1=path_1,  # [1, dpt_dim, h, w]
                         cls_tokens=cls_tokens,  # [1, 1, embed_dim]
                         attention_weights_list=attention_weights_list,
-                        input_shape=(1, 1, 3, h, w)  # B=1, T=1
+                        h=h, w=w  # For importance map sizing
                     )
 
                     scale = gear5_outputs['scale']  # [1, 1]
@@ -1637,9 +1653,12 @@ class Gear5Tester:
                     out = F.interpolate(out, (h, w), mode="bilinear", align_corners=True)
                     relative_depth = self.model.depth_head.scratch.output_conv2(out)  # [1, 1, H, W]
 
-                    # Get scale/shift/importance_map from Gear5MetricHead
-                    gear5_outputs = self.model.gear5_metric_head(
-                        cls_tokens=cls_tokens,
+                    # Get scale/shift/importance_map from Gear5MetricHead (stateful per-frame processing)
+                    # NOTE: start_new_sequence() is called ONCE before the loop,
+                    #       forward_single_frame() maintains hidden state across frames
+                    cls_token_single = cls_tokens[:, 0]  # [1, embed_dim] - extract single frame CLS
+                    gear5_outputs = self.model.gear5_metric_head.forward_single_frame(
+                        cls_token=cls_token_single,
                         attention_weights_list=attention_weights_list,
                         patch_h=patch_h,
                         patch_w=patch_w
@@ -1649,10 +1668,16 @@ class Gear5Tester:
                     shift = gear5_outputs['shift']  # [1, 1]
                     importance_map = gear5_outputs['importance_map']  # [1, 1, patch_h, patch_w]
 
-                # Apply scale/shift to relative depth
+                # Apply scale/shift to relative depth → final metric depth
                 scale_expanded = scale.view(1, 1, 1, 1)  # [1, 1, 1, 1]
                 shift_expanded = shift.view(1, 1, 1, 1)  # [1, 1, 1, 1]
                 pred_depth_inverse_100 = scale_expanded * relative_depth + shift_expanded  # [1, 1, H, W]
+
+                # End timing for FPS measurement (depth estimation complete)
+                if t == T - 1 and start_time is not None:
+                    torch.cuda.synchronize()
+                    import time
+                    end_time = time.time()
 
                 # Save canonical pred mask (before de-canonicalization!)
                 MIN_INVERSE_CANONICAL = 100.0 / 70.0
@@ -1686,11 +1711,6 @@ class Gear5Tester:
                 importance_map_resized = F.interpolate(
                     importance_map, size=(h_full, w_full), mode='bilinear', align_corners=True
                 )  # [1, 1, H, W] at image resolution
-
-            # End timing for FPS measurement (after last frame, like original FlashDepth)
-            if t == T - 1 and start_time is not None:
-                torch.cuda.synchronize()
-                end_time = time.time()
 
             # List append: Keep on GPU during FPS measurement, move to CPU after
             # This prevents .cpu() overhead from affecting FPS while avoiding OOM on long sequences
@@ -2141,10 +2161,15 @@ class Gear5Tester:
         if self.enable_visualization and len(frame_metrics) > 0:
             logger.info(f"Best frame for sequence {sequence_id}: Frame {best_frame_idx} (AbsRel={best_frame_abs_rel:.4f})")
 
-            # Gear5 doesn't use multi-layer fusion weights (single temporal backend: GRU or Mamba2)
+            # Gear5 doesn't use multi-layer fusion weights
             layer_weights = None
-            use_mamba = self.config.model.get('use_mamba_temporal', False)
-            temporal_backend = "Mamba2" if use_mamba else "GRU"
+            if self.use_bankai:
+                # Bankai: UnifiedMamba replaces both FlashDepth Mamba and TSP
+                temporal_backend = "UnifiedMamba"
+            else:
+                # Standard Gear5: TSP uses GRU or Mamba2
+                use_mamba = self.config.model.get('use_mamba_temporal', False)
+                temporal_backend = "Mamba2" if use_mamba else "GRU"
             logger.info(f"Gear5 uses {temporal_backend}-based temporal modeling (no layer fusion weights)")
 
             # Get segmentation and actual frame number for best frame

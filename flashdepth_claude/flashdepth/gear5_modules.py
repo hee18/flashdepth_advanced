@@ -171,7 +171,7 @@ class TemporalScalePredictor(nn.Module):
         # 2. Temporal modeling: GRU or Mamba2
         if use_mamba:
             # Mamba2: Use MambaBlock for temporal modeling
-            from .mamba import MambaBlock
+            from .mamba import MambaBlock, InferenceParams
 
             # NOTE: This is the NEW Mamba2 for TemporalScalePredictor ONLY
             # The original FlashDepth Mamba modules are FROZEN during training
@@ -188,6 +188,11 @@ class TemporalScalePredictor(nn.Module):
             # Project Mamba output to hidden_dim
             self.mamba_proj = nn.Linear(feature_dim, hidden_dim)
 
+            # Inference params for stateful processing
+            self.inference_params = None
+            self.max_seqlen = 60000
+            self.max_batch_size = 32
+
             logging.info(f"TemporalScalePredictor: Using Mamba2 for temporal modeling")
         else:
             # GRU: Lightweight temporal modeling
@@ -197,6 +202,9 @@ class TemporalScalePredictor(nn.Module):
                 num_layers=num_layers,
                 batch_first=True  # Input: [B, T, feature_dim]
             )
+            # Hidden state for stateful processing
+            self.gru_hidden = None
+
             logging.info(f"TemporalScalePredictor: Using GRU for temporal modeling")
 
         # 3. Scale/Shift Heads
@@ -247,6 +255,67 @@ class TemporalScalePredictor(nn.Module):
         # 4. Ensure positive scale with Softplus
         scale = F.softplus(scale_logits)  # [B, T]
         shift = shift_logits  # [B, T] - any value
+
+        return scale, shift
+
+    def start_new_sequence(self, batch_size=1):
+        """
+        Initialize hidden states for a new video sequence.
+        Call this ONCE at the start of each sequence, then use forward_single_frame() for each frame.
+        """
+        if self.use_mamba:
+            from .mamba import InferenceParams
+            self.max_batch_size = batch_size
+            self.inference_params = InferenceParams(
+                max_seqlen=self.max_seqlen,
+                max_batch_size=self.max_batch_size
+            )
+        else:
+            # Reset GRU hidden state
+            self.gru_hidden = None
+
+    def forward_single_frame(self, cls_token):
+        """
+        Process a single frame through TSP (for inference/testing).
+
+        IMPORTANT: Call start_new_sequence() ONCE before processing the first frame.
+
+        Args:
+            cls_token: [B, embed_dim] - CLS token for single frame
+
+        Returns:
+            scale: [B] - positive scale factor
+            shift: [B] - shift value
+        """
+        B = cls_token.shape[0]
+
+        # 1. Feature extraction
+        features = self.feature_net(cls_token)  # [B, feature_dim]
+
+        # 2. Temporal modeling (stateful)
+        if self.use_mamba:
+            # Mamba2 path with inference_params for hidden state
+            features_seq = features.unsqueeze(1)  # [B, 1, feature_dim]
+            mamba_output = self.temporal_mamba(features_seq, inference_params=self.inference_params)  # [B, 1, feature_dim]
+
+            # Update sequence offset
+            if self.inference_params is not None:
+                self.inference_params.seqlen_offset += 1
+
+            hidden_states = self.mamba_proj(mamba_output.squeeze(1))  # [B, hidden_dim]
+        else:
+            # GRU path with persistent hidden state
+            features_seq = features.unsqueeze(1)  # [B, 1, feature_dim]
+            gru_output, self.gru_hidden = self.temporal_gru(features_seq, self.gru_hidden)  # [B, 1, hidden_dim]
+            hidden_states = gru_output.squeeze(1)  # [B, hidden_dim]
+
+        # 3. Predict scale and shift
+        scale_logits = self.scale_head(hidden_states).squeeze(-1)  # [B]
+        shift_logits = self.shift_head(hidden_states).squeeze(-1)  # [B]
+
+        # 4. Ensure positive scale with Softplus
+        scale = F.softplus(scale_logits)  # [B]
+        shift = shift_logits  # [B]
 
         return scale, shift
 
@@ -313,6 +382,50 @@ class Gear5MetricHead(nn.Module):
         T = cls_tokens.shape[1]
         B = BT // T
         importance_map = importance_map.view(B, T, patch_h, patch_w)  # [B, T, patch_h, patch_w]
+
+        return {
+            'scale': scale,
+            'shift': shift,
+            'importance_map': importance_map
+        }
+
+    def start_new_sequence(self, batch_size=1):
+        """
+        Initialize hidden states for a new video sequence.
+        Call this ONCE at the start of each sequence, then use forward_single_frame() for each frame.
+        """
+        self.temporal_scale_predictor.start_new_sequence(batch_size=batch_size)
+
+    def forward_single_frame(self, cls_token, attention_weights_list, patch_h, patch_w):
+        """
+        Process a single frame through Gear5MetricHead (for inference/testing).
+
+        IMPORTANT: Call start_new_sequence() ONCE before processing the first frame.
+
+        Args:
+            cls_token: [B, embed_dim] - CLS token for single frame
+            attention_weights_list: List of [B, num_heads, N+1, N+1] from 2 layers
+            patch_h, patch_w: Spatial patch dimensions
+
+        Returns:
+            dict with:
+                - scale: [B, 1]
+                - shift: [B, 1]
+                - importance_map: [B, 1, patch_h, patch_w]
+        """
+        B = cls_token.shape[0]
+
+        # 1. Predict scale and shift (stateful)
+        scale, shift = self.temporal_scale_predictor.forward_single_frame(cls_token)  # [B], [B]
+
+        # Reshape to [B, 1] for consistency
+        scale = scale.unsqueeze(1)  # [B, 1]
+        shift = shift.unsqueeze(1)  # [B, 1]
+
+        # 2. Generate importance map
+        importance_map = self.importance_map_generator(
+            attention_weights_list, patch_h, patch_w
+        )  # [B, 1, patch_h, patch_w]
 
         return {
             'scale': scale,
@@ -678,7 +791,91 @@ class BankaiMetricHead(nn.Module):
         total_params = sum(p.numel() for p in self.parameters())
         trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
         logging.info(f"BankaiMetricHead: {trainable_params:,} / {total_params:,} trainable parameters")
-    
+
+    def start_new_sequence(self, batch_size=1):
+        """
+        Initialize Mamba hidden states for a new video sequence.
+        Call this ONCE at the start of each sequence, then use forward_single_frame() for each frame.
+        """
+        self.unified_mamba.start_new_sequence(batch_size=batch_size)
+
+    def forward_single_frame(self,
+                             path_1,
+                             cls_tokens,
+                             attention_weights_list,
+                             h, w,
+                             teacher_cls_tokens=None):
+        """
+        Process a single frame through Bankai (for inference/testing).
+
+        IMPORTANT: Call start_new_sequence() ONCE before processing the first frame of each sequence.
+
+        Args:
+            path_1: [B, dpt_dim, h, w] - DPT path_1 features for single frame
+            cls_tokens: [B, 1, cls_embed_dim] - CLS token for single frame
+            attention_weights_list: List of [B, num_heads, N+1, N+1] from 2 layers
+            h, w: Spatial dimensions (for importance map)
+            teacher_cls_tokens: [B, 1, teacher_cls_dim] - Teacher CLS tokens (Hybrid only)
+
+        Returns:
+            dict with:
+                - spatial_out: [B, dpt_dim, h, w] - Enhanced spatial features
+                - scale: [B, 1] - Scale factor
+                - shift: [B, 1] - Shift factor
+                - importance_map: [B, 1, patch_h, patch_w]
+        """
+        B = path_1.shape[0]
+        dpt_dim = path_1.shape[1]
+        h_spatial, w_spatial = path_1.shape[2], path_1.shape[3]
+        patch_h, patch_w = h // 14, w // 14  # Assuming patch_size=14
+
+        # Hybrid mode: Fuse CLS tokens via CrossAttention
+        if self.use_hybrid_cls_fusion and teacher_cls_tokens is not None:
+            q = cls_tokens.reshape(B, 1, -1)  # [B, 1, cls_embed_dim]
+            kv = teacher_cls_tokens.reshape(B, 1, -1)  # [B, 1, teacher_cls_dim]
+            fused_cls, _ = self.cls_cross_attn(q, kv, kv)
+            cls_tokens = fused_cls.reshape(B, 1, -1)
+
+        # Apply downsampling
+        if self.unified_mamba.downsample_factor != 1.0:
+            h_down = int(h_spatial * self.unified_mamba.downsample_factor)
+            w_down = int(w_spatial * self.unified_mamba.downsample_factor)
+            path_1_down = F.adaptive_avg_pool2d(path_1, (h_down, w_down))
+        else:
+            h_down, w_down = h_spatial, w_spatial
+            path_1_down = path_1
+
+        # Flatten spatial features: [B, dpt_dim, h_down, w_down] -> [B, h_down*w_down, dpt_dim]
+        frame_spatial_flat = path_1_down.permute(0, 2, 3, 1).reshape(B, h_down * w_down, dpt_dim)
+
+        # Extract CLS token for this frame: [B, 1, cls_embed_dim] -> [B, cls_embed_dim]
+        frame_cls = cls_tokens[:, 0]
+
+        # Process through unified Mamba (uses existing hidden state)
+        spatial_out_flat, scale, shift = self.unified_mamba.forward_single_frame(
+            frame_spatial_flat, frame_cls
+        )
+
+        # Reshape and upsample spatial output: [B, h_down*w_down, dpt_dim] -> [B, dpt_dim, h, w]
+        spatial_out = spatial_out_flat.reshape(B, h_down, w_down, dpt_dim).permute(0, 3, 1, 2)
+        if h_down != h_spatial or w_down != w_spatial:
+            spatial_out = F.interpolate(spatial_out, size=(h_spatial, w_spatial), mode='bilinear', align_corners=True)
+
+        # Add residual connection
+        spatial_out = spatial_out + path_1
+
+        # Generate importance map
+        importance_map = self.importance_map_generator(
+            attention_weights_list, patch_h, patch_w
+        )  # [B, 1, patch_h, patch_w]
+
+        return {
+            'spatial_out': spatial_out,  # [B, dpt_dim, h, w]
+            'scale': scale,  # [B, 1]
+            'shift': shift,  # [B, 1]
+            'importance_map': importance_map  # [B, 1, patch_h, patch_w]
+        }
+
     def forward(self, 
                 path_1,
                 cls_tokens, 
