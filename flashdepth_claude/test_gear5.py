@@ -104,9 +104,25 @@ class Gear5Tester:
         # Bankai mode detection
         self.use_bankai = config.get('use_bankai', False)
         if self.use_bankai:
-            self.bankai_phase = config.get('bankai_phase', 2)  # Default to phase 2 for testing
-            logger.info(f"=== BANKAI MODE ===")
-            logger.info(f"  Bankai Phase: {self.bankai_phase}")
+            raw_bankai_phase = config.get('bankai_phase', 2)  # Default to phase 2 for testing
+            bankai_auto_step = config.get('bankai_auto_step', 5000)
+
+            # Determine actual training phase from checkpoint info
+            # This will be updated when checkpoint is loaded (see _load_checkpoint_phase_info)
+            self._bankai_auto_mode = raw_bankai_phase in ["auto", "Auto", "AUTO", 0, "0"]
+            self._bankai_auto_step = bankai_auto_step
+            self._raw_bankai_phase = raw_bankai_phase
+
+            if self._bankai_auto_mode:
+                # Will be determined after checkpoint load
+                self.bankai_phase = "auto"
+                logger.info(f"=== BANKAI MODE ===")
+                logger.info(f"  Config: auto mode (Phase 1→2 at step {bankai_auto_step})")
+                logger.info(f"  Actual training phase will be inferred from checkpoint...")
+            else:
+                self.bankai_phase = int(raw_bankai_phase)
+                logger.info(f"=== BANKAI MODE ===")
+                logger.info(f"  Bankai Phase: {self.bankai_phase}")
 
         logger.info(f"Testing Phase {self.phase}")
 
@@ -182,24 +198,23 @@ class Gear5Tester:
         # Add Gear5 metric head (unified single-stage)
         model_embed_dim = 1024 if model.encoder == 'vitl' else 384
 
-        # Get use_mamba_temporal from config (matches train_gear5.py)
+        # Get use_mamba_temporal from config (only used for non-Bankai Gear5 mode)
         use_mamba_temporal = self.config.model.get('use_mamba_temporal', False)
-        if use_mamba_temporal:
-            logger.info("TemporalScalePredictor: Using Mamba2 for temporal modeling")
-        else:
-            logger.info("TemporalScalePredictor: Using GRU for temporal modeling")
 
-        # Determine GSP embed_dim based on tsp_mode (same logic as train_gear5.py)
+        # Determine GSP/CLS embed_dim based on tsp_mode (same logic as train_gear5.py)
         tsp_mode = self.config.model.get('tsp_mode', 'auto')
         if tsp_mode == 'l':
             gsp_embed_dim = 1024
-            logger.info(f"TSP mode 'l': Using TSP-L with 1024-dim CLS tokens (forced)")
+            if not self.use_bankai:
+                logger.info(f"TSP mode 'l': Using TSP-L with 1024-dim CLS tokens (forced)")
         elif tsp_mode == 's':
             gsp_embed_dim = 384
-            logger.info(f"TSP mode 's': Using TSP-S with 384-dim CLS tokens (forced)")
+            if not self.use_bankai:
+                logger.info(f"TSP mode 's': Using TSP-S with 384-dim CLS tokens (forced)")
         else:  # auto
             gsp_embed_dim = model_embed_dim
-            logger.info(f"TSP mode 'auto': Using TSP with {gsp_embed_dim}-dim CLS tokens")
+            if not self.use_bankai:
+                logger.info(f"TSP mode 'auto': Using TSP with {gsp_embed_dim}-dim CLS tokens")
 
         # Create metric head based on mode
         dpt_dim = 256 if model.encoder == 'vitl' else 64
@@ -242,7 +257,12 @@ class Gear5Tester:
                 model.use_mamba = False  # Prevent forward from using mamba
                 logger.info(f"  Original Mamba REMOVED: {original_mamba_params:,} params freed")
         else:
-            # Standard Gear5 mode
+            # Standard Gear5 mode (non-Bankai)
+            if use_mamba_temporal:
+                logger.info("TemporalScalePredictor: Using Mamba2 for temporal modeling")
+            else:
+                logger.info("TemporalScalePredictor: Using GRU for temporal modeling")
+
             model.gear5_metric_head = Gear5MetricHead(
                 embed_dim=gsp_embed_dim,
                 feature_dim=256,
@@ -345,7 +365,20 @@ class Gear5Tester:
                 if 'global_step' in checkpoint:
                     logger.info(f"Checkpoint step: {checkpoint['global_step']}")
                 if 'phase' in checkpoint:
-                    logger.info(f"Checkpoint phase: {checkpoint['phase']}")
+                    logger.info(f"Checkpoint resolution phase: {checkpoint['phase']} (1=518×518, 2=2K)")
+
+                # Determine actual Bankai training phase from checkpoint
+                if self.use_bankai and self._bankai_auto_mode:
+                    global_step = checkpoint.get('global_step', 0)
+                    # In auto mode, Phase 1→2 transition happens at bankai_auto_step
+                    if global_step >= self._bankai_auto_step:
+                        actual_phase = 2
+                        logger.info(f"  Bankai training: auto mode, transitioned to Phase 2 at step {self._bankai_auto_step}")
+                    else:
+                        actual_phase = 1
+                        logger.info(f"  Bankai training: auto mode, still in Phase 1 (step {global_step} < {self._bankai_auto_step})")
+                    self.bankai_phase = actual_phase
+                    logger.info(f"  Bankai Phase (inferred): {self.bankai_phase}")
             else:
                 logger.warning(f"Checkpoint {checkpoint_path} not found")
                 raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
