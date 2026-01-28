@@ -1080,7 +1080,7 @@ class Gear5Tester:
             logger.info(f"  δ1: {worst_seq['a1']:.4f}")
             logger.info(f"Worst sequence saved to {worst_seq_path}")
 
-            # Save scale/shift comparison JSON (TSP predictions vs per-frame optimal oracle)
+            # Save scale/shift comparison JSON (pred vs per-frame optimal oracle)
             scale_shift_comparison = []
             for result in all_metrics:
                 seq_id = result.get('sequence_id', -1)
@@ -1091,23 +1091,24 @@ class Gear5Tester:
                 opt_scales = result.get('_per_frame_optimal_scales', [])
                 opt_shifts = result.get('_per_frame_optimal_shifts', [])
 
-                # Compute per-frame errors (TSP prediction vs per-frame optimal)
+                # Compute per-frame errors (pred vs per-frame optimal) in AbsRel form
+                # scale_error = |pred - opt| / |opt|, shift_error = |pred - opt| / (|opt| + eps)
                 per_frame_scale_errors = []
                 per_frame_shift_errors = []
                 if len(pred_scales) == len(opt_scales) and len(pred_scales) > 0:
-                    per_frame_scale_errors = [abs(p - o) for p, o in zip(pred_scales, opt_scales)]
-                    per_frame_shift_errors = [abs(p - o) for p, o in zip(pred_shifts, opt_shifts)]
+                    per_frame_scale_errors = [abs(p - o) / (abs(o) + 1e-8) for p, o in zip(pred_scales, opt_scales)]
+                    per_frame_shift_errors = [abs(p - o) / (abs(o) + 1e-8) for p, o in zip(pred_shifts, opt_shifts)]
 
                 comparison_entry = {
                     'sequence_id': seq_id,
                     'abs_rel': result.get('abs_rel', 0.0),
-                    # TSP (predicted) scale/shift statistics
-                    'tsp_scale_mean': result.get('tsp_scale_mean', 1.0),
-                    'tsp_scale_min': float(np.min(pred_scales)) if pred_scales else 1.0,
-                    'tsp_scale_max': float(np.max(pred_scales)) if pred_scales else 1.0,
-                    'tsp_shift_mean': result.get('tsp_shift_mean', 0.0),
-                    'tsp_shift_min': float(np.min(pred_shifts)) if pred_shifts else 0.0,
-                    'tsp_shift_max': float(np.max(pred_shifts)) if pred_shifts else 0.0,
+                    # Predicted scale/shift statistics
+                    'pred_scale_mean': result.get('tsp_scale_mean', 1.0),
+                    'pred_scale_min': float(np.min(pred_scales)) if pred_scales else 1.0,
+                    'pred_scale_max': float(np.max(pred_scales)) if pred_scales else 1.0,
+                    'pred_shift_mean': result.get('tsp_shift_mean', 0.0),
+                    'pred_shift_min': float(np.min(pred_shifts)) if pred_shifts else 0.0,
+                    'pred_shift_max': float(np.max(pred_shifts)) if pred_shifts else 0.0,
                     # Optimal scale/shift statistics
                     'optimal_scale_mean': result.get('optimal_scale', 1.0),  # mean of per-frame optimal
                     'optimal_scale_min': float(np.min(opt_scales)) if opt_scales else 1.0,
@@ -1122,31 +1123,42 @@ class Gear5Tester:
                     'shift_error_max': float(np.max(per_frame_shift_errors)) if per_frame_shift_errors else 0.0,
                 }
 
-                # Add per-frame details
-                if pred_scales:
-                    comparison_entry['per_frame_tsp_scales'] = pred_scales
-                    comparison_entry['per_frame_optimal_scales'] = opt_scales
-                    comparison_entry['per_frame_scale_errors'] = per_frame_scale_errors
-                    # Scale drift analysis
+                # Add per-frame details as unified list
+                # Format: [pred_scale, opt_scale, scale_error, pred_shift, opt_shift, shift_error]
+                if pred_scales and len(pred_scales) == len(opt_scales):
+                    pred_vs_optimal = []
+                    for i in range(len(pred_scales)):
+                        pred_vs_optimal.append([
+                            pred_scales[i],
+                            opt_scales[i],
+                            per_frame_scale_errors[i],
+                            pred_shifts[i],
+                            opt_shifts[i],
+                            per_frame_shift_errors[i]
+                        ])
+                    comparison_entry['pred_vs_optimal_scale_and_shift'] = pred_vs_optimal
+
+                    # Scale drift analysis: find top 3 frames with largest changes
                     if len(pred_scales) > 1:
-                        scale_diffs = [abs(pred_scales[i+1] - pred_scales[i]) for i in range(len(pred_scales)-1)]
+                        pred_scale_diffs = [abs(pred_scales[i+1] - pred_scales[i]) for i in range(len(pred_scales)-1)]
+                        opt_scale_diffs = [abs(opt_scales[i+1] - opt_scales[i]) for i in range(len(opt_scales)-1)]
+                        # Get indices of top 3 largest changes, +1 to get the "to" frame number
+                        pred_top3_idx = sorted(range(len(pred_scale_diffs)), key=lambda x: pred_scale_diffs[x], reverse=True)[:3]
+                        opt_top3_idx = sorted(range(len(opt_scale_diffs)), key=lambda x: opt_scale_diffs[x], reverse=True)[:3]
                         comparison_entry['scale_drift'] = {
-                            'mean_frame_change': float(np.mean(scale_diffs)),
-                            'max_frame_change': float(np.max(scale_diffs)),
-                            'total_drift': float(abs(pred_scales[-1] - pred_scales[0]))
+                            'pred_max_frame_change': [i + 1 for i in pred_top3_idx],
+                            'optimal_max_frame_change': [i + 1 for i in opt_top3_idx]
                         }
 
-                if pred_shifts:
-                    comparison_entry['per_frame_tsp_shifts'] = pred_shifts
-                    comparison_entry['per_frame_optimal_shifts'] = opt_shifts
-                    comparison_entry['per_frame_shift_errors'] = per_frame_shift_errors
-                    # Shift drift analysis
+                    # Shift drift analysis: find top 3 frames with largest changes
                     if len(pred_shifts) > 1:
-                        shift_diffs = [abs(pred_shifts[i+1] - pred_shifts[i]) for i in range(len(pred_shifts)-1)]
+                        pred_shift_diffs = [abs(pred_shifts[i+1] - pred_shifts[i]) for i in range(len(pred_shifts)-1)]
+                        opt_shift_diffs = [abs(opt_shifts[i+1] - opt_shifts[i]) for i in range(len(opt_shifts)-1)]
+                        pred_top3_idx = sorted(range(len(pred_shift_diffs)), key=lambda x: pred_shift_diffs[x], reverse=True)[:3]
+                        opt_top3_idx = sorted(range(len(opt_shift_diffs)), key=lambda x: opt_shift_diffs[x], reverse=True)[:3]
                         comparison_entry['shift_drift'] = {
-                            'mean_frame_change': float(np.mean(shift_diffs)),
-                            'max_frame_change': float(np.max(shift_diffs)),
-                            'total_drift': float(abs(pred_shifts[-1] - pred_shifts[0]))
+                            'pred_max_frame_change': [i + 1 for i in pred_top3_idx],
+                            'optimal_max_frame_change': [i + 1 for i in opt_top3_idx]
                         }
 
                 scale_shift_comparison.append(comparison_entry)
@@ -1404,6 +1416,7 @@ class Gear5Tester:
 
         # Storage for predictions (keep on GPU during FPS measurement to avoid .cpu() overhead)
         pred_depths_gpu = []
+        relative_depths_gpu = []  # Store relative depth for optimal scale/shift computation
         importance_maps_gpu = []
         scales_gpu = []
         shifts_gpu = []
@@ -1625,6 +1638,14 @@ class Gear5Tester:
                 # Convert to metric depth (already in actual space after de-canonicalization)
                 pred_depth_metric = 100.0 / (pred_depth_inverse_100[0] + 1e-8)  # [1, H, W] in actual meters
 
+                # Interpolate relative_depth to GT resolution for optimal scale/shift computation
+                if relative_depth.shape[-2:] != gt_t_shape:
+                    relative_depth_resized = F.interpolate(
+                        relative_depth, size=gt_t_shape, mode="bilinear", align_corners=True
+                    )
+                else:
+                    relative_depth_resized = relative_depth
+
                 # Upsample importance_map to image resolution for smooth visualization
                 h_full, w_full = img_t.shape[1:]  # Image resolution
                 importance_map_resized = F.interpolate(
@@ -1641,6 +1662,7 @@ class Gear5Tester:
             if start_time is None or t >= T - 1:
                 # FPS measurement ended or not started - move to CPU immediately
                 pred_depths_gpu.append(pred_depth_metric.cpu())
+                relative_depths_gpu.append(relative_depth_resized[0].cpu())  # [1, H, W] - for optimal scale/shift
                 importance_maps_gpu.append(importance_map_resized[0].cpu())
                 scales_gpu.append(scale[0].cpu())
                 shifts_gpu.append(shift[0].cpu())
@@ -1648,6 +1670,7 @@ class Gear5Tester:
             else:
                 # FPS measurement in progress - keep on GPU
                 pred_depths_gpu.append(pred_depth_metric)
+                relative_depths_gpu.append(relative_depth_resized[0])  # [1, H, W] - for optimal scale/shift
                 importance_maps_gpu.append(importance_map_resized[0])
                 scales_gpu.append(scale[0])
                 shifts_gpu.append(shift[0])
@@ -1657,7 +1680,7 @@ class Gear5Tester:
             # Critical for long sequences (e.g., urbansyn 1000 frames)
             del encoder_features, cls_tokens_list, cls_tokens_averaged, cls_tokens
             del attention_weights_list, dpt_features, path_1, path_1_temporal
-            del relative_depth, gear5_outputs, scale, shift
+            del gear5_outputs, scale, shift, relative_depth, relative_depth_resized
             del importance_map, importance_map_resized, pred_depth_inverse_100, pred_depth_metric
 
         # Calculate FPS (like original FlashDepth: exclude warmup frames)
@@ -1673,13 +1696,14 @@ class Gear5Tester:
 
         # Stack predictions (mix of CPU and GPU tensors - move remaining GPU tensors to CPU)
         pred_depths = torch.stack([p.cpu() if p.is_cuda else p for p in pred_depths_gpu], dim=0)  # [T, 1, H, W] in meters
+        relative_depths = torch.stack([r.cpu() if r.is_cuda else r for r in relative_depths_gpu], dim=0)  # [T, 1, H, W] relative
         importance_maps = torch.stack([im.cpu() if im.is_cuda else im for im in importance_maps_gpu], dim=0)  # [T, 1, H, W]
         scales = torch.stack([s.cpu() if s.is_cuda else s for s in scales_gpu], dim=0)  # [T, 1]
         shifts = torch.stack([s.cpu() if s.is_cuda else s for s in shifts_gpu], dim=0)  # [T, 1]
         canonical_pred_valid_all = [cpv.cpu() if cpv.is_cuda else cpv for cpv in canonical_pred_valid_gpu]  # Mixed CPU/GPU
 
         # Clear memory
-        del pred_depths_gpu, importance_maps_gpu, scales_gpu, shifts_gpu, canonical_pred_valid_gpu
+        del pred_depths_gpu, relative_depths_gpu, importance_maps_gpu, scales_gpu, shifts_gpu, canonical_pred_valid_gpu
         torch.cuda.empty_cache()
 
         # Convert GT to metric depth for visualization
@@ -1877,29 +1901,34 @@ class Gear5Tester:
         metrics['_per_frame_scales'] = [float(s.item()) for s in scales[:, 0]]
         metrics['_per_frame_shifts'] = [float(s.item()) for s in shifts[:, 0]]
 
-        # Compute per-frame optimal scale/shift that minimizes AbsRel (least squares in depth space)
-        # This serves as the "oracle" reference for comparing with TSP predictions
+        # Compute per-frame optimal scale/shift using least squares (minimizes L2 error in inverse depth space)
+        # Uses relative depth (not pred_metric) to find oracle scale/shift
+        # Formula: gt_inverse = opt_scale * relative_depth + opt_shift
         MAX_DEPTH = 70.0
+        MIN_INVERSE = 100.0 / MAX_DEPTH  # Minimum valid inverse depth (corresponds to MAX_DEPTH)
         per_frame_optimal_scales = []
         per_frame_optimal_shifts = []
 
-        for t in range(pred_depths_cpu.shape[0]):
-            pred_frame = pred_depths_cpu[t, 0]
-            gt_frame = gt_depth_metric_cpu[t, 0]
-            valid_mask = (gt_frame > 0) & (gt_frame < MAX_DEPTH) & (pred_frame > 0) & (pred_frame < MAX_DEPTH)
+        for t in range(relative_depths.shape[0]):
+            relative_frame = relative_depths[t, 0]  # [H, W] relative inverse depth
+            gt_frame = gt_depth_metric_cpu[t, 0]  # [H, W] metric depth
+            gt_inverse = 100.0 / (gt_frame + 1e-8)  # Convert GT to inverse depth (100/m)
+
+            # Valid mask: GT in valid range, relative depth positive
+            valid_mask = (gt_frame > 0) & (gt_frame < MAX_DEPTH) & (relative_frame > 0)
 
             if valid_mask.sum() > 100:  # Need sufficient pixels for stable estimation
-                pred_valid = pred_frame[valid_mask]
-                gt_valid = gt_frame[valid_mask]
-                # Least squares: gt = scale * pred + shift
-                A = torch.stack([pred_valid, torch.ones_like(pred_valid)], dim=1)
+                relative_valid = relative_frame[valid_mask]
+                gt_inverse_valid = gt_inverse[valid_mask]
+                # Least squares: gt_inverse = scale * relative + shift
+                A = torch.stack([relative_valid, torch.ones_like(relative_valid)], dim=1)
                 try:
-                    solution = torch.linalg.lstsq(A, gt_valid, rcond=None).solution
+                    solution = torch.linalg.lstsq(A, gt_inverse_valid, rcond=None).solution
                     opt_scale = float(solution[0].item())
                     opt_shift = float(solution[1].item())
                 except:
                     # Fallback: median scaling
-                    opt_scale = float(torch.median(gt_valid / (pred_valid + 1e-8)).item())
+                    opt_scale = float(torch.median(gt_inverse_valid / (relative_valid + 1e-8)).item())
                     opt_shift = 0.0
             else:
                 opt_scale = 1.0
