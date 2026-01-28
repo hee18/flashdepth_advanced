@@ -1091,13 +1091,13 @@ class Gear5Tester:
                 opt_scales = result.get('_per_frame_optimal_scales', [])
                 opt_shifts = result.get('_per_frame_optimal_shifts', [])
 
-                # Compute per-frame errors (pred vs per-frame optimal) in AbsRel form
-                # scale_error = |pred - opt| / |opt|, shift_error = |pred - opt| / (|opt| + eps)
-                per_frame_scale_errors = []
-                per_frame_shift_errors = []
+                # Compute per-frame differences (pred vs per-frame optimal)
+                # scale_ratio = pred / opt, shift_diff = pred - opt
+                per_frame_scale_ratios = []
+                per_frame_shift_diffs = []
                 if len(pred_scales) == len(opt_scales) and len(pred_scales) > 0:
-                    per_frame_scale_errors = [abs(p - o) / (abs(o) + 1e-8) for p, o in zip(pred_scales, opt_scales)]
-                    per_frame_shift_errors = [abs(p - o) / (abs(o) + 1e-8) for p, o in zip(pred_shifts, opt_shifts)]
+                    per_frame_scale_ratios = [p / (o + 1e-8) for p, o in zip(pred_scales, opt_scales)]
+                    per_frame_shift_diffs = [p - o for p, o in zip(pred_shifts, opt_shifts)]
 
                 comparison_entry = {
                     'sequence_id': seq_id,
@@ -1116,25 +1116,27 @@ class Gear5Tester:
                     'optimal_shift_mean': result.get('optimal_shift', 0.0),
                     'optimal_shift_min': float(np.min(opt_shifts)) if opt_shifts else 0.0,
                     'optimal_shift_max': float(np.max(opt_shifts)) if opt_shifts else 0.0,
-                    # Per-frame error statistics
-                    'scale_error_mean': float(np.mean(per_frame_scale_errors)) if per_frame_scale_errors else 0.0,
-                    'scale_error_max': float(np.max(per_frame_scale_errors)) if per_frame_scale_errors else 0.0,
-                    'shift_error_mean': float(np.mean(per_frame_shift_errors)) if per_frame_shift_errors else 0.0,
-                    'shift_error_max': float(np.max(per_frame_shift_errors)) if per_frame_shift_errors else 0.0,
+                    # Per-frame difference statistics (pred/opt for scale, pred-opt for shift)
+                    'scale_ratio_mean': float(np.mean(per_frame_scale_ratios)) if per_frame_scale_ratios else 1.0,
+                    'scale_ratio_min': float(np.min(per_frame_scale_ratios)) if per_frame_scale_ratios else 1.0,
+                    'scale_ratio_max': float(np.max(per_frame_scale_ratios)) if per_frame_scale_ratios else 1.0,
+                    'shift_diff_mean': float(np.mean(per_frame_shift_diffs)) if per_frame_shift_diffs else 0.0,
+                    'shift_diff_min': float(np.min(per_frame_shift_diffs)) if per_frame_shift_diffs else 0.0,
+                    'shift_diff_max': float(np.max(per_frame_shift_diffs)) if per_frame_shift_diffs else 0.0,
                 }
 
                 # Add per-frame details as unified list
-                # Format: [pred_scale, opt_scale, scale_error, pred_shift, opt_shift, shift_error]
+                # Format: [pred_scale, opt_scale, scale_ratio(pred/opt), pred_shift, opt_shift, shift_diff(pred-opt)]
                 if pred_scales and len(pred_scales) == len(opt_scales):
                     pred_vs_optimal = []
                     for i in range(len(pred_scales)):
                         pred_vs_optimal.append([
                             pred_scales[i],
                             opt_scales[i],
-                            per_frame_scale_errors[i],
+                            per_frame_scale_ratios[i],
                             pred_shifts[i],
                             opt_shifts[i],
-                            per_frame_shift_errors[i]
+                            per_frame_shift_diffs[i]
                         ])
                     comparison_entry['pred_vs_optimal_scale_and_shift'] = pred_vs_optimal
 
@@ -2376,7 +2378,11 @@ class Gear5Tester:
                     opt_s = opt_scales[t]
                     opt_sh = opt_shifts[t] if t < len(opt_shifts) else 0.0
 
-                    info_text = f'TSP: scale={tsp_s:.3f}, shift={tsp_sh:.3f}  |  Optimal: scale={opt_s:.3f}, shift={opt_sh:.3f}'
+                    # Compute differences: scale ratio (pred/opt), shift difference (pred-opt)
+                    scale_ratio = tsp_s / (opt_s + 1e-8)
+                    shift_diff = tsp_sh - opt_sh
+
+                    info_text = f'Pred: scale={tsp_s:.3f}, shift={tsp_sh:.3f}  |  Optimal: scale={opt_s:.3f}, shift={opt_sh:.3f}  |  Δ: scale={scale_ratio:.3f}x, shift={shift_diff:+.3f}'
                     fig.text(0.5, 0.02, info_text, ha='center', va='bottom', fontsize=9,
                              bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8))
 
