@@ -97,6 +97,7 @@ show_usage() {
     echo "  --frame N            Export frame N ±4 frames (9 total) as individual images/depth maps (e.g., --seq 6 --frame 459)"
     echo "  --section START,END  Frame section for infer_avante (e.g., --section 450,480 for frames 450-480)"
     echo "  --no-inverse          Apply scale/shift in depth space instead of inverse depth space"
+    echo "  --no-shift            Disable shift (scale-only mode): shift is always 0, only scale is learned/evaluated"
     echo "  --max-depth METERS   Max valid depth threshold for infer_avante (default: 70.0)"
     echo ""
     echo "Note: Regularization losses are deprecated. Importance map now uses raw DINOv2 attention (frozen)."
@@ -193,6 +194,7 @@ TGM_WEIGHT="0.3"  # TGM loss weight for Bankai mode
 USE_LOG_SPACE="true"  # Use log space for depth/TGM loss (--no-log-space to disable)
 DDP_GPUS="0,1"  # GPU IDs for DDP training (e.g., "0,1" or "1,2")
 NO_INVERSE="false"  # Apply scale/shift in depth space instead of inverse depth (--no-inverse)
+NO_SHIFT="false"  # Disable shift, scale-only mode (--no-shift)
 
 # Parse arguments
 USER_BATCH_SIZE=""  # Track if user explicitly set batch size
@@ -365,6 +367,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --no-inverse)
             NO_INVERSE="true"
+            shift
+            ;;
+        --no-shift)
+            NO_SHIFT="true"
             shift
             ;;
         --ddp-gpus)
@@ -1176,6 +1182,7 @@ case $COMMAND in
         echo "  - CLS layers: $CLS_LAYERS"
         echo "  - TSP mode: $TSP_MODE"
         echo "  - No-inverse: $NO_INVERSE"
+        echo "  - No-shift: $NO_SHIFT"
         echo ""
 
         # Build train_gear5 command with config variant
@@ -1193,6 +1200,7 @@ case $COMMAND in
             loss_type=$LOSS_TYPE \
             cls_layers='[$CLS_LAYERS]' \
             +no_inverse=$NO_INVERSE \
+            +no_shift=$NO_SHIFT \
             +results_dir=$RESULTS_DIR"
 
         # Add gear_checkpoint if specified (required for Phase 2 hybrid)
@@ -1251,6 +1259,7 @@ case $COMMAND in
         echo "  - CLS layers: $CLS_LAYERS"
         echo "  - TSP mode: $TSP_MODE"
         echo "  - No-inverse: $NO_INVERSE"
+        echo "  - No-shift: $NO_SHIFT"
         echo ""
 
         DOCKER_CMD="CUDA_VISIBLE_DEVICES=0,1 docker compose run --rm \
@@ -1279,6 +1288,7 @@ case $COMMAND in
             loss_type=$LOSS_TYPE \
             cls_layers='[$CLS_LAYERS]' \
             +no_inverse=$NO_INVERSE \
+            +no_shift=$NO_SHIFT \
             +results_dir=$RESULTS_DIR"
 
         # Add gear_checkpoint if specified (required for Phase 2 hybrid)
@@ -1368,6 +1378,7 @@ case $COMMAND in
         echo "  - CLS layers: $CLS_LAYERS"
         echo "  - TSP mode: $TSP_MODE"
         echo "  - No-inverse: $NO_INVERSE"
+        echo "  - No-shift: $NO_SHIFT"
         if [ "$OBJWISE_FLAG" == "true" ]; then
             echo "  - Object-wise evaluation: ENABLED"
         fi
@@ -1390,6 +1401,7 @@ case $COMMAND in
             model.tsp_mode=$TSP_MODE \
             training.workers=$WORKERS \
             +no_inverse=$NO_INVERSE \
+            +no_shift=$NO_SHIFT \
             +results_dir=$RESULTS_DIR \
             +gpu=$GPU_ID \
             +vid_len=$VID_LEN \
@@ -1460,6 +1472,7 @@ case $COMMAND in
         echo "  - TGM weight: $TGM_WEIGHT"
         echo "  - Log space: $USE_LOG_SPACE"
         echo "  - No-inverse: $NO_INVERSE"
+        echo "  - No-shift: $NO_SHIFT"
         echo "  - CLS layers: $CLS_LAYERS"
         echo "  - Batch size: $BATCH_SIZE"
         echo "  - Workers: $WORKERS"
@@ -1482,6 +1495,7 @@ case $COMMAND in
             tgm_weight=$TGM_WEIGHT \
             +use_log_space=$USE_LOG_SPACE \
             +no_inverse=$NO_INVERSE \
+            +no_shift=$NO_SHIFT \
             use_canonical_space=$USE_CANONICAL \
             cls_layers='[$CLS_LAYERS]' \
             +results_dir=$RESULTS_DIR"
@@ -1522,6 +1536,7 @@ case $COMMAND in
         echo "  - TGM weight: $TGM_WEIGHT"
         echo "  - Log space: $USE_LOG_SPACE"
         echo "  - No-inverse: $NO_INVERSE"
+        echo "  - No-shift: $NO_SHIFT"
         echo "  - CLS layers: $CLS_LAYERS"
         echo "  - Resolution: $RES_NAME"
         echo "  - Batch size per GPU: $BATCH_SIZE"
@@ -1558,6 +1573,7 @@ case $COMMAND in
             tgm_weight=$TGM_WEIGHT \
             +use_log_space=$USE_LOG_SPACE \
             +no_inverse=$NO_INVERSE \
+            +no_shift=$NO_SHIFT \
             use_canonical_space=$USE_CANONICAL \
             cls_layers='[$CLS_LAYERS]' \
             +results_dir=$RESULTS_DIR"
@@ -1588,6 +1604,7 @@ case $COMMAND in
         echo "  - Resolution: $RESOLUTION"
         echo "  - Visualization: $VISUALIZATION"
         echo "  - No-inverse: $NO_INVERSE"
+        echo "  - No-shift: $NO_SHIFT"
         if [ -n "$OBJWISE_DATASET" ]; then
             echo "  - Dataset: $OBJWISE_DATASET"
         else
@@ -1608,6 +1625,7 @@ case $COMMAND in
             bankai_phase=$BANKAI_PHASE \
             +bankai_auto_step=$BANKAI_AUTO_STEP \
             +no_inverse=$NO_INVERSE \
+            +no_shift=$NO_SHIFT \
             +results_dir=$RESULTS_DIR \
             +gpu=$GPU_ID \
             +vid_len=$VID_LEN \

@@ -145,8 +145,11 @@ class Gear5Trainer:
 
         # No-inverse mode: apply scale/shift in depth space instead of inverse depth space
         self.no_inverse = config.get('no_inverse', False)
+        # No-shift mode: only learn scale, shift is always 0
+        self.no_shift = config.get('no_shift', False)
         if rank == 0:
             logging.info(f"  No-inverse (depth-space scale/shift): {self.no_inverse}")
+            logging.info(f"  No-shift (scale only): {self.no_shift}")
 
         # Setup device
         self.device = f"cuda:{local_rank}"
@@ -1432,6 +1435,10 @@ class Gear5Trainer:
                     # Reshape to [B, T, 1, H, W]
                     pred_relative_inverse = pred_relative_inverse.view(B_orig, T_orig, 1, H, W)
 
+            # No-shift mode: zero out shift so only scale is used
+            if self.no_shift:
+                shift = torch.zeros_like(shift)
+
             # Apply scale and shift to convert relative depth to metric depth
             if self.no_inverse:
                 # Depth-space scale/shift: rel_inv → 100/rel_inv → scale*rel_depth + shift
@@ -1750,6 +1757,10 @@ class Gear5Trainer:
                     scale = gear5_outputs['scale']  # [B, T]
                     shift = gear5_outputs['shift']  # [B, T]
                     importance_map = gear5_outputs['importance_map']  # [B, T, patch_h, patch_w]
+
+                # No-shift mode: zero out shift so only scale is used
+                if self.no_shift:
+                    shift = torch.zeros_like(shift)
 
                 if self.no_inverse:
                     # Depth-space scale/shift: rel_inv → 100/rel_inv → scale*rel_depth + shift

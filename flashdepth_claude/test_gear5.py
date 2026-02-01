@@ -126,7 +126,9 @@ class Gear5Tester:
 
         # No-inverse mode: apply scale/shift in depth space instead of inverse depth space
         self.no_inverse = config.get('no_inverse', False)
+        self.no_shift = config.get('no_shift', False)
         logger.info(f"  No-inverse (depth-space scale/shift): {self.no_inverse}")
+        logger.info(f"  No-shift (scale only): {self.no_shift}")
 
         logger.info(f"Testing Phase {self.phase}")
 
@@ -1048,8 +1050,10 @@ class Gear5Tester:
 
             # Reorder per-sequence results
             metric_order = ['abs_rel', 'a1', 'a2', 'a3', 'fps', 'tae', 'tae_reproj', 'tae_reproj_gt', 'mae', 'rmse',
-                            'tsp_scale_mean', 'tsp_shift_mean', 'tsp_scale_std', 'tsp_shift_std',
-                            'tsp_scale_max', 'tsp_scale_min', 'tsp_shift_max', 'tsp_shift_min']
+                            'pred_scale_mean', 'pred_shift_mean',
+                            'pred_scale_max', 'pred_scale_min', 'pred_shift_max', 'pred_shift_min',
+                            'optimal_scale_mean', 'optimal_shift_mean',
+                            'optimal_scale_max', 'optimal_scale_min', 'optimal_shift_max', 'optimal_shift_min']
             reordered_metrics = []
             for result in all_metrics:
                 reordered = {}
@@ -1060,9 +1064,10 @@ class Gear5Tester:
                 for key in metric_order:
                     if key in result:
                         reordered[key] = result[key]
-                # Add any remaining keys (exclude _per_frame data and nested dicts)
+                # Add any remaining keys (exclude _per_frame data, nested dicts, and std which goes to scale_shift_comparison)
+                exclude_keys = {'pred_scale_std', 'pred_shift_std'}
                 for key, value in result.items():
-                    if key not in reordered and not key.startswith('_per_frame') and not isinstance(value, dict):
+                    if key not in reordered and not key.startswith('_per_frame') and not isinstance(value, dict) and key not in exclude_keys:
                         reordered[key] = value
                 reordered_metrics.append(reordered)
 
@@ -1139,18 +1144,20 @@ class Gear5Tester:
                 comparison_entry = {
                     'sequence_id': seq_id,
                     'abs_rel': result.get('abs_rel', 0.0),
-                    # Predicted scale/shift statistics
-                    'pred_scale_mean': result.get('tsp_scale_mean', 1.0),
+                    # Predicted scale/shift statistics (including std moved from per_sequence_results)
+                    'pred_scale_mean': result.get('pred_scale_mean', 1.0),
+                    'pred_scale_std': result.get('pred_scale_std', 0.0),
                     'pred_scale_min': float(np.min(pred_scales)) if pred_scales else 1.0,
                     'pred_scale_max': float(np.max(pred_scales)) if pred_scales else 1.0,
-                    'pred_shift_mean': result.get('tsp_shift_mean', 0.0),
+                    'pred_shift_mean': result.get('pred_shift_mean', 0.0),
+                    'pred_shift_std': result.get('pred_shift_std', 0.0),
                     'pred_shift_min': float(np.min(pred_shifts)) if pred_shifts else 0.0,
                     'pred_shift_max': float(np.max(pred_shifts)) if pred_shifts else 0.0,
                     # Optimal scale/shift statistics
-                    'optimal_scale_mean': result.get('optimal_scale', 1.0),  # mean of per-frame optimal
+                    'optimal_scale_mean': result.get('optimal_scale_mean', 1.0),
                     'optimal_scale_min': float(np.min(opt_scales)) if opt_scales else 1.0,
                     'optimal_scale_max': float(np.max(opt_scales)) if opt_scales else 1.0,
-                    'optimal_shift_mean': result.get('optimal_shift', 0.0),
+                    'optimal_shift_mean': result.get('optimal_shift_mean', 0.0),
                     'optimal_shift_min': float(np.min(opt_shifts)) if opt_shifts else 0.0,
                     'optimal_shift_max': float(np.max(opt_shifts)) if opt_shifts else 0.0,
                     # Per-frame difference statistics (pred/opt for scale, pred-opt for shift)
@@ -1672,6 +1679,10 @@ class Gear5Tester:
                     shift = gear5_outputs['shift']  # [1, 1]
                     importance_map = gear5_outputs['importance_map']  # [1, 1, patch_h, patch_w]
 
+                # No-shift mode: zero out shift so only scale is used
+                if self.no_shift:
+                    shift = torch.zeros_like(shift)
+
                 # Apply scale/shift to relative depth → final metric depth
                 if self.no_inverse:
                     # Depth-space scale/shift: rel_inv → 100/rel_inv → scale*rel_depth + shift
@@ -1990,15 +2001,15 @@ class Gear5Tester:
         # Add FPS to metrics
         metrics['fps'] = fps
 
-        # Add TSP scale/shift statistics to metrics
-        metrics['tsp_scale_mean'] = float(scales.mean().item())
-        metrics['tsp_shift_mean'] = float(shifts.mean().item())
-        metrics['tsp_scale_std'] = float(scales.std().item())
-        metrics['tsp_shift_std'] = float(shifts.std().item())
-        metrics['tsp_scale_max'] = float(scales.max().item())
-        metrics['tsp_scale_min'] = float(scales.min().item())
-        metrics['tsp_shift_max'] = float(shifts.max().item())
-        metrics['tsp_shift_min'] = float(shifts.min().item())
+        # Add predicted scale/shift statistics to metrics
+        metrics['pred_scale_mean'] = float(scales.mean().item())
+        metrics['pred_shift_mean'] = float(shifts.mean().item())
+        metrics['pred_scale_std'] = float(scales.std().item())
+        metrics['pred_shift_std'] = float(shifts.std().item())
+        metrics['pred_scale_max'] = float(scales.max().item())
+        metrics['pred_scale_min'] = float(scales.min().item())
+        metrics['pred_shift_max'] = float(shifts.max().item())
+        metrics['pred_shift_min'] = float(shifts.min().item())
 
         # Store per-frame scale/shift for JSON export
         metrics['_per_frame_scales'] = [float(s.item()) for s in scales[:, 0]]
@@ -2019,15 +2030,20 @@ class Gear5Tester:
                 if valid_mask.sum() > 100:
                     rel_valid = rel_depth_frame[valid_mask]
                     gt_valid = gt_frame[valid_mask]
-                    # Least squares: gt_depth = scale * rel_depth + shift
-                    A = torch.stack([rel_valid, torch.ones_like(rel_valid)], dim=1)
-                    try:
-                        solution = torch.linalg.lstsq(A, gt_valid, rcond=None).solution
-                        opt_scale = float(solution[0].item())
-                        opt_shift = float(solution[1].item())
-                    except:
-                        opt_scale = float(torch.median(gt_valid / (rel_valid + 1e-8)).item())
+                    if self.no_shift:
+                        # Scale-only LSE: gt = scale * rel → scale = (rel^T @ gt) / (rel^T @ rel)
+                        opt_scale = float((rel_valid * gt_valid).sum() / (rel_valid * rel_valid).sum())
                         opt_shift = 0.0
+                    else:
+                        # Least squares: gt_depth = scale * rel_depth + shift
+                        A = torch.stack([rel_valid, torch.ones_like(rel_valid)], dim=1)
+                        try:
+                            solution = torch.linalg.lstsq(A, gt_valid, rcond=None).solution
+                            opt_scale = float(solution[0].item())
+                            opt_shift = float(solution[1].item())
+                        except:
+                            opt_scale = float(torch.median(gt_valid / (rel_valid + 1e-8)).item())
+                            opt_shift = 0.0
                 else:
                     opt_scale = 1.0
                     opt_shift = 0.0
@@ -2048,16 +2064,21 @@ class Gear5Tester:
                 if valid_mask.sum() > 100:  # Need sufficient pixels for stable estimation
                     relative_valid = relative_frame[valid_mask]
                     gt_inverse_valid = gt_inverse[valid_mask]
-                    # Least squares: gt_inverse = scale * relative + shift
-                    A = torch.stack([relative_valid, torch.ones_like(relative_valid)], dim=1)
-                    try:
-                        solution = torch.linalg.lstsq(A, gt_inverse_valid, rcond=None).solution
-                        opt_scale = float(solution[0].item())
-                        opt_shift = float(solution[1].item())
-                    except:
-                        # Fallback: median scaling
-                        opt_scale = float(torch.median(gt_inverse_valid / (relative_valid + 1e-8)).item())
+                    if self.no_shift:
+                        # Scale-only LSE: gt_inv = scale * rel_inv → scale = (rel^T @ gt) / (rel^T @ rel)
+                        opt_scale = float((relative_valid * gt_inverse_valid).sum() / (relative_valid * relative_valid).sum())
                         opt_shift = 0.0
+                    else:
+                        # Least squares: gt_inverse = scale * relative + shift
+                        A = torch.stack([relative_valid, torch.ones_like(relative_valid)], dim=1)
+                        try:
+                            solution = torch.linalg.lstsq(A, gt_inverse_valid, rcond=None).solution
+                            opt_scale = float(solution[0].item())
+                            opt_shift = float(solution[1].item())
+                        except:
+                            # Fallback: median scaling
+                            opt_scale = float(torch.median(gt_inverse_valid / (relative_valid + 1e-8)).item())
+                            opt_shift = 0.0
                 else:
                     opt_scale = 1.0
                     opt_shift = 0.0
@@ -2068,9 +2089,13 @@ class Gear5Tester:
         # Store per-frame optimal values
         metrics['_per_frame_optimal_scales'] = per_frame_optimal_scales
         metrics['_per_frame_optimal_shifts'] = per_frame_optimal_shifts
-        # Sequence-level summary (mean of per-frame optmals)
-        metrics['optimal_scale'] = float(np.mean(per_frame_optimal_scales))
-        metrics['optimal_shift'] = float(np.mean(per_frame_optimal_shifts))
+        # Sequence-level summary (mean/max/min of per-frame optimals)
+        metrics['optimal_scale_mean'] = float(np.mean(per_frame_optimal_scales))
+        metrics['optimal_shift_mean'] = float(np.mean(per_frame_optimal_shifts))
+        metrics['optimal_scale_max'] = float(np.max(per_frame_optimal_scales))
+        metrics['optimal_scale_min'] = float(np.min(per_frame_optimal_scales))
+        metrics['optimal_shift_max'] = float(np.max(per_frame_optimal_shifts))
+        metrics['optimal_shift_min'] = float(np.min(per_frame_optimal_shifts))
 
         # Object-wise evaluation: compute per-class metrics for all frames
         # Initialize variables
@@ -2467,8 +2492,8 @@ class Gear5Tester:
         heatmap_dir.mkdir(parents=True, exist_ok=True)
 
         # Get per-frame scale/shift data if available
-        tsp_scales = metrics.get('_per_frame_scales', []) if metrics else []
-        tsp_shifts = metrics.get('_per_frame_shifts', []) if metrics else []
+        pred_scales = metrics.get('_per_frame_scales', []) if metrics else []
+        pred_shifts = metrics.get('_per_frame_shifts', []) if metrics else []
         opt_scales = metrics.get('_per_frame_optimal_scales', []) if metrics else []
         opt_shifts = metrics.get('_per_frame_optimal_shifts', []) if metrics else []
 
@@ -2503,17 +2528,17 @@ class Gear5Tester:
                 ax.axis('off')
 
                 # Add scale/shift info at the bottom
-                if t < len(tsp_scales) and t < len(opt_scales):
-                    tsp_s = tsp_scales[t]
-                    tsp_sh = tsp_shifts[t] if t < len(tsp_shifts) else 0.0
+                if t < len(pred_scales) and t < len(opt_scales):
+                    pred_s = pred_scales[t]
+                    pred_sh = pred_shifts[t] if t < len(pred_shifts) else 0.0
                     opt_s = opt_scales[t]
                     opt_sh = opt_shifts[t] if t < len(opt_shifts) else 0.0
 
                     # Compute differences: scale ratio (pred/opt), shift difference (pred-opt)
-                    scale_ratio = tsp_s / (opt_s + 1e-8)
-                    shift_diff = tsp_sh - opt_sh
+                    scale_ratio = pred_s / (opt_s + 1e-8)
+                    shift_diff = pred_sh - opt_sh
 
-                    info_text = f'Pred: scale={tsp_s:.3f}, shift={tsp_sh:.3f}  |  Optimal: scale={opt_s:.3f}, shift={opt_sh:.3f}  |  Δ: scale={scale_ratio:.3f}x, shift={shift_diff:+.3f}'
+                    info_text = f'Pred: scale={pred_s:.3f}, shift={pred_sh:.3f}  |  Optimal: scale={opt_s:.3f}, shift={opt_sh:.3f}  |  Δ: scale={scale_ratio:.3f}x, shift={shift_diff:+.3f}'
                     fig.text(0.5, 0.02, info_text, ha='center', va='bottom', fontsize=9,
                              bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8))
 
@@ -3207,9 +3232,10 @@ class Gear5Tester:
                 if all(isinstance(v, (int, float, np.number)) for v in values):
                     aggregated_raw[key] = np.mean(values)
 
-        # Reorder metrics: abs_rel, a1, a2, a3, fps, tae, tae_reproj, mae, rmse, then TSP stats
+        # Reorder metrics: abs_rel, a1, a2, a3, fps, tae, tae_reproj, mae, rmse, then pred/optimal stats
         metric_order = ['abs_rel', 'a1', 'a2', 'a3', 'fps', 'tae', 'tae_reproj', 'tae_reproj_gt', 'mae', 'rmse',
-                        'tsp_scale_mean', 'tsp_shift_mean', 'tsp_scale_std', 'tsp_shift_std']
+                        'pred_scale_mean', 'pred_shift_mean',
+                        'optimal_scale_mean', 'optimal_shift_mean']
         aggregated = {}
         for key in metric_order:
             if key in aggregated_raw:
