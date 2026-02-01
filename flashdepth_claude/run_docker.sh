@@ -96,6 +96,7 @@ show_usage() {
     echo "  --best-figure        Export best_frame ±4 frames (9 total) as individual images/depth maps"
     echo "  --frame N            Export frame N ±4 frames (9 total) as individual images/depth maps (e.g., --seq 6 --frame 459)"
     echo "  --section START,END  Frame section for infer_avante (e.g., --section 450,480 for frames 450-480)"
+    echo "  --no-inverse          Apply scale/shift in depth space instead of inverse depth space"
     echo "  --max-depth METERS   Max valid depth threshold for infer_avante (default: 70.0)"
     echo ""
     echo "Note: Regularization losses are deprecated. Importance map now uses raw DINOv2 attention (frozen)."
@@ -191,6 +192,7 @@ BANKAI_AUTO_STEP="5000"  # Step at which to transition from Phase 1 to Phase 2 i
 TGM_WEIGHT="0.3"  # TGM loss weight for Bankai mode
 USE_LOG_SPACE="true"  # Use log space for depth/TGM loss (--no-log-space to disable)
 DDP_GPUS="0,1"  # GPU IDs for DDP training (e.g., "0,1" or "1,2")
+NO_INVERSE="false"  # Apply scale/shift in depth space instead of inverse depth (--no-inverse)
 
 # Parse arguments
 USER_BATCH_SIZE=""  # Track if user explicitly set batch size
@@ -359,6 +361,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --no-log-space)
             USE_LOG_SPACE="false"
+            shift
+            ;;
+        --no-inverse)
+            NO_INVERSE="true"
             shift
             ;;
         --ddp-gpus)
@@ -1169,6 +1175,7 @@ case $COMMAND in
         echo "  - Temporal backend: $([ "$MAMBA" = "true" ] && echo "Mamba2" || echo "GRU")"
         echo "  - CLS layers: $CLS_LAYERS"
         echo "  - TSP mode: $TSP_MODE"
+        echo "  - No-inverse: $NO_INVERSE"
         echo ""
 
         # Build train_gear5 command with config variant
@@ -1185,6 +1192,7 @@ case $COMMAND in
             use_canonical_space=$USE_CANONICAL \
             loss_type=$LOSS_TYPE \
             cls_layers='[$CLS_LAYERS]' \
+            +no_inverse=$NO_INVERSE \
             +results_dir=$RESULTS_DIR"
 
         # Add gear_checkpoint if specified (required for Phase 2 hybrid)
@@ -1242,6 +1250,7 @@ case $COMMAND in
         echo "  - Temporal backend: $([ "$MAMBA" = "true" ] && echo "Mamba2" || echo "GRU")"
         echo "  - CLS layers: $CLS_LAYERS"
         echo "  - TSP mode: $TSP_MODE"
+        echo "  - No-inverse: $NO_INVERSE"
         echo ""
 
         DOCKER_CMD="CUDA_VISIBLE_DEVICES=0,1 docker compose run --rm \
@@ -1269,6 +1278,7 @@ case $COMMAND in
             use_canonical_space=$USE_CANONICAL \
             loss_type=$LOSS_TYPE \
             cls_layers='[$CLS_LAYERS]' \
+            +no_inverse=$NO_INVERSE \
             +results_dir=$RESULTS_DIR"
 
         # Add gear_checkpoint if specified (required for Phase 2 hybrid)
@@ -1357,6 +1367,7 @@ case $COMMAND in
         echo "  - Temporal backend: $([ "$MAMBA" = "true" ] && echo "Mamba2" || echo "GRU")"
         echo "  - CLS layers: $CLS_LAYERS"
         echo "  - TSP mode: $TSP_MODE"
+        echo "  - No-inverse: $NO_INVERSE"
         if [ "$OBJWISE_FLAG" == "true" ]; then
             echo "  - Object-wise evaluation: ENABLED"
         fi
@@ -1378,6 +1389,7 @@ case $COMMAND in
             model.use_mamba_temporal=$MAMBA \
             model.tsp_mode=$TSP_MODE \
             training.workers=$WORKERS \
+            +no_inverse=$NO_INVERSE \
             +results_dir=$RESULTS_DIR \
             +gpu=$GPU_ID \
             +vid_len=$VID_LEN \
@@ -1447,6 +1459,7 @@ case $COMMAND in
         echo "  - Bankai phase: $BANKAI_PHASE (auto step: $BANKAI_AUTO_STEP)"
         echo "  - TGM weight: $TGM_WEIGHT"
         echo "  - Log space: $USE_LOG_SPACE"
+        echo "  - No-inverse: $NO_INVERSE"
         echo "  - CLS layers: $CLS_LAYERS"
         echo "  - Batch size: $BATCH_SIZE"
         echo "  - Workers: $WORKERS"
@@ -1468,6 +1481,7 @@ case $COMMAND in
             +bankai_auto_step=$BANKAI_AUTO_STEP \
             tgm_weight=$TGM_WEIGHT \
             +use_log_space=$USE_LOG_SPACE \
+            +no_inverse=$NO_INVERSE \
             use_canonical_space=$USE_CANONICAL \
             cls_layers='[$CLS_LAYERS]' \
             +results_dir=$RESULTS_DIR"
@@ -1507,6 +1521,7 @@ case $COMMAND in
         echo "  - Bankai phase: $BANKAI_PHASE (auto step: $BANKAI_AUTO_STEP)"
         echo "  - TGM weight: $TGM_WEIGHT"
         echo "  - Log space: $USE_LOG_SPACE"
+        echo "  - No-inverse: $NO_INVERSE"
         echo "  - CLS layers: $CLS_LAYERS"
         echo "  - Resolution: $RES_NAME"
         echo "  - Batch size per GPU: $BATCH_SIZE"
@@ -1542,6 +1557,7 @@ case $COMMAND in
             +bankai_auto_step=$BANKAI_AUTO_STEP \
             tgm_weight=$TGM_WEIGHT \
             +use_log_space=$USE_LOG_SPACE \
+            +no_inverse=$NO_INVERSE \
             use_canonical_space=$USE_CANONICAL \
             cls_layers='[$CLS_LAYERS]' \
             +results_dir=$RESULTS_DIR"
@@ -1571,6 +1587,7 @@ case $COMMAND in
         echo "  - Config variant: $CONFIG_VARIANT"
         echo "  - Resolution: $RESOLUTION"
         echo "  - Visualization: $VISUALIZATION"
+        echo "  - No-inverse: $NO_INVERSE"
         if [ -n "$OBJWISE_DATASET" ]; then
             echo "  - Dataset: $OBJWISE_DATASET"
         else
@@ -1590,6 +1607,7 @@ case $COMMAND in
             use_bankai=true \
             bankai_phase=$BANKAI_PHASE \
             +bankai_auto_step=$BANKAI_AUTO_STEP \
+            +no_inverse=$NO_INVERSE \
             +results_dir=$RESULTS_DIR \
             +gpu=$GPU_ID \
             +vid_len=$VID_LEN \

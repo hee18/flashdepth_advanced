@@ -124,6 +124,10 @@ class Gear5Tester:
                 logger.info(f"=== BANKAI MODE ===")
                 logger.info(f"  Bankai Phase: {self.bankai_phase}")
 
+        # No-inverse mode: apply scale/shift in depth space instead of inverse depth space
+        self.no_inverse = config.get('no_inverse', False)
+        logger.info(f"  No-inverse (depth-space scale/shift): {self.no_inverse}")
+
         logger.info(f"Testing Phase {self.phase}")
 
         # Object-wise evaluation configuration
@@ -1669,34 +1673,75 @@ class Gear5Tester:
                     importance_map = gear5_outputs['importance_map']  # [1, 1, patch_h, patch_w]
 
                 # Apply scale/shift to relative depth → final metric depth
-                scale_expanded = scale.view(1, 1, 1, 1)  # [1, 1, 1, 1]
-                shift_expanded = shift.view(1, 1, 1, 1)  # [1, 1, 1, 1]
-                pred_depth_inverse_100 = scale_expanded * relative_depth + shift_expanded  # [1, 1, H, W]
+                if self.no_inverse:
+                    # Depth-space scale/shift: rel_inv → 100/rel_inv → scale*rel_depth + shift
+                    EPS = 1e-6
+                    rel_depth = 100.0 / relative_depth.clamp(min=EPS)  # [1, 1, H, W] — 100 factor preserved
 
-                # End timing for FPS measurement (depth estimation complete)
-                if t == T - 1 and start_time is not None:
-                    torch.cuda.synchronize()
-                    import time
-                    end_time = time.time()
+                    # Shift clamping: prevent negative final depth
+                    min_rel_depth = rel_depth.amin()
+                    shift_lower_bound = -scale.abs() * min_rel_depth
+                    shift_clamped = torch.clamp(shift, min=shift_lower_bound)
 
-                # Save canonical pred mask (before de-canonicalization!)
-                MIN_INVERSE_CANONICAL = 100.0 / 70.0
-                canonical_pred_valid_t = (pred_depth_inverse_100 > MIN_INVERSE_CANONICAL)  # [1, 1, H, W]
+                    scale_expanded = scale.view(1, 1, 1, 1)
+                    shift_expanded = shift_clamped.view(1, 1, 1, 1)
+                    pred_depth_canonical = scale_expanded * rel_depth + shift_expanded  # [1, 1, H, W] depth space
 
-                # De-canonicalization: convert from canonical space to actual space (inverse depth)
-                # pred_inverse_actual = pred_inverse_canonical * (CANONICAL_FX / fx_actual)
-                # Use per-frame fx_actual for correct de-canonicalization
-                pred_depth_inverse_100 = pred_depth_inverse_100 * de_canonical_ratio_inverse[0, t]  # [1, 1, H, W] in actual space
+                    # End timing for FPS measurement (depth estimation complete)
+                    if t == T - 1 and start_time is not None:
+                        torch.cuda.synchronize()
+                        import time
+                        end_time = time.time()
 
-                # Interpolate prediction to GT resolution (like train_gear5.py validation)
-                gt_t_shape = gt_t_inverse.shape[-2:]  # GT original resolution
-                if pred_depth_inverse_100.shape[-2:] != gt_t_shape:
-                    pred_depth_inverse_100 = F.interpolate(
-                        pred_depth_inverse_100, size=gt_t_shape, mode="bilinear", align_corners=True
-                    )
+                    # Valid mask: 0 < depth < 70m (canonical space)
+                    canonical_pred_valid_t = (pred_depth_canonical > 0) & (pred_depth_canonical < 70.0)  # [1, 1, H, W]
 
-                # Convert to metric depth (already in actual space after de-canonicalization)
-                pred_depth_metric = 100.0 / (pred_depth_inverse_100[0] + 1e-8)  # [1, H, W] in actual meters
+                    # De-canonicalization: depth space → metric depth
+                    # In depth space, de-canonicalization uses metric ratio (inverse of inverse ratio)
+                    pred_depth_canonical = pred_depth_canonical * de_canonical_ratio_metric[0, t]
+
+                    # Interpolate prediction to GT resolution
+                    gt_t_shape = gt_t_inverse.shape[-2:]
+                    if pred_depth_canonical.shape[-2:] != gt_t_shape:
+                        pred_depth_canonical = F.interpolate(
+                            pred_depth_canonical, size=gt_t_shape, mode="bilinear", align_corners=True
+                        )
+
+                    pred_depth_metric = pred_depth_canonical[0]  # [1, H, W] in actual meters
+                else:
+                    scale_expanded = scale.view(1, 1, 1, 1)  # [1, 1, 1, 1]
+                    shift_expanded = shift.view(1, 1, 1, 1)  # [1, 1, 1, 1]
+
+                    # Shift clamping (unified with train): prevent negative inverse depth
+                    GLOBAL_MIN_INVERSE = 100.0 / 300.0
+                    shift_lower_bound = -scale.abs() * GLOBAL_MIN_INVERSE
+                    shift_clamped = torch.clamp(shift, min=shift_lower_bound)
+                    shift_expanded = shift_clamped.view(1, 1, 1, 1)
+
+                    pred_depth_inverse_100 = scale_expanded * relative_depth + shift_expanded  # [1, 1, H, W]
+
+                    # End timing for FPS measurement (depth estimation complete)
+                    if t == T - 1 and start_time is not None:
+                        torch.cuda.synchronize()
+                        import time
+                        end_time = time.time()
+
+                    # Save canonical pred mask (before de-canonicalization!)
+                    MIN_INVERSE_CANONICAL = 100.0 / 70.0
+                    canonical_pred_valid_t = (pred_depth_inverse_100 > MIN_INVERSE_CANONICAL)  # [1, 1, H, W]
+
+                    # De-canonicalization: convert from canonical space to actual space (inverse depth)
+                    pred_depth_inverse_100 = pred_depth_inverse_100 * de_canonical_ratio_inverse[0, t]  # [1, 1, H, W] in actual space
+
+                    # Interpolate prediction to GT resolution (like train_gear5.py validation)
+                    gt_t_shape = gt_t_inverse.shape[-2:]  # GT original resolution
+                    if pred_depth_inverse_100.shape[-2:] != gt_t_shape:
+                        pred_depth_inverse_100 = F.interpolate(
+                            pred_depth_inverse_100, size=gt_t_shape, mode="bilinear", align_corners=True
+                        )
+
+                    # Convert to metric depth (already in actual space after de-canonicalization)
+                    pred_depth_metric = 100.0 / (pred_depth_inverse_100[0] + 1e-8)  # [1, H, W] in actual meters
 
                 # Interpolate relative_depth to GT resolution for optimal scale/shift computation
                 if relative_depth.shape[-2:] != gt_t_shape:
@@ -1736,7 +1781,10 @@ class Gear5Tester:
             del encoder_features, cls_tokens_list, cls_tokens_averaged, cls_tokens
             del attention_weights_list, dpt_features, path_1, path_1_temporal
             del gear5_outputs, scale, shift, relative_depth, relative_depth_resized
-            del importance_map, importance_map_resized, pred_depth_inverse_100, pred_depth_metric
+            if self.no_inverse:
+                del rel_depth, importance_map, importance_map_resized, pred_depth_canonical, pred_depth_metric
+            else:
+                del importance_map, importance_map_resized, pred_depth_inverse_100, pred_depth_metric
 
         # Calculate FPS (like original FlashDepth: exclude warmup frames)
         if start_time is not None:
@@ -1956,41 +2004,66 @@ class Gear5Tester:
         metrics['_per_frame_scales'] = [float(s.item()) for s in scales[:, 0]]
         metrics['_per_frame_shifts'] = [float(s.item()) for s in shifts[:, 0]]
 
-        # Compute per-frame optimal scale/shift using least squares (minimizes L2 error in inverse depth space)
-        # Uses relative depth (not pred_metric) to find oracle scale/shift
-        # Formula: gt_inverse = opt_scale * relative_depth + opt_shift
+        # Compute per-frame optimal scale/shift using least squares
         MAX_DEPTH = 70.0
-        MIN_INVERSE = 100.0 / MAX_DEPTH  # Minimum valid inverse depth (corresponds to MAX_DEPTH)
         per_frame_optimal_scales = []
         per_frame_optimal_shifts = []
 
-        for t in range(relative_depths.shape[0]):
-            relative_frame = relative_depths[t, 0]  # [H, W] relative inverse depth
-            gt_frame = gt_depth_metric_cpu[t, 0]  # [H, W] metric depth
-            gt_inverse = 100.0 / (gt_frame + 1e-8)  # Convert GT to inverse depth (100/m)
+        if self.no_inverse:
+            # Depth-space: fit gt_depth = scale * rel_depth + shift
+            for t in range(relative_depths.shape[0]):
+                rel_depth_frame = 100.0 / (relative_depths[t, 0].clamp(min=1e-6))  # [H, W] — 100 factor preserved
+                gt_frame = gt_depth_metric_cpu[t, 0]  # [H, W] metric depth (meters)
+                valid_mask = (gt_frame > 0) & (gt_frame < MAX_DEPTH) & (rel_depth_frame > 0)
 
-            # Valid mask: GT in valid range, relative depth positive
-            valid_mask = (gt_frame > 0) & (gt_frame < MAX_DEPTH) & (relative_frame > 0)
-
-            if valid_mask.sum() > 100:  # Need sufficient pixels for stable estimation
-                relative_valid = relative_frame[valid_mask]
-                gt_inverse_valid = gt_inverse[valid_mask]
-                # Least squares: gt_inverse = scale * relative + shift
-                A = torch.stack([relative_valid, torch.ones_like(relative_valid)], dim=1)
-                try:
-                    solution = torch.linalg.lstsq(A, gt_inverse_valid, rcond=None).solution
-                    opt_scale = float(solution[0].item())
-                    opt_shift = float(solution[1].item())
-                except:
-                    # Fallback: median scaling
-                    opt_scale = float(torch.median(gt_inverse_valid / (relative_valid + 1e-8)).item())
+                if valid_mask.sum() > 100:
+                    rel_valid = rel_depth_frame[valid_mask]
+                    gt_valid = gt_frame[valid_mask]
+                    # Least squares: gt_depth = scale * rel_depth + shift
+                    A = torch.stack([rel_valid, torch.ones_like(rel_valid)], dim=1)
+                    try:
+                        solution = torch.linalg.lstsq(A, gt_valid, rcond=None).solution
+                        opt_scale = float(solution[0].item())
+                        opt_shift = float(solution[1].item())
+                    except:
+                        opt_scale = float(torch.median(gt_valid / (rel_valid + 1e-8)).item())
+                        opt_shift = 0.0
+                else:
+                    opt_scale = 1.0
                     opt_shift = 0.0
-            else:
-                opt_scale = 1.0
-                opt_shift = 0.0
 
-            per_frame_optimal_scales.append(opt_scale)
-            per_frame_optimal_shifts.append(opt_shift)
+                per_frame_optimal_scales.append(opt_scale)
+                per_frame_optimal_shifts.append(opt_shift)
+        else:
+            # Inverse depth space: fit gt_inverse = scale * relative_inv + shift
+            MIN_INVERSE = 100.0 / MAX_DEPTH  # Minimum valid inverse depth (corresponds to MAX_DEPTH)
+            for t in range(relative_depths.shape[0]):
+                relative_frame = relative_depths[t, 0]  # [H, W] relative inverse depth
+                gt_frame = gt_depth_metric_cpu[t, 0]  # [H, W] metric depth
+                gt_inverse = 100.0 / (gt_frame + 1e-8)  # Convert GT to inverse depth (100/m)
+
+                # Valid mask: GT in valid range, relative depth positive
+                valid_mask = (gt_frame > 0) & (gt_frame < MAX_DEPTH) & (relative_frame > 0)
+
+                if valid_mask.sum() > 100:  # Need sufficient pixels for stable estimation
+                    relative_valid = relative_frame[valid_mask]
+                    gt_inverse_valid = gt_inverse[valid_mask]
+                    # Least squares: gt_inverse = scale * relative + shift
+                    A = torch.stack([relative_valid, torch.ones_like(relative_valid)], dim=1)
+                    try:
+                        solution = torch.linalg.lstsq(A, gt_inverse_valid, rcond=None).solution
+                        opt_scale = float(solution[0].item())
+                        opt_shift = float(solution[1].item())
+                    except:
+                        # Fallback: median scaling
+                        opt_scale = float(torch.median(gt_inverse_valid / (relative_valid + 1e-8)).item())
+                        opt_shift = 0.0
+                else:
+                    opt_scale = 1.0
+                    opt_shift = 0.0
+
+                per_frame_optimal_scales.append(opt_scale)
+                per_frame_optimal_shifts.append(opt_shift)
 
         # Store per-frame optimal values
         metrics['_per_frame_optimal_scales'] = per_frame_optimal_scales

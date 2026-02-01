@@ -143,6 +143,11 @@ class Gear5Trainer:
             self.bankai_auto_transition_step = None
             self.use_log_space = config.get('use_log_space', True)
 
+        # No-inverse mode: apply scale/shift in depth space instead of inverse depth space
+        self.no_inverse = config.get('no_inverse', False)
+        if rank == 0:
+            logging.info(f"  No-inverse (depth-space scale/shift): {self.no_inverse}")
+
         # Setup device
         self.device = f"cuda:{local_rank}"
         torch.cuda.set_device(local_rank)
@@ -1428,34 +1433,58 @@ class Gear5Trainer:
                     pred_relative_inverse = pred_relative_inverse.view(B_orig, T_orig, 1, H, W)
 
             # Apply scale and shift to convert relative depth to metric depth
-            # D_metric_inverse = scale * D_relative_inverse + shift
+            if self.no_inverse:
+                # Depth-space scale/shift: rel_inv → 100/rel_inv → scale*rel_depth + shift
+                EPS = 1e-6
+                pred_relative_depth = 100.0 / pred_relative_inverse.clamp(min=EPS)  # [B, T, 1, H, W]
 
-            # Apply shift lower bound constraint (same as validation)
-            # This prevents metric depth from becoming negative
-            GLOBAL_MIN_INVERSE = 100.0 / 300.0  # 0.333 (300m max depth assumption)
-            shift_lower_bound = -scale.abs() * GLOBAL_MIN_INVERSE  # [B, T]
-            shift_clamped = torch.clamp(shift, min=shift_lower_bound)  # [B, T]
+                # Shift lower bound: ensure final depth stays non-negative
+                # min(rel_depth) per batch element, dynamically computed
+                min_rel_depth = pred_relative_depth.detach().view(B_orig, T_orig, -1).amin(dim=-1)  # [B, T]
+                shift_lower_bound = -scale.abs() * min_rel_depth  # [B, T]
+                shift_clamped = torch.clamp(shift, min=shift_lower_bound)  # [B, T]
 
-            # Reshape scale and shift to match pred dimensions: [B, T] -> [B, T, 1, 1, 1]
-            scale_expanded = scale.view(B_orig, T_orig, 1, 1, 1)  # [B, T, 1, 1, 1]
-            shift_expanded = shift_clamped.view(B_orig, T_orig, 1, 1, 1)  # [B, T, 1, 1, 1]
+                scale_expanded = scale.view(B_orig, T_orig, 1, 1, 1)
+                shift_expanded = shift_clamped.view(B_orig, T_orig, 1, 1, 1)
+                pred_metric_depth = scale_expanded * pred_relative_depth + shift_expanded  # [B, T, 1, H, W]
+            else:
+                # Inverse depth space: D_metric_inverse = scale * D_relative_inverse + shift
+                # Apply shift lower bound constraint (same as validation)
+                # This prevents metric depth from becoming negative
+                GLOBAL_MIN_INVERSE = 100.0 / 300.0  # 0.333 (300m max depth assumption)
+                shift_lower_bound = -scale.abs() * GLOBAL_MIN_INVERSE  # [B, T]
+                shift_clamped = torch.clamp(shift, min=shift_lower_bound)  # [B, T]
 
-            # Apply transformation (this is where gradients flow to scale/shift!)
-            pred_metric_inverse = scale_expanded * pred_relative_inverse + shift_expanded  # [B, T, 1, H, W]
+                # Reshape scale and shift to match pred dimensions: [B, T] -> [B, T, 1, 1, 1]
+                scale_expanded = scale.view(B_orig, T_orig, 1, 1, 1)  # [B, T, 1, 1, 1]
+                shift_expanded = shift_clamped.view(B_orig, T_orig, 1, 1, 1)  # [B, T, 1, 1, 1]
+
+                # Apply transformation (this is where gradients flow to scale/shift!)
+                pred_metric_inverse = scale_expanded * pred_relative_inverse + shift_expanded  # [B, T, 1, H, W]
 
         # Compute loss (outside autocast for numerical stability and gradient flow)
         with torch.amp.autocast('cuda', enabled=False):
-            # Training valid mask: GT > 0 + actual valid masks (no 70m threshold in training, like Gear2)
-            # Test uses 70m threshold in test_gear5.py for canonical space evaluation
-            gt_valid = (gt_depth_inverse_100 > 0)
+            if self.no_inverse:
+                # Depth-space loss: compare pred_metric_depth vs GT in meters
+                # GT: gt_depth from dataloader is 1/meters → convert to meters
+                EPS = 1e-6
+                gt_depth_meters = 1.0 / gt_depth.clamp(min=EPS)  # [B, T, 1, H, W] in meters
+                gt_valid = (gt_depth > 0) & actual_valid_masks.unsqueeze(2)
 
-            # Combine with actual valid masks from dataloader
-            # actual_valid_masks: [B, T, H, W], need to add channel dim to match gt_depth: [B, T, 1, H, W]
-            gt_valid = gt_valid & actual_valid_masks.unsqueeze(2)
+                pred_depth_flat = pred_metric_depth.float().flatten()
+                gt_depth_flat = gt_depth_meters.float().flatten()
+            else:
+                # Training valid mask: GT > 0 + actual valid masks (no 70m threshold in training, like Gear2)
+                # Test uses 70m threshold in test_gear5.py for canonical space evaluation
+                gt_valid = (gt_depth_inverse_100 > 0)
 
-            # Flatten for loss computation
-            pred_depth_flat = pred_metric_inverse.float().flatten()
-            gt_depth_flat = gt_depth_inverse_100.float().flatten()
+                # Combine with actual valid masks from dataloader
+                # actual_valid_masks: [B, T, H, W], need to add channel dim to match gt_depth: [B, T, 1, H, W]
+                gt_valid = gt_valid & actual_valid_masks.unsqueeze(2)
+
+                # Flatten for loss computation
+                pred_depth_flat = pred_metric_inverse.float().flatten()
+                gt_depth_flat = gt_depth_inverse_100.float().flatten()
             valid_mask = gt_valid.flatten()
 
             # Check if we have valid pixels (avoid division by zero)
@@ -1503,9 +1532,14 @@ class Gear5Trainer:
             tgm_loss_value = 0.0
             if self.use_bankai and self.tgm_weight > 0 and T_orig >= 2:
                 # Reshape for TGM loss: need [B, T, H, W] format
-                pred_for_tgm = pred_metric_inverse.squeeze(2).float()  # [B, T, H, W]
-                gt_for_tgm = gt_depth_inverse_100.squeeze(2).float()  # [B, T, H, W]
-                valid_for_tgm = gt_valid.squeeze(2)  # [B, T, H, W]
+                if self.no_inverse:
+                    pred_for_tgm = pred_metric_depth.squeeze(2).float()  # [B, T, H, W] depth space (meters)
+                    gt_for_tgm = gt_depth_meters.squeeze(2).float()     # [B, T, H, W] meters
+                    valid_for_tgm = (gt_depth.squeeze(2) > 0)           # [B, T, H, W]
+                else:
+                    pred_for_tgm = pred_metric_inverse.squeeze(2).float()  # [B, T, H, W]
+                    gt_for_tgm = gt_depth_inverse_100.squeeze(2).float()  # [B, T, H, W]
+                    valid_for_tgm = gt_valid.squeeze(2)  # [B, T, H, W]
 
                 # Compute TGM loss
                 tgm_loss = TGMTemporalLoss(use_log_space=self.use_log_space)(pred_for_tgm, gt_for_tgm, valid_for_tgm)
@@ -1717,25 +1751,49 @@ class Gear5Trainer:
                     shift = gear5_outputs['shift']  # [B, T]
                     importance_map = gear5_outputs['importance_map']  # [B, T, patch_h, patch_w]
 
-                # Apply shift lower bound constraint (Option 1)
-                GLOBAL_MIN_INVERSE = 100.0 / 300.0  # 0.333 (300m max depth assumption)
-                shift_lower_bound = -scale.abs() * GLOBAL_MIN_INVERSE  # [B, T]
-                shift_clamped = torch.clamp(shift, min=shift_lower_bound)  # [B, T]
+                if self.no_inverse:
+                    # Depth-space scale/shift: rel_inv → 100/rel_inv → scale*rel_depth + shift
+                    EPS = 1e-6
+                    pred_relative_depth_flat = 100.0 / relative_depth.clamp(min=EPS)  # [B*T, 1, H, W]
 
-                # Apply scale/shift to relative depth with clamped shift
-                scale_flat = scale.view(B_orig * T_orig, 1, 1, 1)  # [B*T, 1, 1, 1]
-                shift_flat = shift_clamped.view(B_orig * T_orig, 1, 1, 1)  # [B*T, 1, 1, 1]
-                pred_depth_inverse_100 = scale_flat * relative_depth + shift_flat  # [B*T, 1, H, W] in 100/m
+                    # Shift lower bound: ensure final depth stays non-negative
+                    min_rel_depth = pred_relative_depth_flat.detach().view(B_orig * T_orig, -1).amin(dim=-1)  # [B*T]
+                    scale_bt = scale.view(B_orig * T_orig)
+                    shift_bt = shift.view(B_orig * T_orig)
+                    shift_lower_bound = -scale_bt.abs() * min_rel_depth
+                    shift_clamped_bt = torch.clamp(shift_bt, min=shift_lower_bound)
 
-                pred_depth_inverse = pred_depth_inverse_100  # [B*T, 1, H, W] inverse depth (100/m)
+                    scale_flat = scale_bt.view(B_orig * T_orig, 1, 1, 1)
+                    shift_flat = shift_clamped_bt.view(B_orig * T_orig, 1, 1, 1)
+                    pred_depth_val = scale_flat * pred_relative_depth_flat + shift_flat  # [B*T, 1, H, W] in meters
+
+                    # For loss, use depth space
+                    pred_depth_inverse = pred_depth_val  # reuse variable name for downstream code
+                else:
+                    # Apply shift lower bound constraint (Option 1)
+                    GLOBAL_MIN_INVERSE = 100.0 / 300.0  # 0.333 (300m max depth assumption)
+                    shift_lower_bound = -scale.abs() * GLOBAL_MIN_INVERSE  # [B, T]
+                    shift_clamped = torch.clamp(shift, min=shift_lower_bound)  # [B, T]
+
+                    # Apply scale/shift to relative depth with clamped shift
+                    scale_flat = scale.view(B_orig * T_orig, 1, 1, 1)  # [B*T, 1, 1, 1]
+                    shift_flat = shift_clamped.view(B_orig * T_orig, 1, 1, 1)  # [B*T, 1, 1, 1]
+                    pred_depth_inverse_100 = scale_flat * relative_depth + shift_flat  # [B*T, 1, H, W] in 100/m
+
+                    pred_depth_inverse = pred_depth_inverse_100  # [B*T, 1, H, W] inverse depth (100/m)
 
                 # Reshape GT from (B, T, 1, H, W) to (B*T, 1, H, W)
-                gt_depth_inverse_flat = rearrange(gt_depth_inverse_100, 'b t 1 h w -> (b t) 1 h w')
+                if self.no_inverse:
+                    EPS_val = 1e-6
+                    gt_depth_meters_val = 1.0 / gt_depth.clamp(min=EPS_val)  # [B, T, 1, H, W] in meters
+                    gt_depth_inverse_flat = rearrange(gt_depth_meters_val, 'b t 1 h w -> (b t) 1 h w')
+                else:
+                    gt_depth_inverse_flat = rearrange(gt_depth_inverse_100, 'b t 1 h w -> (b t) 1 h w')
 
                 # DEBUG: Check prediction range at step 0
                 if self.global_step == 0 and batch_idx == 0 and self.rank == 0:
                     self.logger.info(f"DEBUG VALIDATION - Pred before interpolate: min={pred_depth_inverse.min():.4f}, max={pred_depth_inverse.max():.4f}, mean={pred_depth_inverse.mean():.4f}")
-                    self.logger.info(f"DEBUG VALIDATION - GT inverse_100: min={gt_depth_inverse_flat.min():.4f}, max={gt_depth_inverse_flat.max():.4f}")
+                    self.logger.info(f"DEBUG VALIDATION - GT: min={gt_depth_inverse_flat.min():.4f}, max={gt_depth_inverse_flat.max():.4f}")
 
                 # Interpolate prediction to GT resolution (like original FlashDepth validation)
                 gt_shape = gt_depth_inverse_flat.shape[-2:]
