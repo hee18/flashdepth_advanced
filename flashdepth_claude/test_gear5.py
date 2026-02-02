@@ -2519,13 +2519,17 @@ class Gear5Tester:
                 # Compute mean AbsRel for this frame
                 abs_rel = np.mean(error[valid])
 
+                # Compute δ1 for this frame
+                thresh = np.maximum(gt[valid] / (pred[valid] + 1e-8), pred[valid] / (gt[valid] + 1e-8))
+                delta_1 = np.mean(thresh < 1.25)
+
                 # Create figure with extra space at bottom for text
                 fig, ax = plt.subplots(figsize=(8, 6.8))
                 cmap = plt.cm.hot.copy()
                 cmap.set_bad(color='black')
                 im = ax.imshow(error_display, cmap=cmap, vmin=0, vmax=1)
                 plt.colorbar(im, ax=ax, label='AbsRel Error')
-                ax.set_title(f'Seq {sequence_id} Frame {t} | AbsRel: {abs_rel:.3f}')
+                ax.set_title(f'Seq {sequence_id} Frame {t} | AbsRel: {abs_rel:.3f} | \u03b41: {delta_1:.3f}')
                 ax.axis('off')
 
                 # Add scale/shift info at the bottom
