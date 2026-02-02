@@ -1929,8 +1929,9 @@ class Gear5Tester:
             for t in range(pred_depths_cpu.shape[0]):
                 pred_frame = pred_depths_cpu[t, 0]
                 gt_frame = gt_depth_metric_cpu[t, 0]
-                # Range mask
-                range_mask = (gt_frame >= depth_min) & (gt_frame < depth_max) & (gt_frame > 0)
+                # Range mask (filter both GT and pred, consistent with overall metrics)
+                MAX_DEPTH = 70.0
+                range_mask = (gt_frame >= depth_min) & (gt_frame < depth_max) & (gt_frame > 0) & (pred_frame > 0) & (pred_frame < MAX_DEPTH)
                 if range_mask.sum() > 0:
                     pred_valid = pred_frame[range_mask]
                     gt_valid = gt_frame[range_mask]
