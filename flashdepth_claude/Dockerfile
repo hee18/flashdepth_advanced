@@ -62,11 +62,15 @@ RUN python -m pip install --no-build-isolation .
 # Go back to app directory
 WORKDIR /app
 
+# Clone Sea-RAFT for Onepiece training (optical flow estimation)
+RUN git clone https://github.com/princeton-vl/SEA-RAFT.git /app/third_party/SEA-RAFT || true
+RUN pip install easydict || true
+
 # Copy the entire project
 COPY . /app/
 
 # Create directories for data mounting and results
-RUN mkdir -p /data/datasets /app/train_results
+RUN mkdir -p /data/datasets /app/train_results /app/third_party/SEA-RAFT/models
 
 # Set environment variables
 ENV PYTHONPATH=/app:$PYTHONPATH

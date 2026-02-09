@@ -20,6 +20,7 @@ from utils.helpers import *
 
 from utils.eval_metrics.metrics import compute_depth_metrics
 from .heads import GlobalScalePredictor, MetricDepthLoss
+from .onepiece_modules import UnifiedGlobalMamba, OnepieceMetricHead, SceneCutDetector
 
 
 
@@ -102,6 +103,41 @@ class FlashDepth(nn.Module):
         if self.use_metric_head:
             self.gsp_head = GlobalScalePredictor(input_dim=self.pretrained.embed_dim)
             logging.info("Global Scale Predictor initialized for metric depth estimation")
+
+        # Onepiece: Unified Global Mamba + OnepieceMetricHead + SceneCutDetector
+        self.use_onepiece = kwargs.get('use_onepiece', False)
+        if self.use_onepiece:
+            onepiece_mamba_layers = kwargs.get('unified_mamba_layers', 2)
+            onepiece_d_state = kwargs.get('unified_mamba_d_state', 64)
+            onepiece_d_conv = kwargs.get('unified_mamba_d_conv', 4)
+
+            # CLS(1024) + GAP(256) = 1280 for ViT-L
+            cls_dim = self.pretrained.embed_dim  # 1024 for ViT-L
+            gap_dim = dpt_dim  # 256 for ViT-L
+            unified_dim = cls_dim + gap_dim  # 1280
+
+            self.unified_global_mamba = UnifiedGlobalMamba(
+                d_input=unified_dim,
+                num_layers=onepiece_mamba_layers,
+                d_state=onepiece_d_state,
+                d_conv=onepiece_d_conv,
+                expand=2,
+                headdim=64,
+                max_batch_size=batch_size
+            )
+            self.onepiece_metric_head = OnepieceMetricHead(
+                input_dim=unified_dim,
+                dpt_dim=gap_dim
+            )
+            self.scene_cut_detector = SceneCutDetector(
+                tau=kwargs.get('scene_cut_tau', 0.05),
+                k=kwargs.get('scene_cut_k', 80)
+            )
+            logging.info(
+                f"Onepiece initialized: unified_dim={unified_dim}, "
+                f"mamba_layers={onepiece_mamba_layers}, "
+                f"d_state={onepiece_d_state}, d_conv={onepiece_d_conv}"
+            )
            
 
 
@@ -386,6 +422,166 @@ class FlashDepth(nn.Module):
         }
 
         return loss, metrics
+
+    def _get_intermediate_layers_with_cls(self, x, layer_indices, cls_layer_indices=None):
+        """
+        Single-pass extraction of both intermediate layer features and the CLS token.
+        Avoids calling the ViT encoder twice (get_intermediate_layers + forward_features).
+
+        Args:
+            x: Input tensor [B*T, C, H, W]
+            layer_indices: List of block indices to extract features from
+            cls_layer_indices: Optional list of 0-indexed indices into the intermediate layers
+                              for multi-layer CLS averaging. If None, uses last layer only.
+
+        Returns:
+            intermediate_features: List of patch token tensors (CLS stripped)
+            cls_token: Normalized CLS token [B*T, embed_dim]
+                       (averaged across selected layers, or last layer if cls_layer_indices is None)
+        """
+        # Use the internal method to get raw outputs (including CLS at position 0)
+        raw_outputs = self.pretrained._get_intermediate_layers_not_chunked(x, layer_indices)
+
+        # Normalize
+        normed_outputs = [self.pretrained.norm(out) for out in raw_outputs]
+
+        # Extract CLS token(s)
+        if cls_layer_indices is not None and len(cls_layer_indices) > 0:
+            selected_cls = [normed_outputs[idx][:, 0] for idx in cls_layer_indices]
+            cls_token = torch.stack(selected_cls, dim=0).mean(dim=0)  # [B*T, embed_dim]
+        else:
+            cls_token = normed_outputs[-1][:, 0]  # [B*T, embed_dim]
+
+        # Strip CLS and register tokens (same as get_intermediate_layers)
+        num_reg = self.pretrained.num_register_tokens  # 0 for DINOv2
+        intermediate_features = [out[:, 1 + num_reg:] for out in normed_outputs]
+
+        return intermediate_features, cls_token
+
+    def forward_with_onepiece(self, batch, phase=1, no_shift=False,
+                              cls_layer_indices=None, **kwargs):
+        """
+        Forward pass with Onepiece metric depth estimation.
+
+        Pipeline:
+            1. (Frozen) DINOv2 → CLS tokens [B*T, 1024] + intermediate features
+            2. (Frozen/Phase2) DPT → dpt_features [B*T, 256, h, w]
+            3. GAP(dpt_features) → [B*T, 256]
+            4. (Trainable) Concat(CLS, GAP) → [B, T, 1280] → UnifiedGlobalMamba → [B, T, 1280]
+            5a. (Trainable) refined_global → MetricHead → scale, shift
+            5b. (Trainable) refined_global → FiLM → gamma, beta → modulate dpt_features
+            6. (Frozen/Phase2) final_head(modulated_features) → relative_depth
+            7. metric_depth = scale * depth_from_relative(relative_depth) + shift
+
+        Args:
+            batch: (video, gt_depth, ...) or just video tensor
+            phase: 1 or 2 (controls freezing)
+            no_shift: If True, zero out shift (scale-only mode)
+            cls_layer_indices: Optional list of 0-indexed indices into intermediate layers
+                              for multi-layer CLS averaging. If None, uses last layer only.
+            **kwargs: Additional arguments
+
+        Returns:
+            dict with: relative_depth, metric_depth, scale, shift,
+                       dpt_features, cls_tokens, scene_cut_weights, d_cls
+        """
+        if not self.use_onepiece:
+            raise ValueError("Onepiece is not enabled. Set use_onepiece=True.")
+
+        # Handle batch format (Gear5 8-element format)
+        if isinstance(batch, (list, tuple)):
+            video = batch[0]
+        elif isinstance(batch, torch.Tensor):
+            video = batch
+        else:
+            video = batch
+
+        video = video.to(torch.cuda.current_device())
+        B, T, C, H, W = video.shape
+        patch_h, patch_w = H // self.patch_size, W // self.patch_size
+
+        # Reshape: [B, T, C, H, W] → [B*T, C, H, W]
+        video_flat = rearrange(video, 'b t c h w -> (b t) c h w')
+
+        # ===== Step 1: DINOv2 encoder (frozen, single pass) =====
+        with torch.no_grad():
+            encoder_features, cls_tokens_flat = self._get_intermediate_layers_with_cls(
+                video_flat, self.intermediate_layer_idx[self.encoder],
+                cls_layer_indices=cls_layer_indices
+            )
+
+        # ===== Step 2: DPT → dpt_features (no Spatial Mamba) =====
+        if phase == 1:
+            with torch.no_grad():
+                dpt_features = self.depth_head(encoder_features, patch_h, patch_w)
+        else:
+            dpt_features = self.depth_head(encoder_features, patch_h, patch_w)
+
+        dpt_h, dpt_w = dpt_features.shape[2], dpt_features.shape[3]
+
+        # ===== Step 3: GAP =====
+        gap_features = F.adaptive_avg_pool2d(dpt_features, 1).squeeze(-1).squeeze(-1)  # [B*T, 256]
+
+        # ===== Step 4: Unified Global Mamba =====
+        # Concat CLS + GAP → [B*T, 1280]
+        global_tokens = torch.cat([cls_tokens_flat, gap_features], dim=-1)  # [B*T, 1280]
+        global_tokens = rearrange(global_tokens, '(b t) d -> b t d', b=B, t=T)  # [B, T, 1280]
+
+        # Temporal processing through Unified Global Mamba (always trainable)
+        refined_global = self.unified_global_mamba(global_tokens)  # [B, T, 1280]
+        refined_global_flat = rearrange(refined_global, 'b t d -> (b t) d')  # [B*T, 1280]
+
+        # ===== Step 5a: Scale/Shift prediction =====
+        scale, shift, gamma, beta = self.onepiece_metric_head(refined_global_flat)
+        # scale: [B*T, 1], shift: [B*T, 1], gamma: [B*T, 256], beta: [B*T, 256]
+
+        # No-shift mode: zero out shift so only scale is used
+        if no_shift:
+            shift = torch.zeros_like(shift)
+
+        # ===== Step 5b: FiLM modulation on DPT features =====
+        gamma_spatial = gamma.unsqueeze(-1).unsqueeze(-1)  # [B*T, 256, 1, 1]
+        beta_spatial = beta.unsqueeze(-1).unsqueeze(-1)    # [B*T, 256, 1, 1]
+        modulated_features = gamma_spatial * dpt_features + beta_spatial  # [B*T, 256, h, w]
+
+        # ===== Step 6: Final head → relative depth =====
+        if phase == 1:
+            with torch.no_grad():
+                relative_depth = self.final_head(modulated_features, patch_h, patch_w)  # [B*T, H, W]
+        else:
+            relative_depth = self.final_head(modulated_features, patch_h, patch_w)  # [B*T, H, W]
+
+        # ===== Step 7: Metric depth conversion =====
+        # FlashDepth outputs inverse depth * 100, so relative_depth is in 100/m scale
+        # depth_from_relative: 100/m → meters: 100 / relative_depth
+        depth_from_relative = 100.0 / (relative_depth + 1e-8)  # [B*T, H, W] in meters
+
+        # Apply scale and shift
+        scale_spatial = scale.unsqueeze(-1)  # [B*T, 1, 1]
+        shift_spatial = shift.unsqueeze(-1)  # [B*T, 1, 1]
+        metric_depth = scale_spatial * depth_from_relative + shift_spatial  # [B*T, H, W]
+
+        # ===== Scene cut detection =====
+        cls_tokens_seq = rearrange(cls_tokens_flat, '(b t) d -> b t d', b=B, t=T)
+        scene_cut_weights, d_cls = self.scene_cut_detector(cls_tokens_seq)
+
+        # Reshape outputs
+        relative_depth = rearrange(relative_depth, '(b t) h w -> b t h w', b=B, t=T)
+        metric_depth = rearrange(metric_depth, '(b t) h w -> b t h w', b=B, t=T)
+        scale = rearrange(scale, '(b t) 1 -> b t', b=B, t=T)
+        shift = rearrange(shift, '(b t) 1 -> b t', b=B, t=T)
+        dpt_features_seq = rearrange(dpt_features, '(b t) c h w -> b t c h w', b=B, t=T)
+
+        return {
+            'relative_depth': relative_depth,       # [B, T, H, W]
+            'metric_depth': metric_depth,            # [B, T, H, W]
+            'scale': scale,                          # [B, T]
+            'shift': shift,                          # [B, T]
+            'dpt_features': dpt_features_seq,        # [B, T, 256, h, w]
+            'cls_tokens': cls_tokens_seq,            # [B, T, 1024]
+            'scene_cut_weights': scene_cut_weights,  # [B, T-1]
+            'd_cls': d_cls,                          # [B, T-1]
+        }
 
     def final_head(self, x, patch_h, patch_w):
 

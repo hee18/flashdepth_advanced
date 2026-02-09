@@ -1,0 +1,102 @@
+# Onepiece Configuration
+# Unified Global Mamba (1280-dim) for metric depth estimation
+
+# General Settings
+config_dir: null
+inference: false
+load: null
+no_shift: false                  # Scale-only mode (zero out shift)
+
+# Dataset Configuration
+dataset:
+  data_root: null
+  resolution: 'base'        # 518x518
+  video_length: 8            # 8 frames for temporal processing
+  train_datasets: [tartanair]   # Metric GT required
+  val_datasets: [tartanair]
+
+# Training Configuration
+training:
+  batch_size: 3              # Per GPU (video_length=8 x 518x518)
+  workers: 4
+  gradient_checkpointing: true
+  save_freq: 5000
+  val_freq: 1000
+  vis_freq: 250
+  total_iters: 40001
+  iterations: 40001
+  gradient_accumulation: 1
+  wandb: false
+  wandb_name: "onepiece"
+  start_with_val: false
+  weight_decay: 1.0e-6
+  gear3_lr: 1.0e-4           # Base LR for onepiece params
+  lr:
+    onepiece: 1.0e-4          # UnifiedGlobalMamba + OnepieceMetricHead
+    dpt: 1.0e-5               # 1/10 of onepiece (Phase 2)
+    warmup_steps: 500
+
+# Model Configuration
+model:
+  vit_size: "vitl"
+  patch_size: 14
+  attn_class: "MemEffAttention"
+  use_mamba: false             # No Spatial Mamba in Onepiece
+  use_hydra: false
+  use_transformer_rnn: false
+  use_xlstm: false
+  # Onepiece-specific
+  use_onepiece: true
+  unified_mamba_layers: 2
+  unified_mamba_d_state: 64
+  unified_mamba_d_conv: 4
+
+# Hybrid Model Configuration
+hybrid_configs:
+  use_hybrid: false
+  teacher_model_path: null
+  teacher_resolution: 490
+  layers_to_skip: [1,2,3]
+  num_blocks: 4
+  mlp_expand: 2
+  num_heads: 2
+
+# Loss Configuration
+loss:
+  log_l1_weight: 1.0
+  tgm_weight: 1.0
+  feat_cons_weight: 0.01
+  use_log_space: true
+
+# Scene Cut Detection
+scene_cut:
+  tau: 0.05
+  k: 80
+
+# Phase Transition
+phase:
+  auto_transition_step: 5000
+  phase2_warmup_steps: 500
+
+# Evaluation Configuration
+eval:
+  compile: true
+  metrics: false
+  save_grid: false
+  outfolder: "test"
+  test_datasets: [sintel, waymo_seg, eth3d, urbansyn, unreal4k, bonn]
+  test_dataset_resolution: 'base'
+  random_input: null
+  out_video: true
+  out_mp4: true
+  save_res: 518
+  save_depth_npy: true
+  save_vis_map: false
+  dummy_timing: false
+  large_dir: null
+  first_seq_only: false
+
+# Flow Estimation
+flow:
+  model: "sea_raft"            # NO fallback -- fail if Sea-RAFT unavailable
+  checkpoint: "third_party/SEA-RAFT/models/Tartan-C-T-TSKH-spring540x960-M.pth"

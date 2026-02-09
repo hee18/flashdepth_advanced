@@ -426,8 +426,8 @@ class TGMTemporalLoss(nn.Module):
         if pred_mask is not None:
             if pred_mask.ndim == 5:
                 pred_mask = pred_mask.squeeze(2)
-            valid_pred_t1 = pred_mask[:, :-stride]
-            valid_pred_t2 = pred_mask[:, stride:]
+            valid_pred_t1 = pred_mask[:, :-stride].bool()
+            valid_pred_t2 = pred_mask[:, stride:].bool()
             valid = valid & valid_pred_t1 & valid_pred_t2
         
         return valid

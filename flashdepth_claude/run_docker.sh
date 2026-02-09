@@ -50,6 +50,9 @@ show_usage() {
     echo "  train_gear5_film     Start Gear5 FiLM training - Channel-wise FiLM modulation before Mamba"
     echo "  train_gear5_film_ddp Start Gear5 FiLM training with 2 GPUs (GPU 0,1)"
     echo "  test_gear5_film      Start Gear5 FiLM testing"
+    echo "  train_onepiece       Start Onepiece training (Unified Global Mamba, single GPU)"
+    echo "  train_onepiece_ddp   Start Onepiece training with 2 GPUs"
+    echo "  test_onepiece        Start Onepiece testing"
     echo "  infer_avante         Run Gear5 inference on avante_images (custom dataset)"
     echo "  test_gear2_objwise  Start Gear2 object-wise evaluation (Waymo segmentation)"
     echo "  test_gear3_objwise  Start Gear3 object-wise evaluation (Waymo segmentation)"
@@ -200,7 +203,7 @@ NO_SHIFT="false"  # Disable shift, scale-only mode (--no-shift)
 USER_BATCH_SIZE=""  # Track if user explicitly set batch size
 while [[ $# -gt 0 ]]; do
     case $1 in
-        build|train|test|train_gear2|train_gear2_ddp|test_gear2|train_gear3|train_gear3_ddp|test_gear3|train_gear4|train_gear4_ddp|test_gear4|train_gear5|train_gear5_ddp|test_gear5|train_gear5_bankai|train_gear5_bankai_ddp|test_gear5_bankai|train_gear5_film|train_gear5_film_ddp|test_gear5_film|infer_avante|test_gear2_objwise|test_gear3_objwise|test_gear4_objwise|test_gear5_objwise|test_original_flashdepth|shell|clean|logs)
+        build|train|test|train_gear2|train_gear2_ddp|test_gear2|train_gear3|train_gear3_ddp|test_gear3|train_gear4|train_gear4_ddp|test_gear4|train_gear5|train_gear5_ddp|test_gear5|train_gear5_bankai|train_gear5_bankai_ddp|test_gear5_bankai|train_gear5_film|train_gear5_film_ddp|test_gear5_film|train_onepiece|train_onepiece_ddp|test_onepiece|infer_avante|test_gear2_objwise|test_gear3_objwise|test_gear4_objwise|test_gear5_objwise|test_original_flashdepth|shell|clean|logs)
             COMMAND="$1"
             shift
             ;;
@@ -1845,6 +1848,127 @@ case $COMMAND in
     logs)
         echo "Showing container logs..."
         docker compose logs -f flashdepth
+        ;;
+
+    train_onepiece)
+        echo "Starting Onepiece training (Single GPU)..."
+        echo "Configuration:"
+        echo "  - Config variant: $CONFIG_VARIANT (--config-variant, default: l)"
+        echo "  - Config file: configs/onepiece/config_$CONFIG_VARIANT.yaml"
+        echo "  - Batch size: $BATCH_SIZE (--batch-size, default: 3)"
+        echo "  - Workers: $WORKERS (--workers, default: 8)"
+        echo "  - GPU: $GPU_ID (--gpu, default: 0)"
+        echo "  - Total iterations: $TOTAL_ITERS (--epochs, default: 60001)"
+        echo "  - CLS layers: $CLS_LAYERS (--cls-layer, default: 2,4)"
+        echo "  - No-shift: $NO_SHIFT (--no-shift, default: false)"
+        echo "  - WandB: $WANDB (--wandb, default: true)"
+        echo "  - WandB name: ${WANDB_NAME:-auto} (--wandb-name)"
+        echo "  - Checkpoint: ${FLASHDEPTH_CHECKPOINT:-config default} (--flashdepth-checkpoint)"
+        echo "  - Results directory: $RESULTS_DIR (--results-dir)"
+        echo ""
+
+        DOCKER_CMD="CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm -e WANDB_API_KEY=\${WANDB_API_KEY:-} flashdepth python train_onepiece.py \
+            --config-path configs/onepiece \
+            --config-name config_$CONFIG_VARIANT \
+            dataset.data_root=/data/datasets \
+            training.batch_size=$BATCH_SIZE \
+            training.workers=$WORKERS \
+            training.iterations=$TOTAL_ITERS \
+            training.wandb=$WANDB \
+            cls_layers='[$CLS_LAYERS]' \
+            no_shift=$NO_SHIFT \
+            +results_dir=$RESULTS_DIR"
+
+        if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
+            DOCKER_CMD="$DOCKER_CMD load=$FLASHDEPTH_CHECKPOINT"
+        fi
+
+        if [ -n "$WANDB_NAME" ]; then
+            DOCKER_CMD="$DOCKER_CMD training.wandb_name=$WANDB_NAME"
+        fi
+
+        eval $DOCKER_CMD
+        ;;
+
+    train_onepiece_ddp)
+        echo "Starting Onepiece training (Multi-GPU DDP)..."
+        echo "Configuration:"
+        echo "  - Config variant: $CONFIG_VARIANT (--config-variant, default: l)"
+        echo "  - Config file: configs/onepiece/config_$CONFIG_VARIANT.yaml"
+        echo "  - Batch size per GPU: $BATCH_SIZE (--batch-size, default: 3)"
+        echo "  - Effective batch size: $((BATCH_SIZE * 2))"
+        echo "  - Workers: $WORKERS (--workers, default: 8)"
+        echo "  - GPUs: $DDP_GPUS (--ddp-gpus, default: 0,1)"
+        echo "  - Total iterations: $TOTAL_ITERS (--epochs, default: 60001)"
+        echo "  - CLS layers: $CLS_LAYERS (--cls-layer, default: 2,4)"
+        echo "  - No-shift: $NO_SHIFT (--no-shift, default: false)"
+        echo "  - WandB: $WANDB (--wandb, default: true)"
+        echo "  - WandB name: ${WANDB_NAME:-auto} (--wandb-name)"
+        echo "  - Checkpoint: ${FLASHDEPTH_CHECKPOINT:-config default} (--flashdepth-checkpoint)"
+        echo "  - Results directory: $RESULTS_DIR (--results-dir)"
+        echo ""
+
+        DOCKER_CMD="CUDA_VISIBLE_DEVICES=$DDP_GPUS docker compose run --rm \
+            -e GLOO_SOCKET_IFNAME=eth0 \
+            -e NCCL_SOCKET_IFNAME=eth0 \
+            -e NCCL_P2P_DISABLE=1 \
+            -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+            -e WANDB_API_KEY=\${WANDB_API_KEY:-} \
+            flashdepth torchrun \
+            --standalone \
+            --nproc_per_node=2 \
+            train_onepiece.py \
+            --config-path configs/onepiece \
+            --config-name config_$CONFIG_VARIANT \
+            dataset.data_root=/data/datasets \
+            training.batch_size=$BATCH_SIZE \
+            training.workers=$WORKERS \
+            training.iterations=$TOTAL_ITERS \
+            training.wandb=$WANDB \
+            cls_layers='[$CLS_LAYERS]' \
+            no_shift=$NO_SHIFT \
+            +results_dir=$RESULTS_DIR"
+
+        if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
+            DOCKER_CMD="$DOCKER_CMD load=$FLASHDEPTH_CHECKPOINT"
+        fi
+
+        if [ -n "$WANDB_NAME" ]; then
+            DOCKER_CMD="$DOCKER_CMD training.wandb_name=$WANDB_NAME"
+        fi
+
+        eval $DOCKER_CMD
+        ;;
+
+    test_onepiece)
+        echo "Starting Onepiece testing..."
+        echo "Configuration:"
+        echo "  - Config variant: $CONFIG_VARIANT (--config-variant, default: l)"
+        echo "  - Config file: configs/onepiece/config_$CONFIG_VARIANT.yaml"
+        echo "  - GPU: $GPU_ID (--gpu, default: 0)"
+        echo "  - Video length: $VID_LEN (--vid-len, default: 50)"
+        echo "  - Frame interval: $FRAME_INTERVAL (--frame-interval, default: 1)"
+        echo "  - CLS layers: $CLS_LAYERS (--cls-layer, default: 2,4)"
+        echo "  - No-shift: $NO_SHIFT (--no-shift, default: false)"
+        echo "  - Checkpoint: ${GEAR_CHECKPOINT:-config default} (--gear-checkpoint)"
+        echo "  - Results directory: $RESULTS_DIR (--results-dir)"
+        echo ""
+
+        DOCKER_CMD="CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm flashdepth python test_onepiece.py \
+            --config-path configs/onepiece \
+            --config-name config_$CONFIG_VARIANT \
+            dataset.data_root=/data/datasets \
+            dataset.video_length=$VID_LEN \
+            cls_layers='[$CLS_LAYERS]' \
+            no_shift=$NO_SHIFT \
+            +frame_interval=$FRAME_INTERVAL \
+            +results_dir=$RESULTS_DIR"
+
+        if [ -n "$GEAR_CHECKPOINT" ]; then
+            DOCKER_CMD="$DOCKER_CMD load=$GEAR_CHECKPOINT"
+        fi
+
+        eval $DOCKER_CMD
         ;;
 
     "")
