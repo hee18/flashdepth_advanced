@@ -616,11 +616,8 @@ class OnepieceTrainer:
         self.optimizer = self._setup_optimizer()
         self.scheduler = self._setup_scheduler()
 
-        # Update val_vis_config for Phase 2 (fewer samples, match Gear5)
-        self.val_vis_config = {
-            'sintel': {'sequences': [0], 'saved': []},
-            'waymo_seg': {'sequences': [0], 'saved': []}
-        }
+        # Keep same val_vis_config as Phase 1 (visualize all sequences)
+        # Phase 1 config is preserved; no need to reduce to seq0 only
 
         # Set proper train mode
         self._set_train_mode()
@@ -1068,7 +1065,8 @@ class OnepieceTrainer:
 
                 if seq_idx_in_dataset in vis_config['sequences'] and seq_idx_in_dataset not in vis_config['saved']:
                     try:
-                        gt_depth_metric_vis = gt_depth_meters[:1, :1].float().cpu()
+                        # Compute metric depth for vis WITHOUT clamp (preserves -1.0 for non-LiDAR, like Gear5)
+                        gt_depth_metric_vis = (1.0 / (gt_depth.squeeze(2)[:1, :1].float() + 1e-8)).cpu()
                         pred_metric_vis = metric_depth[:1, :1].float().cpu()
 
                         MIN_INVERSE_DEPTH = 100.0 / 70.0
