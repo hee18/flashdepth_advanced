@@ -40,6 +40,8 @@ FRAME=""  # Specific frame to export ±4 frames
 AMP=false
 AMP_DTYPE="bf16"
 LIMIT_SCENES="" # New: Limit NuScenes scenes
+TEST_MODE=""  # Test mode: empty (full), tc (temporal consistency only)
+TC_THRESHOLD=""  # Threshold for rTC metric (default: 1.25)
 
 # Help function
 show_help() {
@@ -83,6 +85,8 @@ Options:
   --amp                    Enable Automatic Mixed Precision (AMP) for inference
   --amp-dtype <bf16|fp16>  Data type for AMP (default: bf16)
   --limit-scenes <n>       For NuScenes, limit the number of scenes to process (e.g., 50)
+  --test-mode <mode>       Test mode: tc (temporal consistency only)
+  --tc-threshold <float>   Threshold for rTC metric (default: 1.25)
   --help                   Show this help message
 
 Examples:
@@ -190,6 +194,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --limit-scenes)
             LIMIT_SCENES="$2"
+            shift 2
+            ;;
+        --test-mode)
+            TEST_MODE="$2"
+            shift 2
+            ;;
+        --tc-threshold)
+            TC_THRESHOLD="$2"
             shift 2
             ;;
         --help)
@@ -349,6 +361,14 @@ fi
 
 if [ -n "$LIMIT_SCENES" ]; then
     CMD="$CMD --limit-scenes $LIMIT_SCENES"
+fi
+
+if [ -n "$TEST_MODE" ]; then
+    CMD="$CMD --test-mode $TEST_MODE"
+fi
+
+if [ -n "$TC_THRESHOLD" ]; then
+    CMD="$CMD --tc-threshold $TC_THRESHOLD"
 fi
 
 CMD="$CMD --visualization $VISUALIZATION"

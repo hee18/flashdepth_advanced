@@ -37,6 +37,7 @@ from dataloaders.combined_dataset import CombinedDataset
 from utils.metric_depth_metrics import MetricDepthMetrics, format_metrics
 from utils.helpers import save_gifs_as_grid, save_grid_to_mp4, depth_to_np_arr, torch_batch_to_np_arr
 from utils.reprojection_tae import ReprojectionTAECalculator
+from utils.temporal_consistency import FlowTemporalConsistency
 
 logging.basicConfig(
     level=logging.INFO,
@@ -88,6 +89,13 @@ class OnepieceTester:
         data_root = config.dataset.get('data_root', '/home/cvlab/hsy/Datasets')
         self.reproj_tae_calculator = ReprojectionTAECalculator(data_root)
         logger.info(f"Reprojection TAE calculator initialized (supported: {self.reproj_tae_calculator.SUPPORTED_DATASETS})")
+
+        # Flow-based temporal consistency (lazy-loaded)
+        self.flow_tc = None
+        self.tc_threshold = config.get('tc_threshold', 1.25)
+
+        # Test mode: None (full), 'tc' (temporal consistency only)
+        self.test_mode = config.get('test_mode', None)
 
     def _setup_cls_layers(self, model):
         """Parse cls_layers config and compute encoder indices for multi-layer CLS averaging."""
@@ -250,8 +258,15 @@ class OnepieceTester:
             if isinstance(v, float):
                 logger.info(f"  {k}: {v:.4f}")
 
+        # TC-only mode: save temporal_consistency.json and return
+        if self.test_mode == 'tc':
+            self._save_temporal_consistency(all_metrics)
+            logger.info("TC-only mode: saved temporal_consistency.json")
+            return
+
         # 1. test_results.json (aggregated)
         metric_order = ['abs_rel', 'a1', 'a2', 'a3', 'fps', 'tae', 'tae_reproj', 'tae_reproj_gt',
+                        'rtc', 'rtc_gt',
                         'mae', 'rmse',
                         'pred_scale_mean', 'pred_shift_mean',
                         'optimal_scale_mean', 'optimal_shift_mean']
@@ -310,6 +325,9 @@ class OnepieceTester:
 
         # 6. temporal_analysis.json
         self._save_temporal_analysis(all_metrics)
+
+        # 7. temporal_consistency.json (flow-based rTC)
+        self._save_temporal_consistency(all_metrics)
 
     @torch.no_grad()
     def test_sequence(self, batch, sequence_id):
@@ -462,8 +480,89 @@ class OnepieceTester:
                 mode='bilinear', align_corners=True
             )
 
-        # === Per-frame metrics ===
         MAX_DEPTH = 70.0
+
+        # === TC-only mode: skip per-frame metrics, depth range, TAE ===
+        if self.test_mode == 'tc':
+            metrics = {
+                'fps': float(fps), 'dataset': str(dataset_name), 'num_frames': T,
+                'abs_rel': 0.0, 'a1': 0.0, 'mae': 0.0, 'rmse': 0.0,
+                'pred_scale_mean': float(scale[0].mean()), 'pred_shift_mean': float(shift[0].mean()),
+                'tae': 0.0, 'tae_reproj': 0.0, 'tae_reproj_gt': 0.0,
+                '_per_frame_tae': [], '_tae_spike_frames': [],
+            }
+            # Compute rTC only
+            if T > 1:
+                try:
+                    if self.flow_tc is None:
+                        self.flow_tc = FlowTemporalConsistency(
+                            device=self.device, thr=self.tc_threshold, max_depth=MAX_DEPTH
+                        )
+                    tc_result = self.flow_tc.compute_rtc(
+                        images[0], pred_depths_cpu, gt_depths=gt_depth_metric_cpu
+                    )
+                    metrics['rtc'] = tc_result['rtc']
+                    metrics['rtc_gt'] = tc_result['rtc_gt']
+                    metrics['_per_frame_rtc'] = tc_result['per_frame_rtc']
+                    metrics['_per_frame_rtc_gt'] = tc_result['per_frame_rtc_gt']
+                    metrics['_rtc_ratio_stats'] = tc_result['ratio_stats']
+                    metrics['_rtc_per_frame_ratio_stats'] = tc_result['per_frame_ratio_stats']
+                    metrics['_rtc_best_frame_idx'] = tc_result['best_frame_idx']
+                    metrics['_rtc_worst_frame_idx'] = tc_result['worst_frame_idx']
+                    logger.info(f"Flow TC: rTC={metrics['rtc']:.4f}, rTC_gt={metrics['rtc_gt']:.4f}")
+
+                    # TC visualizations
+                    if self.enable_visualization and self.flow_tc is not None:
+                        images_cpu = images[0].cpu()
+                        rtc_best = tc_result['best_frame_idx']
+                        rtc_worst = tc_result['worst_frame_idx']
+                        per_frame_rtc = tc_result['per_frame_rtc']
+                        per_frame_rtc_gt = tc_result['per_frame_rtc_gt']
+
+                        self.flow_tc.save_visualization(
+                            pred_depths_cpu, gt_depth_metric_cpu, rtc_worst, sequence_id,
+                            self.save_dir, per_frame_rtc[rtc_worst], label='worst'
+                        )
+                        self.flow_tc.save_visualization(
+                            pred_depths_cpu, gt_depth_metric_cpu, rtc_best, sequence_id,
+                            self.save_dir, per_frame_rtc[rtc_best], label='best'
+                        )
+                        self.flow_tc.save_ratio_heatmap(
+                            images_cpu, pred_depths_cpu, rtc_worst, sequence_id,
+                            self.save_dir, per_frame_rtc[rtc_worst], label='worst'
+                        )
+                        self.flow_tc.save_ratio_heatmap(
+                            images_cpu, pred_depths_cpu, rtc_best, sequence_id,
+                            self.save_dir, per_frame_rtc[rtc_best], label='best'
+                        )
+                        self.flow_tc.save_rtc_plot(
+                            per_frame_rtc, per_frame_rtc_gt, rtc_best, rtc_worst,
+                            sequence_id, self.save_dir
+                        )
+                except Exception as e:
+                    logger.warning(f"Failed to compute flow temporal consistency: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    metrics['rtc'] = 0.0
+                    metrics['rtc_gt'] = 0.0
+                    metrics['_per_frame_rtc'] = []
+                    metrics['_per_frame_rtc_gt'] = []
+                    metrics['_rtc_ratio_stats'] = {}
+                    metrics['_rtc_per_frame_ratio_stats'] = []
+                    metrics['_rtc_best_frame_idx'] = 0
+                    metrics['_rtc_worst_frame_idx'] = 0
+            else:
+                metrics['rtc'] = 0.0
+                metrics['rtc_gt'] = 0.0
+                metrics['_per_frame_rtc'] = []
+                metrics['_per_frame_rtc_gt'] = []
+                metrics['_rtc_ratio_stats'] = {}
+                metrics['_rtc_per_frame_ratio_stats'] = []
+                metrics['_rtc_best_frame_idx'] = 0
+                metrics['_rtc_worst_frame_idx'] = 0
+            return metrics
+
+        # === Per-frame metrics ===
         frame_metrics = []
         per_frame_scales = []
         per_frame_shifts = []
@@ -631,6 +730,47 @@ class OnepieceTester:
             metrics['_per_frame_tae'] = []
             metrics['_tae_spike_frames'] = []
 
+        # === Flow-based Temporal Consistency (rTC) ===
+        if T > 1:
+            try:
+                if self.flow_tc is None:
+                    self.flow_tc = FlowTemporalConsistency(
+                        device=self.device, thr=self.tc_threshold, max_depth=MAX_DEPTH
+                    )
+                tc_result = self.flow_tc.compute_rtc(
+                    images[0], pred_depths_cpu, gt_depths=gt_depth_metric_cpu
+                )
+                metrics['rtc'] = tc_result['rtc']
+                metrics['rtc_gt'] = tc_result['rtc_gt']
+                metrics['_per_frame_rtc'] = tc_result['per_frame_rtc']
+                metrics['_per_frame_rtc_gt'] = tc_result['per_frame_rtc_gt']
+                metrics['_rtc_ratio_stats'] = tc_result['ratio_stats']
+                metrics['_rtc_per_frame_ratio_stats'] = tc_result['per_frame_ratio_stats']
+                metrics['_rtc_best_frame_idx'] = tc_result['best_frame_idx']
+                metrics['_rtc_worst_frame_idx'] = tc_result['worst_frame_idx']
+                logger.info(f"Flow TC: rTC={metrics['rtc']:.4f}, rTC_gt={metrics['rtc_gt']:.4f}")
+            except Exception as e:
+                logger.warning(f"Failed to compute flow temporal consistency: {e}")
+                import traceback
+                traceback.print_exc()
+                metrics['rtc'] = 0.0
+                metrics['rtc_gt'] = 0.0
+                metrics['_per_frame_rtc'] = []
+                metrics['_per_frame_rtc_gt'] = []
+                metrics['_rtc_ratio_stats'] = {}
+                metrics['_rtc_per_frame_ratio_stats'] = []
+                metrics['_rtc_best_frame_idx'] = 0
+                metrics['_rtc_worst_frame_idx'] = 0
+        else:
+            metrics['rtc'] = 0.0
+            metrics['rtc_gt'] = 0.0
+            metrics['_per_frame_rtc'] = []
+            metrics['_per_frame_rtc_gt'] = []
+            metrics['_rtc_ratio_stats'] = {}
+            metrics['_rtc_per_frame_ratio_stats'] = []
+            metrics['_rtc_best_frame_idx'] = 0
+            metrics['_rtc_worst_frame_idx'] = 0
+
         logger.info(
             f"  AbsRel={metrics.get('abs_rel', 0):.4f}, MAE={metrics.get('mae', 0):.4f}, "
             f"RMSE={metrics.get('rmse', 0):.4f}, d1={metrics.get('a1', 0):.4f}, "
@@ -668,6 +808,42 @@ class OnepieceTester:
                 worst_frame_idx, sequence_id, frame_metrics, metrics,
                 frame_type='worst', fps=fps
             )
+
+            # Flow TC visualizations
+            if self.flow_tc is not None and metrics.get('_per_frame_rtc'):
+                try:
+                    rtc_best = metrics['_rtc_best_frame_idx']
+                    rtc_worst = metrics['_rtc_worst_frame_idx']
+                    per_frame_rtc = metrics['_per_frame_rtc']
+                    per_frame_rtc_gt = metrics['_per_frame_rtc_gt']
+
+                    # Depth grids for best/worst TC pairs
+                    self.flow_tc.save_visualization(
+                        pred_depths_cpu, gt_depth_metric_cpu, rtc_worst, sequence_id,
+                        self.save_dir, per_frame_rtc[rtc_worst], label='worst'
+                    )
+                    self.flow_tc.save_visualization(
+                        pred_depths_cpu, gt_depth_metric_cpu, rtc_best, sequence_id,
+                        self.save_dir, per_frame_rtc[rtc_best], label='best'
+                    )
+
+                    # Ratio heatmaps
+                    self.flow_tc.save_ratio_heatmap(
+                        images_cpu, pred_depths_cpu, rtc_worst, sequence_id,
+                        self.save_dir, per_frame_rtc[rtc_worst], label='worst'
+                    )
+                    self.flow_tc.save_ratio_heatmap(
+                        images_cpu, pred_depths_cpu, rtc_best, sequence_id,
+                        self.save_dir, per_frame_rtc[rtc_best], label='best'
+                    )
+
+                    # rTC line plot
+                    self.flow_tc.save_rtc_plot(
+                        per_frame_rtc, per_frame_rtc_gt, rtc_best, rtc_worst,
+                        sequence_id, self.save_dir
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to save TC visualizations: {e}")
 
         return metrics
 
@@ -1051,6 +1227,55 @@ class OnepieceTester:
                 json.dump(temporal_analysis, f, indent=2, default=str)
             logger.info(f"Temporal analysis saved to {self.save_dir / 'temporal_analysis.json'}")
 
+    def _save_temporal_consistency(self, all_metrics):
+        """Save temporal_consistency.json (flow-based rTC metrics)."""
+        has_rtc = any(m.get('rtc', 0) > 0 for m in all_metrics)
+        if not has_rtc:
+            return
+
+        per_sequence = []
+        for result in all_metrics:
+            entry = {
+                'sequence_id': result.get('sequence_id', -1),
+                'rtc': result.get('rtc', 0.0),
+                'rtc_gt': result.get('rtc_gt', 0.0),
+                'per_frame_rtc': result.get('_per_frame_rtc', []),
+                'per_frame_rtc_gt': result.get('_per_frame_rtc_gt', []),
+                'per_frame_ratio_stats': result.get('_rtc_per_frame_ratio_stats', []),
+                'ratio_stats': result.get('_rtc_ratio_stats', {}),
+                'best_frame_idx': result.get('_rtc_best_frame_idx', 0),
+                'worst_frame_idx': result.get('_rtc_worst_frame_idx', 0)
+            }
+            per_sequence.append(entry)
+
+        # Aggregated
+        rtc_values = [m.get('rtc', 0.0) for m in all_metrics if m.get('rtc', 0) > 0]
+        rtc_gt_values = [m.get('rtc_gt', 0.0) for m in all_metrics if m.get('rtc_gt', 0) > 0]
+
+        # Aggregate ratio stats
+        all_ratio_stats = [m.get('_rtc_ratio_stats', {}) for m in all_metrics if m.get('_rtc_ratio_stats')]
+        agg_ratio_stats = {}
+        if all_ratio_stats:
+            for key in ['avg', 'min', 'max', 'p90', 'p95']:
+                values = [rs.get(key, 0.0) for rs in all_ratio_stats if key in rs]
+                if values:
+                    agg_ratio_stats[key] = float(np.mean(values))
+
+        tc_output = {
+            'config': {'threshold': self.tc_threshold, 'flow_model': 'sea_raft'},
+            'aggregated': {
+                'rtc': float(np.mean(rtc_values)) if rtc_values else 0.0,
+                'rtc_gt': float(np.mean(rtc_gt_values)) if rtc_gt_values else 0.0,
+                'ratio_stats': agg_ratio_stats
+            },
+            'per_sequence': per_sequence
+        }
+
+        tc_path = self.save_dir / "temporal_consistency.json"
+        with open(tc_path, 'w') as f:
+            json.dump(tc_output, f, indent=2, default=str)
+        logger.info(f"Temporal consistency saved to {tc_path}")
+
     def _aggregate_metrics(self, all_metrics):
         """Aggregate metrics across sequences with metric_order."""
         metric_keys = set()
@@ -1067,6 +1292,7 @@ class OnepieceTester:
 
         # Reorder
         metric_order = ['abs_rel', 'a1', 'a2', 'a3', 'fps', 'tae', 'tae_reproj', 'tae_reproj_gt',
+                        'rtc', 'rtc_gt',
                         'mae', 'rmse',
                         'pred_scale_mean', 'pred_shift_mean',
                         'optimal_scale_mean', 'optimal_shift_mean']
@@ -1104,9 +1330,35 @@ class OnepieceTester:
 @hydra.main(version_base=None, config_path="configs/onepiece", config_name="config")
 def main(config: DictConfig):
     """Main entry point."""
+    # Apply --test-mode if passed via sys.argv preprocessing
+    test_mode = getattr(main, '_test_mode', None)
+    if test_mode:
+        OmegaConf.update(config, 'test_mode', test_mode, merge=False)
+
     tester = OnepieceTester(config)
     tester.test()
 
 
 if __name__ == "__main__":
+    import sys
+
+    # Handle --test-mode flag BEFORE Hydra processes arguments
+    test_mode = None
+    new_argv = []
+    i = 0
+    while i < len(sys.argv):
+        if sys.argv[i] == '--test-mode' and i + 1 < len(sys.argv):
+            test_mode = sys.argv[i + 1]
+            i += 2
+        elif sys.argv[i].startswith('--test-mode='):
+            test_mode = sys.argv[i].split('=', 1)[1]
+            i += 1
+        else:
+            new_argv.append(sys.argv[i])
+            i += 1
+    sys.argv = new_argv
+
+    # Store test_mode as function attribute so main() can access it
+    main._test_mode = test_mode
+
     main()

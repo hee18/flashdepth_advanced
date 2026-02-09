@@ -41,6 +41,7 @@ from utils.fgwise_evaluation import (
 )
 from utils.comparison_visualization import visualize_sequence_simplified, visualize_best_frame_simplified
 from utils.reprojection_tae import ReprojectionTAECalculator
+from utils.temporal_consistency import FlowTemporalConsistency
 
 # Setup logging
 logging.basicConfig(
@@ -134,6 +135,11 @@ class VideoComparisonTester:
         data_root = config.get('data_root', '/home/cvlab/hsy/Datasets')
         self.reproj_tae_calculator = ReprojectionTAECalculator(data_root)
         logger.info(f"Reprojection TAE calculator initialized (supported: {self.reproj_tae_calculator.SUPPORTED_DATASETS})")
+
+        # Flow-based temporal consistency (lazy-loaded)
+        self.flow_tc = None
+        self.tc_threshold = config.get('tc_threshold', 1.25)
+        self.test_mode = config.get('test_mode', None)
 
         # Load model
         self.model = self._setup_model()
@@ -601,6 +607,38 @@ class VideoComparisonTester:
                 metrics['tae_reproj_gt'] = 0.0
                 metrics['tae'] = 0.0
 
+            # === Flow-based Temporal Consistency (rTC) ===
+            if len(pred_depths) > 1:
+                try:
+                    if self.flow_tc is None:
+                        self.flow_tc = FlowTemporalConsistency(
+                            device=self.device, thr=self.tc_threshold, max_depth=70.0
+                        )
+                    images_for_tc = batch['images'][0] if 'images' in batch else None
+                    if images_for_tc is not None:
+                        tc_result = self.flow_tc.compute_rtc(
+                            images_for_tc, pred_depths_cpu, gt_depths=gt_depth_processed_cpu
+                        )
+                        metrics['rtc'] = tc_result['rtc']
+                        metrics['rtc_gt'] = tc_result['rtc_gt']
+                        metrics['_per_frame_rtc'] = tc_result['per_frame_rtc']
+                        metrics['_per_frame_rtc_gt'] = tc_result['per_frame_rtc_gt']
+                        metrics['_rtc_ratio_stats'] = tc_result['ratio_stats']
+                        metrics['_rtc_per_frame_ratio_stats'] = tc_result['per_frame_ratio_stats']
+                        metrics['_rtc_best_frame_idx'] = tc_result['best_frame_idx']
+                        metrics['_rtc_worst_frame_idx'] = tc_result['worst_frame_idx']
+                        logger.info(f"Flow TC: rTC={metrics['rtc']:.4f}, rTC_gt={metrics['rtc_gt']:.4f}")
+                    else:
+                        metrics['rtc'] = 0.0
+                        metrics['rtc_gt'] = 0.0
+                except Exception as e:
+                    logger.warning(f"Failed to compute flow temporal consistency: {e}")
+                    metrics['rtc'] = 0.0
+                    metrics['rtc_gt'] = 0.0
+            else:
+                metrics['rtc'] = 0.0
+                metrics['rtc_gt'] = 0.0
+
             metrics['fps'] = fps
 
         # Object-wise evaluation (ONLY when enabled - replaces regular metrics)
@@ -899,13 +937,13 @@ class VideoComparisonTester:
 
         # Compute average metrics
         avg_metrics_raw = {}
-        for key in ['mae', 'rmse', 'abs_rel', 'sq_rel', 'rmse_log', 'a1', 'a2', 'a3', 'tae', 'tae_reproj', 'tae_reproj_gt', 'fps']:
+        for key in ['mae', 'rmse', 'abs_rel', 'sq_rel', 'rmse_log', 'a1', 'a2', 'a3', 'tae', 'tae_reproj', 'tae_reproj_gt', 'rtc', 'rtc_gt', 'fps']:
             values = [r[key] for r in self.all_results if key in r]
             if len(values) > 0:
                 avg_metrics_raw[key] = float(np.mean(values))
 
-        # Reorder metrics according to desired order: abs_rel, a1, a2, a3, fps, tae, tae_reproj, mae, rmse
-        metric_order = ['abs_rel', 'a1', 'a2', 'a3', 'fps', 'tae', 'tae_reproj', 'tae_reproj_gt', 'mae', 'rmse']
+        # Reorder metrics according to desired order
+        metric_order = ['abs_rel', 'a1', 'a2', 'a3', 'fps', 'tae', 'tae_reproj', 'tae_reproj_gt', 'rtc', 'rtc_gt', 'mae', 'rmse']
         avg_metrics = {}
         for key in metric_order:
             if key in avg_metrics_raw:
@@ -989,6 +1027,9 @@ class VideoComparisonTester:
             logger.info(f"Worst sequence (highest AbsRel): {worst_seq.get('sequence_id', 'N/A')}")
             logger.info(f"  AbsRel: {worst_seq.get('abs_rel', 0):.4f}, δ1: {worst_seq.get('a1', 0):.4f}")
 
+        # Save temporal_consistency.json (flow-based rTC)
+        self._save_temporal_consistency(self.all_results)
+
         # Aggregate and save object-wise metrics
         if self.object_wise_enabled:
             # Collect all object-wise metrics from sequences
@@ -1050,6 +1091,53 @@ class VideoComparisonTester:
                 with open(fgwise_path, 'w') as f:
                     json.dump(aggregated_fgwise, f, indent=2)
                 logger.info(f"FG-wise results saved to {fgwise_path}")
+
+    def _save_temporal_consistency(self, all_results):
+        """Save temporal_consistency.json (flow-based rTC metrics)."""
+        has_rtc = any(m.get('rtc', 0) > 0 for m in all_results)
+        if not has_rtc:
+            return
+
+        per_sequence = []
+        for result in all_results:
+            entry = {
+                'sequence_id': result.get('sequence_id', -1),
+                'rtc': result.get('rtc', 0.0),
+                'rtc_gt': result.get('rtc_gt', 0.0),
+                'per_frame_rtc': result.get('_per_frame_rtc', []),
+                'per_frame_rtc_gt': result.get('_per_frame_rtc_gt', []),
+                'per_frame_ratio_stats': result.get('_rtc_per_frame_ratio_stats', []),
+                'ratio_stats': result.get('_rtc_ratio_stats', {}),
+                'best_frame_idx': result.get('_rtc_best_frame_idx', 0),
+                'worst_frame_idx': result.get('_rtc_worst_frame_idx', 0)
+            }
+            per_sequence.append(entry)
+
+        rtc_values = [m.get('rtc', 0.0) for m in all_results if m.get('rtc', 0) > 0]
+        rtc_gt_values = [m.get('rtc_gt', 0.0) for m in all_results if m.get('rtc_gt', 0) > 0]
+
+        all_ratio_stats = [m.get('_rtc_ratio_stats', {}) for m in all_results if m.get('_rtc_ratio_stats')]
+        agg_ratio_stats = {}
+        if all_ratio_stats:
+            for key in ['avg', 'min', 'max', 'p90', 'p95']:
+                values = [rs.get(key, 0.0) for rs in all_ratio_stats if key in rs]
+                if values:
+                    agg_ratio_stats[key] = float(np.mean(values))
+
+        tc_output = {
+            'config': {'threshold': self.tc_threshold, 'flow_model': 'sea_raft'},
+            'aggregated': {
+                'rtc': float(np.mean(rtc_values)) if rtc_values else 0.0,
+                'rtc_gt': float(np.mean(rtc_gt_values)) if rtc_gt_values else 0.0,
+                'ratio_stats': agg_ratio_stats
+            },
+            'per_sequence': per_sequence
+        }
+
+        tc_path = self.save_dir / "temporal_consistency.json"
+        with open(tc_path, 'w') as f:
+            json.dump(tc_output, f, indent=2, default=str)
+        logger.info(f"Temporal consistency saved to {tc_path}")
 
     def _export_figure_frames(self, images, pred_depths, gt_depths, best_frame_idx, sequence_id, dataset_name, depth_paths=None):
         """
@@ -1409,6 +1497,10 @@ def main():
                        help='Data type for AMP (bfloat16 or float16)')
     parser.add_argument('--limit-scenes', type=int, default=None,
                        help='Limit the number of NuScenes scenes to process (for debugging)')
+    parser.add_argument('--test-mode', type=str, default=None, choices=['tc'],
+                       help='Test mode: tc (temporal consistency only)')
+    parser.add_argument('--tc-threshold', type=float, default=1.25,
+                       help='Threshold for rTC metric (default: 1.25)')
 
     args = parser.parse_args()
 
@@ -1464,7 +1556,9 @@ def main():
         'frame': args.frame,  # Export specific frame ±4 frames
         'amp': args.amp,
         'amp_dtype': args.amp_dtype,
-        'limit_scenes': args.limit_scenes
+        'limit_scenes': args.limit_scenes,
+        'test_mode': args.test_mode,
+        'tc_threshold': args.tc_threshold
     }
 
     # Import and create adapter (VIDEO MODELS ONLY)

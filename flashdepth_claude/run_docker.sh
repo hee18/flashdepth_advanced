@@ -191,6 +191,7 @@ FGWISE_FLAG="false"  # Enable FG-wise (foreground-wise) evaluation using ViT att
 SECTION=""  # Frame section for infer_avante (e.g., "450,480" for frames 450-480)
 MAX_DEPTH="70.0"  # Max valid depth threshold for infer_avante (meters)
 CBAR="false"  # Show colorbar next to depth visualization
+TEST_MODE=""  # Test mode: empty (full), tc (temporal consistency only)
 BANKAI_PHASE="auto"  # Bankai training phase: 1, 2, or "auto" (auto: Phase 1 until step 5000, then Phase 2)
 BANKAI_AUTO_STEP="5000"  # Step at which to transition from Phase 1 to Phase 2 in auto mode
 TGM_WEIGHT="0.3"  # TGM loss weight for Bankai mode
@@ -351,6 +352,10 @@ while [[ $# -gt 0 ]]; do
         --cbar)
             CBAR="true"
             shift
+            ;;
+        --test-mode)
+            TEST_MODE="$2"
+            shift 2
             ;;
         --bankai-phase)
             BANKAI_PHASE="$2"
@@ -1464,6 +1469,11 @@ case $COMMAND in
             TEST_CMD="$TEST_CMD eval.out_video=false"
         fi
 
+        # Add test-mode if specified
+        if [ -n "$TEST_MODE" ]; then
+            TEST_CMD="$TEST_CMD --test-mode $TEST_MODE"
+        fi
+
         CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm flashdepth $TEST_CMD
         ;;
 
@@ -1966,6 +1976,11 @@ case $COMMAND in
 
         if [ -n "$GEAR_CHECKPOINT" ]; then
             DOCKER_CMD="$DOCKER_CMD load=$GEAR_CHECKPOINT"
+        fi
+
+        # Add test-mode if specified
+        if [ -n "$TEST_MODE" ]; then
+            DOCKER_CMD="$DOCKER_CMD --test-mode $TEST_MODE"
         fi
 
         eval $DOCKER_CMD
