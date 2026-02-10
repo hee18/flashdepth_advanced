@@ -36,6 +36,12 @@ class UnifiedGlobalMamba(nn.Module):
     Two forward modes:
         - forward(x): Batch mode for training (parallel scan on full [B, T, D])
         - forward_single_frame(x): Streaming mode for inference (per-frame with hidden state)
+
+    NOTE - Architectural option (not yet implemented):
+        Current ViT-L uses d_model=1280 (46.36M params) for 514 output values (2 scale/shift + 512 FiLM).
+        Alternative: project CLS 1024→256 before concat → d_input=512, d_model=512 (~5.4M per 2 layers).
+        This would reduce Mamba params by ~6x while keeping the same output dimensionality.
+        See Onepiece.md "Architectural Option: CLS Dimension Reduction" for details.
     """
 
     def __init__(self, d_input, num_layers=2, d_state=64, d_conv=4,

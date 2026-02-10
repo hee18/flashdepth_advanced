@@ -127,6 +127,90 @@ UnifiedGlobalMamba(
 
 **Internal**: 각 layer는 `MambaBlock` (`flashdepth/mamba.py`). `InferenceParams`로 hidden state 관리.
 
+### Spatial Mamba vs UnifiedGlobalMamba 상세 비교
+
+두 Mamba 모두 동일한 `MambaBlock` (`flashdepth/mamba.py`)을 사용한다. MambaBlock 내부 구조:
+
+```
+Input x [B, L, d_model]
+    |
+    v
+[Pre-Norm] LayerNorm(d_model)     ← norm1
+    |
+    v
+[Mamba2 SSM]                       ← mamba (핵심 SSM 블록)
+    |   in_proj:  Linear(d_model → ~4×d_model)   ... 입력 → 내부 확장
+    |   conv1d:   Conv1d(d_inner, kernel=d_conv)  ... 로컬 컨텍스트
+    |   SSM scan: A, B, C, D matrices             ... 시퀀스 모델링
+    |   norm:     RMSNorm(d_inner)
+    |   out_proj: Linear(d_inner → d_model)       ... 내부 → 출력 축소
+    |
+    v
+[Residual] x = residual + mamba_out
+    |
+    v
+[Pre-Norm] LayerNorm(d_model)     ← norm2
+    |
+    v
+[MLP] Linear(d_model → 4×d_model) → GELU → Linear(4×d_model → d_model)
+    |
+    v
+[Residual] x = residual + mlp_out
+    |
+    v
+Output x [B, L, d_model]
+```
+
+#### 설정 비교
+
+| 설정 | Spatial Mamba | UnifiedGlobalMamba |
+|------|-------------|-------------------|
+| **역할** | DPT feature의 temporal consistency | CLS+GAP의 temporal reasoning → scale/shift/FiLM |
+| **입력** | `[B, 196, 256]` (spatial tokens) | `[B, T, 1280]` (1 global token/frame) |
+| d_model | 256 | 1280 |
+| d_inner (=d_model×expand) | 512 | 2560 |
+| expand | 2 | 2 |
+| headdim | 64 | 64 |
+| nheads | 8 | 40 |
+| d_state | 256 | 64 |
+| **d_conv** | **256** | **4** |
+| layers | 4 | 2 |
+| 후처리 | `final_layer` (GELU→Linear, zero-init) | 없음 (MetricHead가 후처리) |
+
+#### Per-layer 파라미터 비교 (실측)
+
+| Component | Spatial (d=256) | Unified (d=1280) | 비율 | 역할 |
+|-----------|:-:|:-:|:-:|------|
+| `in_proj` | [1544, 256] = **395K** | [5288, 1280] = **6,769K** | 17x | 입력→내부 확장 |
+| `conv1d` | [1024, 1, **256**] = **262K** | [2688, 1, **4**] = **11K** | 0.04x | 로컬 컨텍스트 |
+| `out_proj` | [256, 512] = **131K** | [1280, 2560] = **3,277K** | 25x | 내부→출력 축소 |
+| `mlp` | 256↔1024 = **525K** | 1280↔5120 = **13,107K** | 25x | 비선형 변환 |
+| norm, bias 등 | ~3K | ~13K | - | - |
+| **Per-layer 합계** | **1.32M** | **23.18M** | **17.6x** | |
+
+| 집계 | Spatial | Unified |
+|------|:-:|:-:|
+| Per-layer | 1.32M | 23.18M |
+| × Layers | ×4 | ×2 |
+| + final_layer | +66K | - |
+| **Total** | **5.33M** | **46.36M** |
+
+#### conv1d 차이가 큰 이유
+
+- **Spatial Mamba**: `d_conv=256` → DPT feature의 196개 spatial token 간 넓은 로컬 컨텍스트 필요
+- **Unified Mamba**: `d_conv=4` → 프레임 시퀀스에서 인접 4프레임만 보면 충분
+
+conv1d의 weight shape은 `[d_inner, 1, d_conv]`이므로, d_conv가 256 vs 4로 **64배 차이**. 하지만 전체 파라미터에서 conv1d 비중이 작아서(Spatial에서도 20%), 총 파라미터 차이의 주된 원인은 **d_model² 스케일링**인 in_proj, out_proj, mlp.
+
+#### 파라미터가 d_model²에 비례하는 이유
+
+Mamba 파라미터는 sequence length와 무관하고, d_model에 의해 결정된다:
+- `in_proj`: d_model × ~4×d_model ≈ **4 × d_model²**
+- `out_proj`: d_inner × d_model = expand × **d_model²**
+- `mlp`: 2 × d_model × 4×d_model = **8 × d_model²**
+- d_model 5배 (256→1280) → 파라미터 약 **25배/layer**
+- Layer 수 반감 (4→2) 보정 → 최종 **약 8.7배** (5.33M → 46.36M)
+
 ### 2. OnepieceMetricHead (`flashdepth/onepiece_modules.py`)
 
 Refined global token(1280-dim)으로부터 scale/shift와 FiLM parameters를 예측하는 dual-path head.
@@ -751,14 +835,15 @@ CLS layer 선택 로직이 함수 내부에서 처리되므로, caller는 반환
 
 | Module | Parameters | Phase 1 | Phase 2 |
 |--------|-----------|---------|---------|
-| DINOv2 ViT-L | ~304M | Frozen | Frozen |
-| DPT Head (dpt_dim=256) | ~30M | Frozen | **Trainable** |
-| output_conv | ~2M | Frozen | **Trainable** |
-| UnifiedGlobalMamba (1280→1280) | ~46M | **Trainable** | **Trainable** |
-| OnepieceMetricHead (1280, 256) | ~1.2M | **Trainable** | **Trainable** |
+| DINOv2 ViT-L | 304.37M | Frozen | Frozen |
+| DPT Head (dpt_dim=256) | 30.62M | Frozen | **Trainable** |
+| output_conv | 0.33M | Frozen | **Trainable** |
+| UnifiedGlobalMamba (1280→1280) | 46.36M | **Trainable** | **Trainable** |
+| OnepieceMetricHead (1280, 256) | 0.85M | **Trainable** | **Trainable** |
 | SceneCutDetector | 0 | - | - |
-| **Phase 1 total trainable** | **~47.2M** | | |
-| **Phase 2 total trainable** | **~79.2M** | | |
+| **Total** | **382.53M** | | |
+| **Phase 1 trainable** | **47.21M** | | |
+| **Phase 2 trainable** | **78.16M** | | |
 
 ### ViT-S Variant
 
@@ -772,6 +857,37 @@ CLS layer 선택 로직이 함수 내부에서 처리되므로, caller는 반환
 | SceneCutDetector | 0 | - | - |
 | **Phase 1 total trainable** | **~2.4M** | | |
 | **Phase 2 total trainable** | **~4.4M** | | |
+
+### Architectural Option: CLS Dimension Reduction
+
+현재 ViT-L에서 UnifiedGlobalMamba가 46.36M으로 전체 trainable params의 대부분을 차지.
+근본 원인: Mamba 파라미터 수는 d_model²에 비례하며, CLS(1024)+GAP(256)=1280-dim이 d_model로 직접 들어감.
+
+그런데 Mamba의 최종 출력은:
+- Scale/Shift: 2개 scalar
+- FiLM gamma/beta: 각 256개 = 512개 값
+- **총 514개 출력값에 46M params는 과잉일 수 있음**
+
+**변경 옵션:**
+
+```
+현재:   CLS(1024) + GAP(256) → [1280] → Mamba(d=1280, 2L, 46.36M) → 514 outputs
+옵션 A: CLS(1024) → Linear(256) + GAP(256) → [512] → Mamba(d=512, 2L, ~5.4M) → 514 outputs
+옵션 B: CLS(1024) → Linear(256) + GAP(256) → [512] → Mamba(d=512, 4L, ~10.8M) → 514 outputs
+```
+
+**Trade-offs:**
+- CLS 1024→256 projection: semantic 정보 일부 손실 가능. 단, 최종 목적이 scale/shift 2개 + FiLM 512개 값 추출이므로 256-dim으로도 충분할 수 있음
+- d_model 512: d_model²에 비례하므로 파라미터 ~6배 감소 (1280²/512² ≈ 6.25)
+- Layer 수 4로 늘려도 ~10.8M으로 현재 46.36M 대비 ~77% 절감
+- `_find_valid_mamba_dim(512)` = 512 (Mamba2-valid, projection 불필요)
+
+**구현 시 변경점:**
+1. `model.py`: `cls_proj = nn.Linear(cls_dim, gap_dim)` 추가, `unified_dim = gap_dim * 2`
+2. `onepiece_modules.py`: `UnifiedGlobalMamba(d_input=512)`, `OnepieceMetricHead(input_dim=512)`
+3. `config_l.yaml`: `cls_projection: true`, `unified_mamba_layers: 4` 등 옵션 추가
+
+**미적용 상태** — 현재 구조(1280-dim)로 학습 결과 확인 후 필요 시 적용 예정.
 
 ---
 
