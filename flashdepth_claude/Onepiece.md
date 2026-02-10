@@ -262,6 +262,19 @@ DPT feature의 temporal consistency를 optical flow 기반으로 강제.
 
 **Feature downsample**: DPT feature (h, w)를 (h/4, w/4)로 줄여서 flow 연산 효율화
 
+### Depth Valid Range
+
+| Stage | GT Valid | Pred Valid | 비고 |
+|-------|---------|-----------|------|
+| **Training** | `gt_inverse > 0` | `metric_depth > 0` & `< 1000m` | + `actual_valid_masks` AND |
+| **Validation** | `gt > 0` & `< 70m` | `pred > 0` & `< 70m` | test와 동일 기준 |
+| **Test (메트릭)** | `gt > 0` & `< 70m` | `pred > 0` & `< 70m` | 미터 공간 기준 |
+| **Train vis only** | `inverse > 100/70` (70m) | `inverse > 100/200` (200m) | canonical valid mask |
+
+- Training은 상한 **1000m**으로 느슨하게 설정 (원거리 anchor 유지, log L1이 자연 감쇠)
+- Validation/Test는 상한 **70m**으로 통일 (best model 선정과 평가 기준 일치)
+- Training visualization은 별도 canonical threshold 적용 (GT 70m, pred 200m)
+
 ---
 
 ## Flow Estimator (`utils/flow_estimator.py`)
@@ -372,7 +385,7 @@ actual_valid_masks, fx_ratio, resize_ratio, dataset_idx = batch
 | Val datasets | sintel, waymo_seg (Gear5 동일) |
 | Validation freq | 1000 steps |
 | Save freq | 5000 steps |
-| Total iterations | 40001 |
+| Total iterations | 60001 |
 
 ### Validation Configuration (Gear5와 동일)
 

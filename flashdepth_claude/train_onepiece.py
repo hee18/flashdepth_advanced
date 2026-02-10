@@ -1022,8 +1022,10 @@ class OnepieceTrainer:
                     mode='bilinear', align_corners=True
                 ).squeeze(1).view(B, T, gt_depth_meters.shape[-2], gt_depth_meters.shape[-1])
 
-            gt_valid = (gt_depth.squeeze(2) > 0)
-            pred_valid = (metric_depth > 0) & (metric_depth < 1000.0)
+            # Validation uses 70m threshold to match test evaluation
+            VAL_MAX_DEPTH = 70.0
+            gt_valid = (gt_depth.squeeze(2) > 0) & (gt_depth_meters < VAL_MAX_DEPTH)
+            pred_valid = (metric_depth > 0) & (metric_depth < VAL_MAX_DEPTH)
             if actual_valid_masks.ndim == 3:
                 actual_valid_masks = actual_valid_masks.unsqueeze(1)
             valid_mask = gt_valid & pred_valid & actual_valid_masks
