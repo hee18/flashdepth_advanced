@@ -185,7 +185,7 @@ class Gear5Tester:
 
         # Flow-based temporal consistency (lazy-loaded)
         self.flow_tc = None
-        self.tc_threshold = config.get('tc_threshold', 1.25)
+        self.tc_threshold = config.get('tc_threshold', 1.1)
 
         # Test mode: None (full), 'tc' (temporal consistency only)
         self.test_mode = config.get('test_mode', None)
@@ -1860,63 +1860,50 @@ class Gear5Tester:
             }
             T_tc = pred_depths.shape[0]
             if T_tc > 1:
-                try:
-                    MAX_DEPTH_TC = 70.0
-                    if self.flow_tc is None:
-                        self.flow_tc = FlowTemporalConsistency(
-                            device=self.device, thr=self.tc_threshold, max_depth=MAX_DEPTH_TC
-                        )
-                    tc_result = self.flow_tc.compute_rtc(
-                        images[0], pred_depths_cpu, gt_depths=gt_depth_metric_cpu
+                MAX_DEPTH_TC = 70.0
+                if self.flow_tc is None:
+                    self.flow_tc = FlowTemporalConsistency(
+                        device=self.device, thr=self.tc_threshold, max_depth=MAX_DEPTH_TC
                     )
-                    metrics['rtc'] = tc_result['rtc']
-                    metrics['rtc_gt'] = tc_result['rtc_gt']
-                    metrics['_per_frame_rtc'] = tc_result['per_frame_rtc']
-                    metrics['_per_frame_rtc_gt'] = tc_result['per_frame_rtc_gt']
-                    metrics['_rtc_ratio_stats'] = tc_result['ratio_stats']
-                    metrics['_rtc_per_frame_ratio_stats'] = tc_result['per_frame_ratio_stats']
-                    metrics['_rtc_best_frame_idx'] = tc_result['best_frame_idx']
-                    metrics['_rtc_worst_frame_idx'] = tc_result['worst_frame_idx']
-                    logger.info(f"Flow TC: rTC={metrics['rtc']:.4f}, rTC_gt={metrics['rtc_gt']:.4f}")
+                tc_result = self.flow_tc.compute_rtc(
+                    images[0], pred_depths_cpu, gt_depths=gt_depth_metric_cpu
+                )
+                metrics['rtc'] = tc_result['rtc']
+                metrics['rtc_gt'] = tc_result['rtc_gt']
+                metrics['_per_frame_rtc'] = tc_result['per_frame_rtc']
+                metrics['_per_frame_rtc_gt'] = tc_result['per_frame_rtc_gt']
+                metrics['_rtc_ratio_stats'] = tc_result['ratio_stats']
+                metrics['_rtc_per_frame_ratio_stats'] = tc_result['per_frame_ratio_stats']
+                metrics['_rtc_best_frame_idx'] = tc_result['best_frame_idx']
+                metrics['_rtc_worst_frame_idx'] = tc_result['worst_frame_idx']
+                logger.info(f"Flow TC: rTC={metrics['rtc']:.4f}, rTC_gt={metrics['rtc_gt']:.4f}")
 
-                    if self.enable_visualization:
-                        rtc_best = tc_result['best_frame_idx']
-                        rtc_worst = tc_result['worst_frame_idx']
-                        per_frame_rtc = tc_result['per_frame_rtc']
-                        per_frame_rtc_gt = tc_result['per_frame_rtc_gt']
+                if self.enable_visualization:
+                    rtc_best = tc_result['best_frame_idx']
+                    rtc_worst = tc_result['worst_frame_idx']
+                    per_frame_rtc = tc_result['per_frame_rtc']
+                    per_frame_rtc_gt = tc_result['per_frame_rtc_gt']
 
-                        self.flow_tc.save_visualization(
-                            pred_depths_cpu, gt_depth_metric_cpu, rtc_worst, sequence_id,
-                            self.save_dir, per_frame_rtc[rtc_worst], label='worst'
-                        )
-                        self.flow_tc.save_visualization(
-                            pred_depths_cpu, gt_depth_metric_cpu, rtc_best, sequence_id,
-                            self.save_dir, per_frame_rtc[rtc_best], label='best'
-                        )
-                        self.flow_tc.save_ratio_heatmap(
-                            images[0], pred_depths_cpu, rtc_worst, sequence_id,
-                            self.save_dir, per_frame_rtc[rtc_worst], label='worst'
-                        )
-                        self.flow_tc.save_ratio_heatmap(
-                            images[0], pred_depths_cpu, rtc_best, sequence_id,
-                            self.save_dir, per_frame_rtc[rtc_best], label='best'
-                        )
-                        self.flow_tc.save_rtc_plot(
-                            per_frame_rtc, per_frame_rtc_gt, rtc_best, rtc_worst,
-                            sequence_id, self.save_dir
-                        )
-                except Exception as e:
-                    logger.warning(f"Failed to compute flow temporal consistency: {e}")
-                    import traceback
-                    traceback.print_exc()
-                    metrics['rtc'] = 0.0
-                    metrics['rtc_gt'] = 0.0
-                    metrics['_per_frame_rtc'] = []
-                    metrics['_per_frame_rtc_gt'] = []
-                    metrics['_rtc_ratio_stats'] = {}
-                    metrics['_rtc_per_frame_ratio_stats'] = []
-                    metrics['_rtc_best_frame_idx'] = 0
-                    metrics['_rtc_worst_frame_idx'] = 0
+                    self.flow_tc.save_visualization(
+                        pred_depths_cpu, gt_depth_metric_cpu, rtc_worst, sequence_id,
+                        self.save_dir, per_frame_rtc[rtc_worst], label='worst'
+                    )
+                    self.flow_tc.save_visualization(
+                        pred_depths_cpu, gt_depth_metric_cpu, rtc_best, sequence_id,
+                        self.save_dir, per_frame_rtc[rtc_best], label='best'
+                    )
+                    self.flow_tc.save_ratio_heatmap(
+                        images[0], pred_depths_cpu, rtc_worst, sequence_id,
+                        self.save_dir, per_frame_rtc[rtc_worst], label='worst'
+                    )
+                    self.flow_tc.save_ratio_heatmap(
+                        images[0], pred_depths_cpu, rtc_best, sequence_id,
+                        self.save_dir, per_frame_rtc[rtc_best], label='best'
+                    )
+                    self.flow_tc.save_rtc_plot(
+                        per_frame_rtc, per_frame_rtc_gt, rtc_best, rtc_worst,
+                        sequence_id, self.save_dir
+                    )
             else:
                 metrics['rtc'] = 0.0
                 metrics['rtc_gt'] = 0.0
@@ -2098,36 +2085,23 @@ class Gear5Tester:
 
         # === Flow-based Temporal Consistency (rTC) ===
         if len(pred_depths) > 1:
-            try:
-                if self.flow_tc is None:
-                    MAX_DEPTH_TC = 70.0
-                    self.flow_tc = FlowTemporalConsistency(
-                        device=self.device, thr=self.tc_threshold, max_depth=MAX_DEPTH_TC
-                    )
-                tc_result = self.flow_tc.compute_rtc(
-                    images[0], pred_depths_cpu, gt_depths=gt_depth_metric_cpu
+            if self.flow_tc is None:
+                MAX_DEPTH_TC = 70.0
+                self.flow_tc = FlowTemporalConsistency(
+                    device=self.device, thr=self.tc_threshold, max_depth=MAX_DEPTH_TC
                 )
-                metrics['rtc'] = tc_result['rtc']
-                metrics['rtc_gt'] = tc_result['rtc_gt']
-                metrics['_per_frame_rtc'] = tc_result['per_frame_rtc']
-                metrics['_per_frame_rtc_gt'] = tc_result['per_frame_rtc_gt']
-                metrics['_rtc_ratio_stats'] = tc_result['ratio_stats']
-                metrics['_rtc_per_frame_ratio_stats'] = tc_result['per_frame_ratio_stats']
-                metrics['_rtc_best_frame_idx'] = tc_result['best_frame_idx']
-                metrics['_rtc_worst_frame_idx'] = tc_result['worst_frame_idx']
-                logger.info(f"Flow TC: rTC={metrics['rtc']:.4f}, rTC_gt={metrics['rtc_gt']:.4f}")
-            except Exception as e:
-                logger.warning(f"Failed to compute flow temporal consistency: {e}")
-                import traceback
-                traceback.print_exc()
-                metrics['rtc'] = 0.0
-                metrics['rtc_gt'] = 0.0
-                metrics['_per_frame_rtc'] = []
-                metrics['_per_frame_rtc_gt'] = []
-                metrics['_rtc_ratio_stats'] = {}
-                metrics['_rtc_per_frame_ratio_stats'] = []
-                metrics['_rtc_best_frame_idx'] = 0
-                metrics['_rtc_worst_frame_idx'] = 0
+            tc_result = self.flow_tc.compute_rtc(
+                images[0], pred_depths_cpu, gt_depths=gt_depth_metric_cpu
+            )
+            metrics['rtc'] = tc_result['rtc']
+            metrics['rtc_gt'] = tc_result['rtc_gt']
+            metrics['_per_frame_rtc'] = tc_result['per_frame_rtc']
+            metrics['_per_frame_rtc_gt'] = tc_result['per_frame_rtc_gt']
+            metrics['_rtc_ratio_stats'] = tc_result['ratio_stats']
+            metrics['_rtc_per_frame_ratio_stats'] = tc_result['per_frame_ratio_stats']
+            metrics['_rtc_best_frame_idx'] = tc_result['best_frame_idx']
+            metrics['_rtc_worst_frame_idx'] = tc_result['worst_frame_idx']
+            logger.info(f"Flow TC: rTC={metrics['rtc']:.4f}, rTC_gt={metrics['rtc_gt']:.4f}")
         else:
             metrics['rtc'] = 0.0
             metrics['rtc_gt'] = 0.0

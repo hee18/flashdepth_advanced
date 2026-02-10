@@ -10,16 +10,7 @@ from core.utils.utils import coords_grid, InputPadder
 from core.extractor import ResNetFPN
 from core.layer import conv1x1, conv3x3
 
-from huggingface_hub import PyTorchModelHubMixin
-
-class RAFT(
-    nn.Module,
-    PyTorchModelHubMixin, 
-    # optionally, you can add metadata which gets pushed to the model card
-    repo_url="https://github.com/princeton-vl/SEA-RAFT",
-    pipeline_tag="optical-flow-estimation",
-    license="bsd-3-clause",
-):
+class RAFT(nn.Module):
     def __init__(self, args):
         super().__init__()
         self.args = args

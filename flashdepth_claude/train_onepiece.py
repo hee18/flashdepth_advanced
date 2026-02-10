@@ -16,7 +16,7 @@ Training Phases:
         500-step warmup for newly unfrozen params
 
 Loss:
-    L_total = L_log_l1 + L_tgm + L_feat_cons (1:1:1)
+    L_total = L_log_l1 + L_tgm + L_feat_cons (1:1:0.01)
     Scene cut detection: CLS cosine distance (tau=0.05, k=80)
 
 Data:
@@ -883,16 +883,29 @@ class OnepieceTrainer:
             pred_inverse = 100.0 / metric_depth.float().clamp(min=1e-8)
             gt_inverse = gt_depth.squeeze(2).float() * 100.0
 
-            total_loss, loss_components = self.loss_fn(
-                pred_depth=pred_inverse,
-                gt_depth=gt_inverse,
-                valid_mask=valid_mask.float(),
-                dpt_features=dpt_features.float(),
-                images=images.float(),
-                flow_estimator=self.flow_estimator,
-                scene_cut_weights=scene_cut_weights,
-                return_components=True
-            )
+            # Phase 1: skip feat_cons (DPT frozen → no gradient, wastes compute)
+            if self.current_phase == 1:
+                total_loss, loss_components = self.loss_fn(
+                    pred_depth=pred_inverse,
+                    gt_depth=gt_inverse,
+                    valid_mask=valid_mask.float(),
+                    dpt_features=None,
+                    images=None,
+                    flow_estimator=None,
+                    scene_cut_weights=scene_cut_weights,
+                    return_components=True
+                )
+            else:
+                total_loss, loss_components = self.loss_fn(
+                    pred_depth=pred_inverse,
+                    gt_depth=gt_inverse,
+                    valid_mask=valid_mask.float(),
+                    dpt_features=dpt_features.float(),
+                    images=images.float(),
+                    flow_estimator=self.flow_estimator,
+                    scene_cut_weights=scene_cut_weights,
+                    return_components=True
+                )
 
         # Backward pass
         self.optimizer.zero_grad()

@@ -242,8 +242,9 @@ Temporal gradient matching: frame간 depth 변화가 GT와 일치하도록.
 L_tgm = |Delta_pred(t, t-1) - Delta_gt(t, t-1)|
 ```
 
-- Scene cut weight 적용: `L_tgm *= mean(W_temporal)`
-- Scene cut 시 temporal loss 억제
+- Scene cut weight 적용: **per-pair weighting** (각 pair에 해당 W_temporal 개별 적용)
+- Multi-stride (stride=2,4,8) 시 pair (t, t+stride) → `min(W_temporal[t:t+stride])` 사용
+- Scene cut 시 해당 pair만 억제 (다른 pair에 영향 없음)
 
 ### 3. Warp Feature Consistency Loss (NEW)
 
@@ -314,6 +315,7 @@ Docker는 `.:/app` volume mount를 사용하므로, **호스트에 설치하면 
 - LR: 1e-4 (onepiece params)
 - Warmup: 500 steps (0.1 → 1.0 linear)
 - Schedule: Warmup → Constant → Cosine decay (30% 시점부터)
+- **Feature Consistency Loss skip**: DPT frozen → gradient 전파 불가 → Sea-RAFT 연산 자체를 건너뜀
 
 #### Phase 2 (Step 5000+)
 **목표**: Full video optimization (depth quality 향상)
@@ -577,7 +579,7 @@ training:
     dpt: 1.0e-5                 # 1/10 of base (Phase 2)
     warmup_steps: 500
 
-# Loss (1:1:1)
+# Loss (1:1:0.01)
 loss:
   log_l1_weight: 1.0
   tgm_weight: 1.0

@@ -465,15 +465,46 @@ class TGMTemporalLoss(nn.Module):
         
         return error_valid.mean()
     
-    def forward(self, pred_depth, gt_depth, valid_mask=None):
+    def _compute_pair_weights(self, scene_cut_weights, stride, T):
+        """
+        Compute per-pair scene cut weights for a given stride.
+
+        For stride=1: directly use scene_cut_weights[:, t]
+        For stride>1: pair (t, t+stride) uses min of weights across [t, t+stride-1]
+
+        Args:
+            scene_cut_weights: [B, T-1] per-transition weights
+            stride: temporal stride
+            T: total number of frames
+
+        Returns:
+            pair_weights: [B, T-stride] per-pair weights
+        """
+        if stride == 1:
+            return scene_cut_weights
+
+        B = scene_cut_weights.shape[0]
+        num_pairs = T - stride
+        pair_weights = torch.zeros(B, num_pairs, device=scene_cut_weights.device)
+
+        for t in range(num_pairs):
+            # Min weight across transitions spanned by this pair
+            end_idx = min(t + stride, scene_cut_weights.shape[1])
+            pair_weights[:, t] = scene_cut_weights[:, t:end_idx].min(dim=1).values
+
+        return pair_weights
+
+    def forward(self, pred_depth, gt_depth, valid_mask=None, scene_cut_weights=None):
         """
         Compute TGM loss for temporal consistency.
-        
+
         Args:
             pred_depth: [B, T, H, W] or [B, T, 1, H, W] predicted depth
             gt_depth: [B, T, H, W] or [B, T, 1, H, W] ground truth depth
             valid_mask: [B, T, H, W] optional validity mask
-        
+            scene_cut_weights: [B, T-1] optional per-pair weights from SceneCutDetector.
+                               When provided, applies per-pair weighting instead of global mean.
+
         Returns:
             loss: scalar TGM loss
         """
@@ -482,41 +513,54 @@ class TGMTemporalLoss(nn.Module):
             pred_depth = pred_depth.squeeze(2)
         if gt_depth.ndim == 5:
             gt_depth = gt_depth.squeeze(2)
-        
+
         B, T, H, W = pred_depth.shape
-        
+
         # Need at least 2 frames for temporal gradient
         if T < 2:
             return torch.tensor(0.0, device=pred_depth.device)
-        
+
         total_loss = 0.0
         total_weight = 0.0
-        
+
         # Multi-scale temporal gradients
         for scale_idx in range(self.num_scales):
             stride = 2 ** scale_idx
-            
+
             # Skip if stride is too large for sequence length
             if stride >= T:
                 break
-            
+
             # Compute temporal gradients
             pred_grad = self._compute_temporal_gradient(pred_depth, stride)
             gt_grad = self._compute_temporal_gradient(gt_depth, stride)
-            
+
             # Compute validity mask
             scale_valid_mask = self._compute_valid_mask(
                 gt_depth, gt_grad, valid_mask, stride
             )
-            
-            # Compute trimmed MAE
-            scale_loss = self._trimmed_mae(pred_grad, gt_grad, scale_valid_mask)
-            
+
+            # Compute loss (per-pair weighted or global)
+            if scene_cut_weights is not None:
+                pair_weights = self._compute_pair_weights(scene_cut_weights, stride, T)
+                pair_loss_sum = torch.tensor(0.0, device=pred_depth.device)
+                pair_weight_sum = torch.tensor(0.0, device=pred_depth.device)
+                for t in range(pred_grad.shape[1]):
+                    t_loss = self._trimmed_mae(
+                        pred_grad[:, t:t+1], gt_grad[:, t:t+1], scale_valid_mask[:, t:t+1]
+                    )
+                    w = pair_weights[:, t].mean()  # average across batch
+                    pair_loss_sum = pair_loss_sum + w * t_loss
+                    pair_weight_sum = pair_weight_sum + w
+                scale_loss = pair_loss_sum / pair_weight_sum.clamp(min=1e-8)
+            else:
+                scale_loss = self._trimmed_mae(pred_grad, gt_grad, scale_valid_mask)
+
             # Apply decay weight
             weight = self.decay ** scale_idx
             total_loss = total_loss + weight * scale_loss
             total_weight = total_weight + weight
-        
+
         # Normalize by total weight
         if total_weight > 0:
             return total_loss / total_weight

@@ -138,7 +138,7 @@ class VideoComparisonTester:
 
         # Flow-based temporal consistency (lazy-loaded)
         self.flow_tc = None
-        self.tc_threshold = config.get('tc_threshold', 1.25)
+        self.tc_threshold = config.get('tc_threshold', 1.1)
         self.test_mode = config.get('test_mode', None)
 
         # Load model
@@ -347,6 +347,12 @@ class VideoComparisonTester:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
+        # TC-only mode: save temporal_consistency.json only and return
+        if self.test_mode == 'tc':
+            self._save_temporal_consistency(self.all_results)
+            logger.info("TC-only mode: saved temporal_consistency.json")
+            return
+
         # Aggregate and save results
         self._aggregate_and_save_results()
 
@@ -528,6 +534,73 @@ class VideoComparisonTester:
         # Define MAX_DEPTH for valid mask creation (used in both regular and TAE computation)
         MAX_DEPTH = 70.0
 
+        # === TC-only mode: skip per-frame metrics, TAE; compute rTC only ===
+        if self.test_mode == 'tc':
+            metrics = {
+                'fps': float(fps), 'dataset': str(batch.get('dataset_name', 'unknown')),
+                'num_frames': pred_depths.shape[0],
+                'abs_rel': 0.0, 'a1': 0.0, 'mae': 0.0, 'rmse': 0.0,
+                'tae': 0.0, 'tae_reproj': 0.0, 'tae_reproj_gt': 0.0,
+            }
+            T_tc = pred_depths.shape[0]
+            if T_tc > 1:
+                if self.flow_tc is None:
+                    self.flow_tc = FlowTemporalConsistency(
+                        device=self.device, thr=self.tc_threshold, max_depth=MAX_DEPTH
+                    )
+                images_for_tc = batch['images'][0] if 'images' in batch else None
+                if images_for_tc is not None:
+                    tc_result = self.flow_tc.compute_rtc(
+                        images_for_tc, pred_depths_cpu, gt_depths=gt_depth_processed_cpu
+                    )
+                    metrics['rtc'] = tc_result['rtc']
+                    metrics['rtc_gt'] = tc_result['rtc_gt']
+                    metrics['_per_frame_rtc'] = tc_result['per_frame_rtc']
+                    metrics['_per_frame_rtc_gt'] = tc_result['per_frame_rtc_gt']
+                    metrics['_rtc_ratio_stats'] = tc_result['ratio_stats']
+                    metrics['_rtc_per_frame_ratio_stats'] = tc_result['per_frame_ratio_stats']
+                    metrics['_rtc_best_frame_idx'] = tc_result['best_frame_idx']
+                    metrics['_rtc_worst_frame_idx'] = tc_result['worst_frame_idx']
+                    logger.info(f"Flow TC: rTC={metrics['rtc']:.4f}, rTC_gt={metrics['rtc_gt']:.4f}")
+
+                    # TC visualizations (depth grids, ratio heatmaps, rTC plot)
+                    try:
+                        rtc_best = tc_result['best_frame_idx']
+                        rtc_worst = tc_result['worst_frame_idx']
+                        per_frame_rtc = tc_result['per_frame_rtc']
+                        per_frame_rtc_gt = tc_result['per_frame_rtc_gt']
+
+                        self.flow_tc.save_visualization(
+                            pred_depths_cpu, gt_depth_processed_cpu, rtc_worst, sequence_id,
+                            self.save_dir, per_frame_rtc[rtc_worst], label='worst'
+                        )
+                        self.flow_tc.save_visualization(
+                            pred_depths_cpu, gt_depth_processed_cpu, rtc_best, sequence_id,
+                            self.save_dir, per_frame_rtc[rtc_best], label='best'
+                        )
+                        self.flow_tc.save_ratio_heatmap(
+                            images_for_tc, pred_depths_cpu, rtc_worst, sequence_id,
+                            self.save_dir, per_frame_rtc[rtc_worst], label='worst'
+                        )
+                        self.flow_tc.save_ratio_heatmap(
+                            images_for_tc, pred_depths_cpu, rtc_best, sequence_id,
+                            self.save_dir, per_frame_rtc[rtc_best], label='best'
+                        )
+                        self.flow_tc.save_rtc_plot(
+                            per_frame_rtc, per_frame_rtc_gt, rtc_best, rtc_worst,
+                            sequence_id, self.save_dir
+                        )
+                        logger.info(f"TC visualizations saved for sequence {sequence_id}")
+                    except Exception as e:
+                        logger.warning(f"Failed to save TC visualizations: {e}")
+                else:
+                    metrics['rtc'] = 0.0
+                    metrics['rtc_gt'] = 0.0
+            else:
+                metrics['rtc'] = 0.0
+                metrics['rtc_gt'] = 0.0
+            return metrics
+
         # Compute regular metrics if:
         # 1. Object-wise mode is disabled, OR
         # 2. Object-wise mode is enabled but no segmentations available (fallback)
@@ -609,30 +682,25 @@ class VideoComparisonTester:
 
             # === Flow-based Temporal Consistency (rTC) ===
             if len(pred_depths) > 1:
-                try:
-                    if self.flow_tc is None:
-                        self.flow_tc = FlowTemporalConsistency(
-                            device=self.device, thr=self.tc_threshold, max_depth=70.0
-                        )
-                    images_for_tc = batch['images'][0] if 'images' in batch else None
-                    if images_for_tc is not None:
-                        tc_result = self.flow_tc.compute_rtc(
-                            images_for_tc, pred_depths_cpu, gt_depths=gt_depth_processed_cpu
-                        )
-                        metrics['rtc'] = tc_result['rtc']
-                        metrics['rtc_gt'] = tc_result['rtc_gt']
-                        metrics['_per_frame_rtc'] = tc_result['per_frame_rtc']
-                        metrics['_per_frame_rtc_gt'] = tc_result['per_frame_rtc_gt']
-                        metrics['_rtc_ratio_stats'] = tc_result['ratio_stats']
-                        metrics['_rtc_per_frame_ratio_stats'] = tc_result['per_frame_ratio_stats']
-                        metrics['_rtc_best_frame_idx'] = tc_result['best_frame_idx']
-                        metrics['_rtc_worst_frame_idx'] = tc_result['worst_frame_idx']
-                        logger.info(f"Flow TC: rTC={metrics['rtc']:.4f}, rTC_gt={metrics['rtc_gt']:.4f}")
-                    else:
-                        metrics['rtc'] = 0.0
-                        metrics['rtc_gt'] = 0.0
-                except Exception as e:
-                    logger.warning(f"Failed to compute flow temporal consistency: {e}")
+                if self.flow_tc is None:
+                    self.flow_tc = FlowTemporalConsistency(
+                        device=self.device, thr=self.tc_threshold, max_depth=70.0
+                    )
+                images_for_tc = batch['images'][0] if 'images' in batch else None
+                if images_for_tc is not None:
+                    tc_result = self.flow_tc.compute_rtc(
+                        images_for_tc, pred_depths_cpu, gt_depths=gt_depth_processed_cpu
+                    )
+                    metrics['rtc'] = tc_result['rtc']
+                    metrics['rtc_gt'] = tc_result['rtc_gt']
+                    metrics['_per_frame_rtc'] = tc_result['per_frame_rtc']
+                    metrics['_per_frame_rtc_gt'] = tc_result['per_frame_rtc_gt']
+                    metrics['_rtc_ratio_stats'] = tc_result['ratio_stats']
+                    metrics['_rtc_per_frame_ratio_stats'] = tc_result['per_frame_ratio_stats']
+                    metrics['_rtc_best_frame_idx'] = tc_result['best_frame_idx']
+                    metrics['_rtc_worst_frame_idx'] = tc_result['worst_frame_idx']
+                    logger.info(f"Flow TC: rTC={metrics['rtc']:.4f}, rTC_gt={metrics['rtc_gt']:.4f}")
+                else:
                     metrics['rtc'] = 0.0
                     metrics['rtc_gt'] = 0.0
             else:
@@ -1499,8 +1567,8 @@ def main():
                        help='Limit the number of NuScenes scenes to process (for debugging)')
     parser.add_argument('--test-mode', type=str, default=None, choices=['tc'],
                        help='Test mode: tc (temporal consistency only)')
-    parser.add_argument('--tc-threshold', type=float, default=1.25,
-                       help='Threshold for rTC metric (default: 1.25)')
+    parser.add_argument('--tc-threshold', type=float, default=1.1,
+                       help='Threshold for rTC metric (default: 1.1)')
 
     args = parser.parse_args()
 

@@ -32,11 +32,11 @@ class FlowTemporalConsistency:
     Lazy-loads SEA-RAFT on first use (~200MB GPU, ~1-2s loading time).
     """
 
-    def __init__(self, device='cuda:0', thr=1.25, max_depth=70.0, checkpoint_path=None):
+    def __init__(self, device='cuda:0', thr=1.1, max_depth=70.0, checkpoint_path=None):
         """
         Args:
             device: torch device
-            thr: ratio threshold for rTC (default 1.25, same as delta1)
+            thr: ratio threshold for rTC (default 1.1)
             max_depth: maximum valid depth in meters
             checkpoint_path: path to SEA-RAFT weights (auto-detected if None)
         """

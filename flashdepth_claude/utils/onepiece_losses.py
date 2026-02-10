@@ -1,7 +1,7 @@
 """
 Onepiece Loss Functions.
 
-Combined loss: L_total = L_log_l1 + L_tgm + L_feat_cons (1:1:1 default)
+Combined loss: L_total = L_log_l1 + L_tgm + L_feat_cons (1:1:0.01 default)
 
 Components:
     - L_log_l1: Reuses LogL1Loss from gear_losses (metric depth space)
@@ -151,7 +151,7 @@ class OnepieceCombinedLoss(nn.Module):
 
     L_total = w1 * L_log_l1 + w2 * L_tgm + w3 * L_feat_cons
 
-    Default weights: 1:1:1
+    Default weights: 1:1:0.01
     """
 
     def __init__(self, log_l1_weight=1.0, tgm_weight=1.0, feat_cons_weight=1.0,
@@ -194,15 +194,10 @@ class OnepieceCombinedLoss(nn.Module):
         # 1. Log L1 Loss (per-frame, no scene cut weighting)
         l_log_l1 = self.log_l1_loss(pred_depth, gt_depth, valid_mask)
 
-        # 2. TGM Loss (temporal, with scene cut weighting via valid mask)
+        # 2. TGM Loss (temporal, with per-pair scene cut weighting)
         if self.tgm_weight > 0 and pred_depth.shape[1] >= 2:
-            l_tgm = self.tgm_loss(pred_depth, gt_depth, valid_mask)
-
-            # Apply scene cut weights to TGM loss
-            # TGM already uses per-pair temporal gradients, so we weight the result
-            if scene_cut_weights is not None:
-                mean_weight = scene_cut_weights.mean()
-                l_tgm = l_tgm * mean_weight
+            l_tgm = self.tgm_loss(pred_depth, gt_depth, valid_mask,
+                                   scene_cut_weights=scene_cut_weights)
         else:
             l_tgm = torch.tensor(0.0, device=pred_depth.device)
 
