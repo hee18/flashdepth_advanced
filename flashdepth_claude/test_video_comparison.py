@@ -230,29 +230,25 @@ class VideoComparisonTester:
 
         logger.info(f"Setting up test loader for dataset: {dataset_name}")
 
-        # Object-wise datasets
-        if dataset_name.endswith('_seg'):
-            base_dataset_name = dataset_name.replace('_seg', '')
+        # Remove _seg suffix if present (for unified naming)
+        base_dataset_name = dataset_name.replace('_seg', '') if dataset_name.endswith('_seg') else dataset_name
+
+        # Dataset selection based on --objwise flag
+        # --objwise: Use SegmentationDataset (inverse depth)
+        # No flag: Use ComparisonDataset (metric depth)
+        if self.object_wise_enabled:
             if base_dataset_name == 'waymo':
                 # WaymoSegmentationDataset expects data_root to be waymo_seg directory
                 waymo_data_root = str(Path(data_root) / 'waymo_seg')
-
-                # Use objwise_mode only if --objwise flag is set
-                # objwise_mode=True: Use ALL frames with segmentation (ignores video_length)
-                # objwise_mode=False: Use video_length frames (standard sliding window)
-                objwise_mode = self.object_wise_enabled
 
                 dataset = WaymoSegmentationDataset(
                     data_root=waymo_data_root,
                     split='val',
                     video_length=video_length,
-                    objwise_mode=objwise_mode
+                    objwise_mode=True
                 )
                 collate_fn = waymo_collate_fn
-                if objwise_mode:
-                    logger.info(f"Object-wise dataset: waymo_seg (using ALL frames with segmentation, ignoring video_length)")
-                else:
-                    logger.info(f"Standard dataset: waymo_seg (using video_length={video_length} frames)")
+                logger.info(f"Object-wise dataset: waymo_seg (using ALL frames with segmentation, ignoring video_length)")
             elif base_dataset_name == 'urbansyn':
                 dataset = UrbanSynSegmentationDataset(
                     data_root=data_root,
@@ -273,35 +269,38 @@ class VideoComparisonTester:
                 collate_fn = vkitti_collate_fn
                 logger.info(f"Object-wise dataset: vkitti_seg (only_clone={only_clone})")
             else:
-                raise ValueError(f"Unknown segmentation dataset: {dataset_name}")
+                raise ValueError(f"Unknown segmentation dataset for --objwise: {base_dataset_name}. "
+                                f"Supported: waymo, urbansyn, vkitti")
         else:
-            # Standard datasets - use ComparisonDataset for fair comparison
+            # Standard evaluation - use ComparisonDataset (metric depth)
             # ComparisonDataset provides ORIGINAL resolution images
-            # Match FlashDepth original inference behavior (split='test' for comprehensive testing)
-            # waymo: uses 'val' split (hardcoded directory path in dataset implementation)
-            # others: use 'test' split (all scenes)
-            if dataset_name == 'waymo':
+            # waymo_seg: uses 'val' split
+            # others: use 'test' split
+            if base_dataset_name == 'waymo':
                 split = 'val'
             else:
                 split = 'test'
 
             # Get only_clone flag for VKITTI
-            only_clone = self.config.get('only_clone', False) if dataset_name == 'vkitti' else False
+            only_clone = self.config.get('only_clone', False) if base_dataset_name == 'vkitti' else False
 
             # Get seq_list from config (supports all datasets now)
             seq_list = self.config.get('seq_list', None)
 
+            # Use base_dataset_name (with _seg removed) for ComparisonDataset
+            # ComparisonDataset will look for waymo_seg, vkitti, urbansyn directories
             dataset = ComparisonDataset(
-                dataset_name=dataset_name,
+                dataset_name=base_dataset_name if base_dataset_name != 'waymo' else 'waymo_seg',
                 data_root=data_root,
                 split=split,
                 video_length=video_length,
-                objwise_enabled=self.object_wise_enabled,
+                objwise_enabled=False,
                 only_clone=only_clone,
-                seq_list=seq_list,  # Supports all datasets now
-                limit_scenes=self.config.get('limit_scenes') # Pass limit_scenes
+                seq_list=seq_list,
+                limit_scenes=self.config.get('limit_scenes')
             )
             collate_fn = comparison_collate_fn
+            logger.info(f"Standard dataset: {base_dataset_name} (ComparisonDataset, metric depth)")
 
         # For high resolution datasets, use num_workers=0 to avoid OOM and slow worker processes
         num_workers = self.config.get('workers', 4)
@@ -467,6 +466,10 @@ class VideoComparisonTester:
                     intrinsics=intrinsics  # [1, T, 4] or None
                 )
 
+        # Free warmup result to prevent OOM on high-res datasets
+        del _
+        torch.cuda.empty_cache()
+
         # Timed run
         logger.info("Timed inference...")
         torch.cuda.synchronize()
@@ -512,21 +515,27 @@ class VideoComparisonTester:
         best_frame_abs_rel = float('inf')
         frame_metrics = []
 
-        # Upsample predictions to match GT original resolution for visualization
-        # This handles cases where model outputs resized depth (e.g., 518x518)
-        # but we want to visualize at original resolution (e.g., 1920x1280)
+        # Downsample GT to match prediction resolution (prevents OOM on high-res datasets)
         gt_depth_processed_cpu = gt_depth_processed[0].cpu()  # [T, 1, H, W]
         pred_H, pred_W = pred_depths.shape[2:]
         gt_H, gt_W = gt_depth_processed_cpu.shape[2:]
 
         if (gt_H != pred_H) or (gt_W != pred_W):
-            logger.info(f"Upsampling predictions from {pred_H}x{pred_W} to {gt_H}x{gt_W} to match GT original resolution")
-            pred_depths = torch.nn.functional.interpolate(
-                pred_depths,  # [T, 1, H, W]
-                size=(gt_H, gt_W),
-                mode='bilinear',  # Use bilinear for smooth depth upsampling
+            logger.info(f"Downsampling GT from {gt_H}x{gt_W} to {pred_H}x{pred_W} to match prediction resolution")
+            gt_depth_processed_cpu = torch.nn.functional.interpolate(
+                gt_depth_processed_cpu,  # [T, 1, H, W]
+                size=(pred_H, pred_W),
+                mode='bilinear',
                 align_corners=False
             )
+            # Also downsample images in batch for TC (flow must match depth resolution)
+            if 'images' in batch:
+                batch['images'] = torch.nn.functional.interpolate(
+                    batch['images'][0],  # [T, 3, H, W]
+                    size=(pred_H, pred_W),
+                    mode='bilinear',
+                    align_corners=False
+                ).unsqueeze(0)  # [1, T, 3, H, W]
 
         # Compute metrics
         pred_depths_cpu = pred_depths.cpu()
@@ -572,23 +581,28 @@ class VideoComparisonTester:
 
                         self.flow_tc.save_visualization(
                             pred_depths_cpu, gt_depth_processed_cpu, rtc_worst, sequence_id,
-                            self.save_dir, per_frame_rtc[rtc_worst], label='worst'
+                            self.save_dir, per_frame_rtc[rtc_worst], label='worst',
+                            dataset_name=self.dataset_name
                         )
                         self.flow_tc.save_visualization(
                             pred_depths_cpu, gt_depth_processed_cpu, rtc_best, sequence_id,
-                            self.save_dir, per_frame_rtc[rtc_best], label='best'
+                            self.save_dir, per_frame_rtc[rtc_best], label='best',
+                            dataset_name=self.dataset_name
                         )
                         self.flow_tc.save_ratio_heatmap(
                             images_for_tc, pred_depths_cpu, rtc_worst, sequence_id,
-                            self.save_dir, per_frame_rtc[rtc_worst], label='worst'
+                            self.save_dir, per_frame_rtc[rtc_worst], label='worst',
+                            dataset_name=self.dataset_name
                         )
                         self.flow_tc.save_ratio_heatmap(
                             images_for_tc, pred_depths_cpu, rtc_best, sequence_id,
-                            self.save_dir, per_frame_rtc[rtc_best], label='best'
+                            self.save_dir, per_frame_rtc[rtc_best], label='best',
+                            dataset_name=self.dataset_name
                         )
                         self.flow_tc.save_rtc_plot(
                             per_frame_rtc, per_frame_rtc_gt, rtc_best, rtc_worst,
-                            sequence_id, self.save_dir
+                            sequence_id, self.save_dir,
+                            dataset_name=self.dataset_name
                         )
                         logger.info(f"TC visualizations saved for sequence {sequence_id}")
                     except Exception as e:
@@ -681,7 +695,11 @@ class VideoComparisonTester:
                 metrics['tae'] = 0.0
 
             # === Flow-based Temporal Consistency (rTC) ===
-            if len(pred_depths) > 1:
+            if self.test_mode == 'ea':
+                # EA mode: skip rTC (avoids loading SEA-RAFT, saves ~200MB GPU)
+                metrics['rtc'] = 0.0
+                metrics['rtc_gt'] = 0.0
+            elif len(pred_depths) > 1:
                 if self.flow_tc is None:
                     self.flow_tc = FlowTemporalConsistency(
                         device=self.device, thr=self.tc_threshold, max_depth=70.0
@@ -1565,15 +1583,15 @@ def main():
                        help='Data type for AMP (bfloat16 or float16)')
     parser.add_argument('--limit-scenes', type=int, default=None,
                        help='Limit the number of NuScenes scenes to process (for debugging)')
-    parser.add_argument('--test-mode', type=str, default=None, choices=['tc'],
-                       help='Test mode: tc (temporal consistency only)')
+    parser.add_argument('--test-mode', type=str, default=None, choices=['tc', 'ea'],
+                       help='Test mode: tc (temporal consistency only), ea (error & accuracy only, skip rTC)')
     parser.add_argument('--tc-threshold', type=float, default=1.1,
                        help='Threshold for rTC metric (default: 1.1)')
 
     args = parser.parse_args()
 
     # Validate method is a video model
-    VIDEO_MODELS = ['vda', 'depthcrafter']
+    VIDEO_MODELS = ['vda', 'depthcrafter', 'flashdepth']
     if args.method not in VIDEO_MODELS:
         logger.error(f"❌ Error: '{args.method}' is not a video model")
         logger.error(f"   This script is for VIDEO models only: {', '.join(VIDEO_MODELS)}")
@@ -1637,6 +1655,17 @@ def main():
         elif args.method == 'depthcrafter':
             from adapters.depthcrafter_adapter import DepthCrafterAdapter
             adapter = DepthCrafterAdapter()
+        elif args.method == 'flashdepth':
+            from adapters.flashdepth_adapter import FlashDepthAdapter
+            # Infer variant from checkpoint path
+            variant = 'l'  # default
+            if args.checkpoint:
+                if 'flashdepth-s' in args.checkpoint:
+                    variant = 's'
+                elif 'flashdepth/' in args.checkpoint and 'flashdepth-' not in args.checkpoint:
+                    variant = 'hybrid'
+            adapter = FlashDepthAdapter(config_variant=variant, checkpoint_path=args.checkpoint)
+            adapter.set_dataset(config.get('dataset', ''))
         else:
             # Should never reach here due to earlier validation
             raise ValueError(f"Unknown video method: {args.method}")

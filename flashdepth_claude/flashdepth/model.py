@@ -3,7 +3,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
-import time 
+import time
+from contextlib import nullcontext
 from einops import rearrange
 from PIL import Image
 import logging
@@ -578,6 +579,107 @@ class FlashDepth(nn.Module):
             'scale': scale,                          # [B, T]
             'shift': shift,                          # [B, T]
             'dpt_features': dpt_features_seq,        # [B, T, 256, h, w]
+            'cls_tokens': cls_tokens_seq,            # [B, T, 1024]
+            'scene_cut_weights': scene_cut_weights,  # [B, T-1]
+            'd_cls': d_cls,                          # [B, T-1]
+        }
+
+    def forward_with_onepiece_streaming(self, video, phase=2, no_shift=False,
+                                         cls_layer_indices=None):
+        """
+        Frame-by-frame streaming inference with Mamba temporal state.
+
+        Mathematically equivalent to forward_with_onepiece (Mamba2 parallel scan
+        == sequential recurrence), but processes one frame at a time for fair FPS
+        measurement and real-world streaming scenarios.
+
+        Args:
+            video: [B, T, C, H, W] video tensor (already on GPU)
+            phase: 1 or 2 (controls DPT/final_head freezing)
+            no_shift: If True, zero out shift (scale-only mode)
+            cls_layer_indices: Optional list of 0-indexed indices into intermediate
+                              layers for multi-layer CLS averaging.
+
+        Returns:
+            dict with: relative_depth, metric_depth, scale, shift,
+                       cls_tokens, scene_cut_weights, d_cls
+        """
+        if not self.use_onepiece:
+            raise ValueError("Onepiece is not enabled. Set use_onepiece=True.")
+
+        B, T, C, H, W = video.shape
+        patch_h, patch_w = H // self.patch_size, W // self.patch_size
+
+        # Reset Mamba hidden state for new sequence
+        self.unified_global_mamba.start_new_sequence()
+
+        all_metric_depth = []
+        all_scale = []
+        all_shift = []
+        all_relative_depth = []
+        all_cls_tokens = []
+
+        ctx = torch.no_grad() if phase == 1 else nullcontext()
+
+        for t in range(T):
+            frame = video[:, t]  # [B, 3, H, W]
+
+            # Step 1: DINOv2 encoder (always frozen)
+            with torch.no_grad():
+                encoder_features, cls_token = self._get_intermediate_layers_with_cls(
+                    frame, self.intermediate_layer_idx[self.encoder],
+                    cls_layer_indices=cls_layer_indices
+                )  # cls_token: [B, 1024]
+
+            # Step 2: DPT (no spatial Mamba in Onepiece)
+            with ctx:
+                dpt_features = self.depth_head(encoder_features, patch_h, patch_w)  # [B, 256, h, w]
+
+            # Step 3: GAP
+            gap = F.adaptive_avg_pool2d(dpt_features, 1).squeeze(-1).squeeze(-1)  # [B, 256]
+
+            # Step 4: Mamba streaming (single frame with hidden state)
+            global_token = torch.cat([cls_token, gap], dim=-1).unsqueeze(1)  # [B, 1, 1280]
+            refined = self.unified_global_mamba.forward_single_frame(global_token).squeeze(1)  # [B, 1280]
+
+            # Step 5a: MetricHead → scale, shift, FiLM params
+            scale, shift, gamma, beta = self.onepiece_metric_head(refined)
+
+            if no_shift:
+                shift = torch.zeros_like(shift)
+
+            # Step 5b: FiLM modulation on DPT features
+            modulated = gamma.unsqueeze(-1).unsqueeze(-1) * dpt_features + beta.unsqueeze(-1).unsqueeze(-1)
+
+            # Step 6: final_head → relative depth
+            with ctx:
+                relative_depth = self.final_head(modulated, patch_h, patch_w)  # [B, H, W]
+
+            # Step 7: Metric depth conversion
+            depth_from_relative = 100.0 / (relative_depth + 1e-8)
+            metric_depth = scale.unsqueeze(-1) * depth_from_relative + shift.unsqueeze(-1)
+
+            all_metric_depth.append(metric_depth)
+            all_scale.append(scale.squeeze(-1))
+            all_shift.append(shift.squeeze(-1))
+            all_relative_depth.append(relative_depth)
+            all_cls_tokens.append(cls_token)
+
+        # Stack results along time dimension
+        metric_depth = torch.stack(all_metric_depth, dim=1)   # [B, T, H, W]
+        scale = torch.stack(all_scale, dim=1)                  # [B, T]
+        shift = torch.stack(all_shift, dim=1)                  # [B, T]
+        relative_depth = torch.stack(all_relative_depth, dim=1)  # [B, T, H, W]
+        cls_tokens_seq = torch.stack(all_cls_tokens, dim=1)    # [B, T, 1024]
+
+        # Scene cut detection (post-hoc on all CLS tokens, logging only)
+        scene_cut_weights, d_cls = self.scene_cut_detector(cls_tokens_seq)
+
+        return {
+            'relative_depth': relative_depth,       # [B, T, H, W]
+            'metric_depth': metric_depth,            # [B, T, H, W]
+            'scale': scale,                          # [B, T]
+            'shift': shift,                          # [B, T]
             'cls_tokens': cls_tokens_seq,            # [B, T, 1024]
             'scene_cut_weights': scene_cut_weights,  # [B, T-1]
             'd_cls': d_cls,                          # [B, T-1]

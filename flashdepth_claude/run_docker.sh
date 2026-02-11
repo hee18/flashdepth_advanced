@@ -1770,80 +1770,116 @@ case $COMMAND in
         echo "  - Inverse colormap: $INVERSE"
         echo "  - Visualization: $VIS_STATUS"
         echo "  - DataLoader workers: $WORKERS"
+        if [ -n "$TEST_MODE" ]; then
+            echo "  - Test mode: $TEST_MODE"
+        fi
         echo "  - Log file: ${FINAL_RESULTS_DIR}/test.log"
         echo ""
 
         # Create output directory on host
         mkdir -p "$FINAL_RESULTS_DIR"
 
-        # Build base command
-        TEST_CMD="cd /FlashDepth && torchrun --nproc_per_node=1 train.py \
-          --config-path configs/$FLASHDEPTH_CONFIG \
-          inference=true \
-          eval.test_datasets=[$TEST_DATASET] \
-          eval.metrics=true \
-          dataset.data_root=/data/datasets \
-          eval.outfolder=$OUTFOLDER \
-          load=$CHECKPOINT \
-          +eval.inverse=$INVERSE \
-          eval.compile=false \
-          eval.out_video=$OUT_VIDEO \
-          eval.save_depth_npy=$SAVE_DEPTH \
-          eval.num_workers=$WORKERS \
-          eval.test_dataset_resolution=$RESOLUTION"
+        # Use test_video_comparison.py for special test modes (e.g., tc)
+        if [ -n "$TEST_MODE" ]; then
+            echo "Running FlashDepth via test_video_comparison.py (--test-mode $TEST_MODE)..."
 
-        # Add limit_scenes if specified
-        if [ -n "$LIMIT_SCENES" ]; then
-            TEST_CMD="$TEST_CMD \
-          +eval.limit_scenes=$LIMIT_SCENES"
-        fi
+            DOCKER_CMD="CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm flashdepth python test_video_comparison.py \
+                --method flashdepth \
+                --dataset $TEST_DATASET \
+                --data-root /data/datasets \
+                --checkpoint $CHECKPOINT \
+                --results-dir /app/$FINAL_RESULTS_DIR \
+                --gpu 0 \
+                --video-length $VID_LEN \
+                --workers $WORKERS \
+                --depth-mode metric \
+                --test-mode $TEST_MODE"
 
-        # Run test and save log
-        echo "Running FlashDepth inference on $TEST_DATASET..."
-        CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm flashdepth bash -c "$TEST_CMD" 2>&1 | tee "${FINAL_RESULTS_DIR}/test.log"
-
-        # Parse log and save as JSON
-        echo ""
-        echo "Parsing results to JSON..."
-        python3 utils/parse_flashdepth_results.py "${FINAL_RESULTS_DIR}/test.log" "$FINAL_RESULTS_DIR"
-
-        # Run scale/shift alignment evaluation (.npy files are always saved now)
-        if [ -d "$FINAL_RESULTS_DIR" ]; then
-            echo ""
-            echo "Running scale/shift alignment evaluation..."
-
-            # Build eval command with optional --seq and --frame
-            EVAL_CMD="python3 scripts/eval_flashdepth_with_alignment.py \
-                --pred-dir \"$FINAL_RESULTS_DIR\" \
-                --dataset \"$TEST_DATASET\" \
-                --data-root /home/cvlab/hsy/Datasets \
-                --max-depth 70.0 \
-                --output-dir \"${FINAL_RESULTS_DIR}/eval_aligned\""
+            if [ -n "$LIMIT_SCENES" ]; then
+                DOCKER_CMD="$DOCKER_CMD --limit-scenes $LIMIT_SCENES"
+            fi
 
             if [ -n "$SEQ" ]; then
-                EVAL_CMD="$EVAL_CMD --seq \"$SEQ\""
+                DOCKER_CMD="$DOCKER_CMD --seq $SEQ"
             fi
 
-            if [ -n "$FRAME" ]; then
-                EVAL_CMD="$EVAL_CMD --frame $FRAME"
-            fi
+            eval $DOCKER_CMD 2>&1 | tee "${FINAL_RESULTS_DIR}/test.log"
 
-            eval "$EVAL_CMD" 2>&1 | tee -a "${FINAL_RESULTS_DIR}/eval_aligned.log" || echo "Warning: Alignment evaluation failed (GT may not be available for this dataset)"
+            echo ""
+            echo "✓ Test complete! Results saved to:"
+            echo "  - Temporal consistency: ${FINAL_RESULTS_DIR}/temporal_consistency.json"
+            echo "  - Full log: ${FINAL_RESULTS_DIR}/test.log"
         else
-            echo "Warning: Results directory not found: $FINAL_RESULTS_DIR"
-        fi
+            # Original train.py inference pipeline
+            # Build base command
+            TEST_CMD="cd /FlashDepth && torchrun --nproc_per_node=1 train.py \
+              --config-path configs/$FLASHDEPTH_CONFIG \
+              inference=true \
+              eval.test_datasets=[$TEST_DATASET] \
+              eval.metrics=true \
+              dataset.data_root=/data/datasets \
+              eval.outfolder=$OUTFOLDER \
+              load=$CHECKPOINT \
+              +eval.inverse=$INVERSE \
+              eval.compile=false \
+              eval.out_video=$OUT_VIDEO \
+              eval.save_depth_npy=$SAVE_DEPTH \
+              eval.num_workers=$WORKERS \
+              eval.test_dataset_resolution=$RESOLUTION"
 
-        echo ""
-        echo "✓ Test complete! Results saved to:"
-        echo "  - FPS Summary: ${FINAL_RESULTS_DIR}/fps_results.json"
-        echo "  - Per-sequence FPS: ${FINAL_RESULTS_DIR}/per_sequence_fps.json"
-        echo "  - Full log: ${FINAL_RESULTS_DIR}/test.log"
-        echo "  - Depth files (.npy): ${FINAL_RESULTS_DIR}/*/*.npy"
-        echo "  - Aligned evaluation: ${FINAL_RESULTS_DIR}/eval_aligned/"
-        echo "    - eval_results.json (overall metrics with scale/shift)"
-        echo "    - per_sequence_scale_shift.json (per-sequence s,t values)"
-        if [ "$NO_VIDEO" != "true" ]; then
-            echo "  - MP4 videos: ${FINAL_RESULTS_DIR}/*/*.mp4"
+            # Add limit_scenes if specified
+            if [ -n "$LIMIT_SCENES" ]; then
+                TEST_CMD="$TEST_CMD \
+              +eval.limit_scenes=$LIMIT_SCENES"
+            fi
+
+            # Run test and save log
+            echo "Running FlashDepth inference on $TEST_DATASET..."
+            CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm flashdepth bash -c "$TEST_CMD" 2>&1 | tee "${FINAL_RESULTS_DIR}/test.log"
+
+            # Parse log and save as JSON
+            echo ""
+            echo "Parsing results to JSON..."
+            python3 utils/parse_flashdepth_results.py "${FINAL_RESULTS_DIR}/test.log" "$FINAL_RESULTS_DIR"
+
+            # Run scale/shift alignment evaluation (.npy files are always saved now)
+            if [ -d "$FINAL_RESULTS_DIR" ]; then
+                echo ""
+                echo "Running scale/shift alignment evaluation..."
+
+                # Build eval command with optional --seq and --frame
+                EVAL_CMD="python3 scripts/eval_flashdepth_with_alignment.py \
+                    --pred-dir \"$FINAL_RESULTS_DIR\" \
+                    --dataset \"$TEST_DATASET\" \
+                    --data-root /home/cvlab/hsy/Datasets \
+                    --max-depth 70.0 \
+                    --output-dir \"${FINAL_RESULTS_DIR}/eval_aligned\""
+
+                if [ -n "$SEQ" ]; then
+                    EVAL_CMD="$EVAL_CMD --seq \"$SEQ\""
+                fi
+
+                if [ -n "$FRAME" ]; then
+                    EVAL_CMD="$EVAL_CMD --frame $FRAME"
+                fi
+
+                eval "$EVAL_CMD" 2>&1 | tee -a "${FINAL_RESULTS_DIR}/eval_aligned.log" || echo "Warning: Alignment evaluation failed (GT may not be available for this dataset)"
+            else
+                echo "Warning: Results directory not found: $FINAL_RESULTS_DIR"
+            fi
+
+            echo ""
+            echo "✓ Test complete! Results saved to:"
+            echo "  - FPS Summary: ${FINAL_RESULTS_DIR}/fps_results.json"
+            echo "  - Per-sequence FPS: ${FINAL_RESULTS_DIR}/per_sequence_fps.json"
+            echo "  - Full log: ${FINAL_RESULTS_DIR}/test.log"
+            echo "  - Depth files (.npy): ${FINAL_RESULTS_DIR}/*/*.npy"
+            echo "  - Aligned evaluation: ${FINAL_RESULTS_DIR}/eval_aligned/"
+            echo "    - eval_results.json (overall metrics with scale/shift)"
+            echo "    - per_sequence_scale_shift.json (per-sequence s,t values)"
+            if [ "$NO_VIDEO" != "true" ]; then
+                echo "  - MP4 videos: ${FINAL_RESULTS_DIR}/*/*.mp4"
+            fi
         fi
         ;;
 
@@ -1951,6 +1987,9 @@ case $COMMAND in
         ;;
 
     test_onepiece)
+        # Determine test dataset (default: all datasets)
+        ONEPIECE_TEST_DATASET="${OBJWISE_DATASET:-}"
+
         echo "Starting Onepiece testing..."
         echo "Configuration:"
         echo "  - Config variant: $CONFIG_VARIANT (--config-variant, default: l)"
@@ -1962,6 +2001,8 @@ case $COMMAND in
         echo "  - No-shift: $NO_SHIFT (--no-shift, default: false)"
         echo "  - Checkpoint: ${GEAR_CHECKPOINT:-config default} (--gear-checkpoint)"
         echo "  - Results directory: $RESULTS_DIR (--results-dir)"
+        echo "  - Dataset: ${ONEPIECE_TEST_DATASET:-all (default)}"
+        echo "  - No-video: $NO_VIDEO (--no-video, default: false)"
         echo ""
 
         DOCKER_CMD="CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm flashdepth python test_onepiece.py \
@@ -1976,6 +2017,16 @@ case $COMMAND in
 
         if [ -n "$GEAR_CHECKPOINT" ]; then
             DOCKER_CMD="$DOCKER_CMD load=$GEAR_CHECKPOINT"
+        fi
+
+        # Filter to specific dataset if --dataset is provided
+        if [ -n "$ONEPIECE_TEST_DATASET" ]; then
+            DOCKER_CMD="$DOCKER_CMD eval.test_datasets=[$ONEPIECE_TEST_DATASET]"
+        fi
+
+        # Disable video (GIF) generation if --no-video flag is set
+        if [ "$NO_VIDEO" == "true" ]; then
+            DOCKER_CMD="$DOCKER_CMD eval.out_video=false"
         fi
 
         # Add test-mode if specified

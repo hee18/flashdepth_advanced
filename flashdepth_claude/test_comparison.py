@@ -549,21 +549,27 @@ class ComparisonTester:
         # Stack predictions
         pred_depths = torch.stack(pred_depths, dim=0)  # [T, 1, H, W]
 
-        # Upsample predictions to match GT original resolution for visualization
-        # This handles cases where model outputs resized depth (e.g., 518x518)
-        # but we want to visualize at original resolution (e.g., 1920x1280)
+        # Downsample GT to match prediction resolution (prevents OOM on high-res datasets)
         gt_depth_processed_cpu = gt_depth_processed[0].cpu()  # [T, 1, H, W]
         pred_H, pred_W = pred_depths.shape[2:]
         gt_H, gt_W = gt_depth_processed_cpu.shape[2:]
 
         if (gt_H != pred_H) or (gt_W != pred_W):
-            logger.info(f"Upsampling predictions from {pred_H}x{pred_W} to {gt_H}x{gt_W} to match GT original resolution")
-            pred_depths = torch.nn.functional.interpolate(
-                pred_depths,  # [T, 1, H, W]
-                size=(gt_H, gt_W),
-                mode='bilinear',  # Use bilinear for smooth depth upsampling
+            logger.info(f"Downsampling GT from {gt_H}x{gt_W} to {pred_H}x{pred_W} to match prediction resolution")
+            gt_depth_processed_cpu = torch.nn.functional.interpolate(
+                gt_depth_processed_cpu,  # [T, 1, H, W]
+                size=(pred_H, pred_W),
+                mode='bilinear',
                 align_corners=False
             )
+            # Also downsample images in batch for TC (flow must match depth resolution)
+            if 'images' in batch:
+                batch['images'] = torch.nn.functional.interpolate(
+                    batch['images'][0],  # [T, 3, H, W]
+                    size=(pred_H, pred_W),
+                    mode='bilinear',
+                    align_corners=False
+                ).unsqueeze(0)  # [1, T, 3, H, W]
 
         # Compute metrics
         pred_depths_cpu = pred_depths.cpu()
@@ -609,23 +615,28 @@ class ComparisonTester:
 
                         self.flow_tc.save_visualization(
                             pred_depths_cpu, gt_depth_processed_cpu, rtc_worst, sequence_id,
-                            self.save_dir, per_frame_rtc[rtc_worst], label='worst'
+                            self.save_dir, per_frame_rtc[rtc_worst], label='worst',
+                            dataset_name=self.dataset_name
                         )
                         self.flow_tc.save_visualization(
                             pred_depths_cpu, gt_depth_processed_cpu, rtc_best, sequence_id,
-                            self.save_dir, per_frame_rtc[rtc_best], label='best'
+                            self.save_dir, per_frame_rtc[rtc_best], label='best',
+                            dataset_name=self.dataset_name
                         )
                         self.flow_tc.save_ratio_heatmap(
                             images_for_tc, pred_depths_cpu, rtc_worst, sequence_id,
-                            self.save_dir, per_frame_rtc[rtc_worst], label='worst'
+                            self.save_dir, per_frame_rtc[rtc_worst], label='worst',
+                            dataset_name=self.dataset_name
                         )
                         self.flow_tc.save_ratio_heatmap(
                             images_for_tc, pred_depths_cpu, rtc_best, sequence_id,
-                            self.save_dir, per_frame_rtc[rtc_best], label='best'
+                            self.save_dir, per_frame_rtc[rtc_best], label='best',
+                            dataset_name=self.dataset_name
                         )
                         self.flow_tc.save_rtc_plot(
                             per_frame_rtc, per_frame_rtc_gt, rtc_best, rtc_worst,
-                            sequence_id, self.save_dir
+                            sequence_id, self.save_dir,
+                            dataset_name=self.dataset_name
                         )
                         logger.info(f"TC visualizations saved for sequence {sequence_id}")
                     except Exception as e:
@@ -725,7 +736,11 @@ class ComparisonTester:
                 metrics['tae'] = 0.0
 
             # === Flow-based Temporal Consistency (rTC) ===
-            if len(pred_depths) > 1:
+            if self.test_mode == 'ea':
+                # EA mode: skip rTC (avoids loading SEA-RAFT, saves ~200MB GPU)
+                metrics['rtc'] = 0.0
+                metrics['rtc_gt'] = 0.0
+            elif len(pred_depths) > 1:
                 if self.flow_tc is None:
                     self.flow_tc = FlowTemporalConsistency(
                         device=self.device, thr=self.tc_threshold, max_depth=70.0
@@ -1609,8 +1624,8 @@ def main():
                        help='Data type for AMP (bfloat16 or float16)')
     parser.add_argument('--limit-scenes', type=int, default=None,
                        help='Limit the number of NuScenes scenes to process (for debugging)')
-    parser.add_argument('--test-mode', type=str, default=None, choices=['tc'],
-                       help='Test mode: tc (temporal consistency only)')
+    parser.add_argument('--test-mode', type=str, default=None, choices=['tc', 'ea'],
+                       help='Test mode: tc (temporal consistency only), ea (error & accuracy only, skip rTC)')
     parser.add_argument('--tc-threshold', type=float, default=1.1,
                        help='Threshold for rTC metric (default: 1.1)')
 

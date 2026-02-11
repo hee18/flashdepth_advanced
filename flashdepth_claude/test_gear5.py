@@ -1729,12 +1729,12 @@ class Gear5Tester:
                     # In depth space, de-canonicalization uses metric ratio (inverse of inverse ratio)
                     pred_depth_canonical = pred_depth_canonical * de_canonical_ratio_metric[0, t]
 
-                    # Interpolate prediction to GT resolution
+                    # Downsample GT to match prediction resolution if needed
+                    if gt_t_inverse.shape[-2:] != pred_depth_canonical.shape[-2:]:
+                        gt_t_inverse = F.interpolate(
+                            gt_t_inverse.unsqueeze(0), size=pred_depth_canonical.shape[-2:], mode="bilinear", align_corners=True
+                        ).squeeze(0)
                     gt_t_shape = gt_t_inverse.shape[-2:]
-                    if pred_depth_canonical.shape[-2:] != gt_t_shape:
-                        pred_depth_canonical = F.interpolate(
-                            pred_depth_canonical, size=gt_t_shape, mode="bilinear", align_corners=True
-                        )
 
                     pred_depth_metric = pred_depth_canonical[0]  # [1, H, W] in actual meters
                 else:
@@ -1762,12 +1762,12 @@ class Gear5Tester:
                     # De-canonicalization: convert from canonical space to actual space (inverse depth)
                     pred_depth_inverse_100 = pred_depth_inverse_100 * de_canonical_ratio_inverse[0, t]  # [1, 1, H, W] in actual space
 
-                    # Interpolate prediction to GT resolution (like train_gear5.py validation)
-                    gt_t_shape = gt_t_inverse.shape[-2:]  # GT original resolution
-                    if pred_depth_inverse_100.shape[-2:] != gt_t_shape:
-                        pred_depth_inverse_100 = F.interpolate(
-                            pred_depth_inverse_100, size=gt_t_shape, mode="bilinear", align_corners=True
-                        )
+                    # Downsample GT to match prediction resolution if needed
+                    if gt_t_inverse.shape[-2:] != pred_depth_inverse_100.shape[-2:]:
+                        gt_t_inverse = F.interpolate(
+                            gt_t_inverse.unsqueeze(0), size=pred_depth_inverse_100.shape[-2:], mode="bilinear", align_corners=True
+                        ).squeeze(0)
+                    gt_t_shape = gt_t_inverse.shape[-2:]
 
                     # Convert to metric depth (already in actual space after de-canonicalization)
                     pred_depth_metric = 100.0 / (pred_depth_inverse_100[0] + 1e-8)  # [1, H, W] in actual meters
@@ -1849,6 +1849,22 @@ class Gear5Tester:
         pred_depths_cpu = pred_depths
         gt_depth_metric_cpu = gt_depth_metric
 
+        # Downsample GT to match prediction resolution if needed (prevents OOM on high-res datasets)
+        if pred_depths_cpu.shape[-2:] != gt_depth_metric_cpu.shape[-2:]:
+            pred_h, pred_w = pred_depths_cpu.shape[-2:]
+            logger.info(f"Downsampling GT from {gt_depth_metric_cpu.shape[-2:]} to ({pred_h}, {pred_w})")
+            gt_depth_metric_cpu = F.interpolate(
+                gt_depth_metric_cpu, size=(pred_h, pred_w),
+                mode='bilinear', align_corners=True
+            )
+            # Also downsample images for TC (flow must match depth resolution)
+            if images.shape[-2:] != (pred_h, pred_w):
+                images = F.interpolate(
+                    images[0],  # [T, 3, H, W]
+                    size=(pred_h, pred_w),
+                    mode='bilinear', align_corners=False
+                ).unsqueeze(0)  # [1, T, 3, H, W]
+
         # === TC-only mode: skip per-frame metrics, depth range, TAE ===
         if self.test_mode == 'tc':
             metrics = {
@@ -1886,23 +1902,27 @@ class Gear5Tester:
 
                     self.flow_tc.save_visualization(
                         pred_depths_cpu, gt_depth_metric_cpu, rtc_worst, sequence_id,
-                        self.save_dir, per_frame_rtc[rtc_worst], label='worst'
+                        self.save_dir, per_frame_rtc[rtc_worst], label='worst',
+                        dataset_name=dataset_name
                     )
                     self.flow_tc.save_visualization(
                         pred_depths_cpu, gt_depth_metric_cpu, rtc_best, sequence_id,
-                        self.save_dir, per_frame_rtc[rtc_best], label='best'
+                        self.save_dir, per_frame_rtc[rtc_best], label='best',
+                        dataset_name=dataset_name
                     )
                     self.flow_tc.save_ratio_heatmap(
                         images[0], pred_depths_cpu, rtc_worst, sequence_id,
-                        self.save_dir, per_frame_rtc[rtc_worst], label='worst'
+                        self.save_dir, per_frame_rtc[rtc_worst], label='worst',
+                        dataset_name=dataset_name
                     )
                     self.flow_tc.save_ratio_heatmap(
                         images[0], pred_depths_cpu, rtc_best, sequence_id,
-                        self.save_dir, per_frame_rtc[rtc_best], label='best'
+                        self.save_dir, per_frame_rtc[rtc_best], label='best',
+                        dataset_name=dataset_name
                     )
                     self.flow_tc.save_rtc_plot(
                         per_frame_rtc, per_frame_rtc_gt, rtc_best, rtc_worst,
-                        sequence_id, self.save_dir
+                        sequence_id, self.save_dir, dataset_name=dataset_name
                     )
             else:
                 metrics['rtc'] = 0.0
@@ -2084,7 +2104,17 @@ class Gear5Tester:
             metrics['_tae_spike_frames'] = []
 
         # === Flow-based Temporal Consistency (rTC) ===
-        if len(pred_depths) > 1:
+        if self.test_mode == 'ea':
+            # EA mode: skip rTC (avoids loading SEA-RAFT, saves ~200MB GPU)
+            metrics['rtc'] = 0.0
+            metrics['rtc_gt'] = 0.0
+            metrics['_per_frame_rtc'] = []
+            metrics['_per_frame_rtc_gt'] = []
+            metrics['_rtc_ratio_stats'] = {}
+            metrics['_rtc_per_frame_ratio_stats'] = []
+            metrics['_rtc_best_frame_idx'] = 0
+            metrics['_rtc_worst_frame_idx'] = 0
+        elif len(pred_depths) > 1:
             if self.flow_tc is None:
                 MAX_DEPTH_TC = 70.0
                 self.flow_tc = FlowTemporalConsistency(
@@ -2477,23 +2507,27 @@ class Gear5Tester:
 
                 self.flow_tc.save_visualization(
                     pred_depths_cpu, gt_depth_metric_cpu, rtc_worst, sequence_id,
-                    self.save_dir, per_frame_rtc[rtc_worst], label='worst'
+                    self.save_dir, per_frame_rtc[rtc_worst], label='worst',
+                    dataset_name=dataset_name
                 )
                 self.flow_tc.save_visualization(
                     pred_depths_cpu, gt_depth_metric_cpu, rtc_best, sequence_id,
-                    self.save_dir, per_frame_rtc[rtc_best], label='best'
+                    self.save_dir, per_frame_rtc[rtc_best], label='best',
+                    dataset_name=dataset_name
                 )
                 self.flow_tc.save_ratio_heatmap(
                     images[0], pred_depths_cpu, rtc_worst, sequence_id,
-                    self.save_dir, per_frame_rtc[rtc_worst], label='worst'
+                    self.save_dir, per_frame_rtc[rtc_worst], label='worst',
+                    dataset_name=dataset_name
                 )
                 self.flow_tc.save_ratio_heatmap(
                     images[0], pred_depths_cpu, rtc_best, sequence_id,
-                    self.save_dir, per_frame_rtc[rtc_best], label='best'
+                    self.save_dir, per_frame_rtc[rtc_best], label='best',
+                    dataset_name=dataset_name
                 )
                 self.flow_tc.save_rtc_plot(
                     per_frame_rtc, per_frame_rtc_gt, rtc_best, rtc_worst,
-                    sequence_id, self.save_dir
+                    sequence_id, self.save_dir, dataset_name=dataset_name
                 )
             except Exception as e:
                 logger.warning(f"Failed to save TC visualizations: {e}")
@@ -3460,7 +3494,7 @@ def main(config: DictConfig):
     # Apply --test-mode if passed via sys.argv preprocessing
     test_mode = getattr(main, '_test_mode', None)
     if test_mode:
-        OmegaConf.update(config, 'test_mode', test_mode, merge=False)
+        OmegaConf.update(config, 'test_mode', test_mode, force_add=True)
 
     tester = Gear5Tester(config)
     tester.test()

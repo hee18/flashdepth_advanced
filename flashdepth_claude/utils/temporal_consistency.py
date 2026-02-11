@@ -32,6 +32,11 @@ class FlowTemporalConsistency:
     Lazy-loads SEA-RAFT on first use (~200MB GPU, ~1-2s loading time).
     """
 
+    # SEA-RAFT was trained at 540x960; limit long edge to avoid OOM on high-res inputs
+    FLOW_MAX_LONG_EDGE = 960
+    # Cap visualization resolution to avoid slow matplotlib rendering on high-res datasets
+    VIS_MAX_LONG_EDGE = 1024
+
     def __init__(self, device='cuda:0', thr=1.1, max_depth=70.0, checkpoint_path=None):
         """
         Args:
@@ -46,9 +51,16 @@ class FlowTemporalConsistency:
         self.checkpoint_path = checkpoint_path
         self._flow_estimator = None  # Lazy loaded
 
+    def offload_to_cpu(self):
+        """Move SEA-RAFT to CPU to free GPU memory between sequences."""
+        if self._flow_estimator is not None:
+            self._flow_estimator.model.cpu()
+            torch.cuda.empty_cache()
+
     def _get_flow_estimator(self):
         """Lazy-load SEA-RAFT flow estimator on first use."""
         if self._flow_estimator is not None:
+            self._flow_estimator.model.to(self.device)
             return self._flow_estimator
 
         import os
@@ -113,7 +125,20 @@ class FlowTemporalConsistency:
                 'best_frame_idx': 0, 'worst_frame_idx': 0
             }
 
-        # De-normalize images for SEA-RAFT (expects 0-1)
+        # Downscale on CPU BEFORE moving to GPU to avoid OOM on high-res inputs
+        _, _, H_orig, W_orig = images.shape
+        long_edge = max(H_orig, W_orig)
+        if long_edge > self.FLOW_MAX_LONG_EDGE:
+            scale_factor = self.FLOW_MAX_LONG_EDGE / long_edge
+            new_H = (int(H_orig * scale_factor) // 8) * 8
+            new_W = (int(W_orig * scale_factor) // 8) * 8
+            logger.info(f"Downscaling for flow estimation: {H_orig}x{W_orig} -> {new_H}x{new_W}")
+            images = F.interpolate(images.float(), size=(new_H, new_W), mode='bilinear', align_corners=False)
+            pred_depths = F.interpolate(pred_depths.float(), size=(new_H, new_W), mode='bilinear', align_corners=False)
+            if gt_depths is not None:
+                gt_depths = F.interpolate(gt_depths.float(), size=(new_H, new_W), mode='bilinear', align_corners=False)
+
+        # De-normalize images for SEA-RAFT (expects 0-1) and move to GPU
         images_01 = self._denormalize_images(images.to(self.device))
 
         # Ensure depths are on device and float32
@@ -286,6 +311,17 @@ class FlowTemporalConsistency:
             ratio_map: [H, W] numpy array of depth ratios (0 where invalid)
         """
         flow_estimator = self._get_flow_estimator()
+
+        # Downscale on CPU BEFORE moving to GPU to avoid OOM
+        _, _, H_orig, W_orig = images.shape
+        long_edge = max(H_orig, W_orig)
+        if long_edge > self.FLOW_MAX_LONG_EDGE:
+            scale_factor = self.FLOW_MAX_LONG_EDGE / long_edge
+            new_H = (int(H_orig * scale_factor) // 8) * 8
+            new_W = (int(W_orig * scale_factor) // 8) * 8
+            images = F.interpolate(images.float(), size=(new_H, new_W), mode='bilinear', align_corners=False)
+            pred_depths = F.interpolate(pred_depths.float(), size=(new_H, new_W), mode='bilinear', align_corners=False)
+
         images_01 = self._denormalize_images(images.to(self.device))
         pred_d = pred_depths.to(self.device).float()
 
@@ -325,7 +361,7 @@ class FlowTemporalConsistency:
     # === Visualization methods ===
 
     def save_visualization(self, pred_depths, gt_depths, frame_idx, sequence_id,
-                           save_dir, rtc_value, label='worst'):
+                           save_dir, rtc_value, label='worst', dataset_name=''):
         """
         Save 2-row 4-column depth grid visualization.
 
@@ -340,6 +376,7 @@ class FlowTemporalConsistency:
             save_dir: Path
             rtc_value: float
             label: 'worst' or 'best'
+            dataset_name: str - dataset name for title
         """
         T = pred_depths.shape[0]
 
@@ -351,14 +388,29 @@ class FlowTemporalConsistency:
             min(T - 1, frame_idx + 2)
         ]
 
+        # Downscale for visualization if high-res (e.g. ETH3D 4135x6205)
+        _, _, H_orig, W_orig = pred_depths.shape
+        long_edge = max(H_orig, W_orig)
+        if long_edge > self.VIS_MAX_LONG_EDGE:
+            scale = self.VIS_MAX_LONG_EDGE / long_edge
+            new_H = int(H_orig * scale)
+            new_W = int(W_orig * scale)
+            pred_depths = F.interpolate(pred_depths.float(), size=(new_H, new_W),
+                                        mode='bilinear', align_corners=False)
+            gt_depths = F.interpolate(gt_depths.float(), size=(new_H, new_W),
+                                      mode='bilinear', align_corners=False)
+
         pred_np = pred_depths.cpu().float().numpy()
         gt_np = gt_depths.cpu().float().numpy()
 
         # Compute shared colormap range from GT (2nd-98th percentile)
+        # Also build per-frame GT valid masks for unified pred masking
         gt_valid_all = []
+        gt_valid_masks = {}
         for idx in context_indices:
             gt_frame = gt_np[idx, 0]
             valid = (gt_frame > 0) & (gt_frame < self.max_depth)
+            gt_valid_masks[idx] = valid
             if valid.sum() > 0:
                 gt_valid_all.append(gt_frame[valid])
         if gt_valid_all:
@@ -369,41 +421,48 @@ class FlowTemporalConsistency:
             vmin, vmax = 0, self.max_depth
 
         fig, axes = plt.subplots(2, 4, figsize=(16, 8))
+        fig.set_facecolor('white')
+
+        cmap = plt.cm.plasma_r.copy()
+        cmap.set_bad(color='black')  # Invalid (NaN) pixels shown as black
 
         for col, idx in enumerate(context_indices):
             # Row 0: GT
             gt_frame = gt_np[idx, 0].copy()
-            gt_frame[gt_frame <= 0] = np.nan
-            gt_frame[gt_frame >= self.max_depth] = np.nan
-            axes[0, col].imshow(gt_frame, cmap='plasma_r', vmin=vmin, vmax=vmax)
+            gt_valid = gt_valid_masks[idx]
+            gt_frame[~gt_valid] = np.nan
+            axes[0, col].imshow(gt_frame, cmap=cmap, vmin=vmin, vmax=vmax)
             axes[0, col].set_title(f'GT frame {idx}', fontsize=10)
             axes[0, col].axis('off')
-            axes[0, col].set_facecolor('black')
 
-            # Row 1: Pred
+            # Row 1: Pred (masked by GT valid region + pred valid range)
             pred_frame = pred_np[idx, 0].copy()
-            pred_frame[pred_frame <= 0] = np.nan
-            pred_frame[pred_frame >= self.max_depth] = np.nan
-            axes[1, col].imshow(pred_frame, cmap='plasma_r', vmin=vmin, vmax=vmax)
+            pred_invalid = (pred_frame <= 0) | (pred_frame >= self.max_depth)
+            pred_frame[~gt_valid | pred_invalid] = np.nan
+            axes[1, col].imshow(pred_frame, cmap=cmap, vmin=vmin, vmax=vmax)
             axes[1, col].set_title(f'Pred frame {idx}', fontsize=10)
             axes[1, col].axis('off')
-            axes[1, col].set_facecolor('black')
 
+        ds_prefix = f'{dataset_name} | ' if dataset_name else ''
         fig.suptitle(
-            f'Seq {sequence_id} | {label.upper()} TC (frames {frame_idx}→{frame_idx+1}) | rTC={rtc_value:.4f}',
+            f'{ds_prefix}Seq {sequence_id} | {label.upper()} TC (frames {frame_idx}\u2192{frame_idx+1}) | rTC={rtc_value:.4f}',
             fontsize=13, fontweight='bold'
         )
         plt.tight_layout()
 
         filename = f'tc_{label}_seq{sequence_id:04d}.png'
-        fig.savefig(save_dir / filename, dpi=150, bbox_inches='tight', facecolor='black')
+        fig.savefig(save_dir / filename, dpi=150, bbox_inches='tight', facecolor='white')
         plt.close(fig)
         logger.info(f"Saved TC {label} visualization: {filename}")
 
     def save_ratio_heatmap(self, images, pred_depths, frame_idx, sequence_id,
-                           save_dir, rtc_value, label='worst'):
+                           save_dir, rtc_value, label='worst', dataset_name=''):
         """
         Save pixel-wise depth ratio heatmap.
+
+        For each pixel, computes max(D_k / D_hat, D_hat / D_k) where D_hat is
+        frame k+1's depth warped to frame k via optical flow. Ratio=1 means
+        perfect temporal consistency; higher values indicate inconsistency.
 
         Args:
             images: [T, 3, H, W] ImageNet-normalized
@@ -413,23 +472,29 @@ class FlowTemporalConsistency:
             save_dir: Path
             rtc_value: float
             label: 'worst' or 'best'
+            dataset_name: str - dataset name for title
         """
         ratio_map = self.get_ratio_heatmap(images, pred_depths, frame_idx)
 
         fig, ax = plt.subplots(1, 1, figsize=(10, 6))
+        fig.set_facecolor('white')
 
         # Mask invalid pixels
         display_map = ratio_map.copy()
         display_map[display_map == 0] = np.nan
 
-        im = ax.imshow(display_map, cmap='hot', vmin=1.0, vmax=2.0)
+        cmap_hot = plt.cm.hot.copy()
+        cmap_hot.set_bad(color='black')  # Invalid pixels shown as black
+        im = ax.imshow(display_map, cmap=cmap_hot, vmin=1.0, vmax=2.0)
+        ds_prefix = f'{dataset_name} | ' if dataset_name else ''
         ax.set_title(
-            f'Seq {sequence_id} | {label.upper()} Ratio Heatmap (frames {frame_idx}→{frame_idx+1}) | rTC={rtc_value:.4f}',
+            f'{ds_prefix}Seq {sequence_id} | {label.upper()} Ratio Heatmap '
+            f'(frames {frame_idx}\u2192{frame_idx+1}) | rTC={rtc_value:.4f}',
             fontsize=11
         )
         ax.axis('off')
-        ax.set_facecolor('black')
-        plt.colorbar(im, ax=ax, label='max(D_i/D_hat, D_hat/D_i)', shrink=0.8)
+        cbar = plt.colorbar(im, ax=ax, shrink=0.8)
+        cbar.set_label(r'max($D_t / \hat{D}_{t+1}$, $\hat{D}_{t+1} / D_t$)', fontsize=10)
         plt.tight_layout()
 
         filename = f'tc_ratio_{label}_seq{sequence_id:04d}.png'
@@ -438,7 +503,7 @@ class FlowTemporalConsistency:
         logger.info(f"Saved ratio heatmap: {filename}")
 
     def save_rtc_plot(self, per_frame_rtc, per_frame_rtc_gt, best_idx, worst_idx,
-                      sequence_id, save_dir):
+                      sequence_id, save_dir, dataset_name=''):
         """
         Save per-frame rTC line plot.
 
@@ -449,6 +514,7 @@ class FlowTemporalConsistency:
             worst_idx: int
             sequence_id: int
             save_dir: Path
+            dataset_name: str - dataset name for title
         """
         n = len(per_frame_rtc)
         if n == 0:
@@ -471,7 +537,8 @@ class FlowTemporalConsistency:
 
         ax.set_xlabel('Frame Pair Index')
         ax.set_ylabel('rTC')
-        ax.set_title(f'Seq {sequence_id} | Per-Frame rTC (thr={self.thr})')
+        ds_prefix = f'{dataset_name} | ' if dataset_name else ''
+        ax.set_title(f'{ds_prefix}Seq {sequence_id} | Per-Frame rTC (thr={self.thr})')
         ax.legend(loc='lower left', fontsize=8)
         ax.set_ylim(0, 1.05)
         ax.grid(True, alpha=0.3)

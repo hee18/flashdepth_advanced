@@ -28,6 +28,7 @@ from torch.utils.data import DataLoader, Dataset
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from matplotlib.gridspec import GridSpec
 
 project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
@@ -94,7 +95,7 @@ class OnepieceTester:
         self.flow_tc = None
         self.tc_threshold = config.get('tc_threshold', 1.1)
 
-        # Test mode: None (full), 'tc' (temporal consistency only)
+        # Test mode: None (full), 'tc' (temporal consistency only), 'ea' (error & accuracy only)
         self.test_mode = config.get('test_mode', None)
 
     def _setup_cls_layers(self, model):
@@ -186,8 +187,9 @@ class OnepieceTester:
         """Setup test data loader."""
         test_datasets = self.config.eval.get('test_datasets',
             ['sintel', 'waymo_seg', 'eth3d', 'urbansyn', 'unreal4k', 'bonn'])
-        resolution = self.config.eval.get('test_dataset_resolution', 'base')
-        video_length = self.config.dataset.get('video_length', 8)
+        resolution = self.config.get('resolution',
+            self.config.eval.get('test_dataset_resolution', 'base'))
+        video_length = int(self.config.dataset.get('video_length', 50))
 
         if isinstance(test_datasets, (ListConfig, str)):
             if isinstance(test_datasets, str):
@@ -198,26 +200,95 @@ class OnepieceTester:
         logger.info(f"Test datasets: {test_datasets}")
         logger.info(f"Resolution: {resolution}, video_length: {video_length}")
 
+        seq_list = self.config.get('seq_list', None)
+        if seq_list is not None:
+            logger.info(f"Filtering to sequences: {seq_list}")
+
         test_dataset = CombinedDataset(
             root_dir=self.config.dataset.data_root,
             enable_dataset_flags=test_datasets,
             resolution=resolution,
             split='test',
             video_length=video_length,
+            seq_list=seq_list,
             skip_gt_canonicalization=True
         )
 
+        num_workers = self.config.training.get('workers', 0)
         test_loader = DataLoader(
             test_dataset,
             batch_size=1,
             shuffle=False,
-            num_workers=self.config.training.workers,
+            num_workers=num_workers,
             pin_memory=True,
             drop_last=False,
+            collate_fn=self._collate_fn,
         )
 
         logger.info(f"Test dataset size: {len(test_dataset)}")
         return test_loader
+
+    def _collate_fn(self, batch):
+        """Custom collate function to filter out None values and convert tuple to dict."""
+        batch = [item for item in batch if item is not None]
+        if len(batch) == 0:
+            return None
+
+        # CombinedDataset returns tuple for val/test splits - convert to dict
+        if len(batch) > 0 and isinstance(batch[0], tuple):
+            if len(batch[0]) == 9:
+                images, depths, focal_lengths_canonical, focal_lengths_actual, actual_valid_masks, fx_ratios, resize_ratios, names, image_paths = zip(*batch)
+                return {
+                    'image': torch.stack(images, dim=0),
+                    'depth': torch.stack(depths, dim=0),
+                    'focal_lengths': torch.stack(focal_lengths_canonical, dim=0),
+                    'focal_lengths_actual': torch.stack(focal_lengths_actual, dim=0),
+                    'actual_valid_mask': torch.stack(actual_valid_masks, dim=0),
+                    'fx_ratio': torch.stack(fx_ratios, dim=0),
+                    'resize_ratio': torch.stack(resize_ratios, dim=0),
+                    'dataset_name': names,
+                    'image_paths': image_paths
+                }
+            elif len(batch[0]) == 8:
+                images, depths, focal_lengths_canonical, focal_lengths_actual, actual_valid_masks, fx_ratios, resize_ratios, names = zip(*batch)
+                return {
+                    'image': torch.stack(images, dim=0),
+                    'depth': torch.stack(depths, dim=0),
+                    'focal_lengths': torch.stack(focal_lengths_canonical, dim=0),
+                    'focal_lengths_actual': torch.stack(focal_lengths_actual, dim=0),
+                    'actual_valid_mask': torch.stack(actual_valid_masks, dim=0),
+                    'fx_ratio': torch.stack(fx_ratios, dim=0),
+                    'resize_ratio': torch.stack(resize_ratios, dim=0),
+                    'dataset_name': names
+                }
+            elif len(batch[0]) == 5:
+                images, depths, focal_lengths, actual_valid_masks, names = zip(*batch)
+                return {
+                    'image': torch.stack(images, dim=0),
+                    'depth': torch.stack(depths, dim=0),
+                    'focal_lengths': torch.stack(focal_lengths, dim=0),
+                    'actual_valid_mask': torch.stack(actual_valid_masks, dim=0),
+                    'dataset_name': names
+                }
+            else:
+                images, depths, focal_lengths, names = zip(*batch)
+                return {
+                    'image': torch.stack(images, dim=0),
+                    'depth': torch.stack(depths, dim=0),
+                    'focal_lengths': torch.stack(focal_lengths, dim=0),
+                    'dataset_name': names
+                }
+
+        # Dict format (segmentation datasets)
+        if len(batch) > 0 and isinstance(batch[0], dict):
+            result = batch[0]
+            if 'images' in result:
+                result['image'] = result.pop('images')
+            if 'focal_lengths_actual' in result and 'focal_lengths' not in result:
+                result['focal_lengths'] = result['focal_lengths_actual']
+            return result
+
+        return batch
 
     @torch.no_grad()
     def test(self):
@@ -420,28 +491,27 @@ class OnepieceTester:
             canonical_gt_valid = (gt_depth_inverse_100 > MIN_INVERSE_CANONICAL)
 
         # === FPS Measurement ===
-        base_dataset_name = dataset_name.split('/')[0] if isinstance(dataset_name, str) else 'unknown'
-        warmup_frames = min(5, T) if base_dataset_name == 'eth3d' else min(10, T)
+        warmup_frames = min(5, T)
 
-        # Forward pass (batch mode - Onepiece processes full sequence at once)
+        # Forward pass (streaming mode - frame-by-frame with Mamba state)
         start_time = None
         with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-            # Warmup: run one forward pass and discard
+            # Warmup: run warmup_frames to JIT-compile CUDA kernels (excluded from FPS)
             if T > warmup_frames:
-                warmup_images = images[:, :1]  # Just 1 frame for warmup
-                _ = self.model.forward_with_onepiece(
-                    (warmup_images,), phase=2, no_shift=self.no_shift,
+                warmup_images = images[:, :warmup_frames]
+                _ = self.model.forward_with_onepiece_streaming(
+                    warmup_images, phase=2, no_shift=self.no_shift,
                     cls_layer_indices=self.encoder_indices
                 )
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()
 
-            # Timed forward pass (full sequence)
+            # Timed forward pass (streaming, frame-by-frame)
             torch.cuda.synchronize()
             start_time = time.time()
 
-            outputs = self.model.forward_with_onepiece(
-                (images,), phase=2, no_shift=self.no_shift,
+            outputs = self.model.forward_with_onepiece_streaming(
+                images, phase=2, no_shift=self.no_shift,
                 cls_layer_indices=self.encoder_indices
             )
 
@@ -457,9 +527,13 @@ class OnepieceTester:
             fps = 0
 
         metric_depth = outputs['metric_depth'].float()  # [B, T, H, W] (canonical space)
+        relative_depth_out = outputs['relative_depth'].float()  # [B, T, H, W] (canonical inv depth)
         scale = outputs['scale'].float()  # [B, T]
         shift = outputs['shift'].float()  # [B, T]
         d_cls = outputs['d_cls'].float()  # [B, T-1]
+
+        # depth_from_relative in canonical meters (same input space as model's scale/shift)
+        dfr_canonical = 100.0 / (relative_depth_out + 1e-8)  # [B, T, H, W]
 
         # De-canonicalize prediction: canonical → actual
         # metric_depth is in canonical meters, multiply by de_canonical_ratio_metric
@@ -472,13 +546,23 @@ class OnepieceTester:
         # Move to CPU for metrics
         pred_depths_cpu = pred_depths_actual[0].unsqueeze(1).cpu()  # [T, 1, H, W]
         gt_depth_metric_cpu = gt_depth_metric.cpu()  # [T, 1, H, W]
+        dfr_canonical_cpu = dfr_canonical[0].cpu()  # [T, H, W]
 
-        # Interpolate if resolution mismatch
+        # Downsample GT to match prediction resolution (prevents OOM on high-res datasets)
         if pred_depths_cpu.shape[-2:] != gt_depth_metric_cpu.shape[-2:]:
-            pred_depths_cpu = F.interpolate(
-                pred_depths_cpu, size=gt_depth_metric_cpu.shape[-2:],
+            pred_h, pred_w = pred_depths_cpu.shape[-2:]
+            logger.info(f"Downsampling GT from {gt_depth_metric_cpu.shape[-2:]} to ({pred_h}, {pred_w})")
+            gt_depth_metric_cpu = F.interpolate(
+                gt_depth_metric_cpu, size=(pred_h, pred_w),
                 mode='bilinear', align_corners=True
             )
+            # Also downsample images for TC (flow must match depth resolution)
+            if images.shape[-2:] != (pred_h, pred_w):
+                images = F.interpolate(
+                    images[0],  # [T, 3, H, W]
+                    size=(pred_h, pred_w),
+                    mode='bilinear', align_corners=False
+                ).unsqueeze(0)  # [1, T, 3, H, W]
 
         MAX_DEPTH = 70.0
 
@@ -520,23 +604,27 @@ class OnepieceTester:
 
                     self.flow_tc.save_visualization(
                         pred_depths_cpu, gt_depth_metric_cpu, rtc_worst, sequence_id,
-                        self.save_dir, per_frame_rtc[rtc_worst], label='worst'
+                        self.save_dir, per_frame_rtc[rtc_worst], label='worst',
+                        dataset_name=dataset_name
                     )
                     self.flow_tc.save_visualization(
                         pred_depths_cpu, gt_depth_metric_cpu, rtc_best, sequence_id,
-                        self.save_dir, per_frame_rtc[rtc_best], label='best'
+                        self.save_dir, per_frame_rtc[rtc_best], label='best',
+                        dataset_name=dataset_name
                     )
                     self.flow_tc.save_ratio_heatmap(
                         images_cpu, pred_depths_cpu, rtc_worst, sequence_id,
-                        self.save_dir, per_frame_rtc[rtc_worst], label='worst'
+                        self.save_dir, per_frame_rtc[rtc_worst], label='worst',
+                        dataset_name=dataset_name
                     )
                     self.flow_tc.save_ratio_heatmap(
                         images_cpu, pred_depths_cpu, rtc_best, sequence_id,
-                        self.save_dir, per_frame_rtc[rtc_best], label='best'
+                        self.save_dir, per_frame_rtc[rtc_best], label='best',
+                        dataset_name=dataset_name
                     )
                     self.flow_tc.save_rtc_plot(
                         per_frame_rtc, per_frame_rtc_gt, rtc_best, rtc_worst,
-                        sequence_id, self.save_dir
+                        sequence_id, self.save_dir, dataset_name=dataset_name
                     )
             else:
                 metrics['rtc'] = 0.0
@@ -547,6 +635,9 @@ class OnepieceTester:
                 metrics['_rtc_per_frame_ratio_stats'] = []
                 metrics['_rtc_best_frame_idx'] = 0
                 metrics['_rtc_worst_frame_idx'] = 0
+            # Offload SEA-RAFT to CPU for next sequence
+            if self.flow_tc is not None:
+                self.flow_tc.offload_to_cpu()
             return metrics
 
         # === Per-frame metrics ===
@@ -572,13 +663,15 @@ class OnepieceTester:
             per_frame_scales.append(float(scale[0, t]))
             per_frame_shifts.append(float(shift[0, t]))
 
-            # Compute optimal (oracle) scale/shift via LSE
+            # Compute optimal (oracle) scale/shift via LSE in canonical space
+            # Same input space as model: gt_canonical = opt_scale * dfr_canonical + opt_shift
             if valid_mask.sum() > 100:
-                pred_valid = pred_frame[valid_mask].numpy()
-                gt_valid = gt_frame[valid_mask].numpy()
-                # Least squares: gt = opt_scale * pred + opt_shift
-                A = np.stack([pred_valid, np.ones_like(pred_valid)], axis=1)
-                result = np.linalg.lstsq(A, gt_valid, rcond=None)
+                dfr_frame = dfr_canonical_cpu[t]  # [H, W] canonical meters
+                de_ratio_t = float(de_canonical_ratio_metric[0, t])
+                dfr_valid = dfr_frame[valid_mask].numpy()
+                gt_canonical_valid = (gt_frame[valid_mask] / de_ratio_t).numpy()
+                A = np.stack([dfr_valid, np.ones_like(dfr_valid)], axis=1)
+                result = np.linalg.lstsq(A, gt_canonical_valid, rcond=None)
                 opt_scale, opt_shift = result[0]
                 per_frame_optimal_scales.append(float(opt_scale))
                 per_frame_optimal_shifts.append(float(opt_shift))
@@ -718,7 +811,17 @@ class OnepieceTester:
             metrics['_tae_spike_frames'] = []
 
         # === Flow-based Temporal Consistency (rTC) ===
-        if T > 1:
+        if self.test_mode == 'ea':
+            # EA mode: skip rTC (avoids loading SEA-RAFT, saves ~200MB GPU)
+            metrics['rtc'] = 0.0
+            metrics['rtc_gt'] = 0.0
+            metrics['_per_frame_rtc'] = []
+            metrics['_per_frame_rtc_gt'] = []
+            metrics['_rtc_ratio_stats'] = {}
+            metrics['_rtc_per_frame_ratio_stats'] = []
+            metrics['_rtc_best_frame_idx'] = 0
+            metrics['_rtc_worst_frame_idx'] = 0
+        elif T > 1:
             if self.flow_tc is None:
                 self.flow_tc = FlowTemporalConsistency(
                     device=self.device, thr=self.tc_threshold, max_depth=MAX_DEPTH
@@ -794,30 +897,38 @@ class OnepieceTester:
                     # Depth grids for best/worst TC pairs
                     self.flow_tc.save_visualization(
                         pred_depths_cpu, gt_depth_metric_cpu, rtc_worst, sequence_id,
-                        self.save_dir, per_frame_rtc[rtc_worst], label='worst'
+                        self.save_dir, per_frame_rtc[rtc_worst], label='worst',
+                        dataset_name=dataset_name
                     )
                     self.flow_tc.save_visualization(
                         pred_depths_cpu, gt_depth_metric_cpu, rtc_best, sequence_id,
-                        self.save_dir, per_frame_rtc[rtc_best], label='best'
+                        self.save_dir, per_frame_rtc[rtc_best], label='best',
+                        dataset_name=dataset_name
                     )
 
                     # Ratio heatmaps
                     self.flow_tc.save_ratio_heatmap(
                         images_cpu, pred_depths_cpu, rtc_worst, sequence_id,
-                        self.save_dir, per_frame_rtc[rtc_worst], label='worst'
+                        self.save_dir, per_frame_rtc[rtc_worst], label='worst',
+                        dataset_name=dataset_name
                     )
                     self.flow_tc.save_ratio_heatmap(
                         images_cpu, pred_depths_cpu, rtc_best, sequence_id,
-                        self.save_dir, per_frame_rtc[rtc_best], label='best'
+                        self.save_dir, per_frame_rtc[rtc_best], label='best',
+                        dataset_name=dataset_name
                     )
 
                     # rTC line plot
                     self.flow_tc.save_rtc_plot(
                         per_frame_rtc, per_frame_rtc_gt, rtc_best, rtc_worst,
-                        sequence_id, self.save_dir
+                        sequence_id, self.save_dir, dataset_name=dataset_name
                     )
                 except Exception as e:
                     logger.warning(f"Failed to save TC visualizations: {e}")
+
+        # Offload SEA-RAFT to CPU for next sequence
+        if self.flow_tc is not None:
+            self.flow_tc.offload_to_cpu()
 
         return metrics
 
@@ -840,7 +951,10 @@ class OnepieceTester:
         seq_dir = self.save_dir / "frames" / f"seq{sequence_id:04d}"
         seq_dir.mkdir(parents=True, exist_ok=True)
 
-        frame_indices = list(range(0, T, self.frame_interval)) if self.frame_interval else list(range(T))
+        if self.frame_interval is not None:
+            frame_indices = list(range(0, T, self.frame_interval))
+        else:
+            frame_indices = list(range(T))
 
         for t in frame_indices:
             fig, axes = plt.subplots(1, 3, figsize=(15, 5))
@@ -863,13 +977,31 @@ class OnepieceTester:
             else:
                 vmin, vmax = 0, 1
 
+            # Sparse dataset detection (same as test_gear5)
+            gt_density = (gt > 0).sum() / gt.size
+            is_sparse = gt_density < 0.5
+
+            if is_sparse:
+                gt_exists = (gt > 0)
+                valid_pixels_per_row = gt_exists.sum(axis=1)
+                valid_rows = valid_pixels_per_row >= 10
+                valid_row_indices = np.where(valid_rows)[0]
+                if len(valid_row_indices) > 0:
+                    height_mask = np.zeros_like(gt, dtype=bool)
+                    height_mask[valid_row_indices.min():valid_row_indices.max()+1, :] = True
+                else:
+                    height_mask = np.ones_like(gt, dtype=bool)
+                pred_show_mask = height_mask & (pred > 0) & (pred < MAX_DEPTH)
+            else:
+                pred_show_mask = gt_valid
+
             cmap = plt.cm.plasma_r.copy()
             cmap.set_bad(color='black')
             axes[1].imshow(gt_display, cmap=cmap, vmin=vmin, vmax=vmax)
             axes[1].set_title(f'GT Depth')
             axes[1].axis('off')
 
-            pred_display = np.where((pred > 0) & (pred < MAX_DEPTH), pred, np.nan)
+            pred_display = np.where(pred_show_mask, pred, np.nan)
             axes[2].imshow(pred_display, cmap=cmap, vmin=vmin, vmax=vmax)
             axes[2].set_title(f'Pred Depth')
             axes[2].axis('off')
@@ -1307,7 +1439,7 @@ def main(config: DictConfig):
     # Apply --test-mode if passed via sys.argv preprocessing
     test_mode = getattr(main, '_test_mode', None)
     if test_mode:
-        OmegaConf.update(config, 'test_mode', test_mode, merge=False)
+        OmegaConf.update(config, 'test_mode', test_mode, force_add=True)
 
     tester = OnepieceTester(config)
     tester.test()
