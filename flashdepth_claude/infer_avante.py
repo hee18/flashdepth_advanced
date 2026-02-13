@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Inference script for avante_images using Gear5 model.
+Inference script for avante_images using Gear5 or Onepiece model.
 Generates depth maps with 70m max depth threshold and 2-98 percentile colormap.
 """
 
@@ -111,6 +111,126 @@ def load_gear5_model(checkpoint_path, device, config_variant='l', use_mamba=Fals
     model.eval()
 
     return model, encoder_indices, target_blocks
+
+
+def load_onepiece_model(checkpoint_path, device, config_variant='l', cls_layers=[2, 4]):
+    """Load Onepiece model with unified global Mamba.
+
+    Returns:
+        model: FlashDepth model with Onepiece modules
+        encoder_indices: List of encoder feature indices for CLS extraction
+    """
+
+    # Model configuration based on variant
+    if config_variant == 'l':
+        vit_size = 'vitl'
+    elif config_variant == 's':
+        vit_size = 'vits'
+    else:
+        vit_size = 'vitl'
+
+    # Model config matching onepiece/config_l.yaml
+    model_config = {
+        'vit_size': vit_size,
+        'patch_size': 14,
+        'attn_class': 'MemEffAttention',
+        'use_mamba': False,          # No Spatial Mamba in Onepiece
+        'use_hydra': False,
+        'use_transformer_rnn': False,
+        'use_xlstm': False,
+        'batch_size': 1,
+        'use_metric_head': False,
+        'use_onepiece': True,
+        'unified_mamba_layers': 2,
+        'unified_mamba_d_state': 64,
+        'unified_mamba_d_conv': 4,
+        'scene_cut_tau': 0.05,
+        'scene_cut_k': 80,
+    }
+
+    model = FlashDepth(**model_config)
+
+    # Setup CLS layer selection (same as test_onepiece.py)
+    intermediate_idx = model.intermediate_layer_idx[model.encoder]
+    encoder_indices = [layer - 1 for layer in cls_layers]
+
+    print(f"CLS layer selection: user specified layers {cls_layers}")
+    print(f"  → encoder_indices: {encoder_indices}")
+
+    # Load checkpoint
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        print(f"Loading checkpoint from {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+
+        if isinstance(checkpoint, dict) and 'model' in checkpoint:
+            state_dict = checkpoint['model']
+        elif isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
+            state_dict = checkpoint['state_dict']
+        else:
+            state_dict = checkpoint
+
+        state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        if missing:
+            print(f"Missing keys ({len(missing)}): {missing[:5]}...")
+        if unexpected:
+            print(f"Unexpected keys ({len(unexpected)}): {unexpected[:5]}...")
+        print("Checkpoint loaded successfully")
+    else:
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+
+    model = model.to(device)
+    model.eval()
+
+    return model, encoder_indices
+
+
+def run_inference_onepiece(model, images_tensor, encoder_indices, device,
+                           no_shift=False, canonical_fx=500.0, actual_fx=None):
+    """
+    Run Onepiece inference using forward_with_onepiece_streaming.
+
+    Args:
+        model: FlashDepth model with Onepiece modules
+        images_tensor: [B, T, C, H, W] input images
+        encoder_indices: List of encoder feature indices for CLS extraction
+        device: torch device
+        no_shift: If True, zero out shift (scale-only mode)
+        canonical_fx: Canonical focal length (500.0)
+        actual_fx: Actual focal length in pixels (for de-canonicalization)
+
+    Returns:
+        metric_depth: [B, T, 1, H, W] numpy array in meters
+    """
+    B, T, C, H, W = images_tensor.shape
+
+    # Default focal length
+    if actual_fx is None:
+        actual_fx = 900.0
+
+    # De-canonicalization: metric_depth_actual = metric_depth_canonical * (actual_fx / canonical_fx)
+    de_canon_ratio_metric = actual_fx / canonical_fx
+
+    with torch.no_grad():
+        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+            outputs = model.forward_with_onepiece_streaming(
+                images_tensor, phase=2, no_shift=no_shift,
+                cls_layer_indices=encoder_indices
+            )
+
+    # metric_depth is in canonical space: [B, T, H, W]
+    metric_depth = outputs['metric_depth'].float()
+
+    # De-canonicalize: canonical → actual
+    pred_depths_actual = metric_depth * de_canon_ratio_metric  # [B, T, H, W]
+
+    # Clamp to reasonable range
+    pred_depths_actual = pred_depths_actual.clamp(min=0.01, max=200.0)
+
+    # Reshape to [B, T, 1, H, W] for consistency with Gear5 output
+    pred_depths_actual = pred_depths_actual.unsqueeze(2).cpu().numpy()
+
+    return pred_depths_actual
 
 
 def depth_to_colormap(depth, max_depth=70.0, percentile_range=(2, 98), return_range=False):
@@ -374,14 +494,14 @@ def run_inference_frame_by_frame(model, images_tensor, encoder_indices, target_b
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Inference on avante_images using Gear5')
+    parser = argparse.ArgumentParser(description='Inference on avante_images using Gear5 or Onepiece')
     parser.add_argument('--input-dir', type=str, default='/data/datasets/avante_images',
                         help='Input directory containing images')
     parser.add_argument('--output-dir', type=str, default='/app/test_results/avante_depth',
                         help='Output directory for depth maps')
     parser.add_argument('--checkpoint', type=str,
                         default='train_results/results_21/gear_5/large/best.pth',
-                        help='Path to Gear5 checkpoint')
+                        help='Path to model checkpoint')
     parser.add_argument('--config-variant', type=str, default='l', choices=['l', 's'],
                         help='Model variant: l (large) or s (small)')
     parser.add_argument('--gpu', type=int, default=0, help='GPU ID')
@@ -396,11 +516,15 @@ def main():
     parser.add_argument('--section', type=str, default=None,
                         help='Frame section to process (e.g., "450,480" for frames 450-480)')
     parser.add_argument('--mamba', action='store_true',
-                        help='Use Mamba2 for temporal modeling')
+                        help='Use Mamba2 for temporal modeling (Gear5 only)')
     parser.add_argument('--cls-layers', type=str, default='2,4',
                         help='CLS token extraction layers (comma-separated)')
     parser.add_argument('--cbar', action='store_true',
                         help='Show colorbar next to depth visualization')
+    parser.add_argument('--model-type', type=str, default='gear5', choices=['gear5', 'onepiece'],
+                        help='Model type: gear5 (default) or onepiece')
+    parser.add_argument('--no-shift', action='store_true',
+                        help='Scale-only mode: zero out shift (Onepiece)')
     args = parser.parse_args()
 
     # Setup device
@@ -411,10 +535,17 @@ def main():
     cls_layers = [int(x.strip()) for x in args.cls_layers.split(',')]
 
     # Load model
-    print(f"Loading Gear5 model (variant: {args.config_variant})...")
-    model, encoder_indices, target_blocks = load_gear5_model(
-        args.checkpoint, device, args.config_variant, args.mamba, cls_layers
-    )
+    if args.model_type == 'onepiece':
+        print(f"Loading Onepiece model (variant: {args.config_variant})...")
+        model, encoder_indices = load_onepiece_model(
+            args.checkpoint, device, args.config_variant, cls_layers
+        )
+        target_blocks = None  # Onepiece doesn't use attention weights
+    else:
+        print(f"Loading Gear5 model (variant: {args.config_variant})...")
+        model, encoder_indices, target_blocks = load_gear5_model(
+            args.checkpoint, device, args.config_variant, args.mamba, cls_layers
+        )
 
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
@@ -470,18 +601,22 @@ def main():
     print(f"De-canonicalization ratio: {args.canonical_fx / actual_fx:.4f}")
     print(f"Max valid depth: {args.max_depth}m")
 
-    # Run inference frame-by-frame (like test_gear5.py)
-    # This properly handles Mamba temporal state and de-canonicalization
-    print("Running inference (frame-by-frame with temporal processing)...")
+    # Run inference
+    print(f"Running inference ({args.model_type}, frame-by-frame with temporal processing)...")
 
     # Add batch dimension: [1, N, C, H, W]
     all_images_batched = all_images.unsqueeze(0).to(device)
 
-    # Run inference
-    metric_depth = run_inference_frame_by_frame(
-        model, all_images_batched, encoder_indices, target_blocks, device,
-        canonical_fx=args.canonical_fx, actual_fx=actual_fx
-    )
+    if args.model_type == 'onepiece':
+        metric_depth = run_inference_onepiece(
+            model, all_images_batched, encoder_indices, device,
+            no_shift=args.no_shift, canonical_fx=args.canonical_fx, actual_fx=actual_fx
+        )
+    else:
+        metric_depth = run_inference_frame_by_frame(
+            model, all_images_batched, encoder_indices, target_blocks, device,
+            canonical_fx=args.canonical_fx, actual_fx=actual_fx
+        )
 
     # Extract depth results: [N, H, W]
     depth_results = [metric_depth[0, i, 0] for i in range(N)]

@@ -102,6 +102,7 @@ show_usage() {
     echo "  --no-inverse          Apply scale/shift in depth space instead of inverse depth space"
     echo "  --no-shift            Disable shift (scale-only mode): shift is always 0, only scale is learned/evaluated"
     echo "  --max-depth METERS   Max valid depth threshold for infer_avante (default: 70.0)"
+    echo "  --model-type TYPE    Model type for infer_avante: gear5 (default), onepiece"
     echo ""
     echo "Note: Regularization losses are deprecated. Importance map now uses raw DINOv2 attention (frozen)."
     echo "Note: test_original_flashdepth now tests all sequences (use --limit-scenes N to limit)."
@@ -199,6 +200,7 @@ USE_LOG_SPACE="true"  # Use log space for depth/TGM loss (--no-log-space to disa
 DDP_GPUS="0,1"  # GPU IDs for DDP training (e.g., "0,1" or "1,2")
 NO_INVERSE="false"  # Apply scale/shift in depth space instead of inverse depth (--no-inverse)
 NO_SHIFT="false"  # Disable shift, scale-only mode (--no-shift)
+MODEL_TYPE="gear5"  # Model type for infer_avante: gear5 (default), onepiece
 
 # Parse arguments
 USER_BATCH_SIZE=""  # Track if user explicitly set batch size
@@ -380,6 +382,10 @@ while [[ $# -gt 0 ]]; do
         --no-shift)
             NO_SHIFT="true"
             shift
+            ;;
+        --model-type)
+            MODEL_TYPE="$2"
+            shift 2
             ;;
         --ddp-gpus)
             DDP_GPUS="$2"
@@ -1313,16 +1319,23 @@ case $COMMAND in
         ;;
 
     infer_avante)
-        # Use --gear-checkpoint if provided, otherwise use default
+        # Use --gear-checkpoint if provided, otherwise use default based on model type
         if [ -n "$GEAR_CHECKPOINT" ]; then
             AVANTE_CHECKPOINT="$GEAR_CHECKPOINT"
         else
-            # Default checkpoint for gear5
-            AVANTE_CHECKPOINT="train_results/results_20/gear_5/large/best.pth"
+            if [ "$MODEL_TYPE" = "onepiece" ]; then
+                # No default checkpoint for Onepiece - require user to specify
+                echo "ERROR: Onepiece model requires --gear-checkpoint <path_to_onepiece_checkpoint>"
+                exit 1
+            else
+                # Default checkpoint for gear5
+                AVANTE_CHECKPOINT="train_results/results_20/gear_5/large/best.pth"
+            fi
         fi
 
-        echo "Running Gear5 inference on avante_images..."
+        echo "Running ${MODEL_TYPE} inference on avante_images..."
         echo "Configuration:"
+        echo "  - Model type: $MODEL_TYPE"
         echo "  - Input: /data/datasets/avante_images"
         echo "  - Output: $RESULTS_DIR"
         echo "  - GPU: $GPU_ID"
@@ -1331,8 +1344,13 @@ case $COMMAND in
         echo "  - Focal length: 900 px (de-canon ratio: 0.5556)"
         echo "  - Max depth: ${MAX_DEPTH}m"
         echo "  - Colormap: 2-98 percentile"
-        echo "  - Temporal backend: $([ "$MAMBA" = "true" ] && echo "Mamba2" || echo "GRU")"
+        if [ "$MODEL_TYPE" = "gear5" ]; then
+            echo "  - Temporal backend: $([ "$MAMBA" = "true" ] && echo "Mamba2" || echo "GRU")"
+        fi
         echo "  - CLS layers: $CLS_LAYERS"
+        if [ "$MODEL_TYPE" = "onepiece" ]; then
+            echo "  - No-shift: $NO_SHIFT"
+        fi
         if [ -n "$SECTION" ]; then
             echo "  - Section: $SECTION (frames)"
         fi
@@ -1340,7 +1358,6 @@ case $COMMAND in
 
         # Build infer_avante command
         # Note: focal-length 900 is default for avante_images (original size 1600x1100)
-        # De-canonicalization: pred_inverse_actual = pred_inverse_canonical * (500 / 900)
         INFER_CMD="python infer_avante.py \
             --input-dir /data/datasets/avante_images \
             --output-dir /app/$RESULTS_DIR \
@@ -1350,11 +1367,17 @@ case $COMMAND in
             --max-depth $MAX_DEPTH \
             --focal-length 900.0 \
             --canonical-fx 500.0 \
-            --cls-layers $CLS_LAYERS"
+            --cls-layers $CLS_LAYERS \
+            --model-type $MODEL_TYPE"
 
-        # Add mamba flag if requested
+        # Add mamba flag if requested (Gear5 only)
         if [ "$MAMBA" = "true" ]; then
             INFER_CMD="$INFER_CMD --mamba"
+        fi
+
+        # Add no-shift flag if requested (Onepiece scale-only mode)
+        if [ "$NO_SHIFT" = "true" ]; then
+            INFER_CMD="$INFER_CMD --no-shift"
         fi
 
         # Add section filter if specified
@@ -1397,6 +1420,9 @@ case $COMMAND in
             echo "  - Dataset: $OBJWISE_DATASET"
         else
             echo "  - Dataset: Using config defaults (all test datasets)"
+        fi
+        if [ -n "$TEST_MODE" ]; then
+            echo "  - Test mode: $TEST_MODE"
         fi
         echo ""
 
@@ -1451,9 +1477,9 @@ case $COMMAND in
             TEST_CMD="$TEST_CMD +best_figure=true"
         fi
 
-        # Add frame export if specified
+        # Add frame export if specified (--frame is stripped from sys.argv before Hydra)
         if [ -n "$FRAME" ]; then
-            TEST_CMD="$TEST_CMD +frame=$FRAME"
+            TEST_CMD="$TEST_CMD --frame $FRAME"
         fi
 
         # Add resolution override
@@ -1626,6 +1652,9 @@ case $COMMAND in
         if [ "$OBJWISE_FLAG" == "true" ]; then
             echo "  - Object-wise evaluation: ENABLED"
         fi
+        if [ -n "$TEST_MODE" ]; then
+            echo "  - Test mode: $TEST_MODE"
+        fi
         echo ""
 
         # Build test_gear5 bankai command
@@ -1633,6 +1662,7 @@ case $COMMAND in
             --config-path configs/gear5 \
             --config-name config_$CONFIG_VARIANT \
             dataset.data_root=/data/datasets \
+            model.use_mamba_temporal=$MAMBA \
             training.workers=$WORKERS \
             use_bankai=true \
             bankai_phase=$BANKAI_PHASE \
@@ -1644,6 +1674,7 @@ case $COMMAND in
             +vid_len=$VID_LEN \
             +frame_interval=$FRAME_INTERVAL \
             +visualization=$VISUALIZATION \
+            cls_layers='[$CLS_LAYERS]' \
             +config_dir=configs/gear5/$CONFIG_VARIANT"
 
         # Add --objwise flag if requested
@@ -1658,6 +1689,21 @@ case $COMMAND in
             TEST_CMD="$TEST_CMD object_wise.dataset=$OBJWISE_DATASET_BASE"
         fi
 
+        # Add seq_list if specified
+        if [ -n "$SEQ" ]; then
+            TEST_CMD="$TEST_CMD +seq_list='[$SEQ]'"
+        fi
+
+        # Add best-figure export if specified
+        if [ "$BEST_FIGURE" == "true" ]; then
+            TEST_CMD="$TEST_CMD +best_figure=true"
+        fi
+
+        # Add frame export if specified (--frame is stripped from sys.argv before Hydra)
+        if [ -n "$FRAME" ]; then
+            TEST_CMD="$TEST_CMD --frame $FRAME"
+        fi
+
         # Add resolution override
         TEST_CMD="$TEST_CMD +resolution=$RESOLUTION"
 
@@ -1669,6 +1715,11 @@ case $COMMAND in
         # Disable video (GIF) generation if --no-video flag is set
         if [ "$NO_VIDEO" == "true" ]; then
             TEST_CMD="$TEST_CMD eval.out_video=false"
+        fi
+
+        # Add test-mode if specified
+        if [ -n "$TEST_MODE" ]; then
+            TEST_CMD="$TEST_CMD --test-mode $TEST_MODE"
         fi
 
         CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm flashdepth $TEST_CMD
@@ -2003,6 +2054,9 @@ case $COMMAND in
         echo "  - Results directory: $RESULTS_DIR (--results-dir)"
         echo "  - Dataset: ${ONEPIECE_TEST_DATASET:-all (default)}"
         echo "  - No-video: $NO_VIDEO (--no-video, default: false)"
+        if [ -n "$TEST_MODE" ]; then
+            echo "  - Test mode: $TEST_MODE"
+        fi
         echo ""
 
         DOCKER_CMD="CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm flashdepth python test_onepiece.py \
@@ -2027,6 +2081,21 @@ case $COMMAND in
         # Disable video (GIF) generation if --no-video flag is set
         if [ "$NO_VIDEO" == "true" ]; then
             DOCKER_CMD="$DOCKER_CMD eval.out_video=false"
+        fi
+
+        # Add seq_list if specified (e.g., --seq 0,4)
+        if [ -n "$SEQ" ]; then
+            DOCKER_CMD="$DOCKER_CMD +seq_list='[$SEQ]'"
+        fi
+
+        # Add best_figure export if specified (--best-figure)
+        if [ "$BEST_FIGURE" == "true" ]; then
+            DOCKER_CMD="$DOCKER_CMD +best_figure=true"
+        fi
+
+        # Add frame export if specified (--frame N or --frame N,M)
+        if [ -n "$FRAME" ]; then
+            DOCKER_CMD="$DOCKER_CMD --frame $FRAME"
         fi
 
         # Add test-mode if specified

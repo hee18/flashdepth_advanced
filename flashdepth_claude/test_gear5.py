@@ -147,11 +147,19 @@ class Gear5Tester:
 
         # Figure export options
         self.export_best_figure = self.config.get('best_figure', False)
-        self.export_frame = self.config.get('frame', None)  # Specific frame index (int or None)
+        # Specific frame index(es) - supports single int or list of ints
+        raw_frame = self.config.get('frame', None)
+        if raw_frame is not None:
+            if isinstance(raw_frame, (list, ListConfig)):
+                self.export_frames = [int(f) for f in raw_frame]
+            else:
+                self.export_frames = [int(raw_frame)]
+        else:
+            self.export_frames = None
         if self.export_best_figure:
             logger.info(f"Best-figure export ENABLED (will save best_frame ±4 intervals as individual images, frame_interval={self.frame_interval or 1})")
-        if self.export_frame is not None:
-            logger.info(f"Frame-specific export ENABLED (will save frame {self.export_frame} ±4 intervals as individual images, frame_interval={self.frame_interval or 1})")
+        if self.export_frames is not None:
+            logger.info(f"Frame-specific export ENABLED (will save frames {self.export_frames} ±4 intervals as individual images, frame_interval={self.frame_interval or 1})")
 
         if self.object_wise_enabled:
             logger.info(f"Object-wise evaluation ENABLED for dataset: {self.object_wise_dataset}")
@@ -1732,7 +1740,7 @@ class Gear5Tester:
                     # Downsample GT to match prediction resolution if needed
                     if gt_t_inverse.shape[-2:] != pred_depth_canonical.shape[-2:]:
                         gt_t_inverse = F.interpolate(
-                            gt_t_inverse.unsqueeze(0), size=pred_depth_canonical.shape[-2:], mode="bilinear", align_corners=True
+                            gt_t_inverse.unsqueeze(0), size=pred_depth_canonical.shape[-2:], mode="bilinear", align_corners=False
                         ).squeeze(0)
                     gt_t_shape = gt_t_inverse.shape[-2:]
 
@@ -1765,7 +1773,7 @@ class Gear5Tester:
                     # Downsample GT to match prediction resolution if needed
                     if gt_t_inverse.shape[-2:] != pred_depth_inverse_100.shape[-2:]:
                         gt_t_inverse = F.interpolate(
-                            gt_t_inverse.unsqueeze(0), size=pred_depth_inverse_100.shape[-2:], mode="bilinear", align_corners=True
+                            gt_t_inverse.unsqueeze(0), size=pred_depth_inverse_100.shape[-2:], mode="bilinear", align_corners=False
                         ).squeeze(0)
                     gt_t_shape = gt_t_inverse.shape[-2:]
 
@@ -1855,7 +1863,7 @@ class Gear5Tester:
             logger.info(f"Downsampling GT from {gt_depth_metric_cpu.shape[-2:]} to ({pred_h}, {pred_w})")
             gt_depth_metric_cpu = F.interpolate(
                 gt_depth_metric_cpu, size=(pred_h, pred_w),
-                mode='bilinear', align_corners=True
+                mode='bilinear', align_corners=False
             )
             # Also downsample images for TC (flow must match depth resolution)
             if images.shape[-2:] != (pred_h, pred_w):
@@ -1864,6 +1872,8 @@ class Gear5Tester:
                     size=(pred_h, pred_w),
                     mode='bilinear', align_corners=False
                 ).unsqueeze(0)  # [1, T, 3, H, W]
+            # Sync gt_depth_metric so all downstream code uses consistent resolution
+            gt_depth_metric = gt_depth_metric_cpu
 
         # === TC-only mode: skip per-frame metrics, depth range, TAE ===
         if self.test_mode == 'tc':
@@ -2534,25 +2544,27 @@ class Gear5Tester:
 
         # Export individual frames if --best-figure or --frame option is enabled
         # NOTE: This is independent of --visualization flag
-        export_frame_idx = None
+        export_frame_indices = []
         if self.export_best_figure and len(frame_metrics) > 0:
-            export_frame_idx = best_frame_idx
+            export_frame_indices.append(best_frame_idx)
             interval_info = f"interval={self.frame_interval}" if self.frame_interval else "interval=1"
             logger.info(f"Exporting best frame {best_frame_idx} ±4 intervals ({interval_info}) (--best-figure)")
-        elif self.export_frame is not None:
-            # User specified exact frame index
-            if self.export_frame < len(pred_depths):
-                export_frame_idx = self.export_frame
-                interval_info = f"interval={self.frame_interval}" if self.frame_interval else "interval=1"
-                logger.info(f"Exporting user-specified frame {self.export_frame} ±4 intervals ({interval_info}) (--frame)")
-            else:
-                logger.warning(f"Requested frame {self.export_frame} exceeds sequence length {len(pred_depths)}, skipping export")
+        if self.export_frames is not None:
+            # User specified exact frame index(es) - supports multiple: --frame 26,80
+            for fidx in self.export_frames:
+                if fidx < len(pred_depths):
+                    if fidx not in export_frame_indices:
+                        export_frame_indices.append(fidx)
+                    interval_info = f"interval={self.frame_interval}" if self.frame_interval else "interval=1"
+                    logger.info(f"Exporting user-specified frame {fidx} ±4 intervals ({interval_info}) (--frame)")
+                else:
+                    logger.warning(f"Requested frame {fidx} exceeds sequence length {len(pred_depths)}, skipping export")
 
-        if export_frame_idx is not None:
+        for export_frame_idx in export_frame_indices:
             self._export_figure_frames(
                 images=images[0],  # [T, 3, H, W]
-                pred_depths=pred_depths,  # [T, 1, H, W]
-                gt_depths=gt_depth_metric,  # [T, 1, H, W]
+                pred_depths=pred_depths_cpu,  # [T, 1, H, W] (model output resolution)
+                gt_depths=gt_depth_metric_cpu,  # [T, 1, H, W] (downsampled to match pred)
                 best_frame_idx=export_frame_idx,
                 sequence_id=sequence_id,
                 dataset_name=dataset_name,
@@ -3496,6 +3508,16 @@ def main(config: DictConfig):
     if test_mode:
         OmegaConf.update(config, 'test_mode', test_mode, force_add=True)
 
+    # Apply --frame if passed via sys.argv preprocessing (supports comma-separated: --frame 26,80)
+    frame_arg = getattr(main, '_frame_arg', None)
+    if frame_arg is not None:
+        # Parse comma-separated frame indices into a list of ints
+        frame_indices = [int(f.strip()) for f in frame_arg.split(',')]
+        if len(frame_indices) == 1:
+            OmegaConf.update(config, 'frame', frame_indices[0], force_add=True)
+        else:
+            OmegaConf.update(config, 'frame', frame_indices, force_add=True)
+
     tester = Gear5Tester(config)
     tester.test()
 
@@ -3512,6 +3534,9 @@ if __name__ == "__main__":
 
     # Handle --test-mode flag BEFORE Hydra processes arguments
     test_mode = None
+    # Handle --frame flag BEFORE Hydra processes arguments
+    # Supports comma-separated values: --frame 26,80
+    frame_arg = None
     new_argv = []
     i = 0
     while i < len(sys.argv):
@@ -3521,6 +3546,12 @@ if __name__ == "__main__":
         elif sys.argv[i].startswith('--test-mode='):
             test_mode = sys.argv[i].split('=', 1)[1]
             i += 1
+        elif sys.argv[i] == '--frame' and i + 1 < len(sys.argv):
+            frame_arg = sys.argv[i + 1]
+            i += 2
+        elif sys.argv[i].startswith('--frame='):
+            frame_arg = sys.argv[i].split('=', 1)[1]
+            i += 1
         else:
             new_argv.append(sys.argv[i])
             i += 1
@@ -3529,5 +3560,6 @@ if __name__ == "__main__":
     # Store as function attributes so main() can access them
     main._objwise_mode = objwise_mode
     main._test_mode = test_mode
+    main._frame_arg = frame_arg
 
     main()

@@ -129,11 +129,6 @@ class FlashDepthAdapter(MethodAdapter):
         B, T, C, H, W = image.shape
         assert B == 1
 
-        # Apply ImageNet normalization (FlashDepth expects normalized input)
-        mean = torch.tensor([0.485, 0.456, 0.406], device=image.device).view(1, 1, 3, 1, 1)
-        std = torch.tensor([0.229, 0.224, 0.225], device=image.device).view(1, 1, 3, 1, 1)
-        image_norm = (image - mean) / std
-
         # Determine processing resolution (must be multiple of patch_size=14)
         # Priority: dataset-specific mapping > round down to nearest 14x multiple
         ps = self.model.patch_size  # 14
@@ -144,9 +139,10 @@ class FlashDepthAdapter(MethodAdapter):
             W_proc = (W // ps) * ps
         need_resize = (H_proc != H) or (W_proc != W)
 
+        # Resize BEFORE normalization to avoid OOM on high-res inputs (e.g., ETH3D 4135x6205)
         if need_resize:
-            image_norm = F.interpolate(
-                image_norm.view(B * T, C, H, W),
+            image = F.interpolate(
+                image.view(B * T, C, H, W),
                 size=(H_proc, W_proc), mode='bilinear', align_corners=False
             ).view(B, T, C, H_proc, W_proc)
 
@@ -156,6 +152,11 @@ class FlashDepthAdapter(MethodAdapter):
                 logger.info(f"[FlashDepth] Processing resolution: {H}x{W} -> resized to {H_proc}x{W_proc}")
             else:
                 logger.info(f"[FlashDepth] Processing resolution: {H}x{W}")
+
+        # Apply ImageNet normalization (after resize, on smaller tensor)
+        mean = torch.tensor([0.485, 0.456, 0.406], device=image.device).view(1, 1, 3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225], device=image.device).view(1, 1, 3, 1, 1)
+        image_norm = (image - mean) / std
 
         # Run inference frame-by-frame with Mamba temporal state
         self.model.mamba.start_new_sequence()

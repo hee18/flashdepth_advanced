@@ -74,6 +74,22 @@ class OnepieceTester:
         # Frame interval for visualization
         self.frame_interval = config.get('frame_interval', 1)
 
+        # Figure export options (same as test_gear5.py)
+        self.export_best_figure = config.get('best_figure', False)
+        # Specific frame index(es) - supports single int or list of ints
+        raw_frame = config.get('frame', None)
+        if raw_frame is not None:
+            if isinstance(raw_frame, (list, ListConfig)):
+                self.export_frames = [int(f) for f in raw_frame]
+            else:
+                self.export_frames = [int(raw_frame)]
+        else:
+            self.export_frames = None
+        if self.export_best_figure:
+            logger.info(f"Best-figure export ENABLED (will save best_frame ±4 intervals as individual images, frame_interval={self.frame_interval or 1})")
+        if self.export_frames is not None:
+            logger.info(f"Frame-specific export ENABLED (will save frames {self.export_frames} ±4 intervals as individual images, frame_interval={self.frame_interval or 1})")
+
         # Enable visualization
         self.enable_visualization = True
 
@@ -554,7 +570,7 @@ class OnepieceTester:
             logger.info(f"Downsampling GT from {gt_depth_metric_cpu.shape[-2:]} to ({pred_h}, {pred_w})")
             gt_depth_metric_cpu = F.interpolate(
                 gt_depth_metric_cpu, size=(pred_h, pred_w),
-                mode='bilinear', align_corners=True
+                mode='bilinear', align_corners=False
             )
             # Also downsample images for TC (flow must match depth resolution)
             if images.shape[-2:] != (pred_h, pred_w):
@@ -926,6 +942,33 @@ class OnepieceTester:
                 except Exception as e:
                     logger.warning(f"Failed to save TC visualizations: {e}")
 
+        # Export individual frames if --best-figure or --frame option is enabled
+        # NOTE: This is independent of --visualization flag
+        export_frame_indices = []
+        if self.export_best_figure and len(frame_metrics) > 0:
+            export_frame_indices.append(best_frame_idx)
+            interval_info = f"interval={self.frame_interval}" if self.frame_interval else "interval=1"
+            logger.info(f"Exporting best frame {best_frame_idx} ±4 intervals ({interval_info}) (--best-figure)")
+        if self.export_frames is not None:
+            for fidx in self.export_frames:
+                if fidx < len(pred_depths_cpu):
+                    if fidx not in export_frame_indices:
+                        export_frame_indices.append(fidx)
+                    interval_info = f"interval={self.frame_interval}" if self.frame_interval else "interval=1"
+                    logger.info(f"Exporting user-specified frame {fidx} ±4 intervals ({interval_info}) (--frame)")
+                else:
+                    logger.warning(f"Requested frame {fidx} exceeds sequence length {len(pred_depths_cpu)}, skipping export")
+
+        for export_frame_idx in export_frame_indices:
+            self._export_figure_frames(
+                images=images[0].cpu(),  # [T, 3, H, W]
+                pred_depths=pred_depths_cpu,  # [T, 1, H, W]
+                gt_depths=gt_depth_metric_cpu,  # [T, 1, H, W]
+                best_frame_idx=export_frame_idx,
+                sequence_id=sequence_id,
+                dataset_name=dataset_name,
+            )
+
         # Offload SEA-RAFT to CPU for next sequence
         if self.flow_tc is not None:
             self.flow_tc.offload_to_cpu()
@@ -1216,6 +1259,123 @@ class OnepieceTester:
         plt.savefig(save_path, dpi=100, bbox_inches='tight')
         plt.close(fig)
 
+    def _export_figure_frames(self, images, pred_depths, gt_depths, best_frame_idx,
+                              sequence_id, dataset_name):
+        """
+        Export individual frames around best_frame (±4 intervals, total 9 frames).
+        Saves: original image, GT depth (colormap), pred depth (colormap).
+
+        Args:
+            images: [T, 3, H, W] tensor
+            pred_depths: [T, 1, H, W] tensor in meters
+            gt_depths: [T, 1, H, W] tensor in meters
+            best_frame_idx: int, index of center frame
+            sequence_id: int, sequence identifier
+            dataset_name: str, name of dataset
+        """
+        import cv2
+        import matplotlib
+
+        T = images.shape[0]
+        MAX_DEPTH = 70.0
+
+        # Determine frame range with frame_interval support
+        frame_interval = self.frame_interval if self.frame_interval is not None else 1
+        target_num_frames = 9
+        half_count = (target_num_frames - 1) // 2  # 4
+
+        # Generate candidate frame indices centered around best_frame_idx
+        frame_indices = []
+        for i in range(-half_count, half_count + 1):
+            idx = best_frame_idx + i * frame_interval
+            if 0 <= idx < T:
+                frame_indices.append(idx)
+
+        # Extend in available direction if not enough frames
+        while len(frame_indices) < target_num_frames:
+            first = frame_indices[0]
+            new_back = first - frame_interval
+            last = frame_indices[-1]
+            new_forward = last + frame_interval
+
+            extended = False
+            if new_back >= 0:
+                frame_indices.insert(0, new_back)
+                extended = True
+            elif new_forward < T:
+                frame_indices.append(new_forward)
+                extended = True
+
+            if not extended:
+                break
+
+        # Ensure best_frame_idx is included
+        if best_frame_idx not in frame_indices and best_frame_idx < T:
+            frame_indices.append(best_frame_idx)
+            frame_indices.sort()
+
+        logger.info(f"Exporting figure frames for sequence {sequence_id}: frames {frame_indices} (center={best_frame_idx}, interval={frame_interval})")
+
+        # Create figures directory
+        figures_dir = self.save_dir / "figures" / f"seq{sequence_id:04d}"
+        figures_dir.mkdir(parents=True, exist_ok=True)
+
+        cmap = matplotlib.colormaps.get_cmap('plasma_r').copy()
+        cmap.set_bad(color='black')
+
+        for t in frame_indices:
+            # 1. Save original image
+            img = images[t].cpu().numpy()  # [3, H, W]
+            mean = np.array([0.485, 0.456, 0.406]).reshape(3, 1, 1)
+            std = np.array([0.229, 0.224, 0.225]).reshape(3, 1, 1)
+            img = img * std + mean
+            img = np.transpose(img, (1, 2, 0))  # [H, W, 3]
+            img = np.clip(img, 0, 1)
+            img = (img * 255).astype(np.uint8)
+            img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+            cv2.imwrite(str(figures_dir / f"frame_{t:04d}_image.png"), img)
+
+            # 2. Save GT depth (colormap)
+            gt_depth = gt_depths[t, 0].cpu().numpy()  # [H, W]
+            pred_depth = pred_depths[t, 0].cpu().numpy()  # [H, W]
+
+            gt_valid = (gt_depth > 0) & (gt_depth < MAX_DEPTH)
+            gt_density = gt_valid.sum() / gt_valid.size
+            is_sparse = gt_density < 0.5
+
+            gt_display = np.where(gt_valid, gt_depth, np.nan)
+            if gt_valid.any():
+                gt_vmin = np.nanpercentile(gt_depth[gt_valid], 2)
+                gt_vmax = np.nanpercentile(gt_depth[gt_valid], 98)
+            else:
+                gt_vmin, gt_vmax = 0, MAX_DEPTH
+
+            gt_colored = cmap((gt_display - gt_vmin) / (gt_vmax - gt_vmin + 1e-8))
+            gt_colored = (gt_colored[:, :, :3] * 255).astype(np.uint8)
+            gt_colored = cv2.cvtColor(gt_colored, cv2.COLOR_RGB2BGR)
+            cv2.imwrite(str(figures_dir / f"frame_{t:04d}_gt_depth.png"), gt_colored)
+
+            # 3. Save pred depth (colormap) - use GT range for comparison
+            if is_sparse:
+                valid_pixels_per_row = gt_valid.sum(axis=1)
+                valid_row_indices = np.where(valid_pixels_per_row >= 10)[0]
+                if len(valid_row_indices) > 0:
+                    height_mask = np.zeros_like(pred_depth, dtype=bool)
+                    height_mask[valid_row_indices.min():valid_row_indices.max()+1, :] = True
+                else:
+                    height_mask = np.ones_like(pred_depth, dtype=bool)
+                pred_show_mask = height_mask & (pred_depth > 0) & (pred_depth < MAX_DEPTH)
+            else:
+                pred_show_mask = gt_valid
+
+            pred_display = np.where(pred_show_mask, pred_depth, np.nan)
+            pred_colored = cmap((pred_display - gt_vmin) / (gt_vmax - gt_vmin + 1e-8))
+            pred_colored = (pred_colored[:, :, :3] * 255).astype(np.uint8)
+            pred_colored = cv2.cvtColor(pred_colored, cv2.COLOR_RGB2BGR)
+            cv2.imwrite(str(figures_dir / f"frame_{t:04d}_pred_depth.png"), pred_colored)
+
+        logger.info(f"Exported {len(frame_indices)} frames × 3 types = {len(frame_indices) * 3} images to {figures_dir}")
+
     def _save_scale_shift_comparison(self, all_metrics):
         """Save scale_shift_comparison.json."""
         scale_shift_comparison = []
@@ -1441,6 +1601,15 @@ def main(config: DictConfig):
     if test_mode:
         OmegaConf.update(config, 'test_mode', test_mode, force_add=True)
 
+    # Apply --frame if passed via sys.argv preprocessing (supports comma-separated: --frame 26,80)
+    frame_arg = getattr(main, '_frame_arg', None)
+    if frame_arg is not None:
+        frame_indices = [int(f.strip()) for f in frame_arg.split(',')]
+        if len(frame_indices) == 1:
+            OmegaConf.update(config, 'frame', frame_indices[0], force_add=True)
+        else:
+            OmegaConf.update(config, 'frame', frame_indices, force_add=True)
+
     tester = OnepieceTester(config)
     tester.test()
 
@@ -1448,8 +1617,9 @@ def main(config: DictConfig):
 if __name__ == "__main__":
     import sys
 
-    # Handle --test-mode flag BEFORE Hydra processes arguments
+    # Handle --test-mode and --frame flags BEFORE Hydra processes arguments
     test_mode = None
+    frame_arg = None
     new_argv = []
     i = 0
     while i < len(sys.argv):
@@ -1459,12 +1629,19 @@ if __name__ == "__main__":
         elif sys.argv[i].startswith('--test-mode='):
             test_mode = sys.argv[i].split('=', 1)[1]
             i += 1
+        elif sys.argv[i] == '--frame' and i + 1 < len(sys.argv):
+            frame_arg = sys.argv[i + 1]
+            i += 2
+        elif sys.argv[i].startswith('--frame='):
+            frame_arg = sys.argv[i].split('=', 1)[1]
+            i += 1
         else:
             new_argv.append(sys.argv[i])
             i += 1
     sys.argv = new_argv
 
-    # Store test_mode as function attribute so main() can access it
+    # Store as function attributes so main() can access them
     main._test_mode = test_mode
+    main._frame_arg = frame_arg
 
     main()
