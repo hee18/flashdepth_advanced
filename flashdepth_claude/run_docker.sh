@@ -1956,7 +1956,6 @@ case $COMMAND in
         echo "  - Workers: $WORKERS (--workers, default: 8)"
         echo "  - GPU: $GPU_ID (--gpu, default: 0)"
         echo "  - Total iterations: $TOTAL_ITERS (--epochs, default: 60001)"
-        echo "  - CLS layers: $CLS_LAYERS (--cls-layer, default: 2,4)"
         echo "  - No-shift: $NO_SHIFT (--no-shift, default: false)"
         echo "  - WandB: $WANDB (--wandb, default: true)"
         echo "  - WandB name: ${WANDB_NAME:-auto} (--wandb-name)"
@@ -1972,7 +1971,6 @@ case $COMMAND in
             training.workers=$WORKERS \
             training.iterations=$TOTAL_ITERS \
             training.wandb=$WANDB \
-            cls_layers='[$CLS_LAYERS]' \
             no_shift=$NO_SHIFT \
             +results_dir=$RESULTS_DIR"
 
@@ -1997,7 +1995,6 @@ case $COMMAND in
         echo "  - Workers: $WORKERS (--workers, default: 8)"
         echo "  - GPUs: $DDP_GPUS (--ddp-gpus, default: 0,1)"
         echo "  - Total iterations: $TOTAL_ITERS (--epochs, default: 60001)"
-        echo "  - CLS layers: $CLS_LAYERS (--cls-layer, default: 2,4)"
         echo "  - No-shift: $NO_SHIFT (--no-shift, default: false)"
         echo "  - WandB: $WANDB (--wandb, default: true)"
         echo "  - WandB name: ${WANDB_NAME:-auto} (--wandb-name)"
@@ -2022,7 +2019,6 @@ case $COMMAND in
             training.workers=$WORKERS \
             training.iterations=$TOTAL_ITERS \
             training.wandb=$WANDB \
-            cls_layers='[$CLS_LAYERS]' \
             no_shift=$NO_SHIFT \
             +results_dir=$RESULTS_DIR"
 
@@ -2048,7 +2044,6 @@ case $COMMAND in
         echo "  - GPU: $GPU_ID (--gpu, default: 0)"
         echo "  - Video length: $VID_LEN (--vid-len, default: 50)"
         echo "  - Frame interval: $FRAME_INTERVAL (--frame-interval, default: 1)"
-        echo "  - CLS layers: $CLS_LAYERS (--cls-layer, default: 2,4)"
         echo "  - No-shift: $NO_SHIFT (--no-shift, default: false)"
         echo "  - Checkpoint: ${GEAR_CHECKPOINT:-config default} (--gear-checkpoint)"
         echo "  - Results directory: $RESULTS_DIR (--results-dir)"
@@ -2064,7 +2059,6 @@ case $COMMAND in
             --config-name config_$CONFIG_VARIANT \
             dataset.data_root=/data/datasets \
             dataset.video_length=$VID_LEN \
-            cls_layers='[$CLS_LAYERS]' \
             no_shift=$NO_SHIFT \
             +frame_interval=$FRAME_INTERVAL \
             +results_dir=$RESULTS_DIR"

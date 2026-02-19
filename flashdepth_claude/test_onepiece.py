@@ -96,7 +96,7 @@ class OnepieceTester:
         # Initialize model
         self.model = self._setup_model()
 
-        # Setup test loader
+        # Setup test loader (after model is set up)
         self.test_loader = self._setup_test_loader()
 
         # Setup metrics
@@ -114,41 +114,6 @@ class OnepieceTester:
         # Test mode: None (full), 'tc' (temporal consistency only), 'ea' (error & accuracy only)
         self.test_mode = config.get('test_mode', None)
 
-    def _setup_cls_layers(self, model):
-        """Parse cls_layers config and compute encoder indices for multi-layer CLS averaging."""
-        cls_layers = self.config.get('cls_layers', [2, 4])
-
-        # Convert OmegaConf ListConfig to plain Python list
-        if isinstance(cls_layers, ListConfig):
-            cls_layers = OmegaConf.to_container(cls_layers)
-
-        # Ensure it's a flat list of integers
-        if isinstance(cls_layers, (list, tuple)):
-            cls_layers = [int(x) for x in cls_layers]
-        elif isinstance(cls_layers, str):
-            cls_layers = cls_layers.strip('[]').split(',')
-            cls_layers = [int(x.strip()) for x in cls_layers if x.strip()]
-        else:
-            cls_layers = [int(cls_layers)]
-
-        # Validate cls_layers (must be 1-4)
-        for layer in cls_layers:
-            if layer < 1 or layer > 4:
-                raise ValueError(f"cls_layers must be between 1 and 4, got {layer}")
-
-        # Convert user's 1-indexed layer numbers to 0-indexed encoder_indices
-        intermediate_idx = model.intermediate_layer_idx[model.encoder]
-        encoder_indices = [layer - 1 for layer in cls_layers]
-        target_blocks = [intermediate_idx[idx] for idx in encoder_indices]
-
-        logger.info(f"CLS layer selection: user specified layers {cls_layers}")
-        logger.info(f"  → encoder_indices: {encoder_indices}")
-        logger.info(f"  → target_blocks: {target_blocks} (actual ViT block indices)")
-
-        self.cls_layers = cls_layers
-        self.encoder_indices = encoder_indices
-        self.target_blocks = target_blocks
-
     def _setup_model(self):
         """Load trained Onepiece model."""
         model_config = dict(self.config.model)
@@ -156,14 +121,7 @@ class OnepieceTester:
         model_config['use_metric_head'] = False
         model_config['use_onepiece'] = True
 
-        scene_cut_config = self.config.get('scene_cut', {})
-        model_config['scene_cut_tau'] = scene_cut_config.get('tau', 0.05)
-        model_config['scene_cut_k'] = scene_cut_config.get('k', 80)
-
         model = FlashDepth(**model_config)
-
-        # Setup CLS layer selection
-        self._setup_cls_layers(model)
 
         checkpoint_path = self.config.get('load')
         if checkpoint_path and os.path.exists(checkpoint_path):
@@ -516,8 +474,7 @@ class OnepieceTester:
             if T > warmup_frames:
                 warmup_images = images[:, :warmup_frames]
                 _ = self.model.forward_with_onepiece_streaming(
-                    warmup_images, phase=2, no_shift=self.no_shift,
-                    cls_layer_indices=self.encoder_indices
+                    warmup_images, phase=2, no_shift=self.no_shift
                 )
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()
@@ -527,8 +484,7 @@ class OnepieceTester:
             start_time = time.time()
 
             outputs = self.model.forward_with_onepiece_streaming(
-                images, phase=2, no_shift=self.no_shift,
-                cls_layer_indices=self.encoder_indices
+                images, phase=2, no_shift=self.no_shift
             )
 
             torch.cuda.synchronize()
@@ -546,10 +502,9 @@ class OnepieceTester:
         relative_depth_out = outputs['relative_depth'].float()  # [B, T, H, W] (canonical inv depth)
         scale = outputs['scale'].float()  # [B, T]
         shift = outputs['shift'].float()  # [B, T]
-        d_cls = outputs['d_cls'].float()  # [B, T-1]
 
-        # depth_from_relative in canonical meters (same input space as model's scale/shift)
-        dfr_canonical = 100.0 / (relative_depth_out + 1e-8)  # [B, T, H, W]
+        # depth_from_relative in canonical meters (scale absorbs the 100x factor)
+        dfr_canonical = 1.0 / (relative_depth_out + 1e-8)  # [B, T, H, W]
 
         # De-canonicalize prediction: canonical → actual
         # metric_depth is in canonical meters, multiply by de_canonical_ratio_metric
@@ -748,11 +703,6 @@ class OnepieceTester:
         metrics['_per_frame_shifts'] = per_frame_shifts
         metrics['_per_frame_optimal_scales'] = per_frame_optimal_scales
         metrics['_per_frame_optimal_shifts'] = per_frame_optimal_shifts
-
-        # D_cls stats
-        if d_cls.numel() > 0:
-            metrics['mean_d_cls'] = float(d_cls.mean())
-            metrics['max_d_cls'] = float(d_cls.max())
 
         # === Depth range analysis ===
         depth_ranges = [(0, 10), (10, 30), (30, 70)]
@@ -1228,8 +1178,8 @@ class OnepieceTester:
         ax6.set_title('Metrics', fontsize=12, fontweight='bold')
         ax6.axis('off')
 
-        # Row 3: Depth Distribution + D_cls
-        ax7 = fig.add_subplot(gs[2, :2])
+        # Row 3: Depth Distribution
+        ax7 = fig.add_subplot(gs[2, :])
         if valid_mask.sum() > 0:
             gt_vals = gt[valid_mask]
             pred_vals = pred[valid_mask]
@@ -1242,18 +1192,6 @@ class OnepieceTester:
             ax7.legend()
             ax7.grid(True, alpha=0.3)
         ax7.set_title('Depth Distribution', fontsize=12, fontweight='bold')
-
-        ax8 = fig.add_subplot(gs[2, 2])
-        d_cls_vals = seq_metrics.get('_d_cls_values', None)
-        if d_cls_vals is not None and len(d_cls_vals) > 0:
-            ax8.plot(range(len(d_cls_vals)), d_cls_vals, 'purple', linewidth=1)
-            ax8.set_xlabel('Frame pair')
-            ax8.set_ylabel('D_cls')
-            ax8.grid(True, alpha=0.3)
-        else:
-            ax8.text(0.5, 0.5, f'D_cls: {seq_metrics.get("mean_d_cls", "N/A")}',
-                    ha='center', va='center', transform=ax8.transAxes, fontsize=12)
-        ax8.set_title('CLS Distance', fontsize=12, fontweight='bold')
 
         save_path = vis_dir / f"{frame_type}_frame_seq{sequence_id:04d}_{t}_absrel_{abs_rel_frame:.4f}.png"
         plt.savefig(save_path, dpi=100, bbox_inches='tight')

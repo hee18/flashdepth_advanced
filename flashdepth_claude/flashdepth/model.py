@@ -21,7 +21,7 @@ from utils.helpers import *
 
 from utils.eval_metrics.metrics import compute_depth_metrics
 from .heads import GlobalScalePredictor, MetricDepthLoss
-from .onepiece_modules import UnifiedGlobalMamba, OnepieceMetricHead, SceneCutDetector
+from .onepiece_modules import UnifiedGlobalMamba, OnepieceFiLMGenerator, OnepieceMetricHead
 
 
 
@@ -105,20 +105,19 @@ class FlashDepth(nn.Module):
             self.gsp_head = GlobalScalePredictor(input_dim=self.pretrained.embed_dim)
             logging.info("Global Scale Predictor initialized for metric depth estimation")
 
-        # Onepiece: Unified Global Mamba + OnepieceMetricHead + SceneCutDetector
+        # Onepiece V2: Unified Global Mamba + FiLMGenerator + MetricHead
         self.use_onepiece = kwargs.get('use_onepiece', False)
         if self.use_onepiece:
-            onepiece_mamba_layers = kwargs.get('unified_mamba_layers', 2)
+            onepiece_mamba_layers = kwargs.get('unified_mamba_layers', 4)
             onepiece_d_state = kwargs.get('unified_mamba_d_state', 64)
             onepiece_d_conv = kwargs.get('unified_mamba_d_conv', 4)
 
-            # CLS(1024) + GAP(256) = 1280 for ViT-L
-            cls_dim = self.pretrained.embed_dim  # 1024 for ViT-L
+            # GAP(256) + GStdP(256) = 512 for ViT-L
             gap_dim = dpt_dim  # 256 for ViT-L
-            unified_dim = cls_dim + gap_dim  # 1280
+            pooled_dim = gap_dim * 2  # 512 (GAP + GStdP)
 
             self.unified_global_mamba = UnifiedGlobalMamba(
-                d_input=unified_dim,
+                d_input=pooled_dim,
                 num_layers=onepiece_mamba_layers,
                 d_state=onepiece_d_state,
                 d_conv=onepiece_d_conv,
@@ -126,16 +125,15 @@ class FlashDepth(nn.Module):
                 headdim=64,
                 max_batch_size=batch_size
             )
-            self.onepiece_metric_head = OnepieceMetricHead(
-                input_dim=unified_dim,
+            self.onepiece_film_generator = OnepieceFiLMGenerator(
+                mamba_dim=pooled_dim,
                 dpt_dim=gap_dim
             )
-            self.scene_cut_detector = SceneCutDetector(
-                tau=kwargs.get('scene_cut_tau', 0.05),
-                k=kwargs.get('scene_cut_k', 80)
+            self.onepiece_metric_head = OnepieceMetricHead(
+                dpt_dim=gap_dim
             )
             logging.info(
-                f"Onepiece initialized: unified_dim={unified_dim}, "
+                f"Onepiece V2 initialized: pooled_dim={pooled_dim}, "
                 f"mamba_layers={onepiece_mamba_layers}, "
                 f"d_state={onepiece_d_state}, d_conv={onepiece_d_conv}"
             )
@@ -459,37 +457,38 @@ class FlashDepth(nn.Module):
 
         return intermediate_features, cls_token
 
-    def forward_with_onepiece(self, batch, phase=1, no_shift=False,
-                              cls_layer_indices=None, **kwargs):
+    def forward_with_onepiece(self, batch, phase=1, no_shift=False, **kwargs):
         """
-        Forward pass with Onepiece metric depth estimation.
+        Forward pass with Onepiece V2 metric depth estimation.
 
         Pipeline:
-            1. (Frozen) DINOv2 → CLS tokens [B*T, 1024] + intermediate features
-            2. (Frozen/Phase2) DPT → dpt_features [B*T, 256, h, w]
-            3. GAP(dpt_features) → [B*T, 256]
-            4. (Trainable) Concat(CLS, GAP) → [B, T, 1280] → UnifiedGlobalMamba → [B, T, 1280]
-            5a. (Trainable) refined_global → MetricHead → scale, shift
-            5b. (Trainable) refined_global → FiLM → gamma, beta → modulate dpt_features
-            6. (Frozen/Phase2) final_head(modulated_features) → relative_depth
-            7. metric_depth = scale * depth_from_relative(relative_depth) + shift
+            1. (Frozen) DINOv2 → encoder_features (no CLS needed)
+            2. (Always frozen) DPT → dpt_features [B*T, 256, h, w]
+            3. GAP + GStdP → [B*T, 512]
+            4. (Trainable) UnifiedGlobalMamba → [B, T, 512]
+            5. FiLMGenerator → gamma, beta → modulate dpt_features
+            6. Relative Head → relative_depth
+            7. MetricHead (Conv) → scale, shift from modulated features
+            8. metric_depth = scale / relative_depth + shift
+
+        Gradient isolation:
+            - metric_depth: full graph (TGM loss)
+            - metric_depth_isolated: MetricHead only (LogL1 loss)
+            - relative_depth_isolated: RelativeHead only (SSIL loss, Phase 2)
 
         Args:
             batch: (video, gt_depth, ...) or just video tensor
             phase: 1 or 2 (controls freezing)
             no_shift: If True, zero out shift (scale-only mode)
-            cls_layer_indices: Optional list of 0-indexed indices into intermediate layers
-                              for multi-layer CLS averaging. If None, uses last layer only.
-            **kwargs: Additional arguments
 
         Returns:
-            dict with: relative_depth, metric_depth, scale, shift,
-                       dpt_features, cls_tokens, scene_cut_weights, d_cls
+            dict with: metric_depth, relative_depth, metric_depth_isolated,
+                       relative_depth_isolated, modulated_features, scale, shift, dpt_features
         """
         if not self.use_onepiece:
             raise ValueError("Onepiece is not enabled. Set use_onepiece=True.")
 
-        # Handle batch format (Gear5 8-element format)
+        # Handle batch format
         if isinstance(batch, (list, tuple)):
             video = batch[0]
         elif isinstance(batch, torch.Tensor):
@@ -504,88 +503,77 @@ class FlashDepth(nn.Module):
         # Reshape: [B, T, C, H, W] → [B*T, C, H, W]
         video_flat = rearrange(video, 'b t c h w -> (b t) c h w')
 
-        # ===== Step 1: DINOv2 encoder (frozen, single pass) =====
+        # ===== Step 1: DINOv2 encoder (frozen, no CLS needed) =====
         with torch.no_grad():
-            encoder_features, cls_tokens_flat = self._get_intermediate_layers_with_cls(
-                video_flat, self.intermediate_layer_idx[self.encoder],
-                cls_layer_indices=cls_layer_indices
+            encoder_features = self.pretrained.get_intermediate_layers(
+                video_flat, self.intermediate_layer_idx[self.encoder]
             )
 
-        # ===== Step 2: DPT → dpt_features (no Spatial Mamba) =====
-        if phase == 1:
-            with torch.no_grad():
-                dpt_features = self.depth_head(encoder_features, patch_h, patch_w)
-        else:
+        # ===== Step 2: DPT (always frozen) =====
+        with torch.no_grad():
             dpt_features = self.depth_head(encoder_features, patch_h, patch_w)
 
-        dpt_h, dpt_w = dpt_features.shape[2], dpt_features.shape[3]
+        # ===== Step 3: GAP + GStdP =====
+        gap = F.adaptive_avg_pool2d(dpt_features, 1).squeeze(-1).squeeze(-1)  # [B*T, 256]
+        gstd = dpt_features.std(dim=(-2, -1))  # [B*T, 256]
+        global_tokens = torch.cat([gap, gstd], dim=-1)  # [B*T, 512]
+        global_tokens = rearrange(global_tokens, '(b t) d -> b t d', b=B, t=T)
 
-        # ===== Step 3: GAP =====
-        gap_features = F.adaptive_avg_pool2d(dpt_features, 1).squeeze(-1).squeeze(-1)  # [B*T, 256]
+        # ===== Step 4: Mamba =====
+        refined = self.unified_global_mamba(global_tokens)  # [B, T, 512]
+        refined_flat = rearrange(refined, 'b t d -> (b t) d')
 
-        # ===== Step 4: Unified Global Mamba =====
-        # Concat CLS + GAP → [B*T, 1280]
-        global_tokens = torch.cat([cls_tokens_flat, gap_features], dim=-1)  # [B*T, 1280]
-        global_tokens = rearrange(global_tokens, '(b t) d -> b t d', b=B, t=T)  # [B, T, 1280]
+        # ===== Step 5: FiLM =====
+        gamma, beta = self.onepiece_film_generator(refined_flat)
+        gamma_s = gamma.unsqueeze(-1).unsqueeze(-1)   # [B*T, 256, 1, 1]
+        beta_s = beta.unsqueeze(-1).unsqueeze(-1)     # [B*T, 256, 1, 1]
+        modulated = gamma_s * dpt_features + beta_s   # [B*T, 256, h, w]
 
-        # Temporal processing through Unified Global Mamba (always trainable)
-        refined_global = self.unified_global_mamba(global_tokens)  # [B, T, 1280]
-        refined_global_flat = rearrange(refined_global, 'b t d -> (b t) d')  # [B*T, 1280]
+        # ===== Step 6a: Relative Head (full graph for TGM) =====
+        if phase == 1:
+            with torch.no_grad():
+                relative_depth = self.final_head(modulated, patch_h, patch_w)
+        else:
+            relative_depth = self.final_head(modulated, patch_h, patch_w)
 
-        # ===== Step 5a: Scale/Shift prediction =====
-        scale, shift, gamma, beta = self.onepiece_metric_head(refined_global_flat)
-        # scale: [B*T, 1], shift: [B*T, 1], gamma: [B*T, 256], beta: [B*T, 256]
-
-        # No-shift mode: zero out shift so only scale is used
+        # ===== Step 6b: Metric Head (full graph for TGM) =====
+        scale, shift = self.onepiece_metric_head(modulated)
         if no_shift:
             shift = torch.zeros_like(shift)
 
-        # ===== Step 5b: FiLM modulation on DPT features =====
-        gamma_spatial = gamma.unsqueeze(-1).unsqueeze(-1)  # [B*T, 256, 1, 1]
-        beta_spatial = beta.unsqueeze(-1).unsqueeze(-1)    # [B*T, 256, 1, 1]
-        modulated_features = gamma_spatial * dpt_features + beta_spatial  # [B*T, 256, h, w]
+        # ===== Step 7: Metric conversion (full graph for TGM) =====
+        # depth = scale / relative_depth + shift (scale init ≈ 100 absorbs the old 100.0 factor)
+        depth_from_rel = 1.0 / (relative_depth + 1e-8)
+        metric_depth = scale.unsqueeze(-1) * depth_from_rel + shift.unsqueeze(-1)
 
-        # ===== Step 6: Final head → relative depth =====
-        if phase == 1:
-            with torch.no_grad():
-                relative_depth = self.final_head(modulated_features, patch_h, patch_w)  # [B*T, H, W]
+        # ===== Gradient-isolated outputs for LogL1 and SSIL =====
+        modulated_d = modulated.detach()
+
+        # For LogL1: MetricHead only
+        scale_iso, shift_iso = self.onepiece_metric_head(modulated_d)
+        if no_shift:
+            shift_iso = torch.zeros_like(shift_iso)
+        metric_depth_iso = scale_iso.unsqueeze(-1) * depth_from_rel.detach() + shift_iso.unsqueeze(-1)
+
+        # For SSIL: RelativeHead only (Phase 2)
+        if phase == 2:
+            relative_depth_iso = self.final_head(modulated_d, patch_h, patch_w)
         else:
-            relative_depth = self.final_head(modulated_features, patch_h, patch_w)  # [B*T, H, W]
+            relative_depth_iso = None
 
-        # ===== Step 7: Metric depth conversion =====
-        # FlashDepth outputs inverse depth * 100, so relative_depth is in 100/m scale
-        # depth_from_relative: 100/m → meters: 100 / relative_depth
-        depth_from_relative = 100.0 / (relative_depth + 1e-8)  # [B*T, H, W] in meters
-
-        # Apply scale and shift
-        scale_spatial = scale.unsqueeze(-1)  # [B*T, 1, 1]
-        shift_spatial = shift.unsqueeze(-1)  # [B*T, 1, 1]
-        metric_depth = scale_spatial * depth_from_relative + shift_spatial  # [B*T, H, W]
-
-        # ===== Scene cut detection =====
-        cls_tokens_seq = rearrange(cls_tokens_flat, '(b t) d -> b t d', b=B, t=T)
-        scene_cut_weights, d_cls = self.scene_cut_detector(cls_tokens_seq)
-
-        # Reshape outputs
-        relative_depth = rearrange(relative_depth, '(b t) h w -> b t h w', b=B, t=T)
-        metric_depth = rearrange(metric_depth, '(b t) h w -> b t h w', b=B, t=T)
-        scale = rearrange(scale, '(b t) 1 -> b t', b=B, t=T)
-        shift = rearrange(shift, '(b t) 1 -> b t', b=B, t=T)
-        dpt_features_seq = rearrange(dpt_features, '(b t) c h w -> b t c h w', b=B, t=T)
-
+        # Reshape and return
         return {
-            'relative_depth': relative_depth,       # [B, T, H, W]
-            'metric_depth': metric_depth,            # [B, T, H, W]
-            'scale': scale,                          # [B, T]
-            'shift': shift,                          # [B, T]
-            'dpt_features': dpt_features_seq,        # [B, T, 256, h, w]
-            'cls_tokens': cls_tokens_seq,            # [B, T, 1024]
-            'scene_cut_weights': scene_cut_weights,  # [B, T-1]
-            'd_cls': d_cls,                          # [B, T-1]
+            'metric_depth': rearrange(metric_depth, '(b t) h w -> b t h w', b=B, t=T),
+            'relative_depth': rearrange(relative_depth, '(b t) h w -> b t h w', b=B, t=T),
+            'metric_depth_isolated': rearrange(metric_depth_iso, '(b t) h w -> b t h w', b=B, t=T),
+            'relative_depth_isolated': rearrange(relative_depth_iso, '(b t) h w -> b t h w', b=B, t=T) if relative_depth_iso is not None else None,
+            'modulated_features': rearrange(modulated, '(b t) c h w -> b t c h w', b=B, t=T),
+            'scale': rearrange(scale, '(b t) 1 -> b t', b=B, t=T),
+            'shift': rearrange(shift, '(b t) 1 -> b t', b=B, t=T),
+            'dpt_features': rearrange(dpt_features, '(b t) c h w -> b t c h w', b=B, t=T),
         }
 
-    def forward_with_onepiece_streaming(self, video, phase=2, no_shift=False,
-                                         cls_layer_indices=None):
+    def forward_with_onepiece_streaming(self, video, phase=2, no_shift=False, **kwargs):
         """
         Frame-by-frame streaming inference with Mamba temporal state.
 
@@ -595,14 +583,11 @@ class FlashDepth(nn.Module):
 
         Args:
             video: [B, T, C, H, W] video tensor (already on GPU)
-            phase: 1 or 2 (controls DPT/final_head freezing)
+            phase: 1 or 2 (controls freezing)
             no_shift: If True, zero out shift (scale-only mode)
-            cls_layer_indices: Optional list of 0-indexed indices into intermediate
-                              layers for multi-layer CLS averaging.
 
         Returns:
-            dict with: relative_depth, metric_depth, scale, shift,
-                       cls_tokens, scene_cut_weights, d_cls
+            dict with: relative_depth, metric_depth, scale, shift
         """
         if not self.use_onepiece:
             raise ValueError("Onepiece is not enabled. Set use_onepiece=True.")
@@ -617,72 +602,60 @@ class FlashDepth(nn.Module):
         all_scale = []
         all_shift = []
         all_relative_depth = []
-        all_cls_tokens = []
-
-        ctx = torch.no_grad() if phase == 1 else nullcontext()
 
         for t in range(T):
             frame = video[:, t]  # [B, 3, H, W]
 
             # Step 1: DINOv2 encoder (always frozen)
             with torch.no_grad():
-                encoder_features, cls_token = self._get_intermediate_layers_with_cls(
-                    frame, self.intermediate_layer_idx[self.encoder],
-                    cls_layer_indices=cls_layer_indices
-                )  # cls_token: [B, 1024]
+                encoder_features = self.pretrained.get_intermediate_layers(
+                    frame, self.intermediate_layer_idx[self.encoder]
+                )
 
-            # Step 2: DPT (no spatial Mamba in Onepiece)
-            with ctx:
+            # Step 2: DPT (always frozen)
+            with torch.no_grad():
                 dpt_features = self.depth_head(encoder_features, patch_h, patch_w)  # [B, 256, h, w]
 
-            # Step 3: GAP
+            # Step 3: GAP + GStdP
             gap = F.adaptive_avg_pool2d(dpt_features, 1).squeeze(-1).squeeze(-1)  # [B, 256]
+            gstd = dpt_features.std(dim=(-2, -1))  # [B, 256]
+            global_token = torch.cat([gap, gstd], dim=-1).unsqueeze(1)  # [B, 1, 512]
 
             # Step 4: Mamba streaming (single frame with hidden state)
-            global_token = torch.cat([cls_token, gap], dim=-1).unsqueeze(1)  # [B, 1, 1280]
-            refined = self.unified_global_mamba.forward_single_frame(global_token).squeeze(1)  # [B, 1280]
+            refined = self.unified_global_mamba.forward_single_frame(global_token).squeeze(1)  # [B, 512]
 
-            # Step 5a: MetricHead → scale, shift, FiLM params
-            scale, shift, gamma, beta = self.onepiece_metric_head(refined)
-
-            if no_shift:
-                shift = torch.zeros_like(shift)
-
-            # Step 5b: FiLM modulation on DPT features
+            # Step 5: FiLM
+            gamma, beta = self.onepiece_film_generator(refined)
             modulated = gamma.unsqueeze(-1).unsqueeze(-1) * dpt_features + beta.unsqueeze(-1).unsqueeze(-1)
 
             # Step 6: final_head → relative depth
-            with ctx:
-                relative_depth = self.final_head(modulated, patch_h, patch_w)  # [B, H, W]
+            relative_depth = self.final_head(modulated, patch_h, patch_w)  # [B, H, W]
 
-            # Step 7: Metric depth conversion
-            depth_from_relative = 100.0 / (relative_depth + 1e-8)
+            # Step 7: MetricHead → scale, shift
+            scale, shift = self.onepiece_metric_head(modulated)
+            if no_shift:
+                shift = torch.zeros_like(shift)
+
+            # Step 8: Metric depth conversion (scale init ≈ 100 absorbs the old 100.0 factor)
+            depth_from_relative = 1.0 / (relative_depth + 1e-8)
             metric_depth = scale.unsqueeze(-1) * depth_from_relative + shift.unsqueeze(-1)
 
             all_metric_depth.append(metric_depth)
             all_scale.append(scale.squeeze(-1))
             all_shift.append(shift.squeeze(-1))
             all_relative_depth.append(relative_depth)
-            all_cls_tokens.append(cls_token)
 
         # Stack results along time dimension
-        metric_depth = torch.stack(all_metric_depth, dim=1)   # [B, T, H, W]
-        scale = torch.stack(all_scale, dim=1)                  # [B, T]
-        shift = torch.stack(all_shift, dim=1)                  # [B, T]
-        relative_depth = torch.stack(all_relative_depth, dim=1)  # [B, T, H, W]
-        cls_tokens_seq = torch.stack(all_cls_tokens, dim=1)    # [B, T, 1024]
-
-        # Scene cut detection (post-hoc on all CLS tokens, logging only)
-        scene_cut_weights, d_cls = self.scene_cut_detector(cls_tokens_seq)
+        metric_depth = torch.stack(all_metric_depth, dim=1)      # [B, T, H, W]
+        scale = torch.stack(all_scale, dim=1)                     # [B, T]
+        shift = torch.stack(all_shift, dim=1)                     # [B, T]
+        relative_depth = torch.stack(all_relative_depth, dim=1)   # [B, T, H, W]
 
         return {
             'relative_depth': relative_depth,       # [B, T, H, W]
             'metric_depth': metric_depth,            # [B, T, H, W]
             'scale': scale,                          # [B, T]
             'shift': shift,                          # [B, T]
-            'cls_tokens': cls_tokens_seq,            # [B, T, 1024]
-            'scene_cut_weights': scene_cut_weights,  # [B, T-1]
-            'd_cls': d_cls,                          # [B, T-1]
         }
 
     def final_head(self, x, patch_h, patch_w):

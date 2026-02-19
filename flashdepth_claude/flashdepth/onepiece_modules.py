@@ -1,13 +1,15 @@
 """
-Onepiece Core Modules for FlashDepth-Metric.
+Onepiece V2 Core Modules for FlashDepth-Metric.
 
 Architecture:
-    CLS(1024) + DPT GAP(256) → Unified Global Mamba(1280) → Metric Head + FiLM
+    DPT features → GAP(256) + GStdP(256) → Unified Global Mamba(512) →
+    FiLMGenerator → gamma, beta → modulate DPT features
+    MetricHead (Conv) → scale, shift from modulated features
 
 Components:
-    1. UnifiedGlobalMamba: 2-layer Mamba2 on concatenated CLS+GAP tokens (1280-dim)
-    2. OnepieceMetricHead: Scale/Shift prediction + FiLM spatial guidance
-    3. SceneCutDetector: CLS cosine distance for scene cut detection
+    1. UnifiedGlobalMamba: 4-layer Mamba2 on GAP+GStdP tokens (512-dim)
+    2. OnepieceFiLMGenerator: FiLM parameter generator from Mamba output
+    3. OnepieceMetricHead: Conv-based scale/shift prediction from spatial features
 """
 
 import torch
@@ -23,12 +25,11 @@ logger = logging.getLogger(__name__)
 
 class UnifiedGlobalMamba(nn.Module):
     """
-    Unified Global Mamba: Temporal processing on CLS + GAP concatenated tokens.
+    Unified Global Mamba: Temporal processing on GAP + GStdP concatenated tokens.
 
-    ViT-L: CLS(1024) + GAP(256) = 1280-dim → d_model=1280 (valid for Mamba2)
-    ViT-S: CLS(384) + GAP(64) = 448-dim → projected to d_model=512 (448 is not Mamba2-valid)
+    ViT-L: GAP(256) + GStdP(256) = 512-dim → d_model=512 (valid for Mamba2)
 
-    Uses 2 MambaBlock layers with expand=2, headdim=64.
+    Uses 4 MambaBlock layers with expand=2, headdim=64.
     Constraint: d_model * expand / headdim must be multiple of 8.
 
     When d_input != d_model, input/output projection layers are added automatically.
@@ -36,15 +37,9 @@ class UnifiedGlobalMamba(nn.Module):
     Two forward modes:
         - forward(x): Batch mode for training (parallel scan on full [B, T, D])
         - forward_single_frame(x): Streaming mode for inference (per-frame with hidden state)
-
-    NOTE - Architectural option (not yet implemented):
-        Current ViT-L uses d_model=1280 (46.36M params) for 514 output values (2 scale/shift + 512 FiLM).
-        Alternative: project CLS 1024→256 before concat → d_input=512, d_model=512 (~5.4M per 2 layers).
-        This would reduce Mamba params by ~6x while keeping the same output dimensionality.
-        See Onepiece.md "Architectural Option: CLS Dimension Reduction" for details.
     """
 
-    def __init__(self, d_input, num_layers=2, d_state=64, d_conv=4,
+    def __init__(self, d_input, num_layers=4, d_state=64, d_conv=4,
                  expand=2, headdim=64, max_batch_size=8):
         super().__init__()
 
@@ -117,7 +112,7 @@ class UnifiedGlobalMamba(nn.Module):
         Batch forward for training.
 
         Args:
-            x: [B, T, d_input] concatenated CLS + GAP tokens
+            x: [B, T, d_input] concatenated GAP + GStdP tokens
 
         Returns:
             out: [B, T, d_input] temporally refined tokens
@@ -166,138 +161,103 @@ class UnifiedGlobalMamba(nn.Module):
         return x
 
 
-class OnepieceMetricHead(nn.Module):
+class OnepieceFiLMGenerator(nn.Module):
     """
-    Metric Head with dual output paths:
-        Path A: Scale/Shift prediction from refined global token (1280-dim)
-        Path B: FiLM spatial guidance from refined GAP position (256-dim)
+    FiLM parameter generator from Mamba output.
 
-    Scale: softplus(raw_scale) → always positive
-    Shift: 0.1 * sigmoid(raw_shift) → range [0, 0.1]
-    FiLM: gamma = 1 + gamma_raw (residual), beta = beta_raw
+    Linear(mamba_dim, dpt_dim) → ReLU → Linear(dpt_dim, dpt_dim*2)
+    Zero-init last layer for identity start (gamma=1, beta=0).
     """
 
-    def __init__(self, input_dim=1280, dpt_dim=256, hidden_dim=512):
+    def __init__(self, mamba_dim=512, dpt_dim=256):
         super().__init__()
-
-        self.input_dim = input_dim
+        self.mamba_dim = mamba_dim
         self.dpt_dim = dpt_dim
 
-        # Path A: Scale/Shift prediction
-        self.scale_shift_mlp = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
+        self.net = nn.Sequential(
+            nn.Linear(mamba_dim, dpt_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, 2)  # [raw_scale, raw_shift]
+            nn.Linear(dpt_dim, dpt_dim * 2)
         )
 
-        # Path B: FiLM generator (from GAP-position slice of refined global)
-        self.film_generator = nn.Sequential(
-            nn.Linear(dpt_dim, dpt_dim),
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        """Zero-init last layer: gamma_raw=0 → gamma=1+0=1, beta=0."""
+        with torch.no_grad():
+            nn.init.zeros_(self.net[-1].weight)
+            nn.init.zeros_(self.net[-1].bias)
+        logger.info("OnepieceFiLMGenerator initialized: FiLM=identity (gamma=1, beta=0)")
+
+    def forward(self, mamba_output):
+        """
+        Args:
+            mamba_output: [B*T, mamba_dim] refined global tokens
+
+        Returns:
+            gamma: [B*T, dpt_dim] multiplicative factor (centered at 1)
+            beta: [B*T, dpt_dim] additive factor
+        """
+        film_out = self.net(mamba_output)  # [B*T, dpt_dim*2]
+        gamma_raw, beta = film_out.chunk(2, dim=-1)  # Each [B*T, dpt_dim]
+        gamma = 1.0 + gamma_raw  # Residual: identity when gamma_raw=0
+        return gamma, beta
+
+
+class OnepieceMetricHead(nn.Module):
+    """
+    Conv-based scale/shift prediction from spatial features.
+
+    Conv2d(dpt_dim, hidden_dim, 1) → ReLU → Conv2d(hidden_dim, 2, 1)
+    → spatial mean → softplus(scale), 1.0*sigmoid(shift)
+
+    Init: scale≈100 (softplus bias=100.0), shift≈0 (sigmoid bias=-5)
+    """
+
+    def __init__(self, dpt_dim=256, hidden_dim=64):
+        super().__init__()
+        self.dpt_dim = dpt_dim
+
+        self.conv = nn.Sequential(
+            nn.Conv2d(dpt_dim, hidden_dim, 1),
             nn.ReLU(),
-            nn.Linear(dpt_dim, dpt_dim * 2)  # [gamma, beta] each dpt_dim
+            nn.Conv2d(hidden_dim, 2, 1)
         )
 
-        # Initialize weights
         self._initialize_weights()
 
     def _initialize_weights(self):
         """Initialize for stable training start."""
-        # Xavier init for all linear layers
-        for module in self.modules():
-            if isinstance(module, nn.Linear):
+        # Xavier init for all conv layers
+        for module in self.conv.modules():
+            if isinstance(module, nn.Conv2d):
                 nn.init.xavier_uniform_(module.weight)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
 
-        # Scale/Shift initialization
+        # Scale/Shift initialization on last conv
         with torch.no_grad():
-            # Scale bias: softplus(x) ≈ 1.0 when x ≈ 0.5413
-            # Start with scale ≈ 1.0
-            self.scale_shift_mlp[-1].bias.data[0] = 0.5413  # softplus(0.5413) ≈ 1.0
+            # Channel 0 = scale: softplus(100.0) ≈ 100.0 (softplus(x)≈x for x>>1)
+            self.conv[-1].bias.data[0] = 100.0
+            # Channel 1 = shift: 1.0 * sigmoid(-5) ≈ 0.007 ≈ 0
+            self.conv[-1].bias.data[1] = -5.0
 
-            # Shift bias: 0.1 * sigmoid(x) = 0 when x → -inf, but we want ~0
-            # sigmoid(-5) ≈ 0.0067, so 0.1 * 0.0067 ≈ 0.0007 ≈ 0
-            self.scale_shift_mlp[-1].bias.data[1] = -5.0
+        logger.info("OnepieceMetricHead initialized: scale≈100.0, shift≈0.0")
 
-        # FiLM zero-init: gamma=0 → 1+0=1 (identity), beta=0
-        with torch.no_grad():
-            nn.init.zeros_(self.film_generator[-1].weight)
-            nn.init.zeros_(self.film_generator[-1].bias)
-
-        logger.info("OnepieceMetricHead initialized: scale≈1.0, shift≈0.0, FiLM=identity")
-
-    def forward(self, refined_global):
+    def forward(self, modulated_features):
         """
         Args:
-            refined_global: [B*T, 1280] refined global tokens from UnifiedGlobalMamba
+            modulated_features: [B*T, dpt_dim, h, w] FiLM-modulated DPT features
 
         Returns:
-            scale: [B*T, 1] positive scale values
-            shift: [B*T, 1] shift values in [0, 0.1]
-            gamma: [B*T, dpt_dim] FiLM multiplicative factor (centered at 1)
-            beta: [B*T, dpt_dim] FiLM additive factor
+            scale: [B*T, 1] positive scale values (init ≈ 100)
+            shift: [B*T, 1] shift values in [0, 1.0]
         """
-        # Path A: Scale/Shift
-        scale_shift = self.scale_shift_mlp(refined_global)  # [B*T, 2]
-        raw_scale, raw_shift = scale_shift[:, 0:1], scale_shift[:, 1:2]
+        out = self.conv(modulated_features)  # [B*T, 2, h, w]
+        out = out.mean(dim=(-2, -1))  # [B*T, 2] spatial mean
+        raw_scale, raw_shift = out[:, 0:1], out[:, 1:2]
 
-        scale = F.softplus(raw_scale)  # Always positive
-        shift = 0.1 * torch.sigmoid(raw_shift)  # Range [0, 0.1]
+        scale = F.softplus(raw_scale)  # Always positive, init ≈ 100
+        shift = 1.0 * torch.sigmoid(raw_shift)  # Range [0, 1.0]
 
-        # Path B: FiLM from GAP-position slice (last 256 dims of 1280)
-        refined_gap = refined_global[:, -self.dpt_dim:]  # [B*T, 256]
-        film_out = self.film_generator(refined_gap)  # [B*T, 512]
-        gamma_raw, beta = film_out.chunk(2, dim=-1)  # Each [B*T, 256]
-
-        gamma = 1.0 + gamma_raw  # Residual: identity when gamma_raw=0
-
-        return scale, shift, gamma, beta
-
-
-class SceneCutDetector(nn.Module):
-    """
-    Scene Cut Detector using CLS token cosine distance.
-
-    D_cls = 1 - cos_sim(CLS_t, CLS_{t-1})
-    W_temporal = 1 - sigmoid(k * (D_cls - tau))
-
-    When D_cls < tau: W_temporal ≈ 1.0 (same scene, keep temporal loss)
-    When D_cls > tau: W_temporal ≈ 0.0 (scene cut, suppress temporal loss)
-
-    Applied to TGM loss and Feature Consistency loss (NOT Log L1, which is per-frame).
-    """
-
-    def __init__(self, tau=0.05, k=80):
-        super().__init__()
-        self.tau = tau
-        self.k = k
-
-    @torch.no_grad()
-    def forward(self, cls_tokens):
-        """
-        Args:
-            cls_tokens: [B, T, 1024] CLS tokens per frame
-
-        Returns:
-            temporal_weights: [B, T-1] weights (1.0=keep, 0.0=cut)
-            d_cls: [B, T-1] cosine distances (for logging)
-        """
-        B, T, D = cls_tokens.shape
-
-        if T < 2:
-            return (
-                torch.ones(B, 0, device=cls_tokens.device),
-                torch.zeros(B, 0, device=cls_tokens.device)
-            )
-
-        # Compute cosine similarity between consecutive frames
-        cls_t = F.normalize(cls_tokens[:, 1:], dim=-1)    # [B, T-1, D]
-        cls_t_prev = F.normalize(cls_tokens[:, :-1], dim=-1)  # [B, T-1, D]
-
-        cos_sim = (cls_t * cls_t_prev).sum(dim=-1)  # [B, T-1]
-        d_cls = 1.0 - cos_sim  # Cosine distance [0, 2]
-
-        # Soft thresholding
-        temporal_weights = 1.0 - torch.sigmoid(self.k * (d_cls - self.tau))  # [B, T-1]
-
-        return temporal_weights, d_cls
+        return scale, shift

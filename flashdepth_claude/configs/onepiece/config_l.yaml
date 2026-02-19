@@ -1,6 +1,5 @@
-# Onepiece Configuration - ViT-L variant
-# Unified Global Mamba (CLS+GAP → 1280-dim) for metric depth estimation
-# Architecture: Frozen FlashDepth + Trainable UnifiedGlobalMamba + OnepieceMetricHead
+# Onepiece V2 Configuration - ViT-L variant
+# GAP+GStdP(512-dim) → Unified Global Mamba (4 layers) → FiLM + MetricHead
 
 # General Settings
 config_variant: l
@@ -8,11 +7,6 @@ config_dir: null
 inference: false
 load: configs/flashdepth-l/iter_10001.pth
 no_shift: false                  # Scale-only mode (zero out shift)
-
-# CLS layer selection (1-indexed, maps to intermediate_layer_idx)
-# ViT-L: [4, 11, 17, 23] → Layer 1=block4, Layer 2=block11, Layer 3=block17, Layer 4=block23
-# Default [2, 4] → blocks [11, 23]
-cls_layers: [2, 4]
 
 # Dataset Configuration
 dataset:
@@ -37,10 +31,9 @@ training:
   wandb_name: "onepiece_l"
   start_with_val: false
   weight_decay: 1.0e-6
-  gear3_lr: 1.0e-4           # Base LR for onepiece params
   lr:
     onepiece: 1.0e-4          # UnifiedGlobalMamba + OnepieceMetricHead
-    dpt: 1.0e-5               # 1/10 of onepiece (Phase 2)
+    dpt: 1.0e-5               # FiLMGenerator + RelativeHead (Phase 2)
     warmup_steps: 500
 
 # Model Configuration
@@ -52,9 +45,9 @@ model:
   use_hydra: false
   use_transformer_rnn: false
   use_xlstm: false
-  # Onepiece-specific
+  # Onepiece V2
   use_onepiece: true
-  unified_mamba_layers: 2
+  unified_mamba_layers: 4
   unified_mamba_d_state: 64
   unified_mamba_d_conv: 4
 
@@ -72,13 +65,9 @@ hybrid_configs:
 loss:
   log_l1_weight: 1.0
   tgm_weight: 1.0
-  feat_cons_weight: 0.01
+  wfc_weight: 0.01
+  ssil_weight: 1.0
   use_log_space: true
-
-# Scene Cut Detection
-scene_cut:
-  tau: 0.05
-  k: 80
 
 # Phase Transition
 phase:
