@@ -53,6 +53,7 @@ show_usage() {
     echo "  train_onepiece       Start Onepiece training (Unified Global Mamba, single GPU)"
     echo "  train_onepiece_ddp   Start Onepiece training with 2 GPUs"
     echo "  test_onepiece        Start Onepiece testing"
+    echo "  test_phase2          Quick Phase 2 integration test (memory + gradient + loss check)"
     echo "  infer_avante         Run Gear5 inference on avante_images (custom dataset)"
     echo "  test_gear2_objwise  Start Gear2 object-wise evaluation (Waymo segmentation)"
     echo "  test_gear3_objwise  Start Gear3 object-wise evaluation (Waymo segmentation)"
@@ -206,7 +207,7 @@ MODEL_TYPE="gear5"  # Model type for infer_avante: gear5 (default), onepiece
 USER_BATCH_SIZE=""  # Track if user explicitly set batch size
 while [[ $# -gt 0 ]]; do
     case $1 in
-        build|train|test|train_gear2|train_gear2_ddp|test_gear2|train_gear3|train_gear3_ddp|test_gear3|train_gear4|train_gear4_ddp|test_gear4|train_gear5|train_gear5_ddp|test_gear5|train_gear5_bankai|train_gear5_bankai_ddp|test_gear5_bankai|train_gear5_film|train_gear5_film_ddp|test_gear5_film|train_onepiece|train_onepiece_ddp|test_onepiece|infer_avante|test_gear2_objwise|test_gear3_objwise|test_gear4_objwise|test_gear5_objwise|test_original_flashdepth|shell|clean|logs)
+        build|train|test|train_gear2|train_gear2_ddp|test_gear2|train_gear3|train_gear3_ddp|test_gear3|train_gear4|train_gear4_ddp|test_gear4|train_gear5|train_gear5_ddp|test_gear5|train_gear5_bankai|train_gear5_bankai_ddp|test_gear5_bankai|train_gear5_film|train_gear5_film_ddp|test_gear5_film|train_onepiece|train_onepiece_ddp|test_onepiece|test_phase2|infer_avante|test_gear2_objwise|test_gear3_objwise|test_gear4_objwise|test_gear5_objwise|test_original_flashdepth|shell|clean|logs)
             COMMAND="$1"
             shift
             ;;
@@ -2028,6 +2029,34 @@ case $COMMAND in
 
         if [ -n "$WANDB_NAME" ]; then
             DOCKER_CMD="$DOCKER_CMD training.wandb_name=$WANDB_NAME"
+        fi
+
+        eval $DOCKER_CMD
+        ;;
+
+    test_phase2)
+        echo "Starting Phase 2 Integration Test..."
+        echo "Configuration:"
+        echo "  - Config variant: $CONFIG_VARIANT (--config-variant, default: l)"
+        echo "  - Config file: configs/onepiece/config_$CONFIG_VARIANT.yaml"
+        echo "  - Batch size: $BATCH_SIZE (--batch-size, default: 3)"
+        echo "  - GPU: $GPU_ID (--gpu, default: 0)"
+        echo "  - Checkpoint: ${FLASHDEPTH_CHECKPOINT:-config default} (--flashdepth-checkpoint)"
+        echo ""
+        echo "Tests: parameter config, forward pass, 4 losses (LogL1+TGM+WFC+SSIL),"
+        echo "       gradient flow, optimizer step, memory report"
+        echo ""
+
+        DOCKER_CMD="CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm \
+            -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+            flashdepth python test_phase2_memory.py \
+            --config-path configs/onepiece \
+            --config-name config_$CONFIG_VARIANT \
+            dataset.data_root=/data/datasets \
+            training.batch_size=$BATCH_SIZE"
+
+        if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
+            DOCKER_CMD="$DOCKER_CMD load=$FLASHDEPTH_CHECKPOINT"
         fi
 
         eval $DOCKER_CMD

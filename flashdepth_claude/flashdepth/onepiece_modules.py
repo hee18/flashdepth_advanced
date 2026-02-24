@@ -257,7 +257,7 @@ class OnepieceMetricHead(nn.Module):
         out = out.mean(dim=(-2, -1))  # [B*T, 2] spatial mean
         raw_scale, raw_shift = out[:, 0:1], out[:, 1:2]
 
-        scale = F.softplus(raw_scale)  # Always positive, init ≈ 100
+        scale = F.softplus(raw_scale).clamp(max=1000.0)  # Positive, capped at 1000
         shift = 1.0 * torch.sigmoid(raw_shift)  # Range [0, 1.0]
 
         return scale, shift

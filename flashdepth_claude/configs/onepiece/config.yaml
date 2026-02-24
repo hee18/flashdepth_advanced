@@ -64,13 +64,12 @@ hybrid_configs:
 loss:
   log_l1_weight: 1.0
   tgm_weight: 1.0
-  wfc_weight: 0.01
-  ssil_weight: 1.0
+  ofc_weight: 0.01
   use_log_space: true
 
 # Phase Transition
 phase:
-  auto_transition_step: 5000
+  auto_transition_step: 1500
   phase2_warmup_steps: 500
 
 # Evaluation Configuration

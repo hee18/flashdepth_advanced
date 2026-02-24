@@ -8,17 +8,17 @@ Architecture:
     MetricHead (Conv) → scale, shift → metric depth
 
 Training Phases:
-    Phase 1 (0 ~ 5K steps): Metric Alignment
+    Phase 1 (0 ~ 1.5K steps): Metric Alignment
         Trainable: UnifiedGlobalMamba + OnepieceMetricHead
         Frozen: DINOv2, DPT, FiLMGenerator, RelativeHead (output_conv)
 
-    Phase 2 (5K+ steps): Full Video Optimization
+    Phase 2 (1.5K+ steps): Full Video Optimization
         Additional unfreeze: FiLMGenerator + RelativeHead
         Frozen: DINOv2, DPT
 
 Loss:
-    Phase 1: L_total = L_log_l1 + L_tgm
-    Phase 2: L_total = L_log_l1 + L_tgm + L_wfc + L_ssil
+    Phase 1: L_total = L_log_l1 + L_tgm  (full graph)
+    Phase 2: L_total = L_log_l1 + L_tgm + L_ofc
 
 Data:
     Gear5 8-element batch format, video_length=8, resolution=518
@@ -147,8 +147,7 @@ class OnepieceTrainer:
         self.loss_fn = OnepieceCombinedLoss(
             log_l1_weight=loss_config.get('log_l1_weight', 1.0),
             tgm_weight=loss_config.get('tgm_weight', 1.0),
-            wfc_weight=loss_config.get('wfc_weight', 0.01),
-            ssil_weight=loss_config.get('ssil_weight', 1.0),
+            ofc_weight=loss_config.get('ofc_weight', 0.01),
             use_log_space=loss_config.get('use_log_space', True)
         )
 
@@ -633,10 +632,8 @@ class OnepieceTrainer:
                 postfix['l1'] = f'{loss_dict["log_l1_loss"]:.4f}'
             if 'tgm_loss' in loss_dict:
                 postfix['tgm'] = f'{loss_dict["tgm_loss"]:.4f}'
-            if 'wfc_loss' in loss_dict and loss_dict['wfc_loss'] > 0:
-                postfix['wfc'] = f'{loss_dict["wfc_loss"]:.4f}'
-            if 'ssil_loss' in loss_dict and loss_dict['ssil_loss'] > 0:
-                postfix['ssil'] = f'{loss_dict["ssil_loss"]:.4f}'
+            if 'ofc_loss' in loss_dict and loss_dict['ofc_loss'] > 0:
+                postfix['ofc'] = f'{loss_dict["ofc_loss"]:.4f}'
             pbar.set_postfix(postfix)
 
             # WandB logging
@@ -658,10 +655,8 @@ class OnepieceTrainer:
                     log_parts.append(f"L1={loss_dict['log_l1_loss']:.4f}")
                 if 'tgm_loss' in loss_dict:
                     log_parts.append(f"TGM={loss_dict['tgm_loss']:.4f}")
-                if 'wfc_loss' in loss_dict and loss_dict['wfc_loss'] > 0:
-                    log_parts.append(f"WFC={loss_dict['wfc_loss']:.4f}")
-                if 'ssil_loss' in loss_dict and loss_dict['ssil_loss'] > 0:
-                    log_parts.append(f"SSIL={loss_dict['ssil_loss']:.4f}")
+                if 'ofc_loss' in loss_dict and loss_dict['ofc_loss'] > 0:
+                    log_parts.append(f"OFC={loss_dict['ofc_loss']:.4f}")
                 if 'mean_scale' in loss_dict:
                     log_parts.append(f"scale={loss_dict['mean_scale']:.4f}")
                 if 'mean_shift' in loss_dict:
@@ -814,8 +809,6 @@ class OnepieceTrainer:
             )
 
             metric_depth = outputs['metric_depth']                    # [B, T, H, W]
-            metric_depth_isolated = outputs['metric_depth_isolated']  # [B, T, H, W]
-            relative_depth_isolated = outputs['relative_depth_isolated']  # [B, T, H, W] or None
             modulated_features = outputs['modulated_features']        # [B, T, 256, h, w]
             scale = outputs['scale']                                  # [B, T]
             shift = outputs['shift']                                  # [B, T]
@@ -831,17 +824,6 @@ class OnepieceTrainer:
                     size=gt_depth_meters.shape[-2:],
                     mode='bilinear', align_corners=True
                 ).squeeze(1).view(B, T, gt_depth_meters.shape[-2], gt_depth_meters.shape[-1])
-                metric_depth_isolated = F.interpolate(
-                    metric_depth_isolated.view(BT, 1, metric_depth_isolated.shape[-2], metric_depth_isolated.shape[-1]),
-                    size=gt_depth_meters.shape[-2:],
-                    mode='bilinear', align_corners=True
-                ).squeeze(1).view(B, T, gt_depth_meters.shape[-2], gt_depth_meters.shape[-1])
-                if relative_depth_isolated is not None:
-                    relative_depth_isolated = F.interpolate(
-                        relative_depth_isolated.view(BT, 1, relative_depth_isolated.shape[-2], relative_depth_isolated.shape[-1]),
-                        size=gt_depth_meters.shape[-2:],
-                        mode='bilinear', align_corners=True
-                    ).squeeze(1).view(B, T, gt_depth_meters.shape[-2], gt_depth_meters.shape[-1])
 
             gt_valid = (gt_depth.squeeze(2) > 0)
             pred_valid = (metric_depth > 0) & (metric_depth < 1000.0)
@@ -851,19 +833,12 @@ class OnepieceTrainer:
 
             # Convert to inverse depth space for LogL1/TGM losses
             pred_inverse = 1.0 / metric_depth.float().clamp(min=1e-8)
-            pred_inverse_isolated = 1.0 / metric_depth_isolated.float().clamp(min=1e-8)
             gt_inverse = gt_depth.squeeze(2).float()  # already 1/m
-
-            # GT inverse depth for SSIL (raw inverse depth, not *100)
-            gt_inverse_for_ssil = gt_depth.squeeze(2).float() * 100.0  # Scale to match relative_depth output
 
             total_loss, loss_components = self.loss_fn(
                 metric_depth=pred_inverse,
                 gt_depth=gt_inverse,
                 valid_mask=valid_mask.float(),
-                metric_depth_isolated=pred_inverse_isolated,
-                relative_depth_isolated=relative_depth_isolated,
-                gt_depth_for_ssil=gt_inverse_for_ssil,
                 modulated_features=modulated_features.float() if self.current_phase == 2 else None,
                 images=images.float() if self.current_phase == 2 else None,
                 flow_estimator=self.flow_estimator if self.current_phase == 2 else None,

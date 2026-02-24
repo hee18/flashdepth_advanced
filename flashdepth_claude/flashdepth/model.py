@@ -471,10 +471,7 @@ class FlashDepth(nn.Module):
             7. MetricHead (Conv) → scale, shift from modulated features
             8. metric_depth = scale / relative_depth + shift
 
-        Gradient isolation:
-            - metric_depth: full graph (TGM loss)
-            - metric_depth_isolated: MetricHead only (LogL1 loss)
-            - relative_depth_isolated: RelativeHead only (SSIL loss, Phase 2)
+        All losses use full-graph metric_depth (no gradient isolation).
 
         Args:
             batch: (video, gt_depth, ...) or just video tensor
@@ -482,8 +479,8 @@ class FlashDepth(nn.Module):
             no_shift: If True, zero out shift (scale-only mode)
 
         Returns:
-            dict with: metric_depth, relative_depth, metric_depth_isolated,
-                       relative_depth_isolated, modulated_features, scale, shift, dpt_features
+            dict with: metric_depth, relative_depth, modulated_features,
+                       scale, shift, dpt_features
         """
         if not self.use_onepiece:
             raise ValueError("Onepiece is not enabled. Set use_onepiece=True.")
@@ -546,27 +543,10 @@ class FlashDepth(nn.Module):
         depth_from_rel = 1.0 / (relative_depth + 1e-8)
         metric_depth = scale.unsqueeze(-1) * depth_from_rel + shift.unsqueeze(-1)
 
-        # ===== Gradient-isolated outputs for LogL1 and SSIL =====
-        modulated_d = modulated.detach()
-
-        # For LogL1: MetricHead only
-        scale_iso, shift_iso = self.onepiece_metric_head(modulated_d)
-        if no_shift:
-            shift_iso = torch.zeros_like(shift_iso)
-        metric_depth_iso = scale_iso.unsqueeze(-1) * depth_from_rel.detach() + shift_iso.unsqueeze(-1)
-
-        # For SSIL: RelativeHead only (Phase 2)
-        if phase == 2:
-            relative_depth_iso = self.final_head(modulated_d, patch_h, patch_w)
-        else:
-            relative_depth_iso = None
-
         # Reshape and return
         return {
             'metric_depth': rearrange(metric_depth, '(b t) h w -> b t h w', b=B, t=T),
             'relative_depth': rearrange(relative_depth, '(b t) h w -> b t h w', b=B, t=T),
-            'metric_depth_isolated': rearrange(metric_depth_iso, '(b t) h w -> b t h w', b=B, t=T),
-            'relative_depth_isolated': rearrange(relative_depth_iso, '(b t) h w -> b t h w', b=B, t=T) if relative_depth_iso is not None else None,
             'modulated_features': rearrange(modulated, '(b t) c h w -> b t c h w', b=B, t=T),
             'scale': rearrange(scale, '(b t) 1 -> b t', b=B, t=T),
             'shift': rearrange(shift, '(b t) 1 -> b t', b=B, t=T),
