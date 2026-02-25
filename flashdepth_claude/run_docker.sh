@@ -60,6 +60,7 @@ show_usage() {
     echo "  test_gear4_objwise  Start Gear4 object-wise evaluation"
     echo "  test_gear5_objwise  Start Gear5 object-wise evaluation"
     echo "  test_original_flashdepth  Test original FlashDepth (without Gear modules) for comparison"
+    echo "  analyze_features  DPT feature flickering analysis (Pre/Post-Mamba, FiLM validity)"
     echo "  shell       Start interactive shell in container"
     echo "  clean       Remove containers and images"
     echo "  logs        Show container logs"
@@ -202,12 +203,15 @@ DDP_GPUS="0,1"  # GPU IDs for DDP training (e.g., "0,1" or "1,2")
 NO_INVERSE="false"  # Apply scale/shift in depth space instead of inverse depth (--no-inverse)
 NO_SHIFT="false"  # Disable shift, scale-only mode (--no-shift)
 MODEL_TYPE="gear5"  # Model type for infer_avante: gear5 (default), onepiece
+FLICKER_THRESHOLD="3.0"  # MAD multiplier for analyze_features flicker detection
+FLICKER_FRAMES=""  # Manual flicker frames for analyze_features (e.g., "10,25")
+DATASET=""  # Dataset override (used by analyze_features)
 
 # Parse arguments
 USER_BATCH_SIZE=""  # Track if user explicitly set batch size
 while [[ $# -gt 0 ]]; do
     case $1 in
-        build|train|test|train_gear2|train_gear2_ddp|test_gear2|train_gear3|train_gear3_ddp|test_gear3|train_gear4|train_gear4_ddp|test_gear4|train_gear5|train_gear5_ddp|test_gear5|train_gear5_bankai|train_gear5_bankai_ddp|test_gear5_bankai|train_gear5_film|train_gear5_film_ddp|test_gear5_film|train_onepiece|train_onepiece_ddp|test_onepiece|test_phase2|infer_avante|test_gear2_objwise|test_gear3_objwise|test_gear4_objwise|test_gear5_objwise|test_original_flashdepth|shell|clean|logs)
+        build|train|test|train_gear2|train_gear2_ddp|test_gear2|train_gear3|train_gear3_ddp|test_gear3|train_gear4|train_gear4_ddp|test_gear4|train_gear5|train_gear5_ddp|test_gear5|train_gear5_bankai|train_gear5_bankai_ddp|test_gear5_bankai|train_gear5_film|train_gear5_film_ddp|test_gear5_film|train_onepiece|train_onepiece_ddp|test_onepiece|test_phase2|infer_avante|test_gear2_objwise|test_gear3_objwise|test_gear4_objwise|test_gear5_objwise|test_original_flashdepth|analyze_features|shell|clean|logs)
             COMMAND="$1"
             shift
             ;;
@@ -266,6 +270,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         --dataset)
             OBJWISE_DATASET="$2"
+            DATASET="$2"
             shift 2
             ;;
         --objwise)
@@ -390,6 +395,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --ddp-gpus)
             DDP_GPUS="$2"
+            shift 2
+            ;;
+        --flicker-threshold)
+            FLICKER_THRESHOLD="$2"
+            shift 2
+            ;;
+        --flicker-frames)
+            FLICKER_FRAMES="$2"
             shift 2
             ;;
         -h|--help)
@@ -2127,6 +2140,76 @@ case $COMMAND in
         fi
 
         eval $DOCKER_CMD
+        ;;
+
+    analyze_features)
+        # Map CONFIG_VARIANT to FlashDepth config/checkpoint
+        case "$CONFIG_VARIANT" in
+            l)
+                FLASHDEPTH_CONFIG="/FlashDepth/configs/flashdepth-l"
+                DEFAULT_CKPT="/FlashDepth/configs/flashdepth-l/iter_10001.pth"
+                ;;
+            s)
+                FLASHDEPTH_CONFIG="/FlashDepth/configs/flashdepth-s"
+                DEFAULT_CKPT="/FlashDepth/configs/flashdepth-s/iter_14001.pth"
+                ;;
+            hybrid)
+                FLASHDEPTH_CONFIG="/FlashDepth/configs/flashdepth"
+                DEFAULT_CKPT="/FlashDepth/configs/flashdepth/iter_43002.pth"
+                ;;
+        esac
+
+        # Use user-provided checkpoint or default
+        CKPT="${FLASHDEPTH_CHECKPOINT:-$DEFAULT_CKPT}"
+        if [[ "$CKPT" != /FlashDepth/* ]] && [[ "$CKPT" != /app/* ]] && [[ "$CKPT" != /* ]]; then
+            CKPT="/app/$CKPT"
+        fi
+
+        # Use OBJWISE_DATASET if set, else fallback to env DATASET, else sintel
+        ANALYZE_DATASET="${OBJWISE_DATASET:-${DATASET:-sintel}}"
+        ANALYZE_SEQ="${SEQ:-0}"
+        ANALYZE_VID_LEN="${VID_LEN:-50}"
+        FLICKER_THRESHOLD="${FLICKER_THRESHOLD:-3.0}"
+        FLICKER_FRAMES_ARG=""
+        if [ -n "$FLICKER_FRAMES" ]; then
+            FLICKER_FRAMES_ARG="--flicker-frames $FLICKER_FRAMES"
+        fi
+
+        # Results dir
+        if [ "$RESULTS_DIR" = "train_results/results_1" ]; then
+            ANALYZE_RESULTS="/app/analysis_results/${CONFIG_VARIANT}_${ANALYZE_DATASET}_seq${ANALYZE_SEQ}"
+        else
+            if [[ "$RESULTS_DIR" != /app/* ]] && [[ "$RESULTS_DIR" != /* ]]; then
+                ANALYZE_RESULTS="/app/$RESULTS_DIR"
+            else
+                ANALYZE_RESULTS="$RESULTS_DIR"
+            fi
+        fi
+
+        echo "DPT Feature Flickering Analysis"
+        echo "Configuration:"
+        echo "  - Config: $CONFIG_VARIANT ($FLASHDEPTH_CONFIG)"
+        echo "  - Checkpoint: $CKPT"
+        echo "  - Dataset: $ANALYZE_DATASET"
+        echo "  - Sequence: $ANALYZE_SEQ"
+        echo "  - Video length: $ANALYZE_VID_LEN"
+        echo "  - Flicker threshold: $FLICKER_THRESHOLD"
+        echo "  - GPU: $GPU_ID"
+        echo "  - Results: $ANALYZE_RESULTS"
+
+        ANALYZE_CMD="python analyze_dpt_features.py \
+            --config-path $FLASHDEPTH_CONFIG \
+            --checkpoint $CKPT \
+            --data-root /data/datasets \
+            --dataset $ANALYZE_DATASET \
+            --seq-idx $ANALYZE_SEQ \
+            --video-length $ANALYZE_VID_LEN \
+            --results-dir $ANALYZE_RESULTS \
+            --flicker-threshold $FLICKER_THRESHOLD \
+            --gpu 0 \
+            $FLICKER_FRAMES_ARG"
+
+        CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm flashdepth $ANALYZE_CMD
         ;;
 
     "")

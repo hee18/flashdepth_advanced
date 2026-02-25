@@ -1,5 +1,32 @@
 # Onepiece V2 Changelog
 
+## 2026-02-25: DPT Feature Flickering Analysis Script
+
+### analyze_dpt_features.py 추가
+- **파일**: `analyze_dpt_features.py` (신규), `run_docker.sh`
+- **목적**: Depth flickering이 FlashDepth 파이프라인 어디서 발생하는지 분석, FiLM modulation 타당성 정량적 검증
+- **구현**:
+  - Monkey-patch `dpt_features_to_mamba` → Pre/Post-Mamba feature 캡처 (원본 코드 수정 없음)
+  - Part A: Temporal stability (frame-to-frame cosine sim, Mamba effect per frame)
+  - Part B: FiLM validity (channel-wise affine alignment R_affine, channel stats drift, variance decomposition)
+  - 자동 flickering frame 감지 (MAD-based outlier) + 수동 override (`--flicker-frames`)
+  - Per-flicker-frame heatmaps (pixel-wise cosine sim, affine residual, depth context strip)
+- **Docker**: `./run_docker.sh analyze_features --config l --dataset sintel --seq 0 --gpu 0`
+- **CLI 옵션**: `--flicker-threshold`, `--flicker-frames`, `--dataset`, `--seq`, `--config`
+
+---
+
+## 2026-02-25: Validation OFC Loss 추가
+
+### Validation에 OFC Loss 포함
+- **파일**: `train_onepiece.py` (`validate()`)
+- **문제**: Phase 2 training loss = LogL1 + TGM + OFC인데, validation loss = LogL1 + TGM만 계산 → best checkpoint 선택 시 temporal feature consistency 미반영
+- **변경**: Phase 2 validation에서 `self.loss_fn.ofc_loss()` 호출하여 OFC loss 계산, `ofc_weight(0.01)` 곱해서 val_loss에 합산
+- **추가 항목**: per-dataset OFC 로깅, wandb `val/ofc_loss`, val_loss_dict에 `ofc_loss` 필드, return dict에 `ofc_loss`
+- Phase 1에서는 기존과 동일 (LogL1 + TGM만)
+
+---
+
 ## 2026-02-24: V2 Loss / Training 개편
 
 ### 1. SSIL 제거
