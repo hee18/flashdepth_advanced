@@ -687,6 +687,8 @@ class OnepieceTrainer:
 
                 if self.config.training.get('wandb', False):
                     wandb.log({'val/loss': val_loss}, step=step)
+                    if 'ofc_loss' in val_metrics:
+                        wandb.log({'val/ofc_loss': val_metrics['ofc_loss']}, step=step)
 
                 if val_loss < self.best_val_loss:
                     self.best_val_loss = val_loss
@@ -872,12 +874,14 @@ class OnepieceTrainer:
         total_loss = 0.0
         total_depth_loss = 0.0
         total_tgm_loss = 0.0
+        total_ofc_loss = 0.0
         num_batches = 0
 
         # Per-dataset tracking
         dataset_losses = {}
         dataset_depth_losses = {}
         dataset_tgm_losses = {}
+        dataset_ofc_losses = {}
 
         # Reset visualization tracking
         for ds_config in self.val_vis_config.values():
@@ -941,6 +945,7 @@ class OnepieceTrainer:
                 )
 
                 metric_depth = outputs['metric_depth']
+                modulated_features = outputs.get('modulated_features', None)
                 scale = outputs['scale']
                 shift = outputs['shift']
 
@@ -985,10 +990,22 @@ class OnepieceTrainer:
                         tgm_error = (pred_diff - gt_diff).abs()
                         avg_tgm_loss = (tgm_error * temporal_valid_w).sum() / temporal_valid_w.sum().clamp(min=1)
 
+                # OFC loss (Phase 2 only, matches training)
+                avg_ofc_loss = torch.tensor(0.0)
+                if (self.current_phase >= 2 and T > 1 and
+                        modulated_features is not None and
+                        self.loss_fn.ofc_weight > 0):
+                    avg_ofc_loss = self.loss_fn.ofc_loss(
+                        modulated_features.float(), images.float(), self.flow_estimator
+                    )
+
                 avg_loss = avg_depth_loss + avg_tgm_loss
+                if self.current_phase >= 2:
+                    avg_loss = avg_loss + self.loss_fn.ofc_weight * avg_ofc_loss
                 total_loss += avg_loss.item()
                 total_depth_loss += avg_depth_loss.item()
                 total_tgm_loss += avg_tgm_loss.item()
+                total_ofc_loss += avg_ofc_loss.item()
                 num_batches += 1
 
                 # Per-dataset tracking
@@ -996,9 +1013,11 @@ class OnepieceTrainer:
                     dataset_losses[current_dataset] = []
                     dataset_depth_losses[current_dataset] = []
                     dataset_tgm_losses[current_dataset] = []
+                    dataset_ofc_losses[current_dataset] = []
                 dataset_losses[current_dataset].append(avg_loss.item())
                 dataset_depth_losses[current_dataset].append(avg_depth_loss.item())
                 dataset_tgm_losses[current_dataset].append(avg_tgm_loss.item() if torch.is_tensor(avg_tgm_loss) else avg_tgm_loss)
+                dataset_ofc_losses[current_dataset].append(avg_ofc_loss.item() if torch.is_tensor(avg_ofc_loss) else avg_ofc_loss)
 
             # Validation visualization
             if self.val_visualizer and current_dataset in self.val_vis_config:
@@ -1037,6 +1056,7 @@ class OnepieceTrainer:
                             'val_loss': avg_loss.item() if valid_mask.sum() > 0 else 0.0,
                             'depth_loss': avg_depth_loss.item() if valid_mask.sum() > 0 else 0.0,
                             'tgm_loss': avg_tgm_loss.item() if torch.is_tensor(avg_tgm_loss) else 0.0,
+                            'ofc_loss': avg_ofc_loss.item() if torch.is_tensor(avg_ofc_loss) else 0.0,
                         }
 
                         self.val_visualizer.create_validation_summary(
@@ -1060,13 +1080,14 @@ class OnepieceTrainer:
             total_processed += 1
 
             # Memory cleanup
-            del images, gt_depth, metric_depth
+            del images, gt_depth, metric_depth, modulated_features
             torch.cuda.empty_cache()
 
         # Compute averages
         avg_loss = total_loss / max(num_batches, 1)
         avg_depth_loss = total_depth_loss / max(num_batches, 1)
         avg_tgm_loss = total_tgm_loss / max(num_batches, 1)
+        avg_ofc_loss = total_ofc_loss / max(num_batches, 1)
 
         # Per-dataset summary
         per_dataset_avg = {}
@@ -1077,17 +1098,24 @@ class OnepieceTrainer:
                 ds_avg = np.mean(dataset_losses[ds_name])
                 ds_depth = np.mean(dataset_depth_losses[ds_name])
                 ds_tgm = np.mean(dataset_tgm_losses[ds_name])
+                ds_ofc = np.mean(dataset_ofc_losses.get(ds_name, [0.0]))
                 ds_count = len(dataset_losses[ds_name])
                 per_dataset_avg[ds_name] = ds_avg
                 per_dataset_num[ds_name] = ds_count
-                self.logger.info(
-                    f"    {ds_name}: loss={ds_avg:.4f} (L1={ds_depth:.4f}, TGM={ds_tgm:.4f}) [{ds_count} seqs]"
-                )
+                if self.current_phase >= 2:
+                    self.logger.info(
+                        f"    {ds_name}: loss={ds_avg:.4f} (L1={ds_depth:.4f}, TGM={ds_tgm:.4f}, OFC={ds_ofc:.4f}) [{ds_count} seqs]"
+                    )
+                else:
+                    self.logger.info(
+                        f"    {ds_name}: loss={ds_avg:.4f} (L1={ds_depth:.4f}, TGM={ds_tgm:.4f}) [{ds_count} seqs]"
+                    )
 
         return {
             'loss': avg_loss,
             'depth_loss': avg_depth_loss,
             'tgm_loss': avg_tgm_loss,
+            'ofc_loss': avg_ofc_loss,
             'dataset_losses': per_dataset_avg,
             'num_sequences': per_dataset_num
         }
