@@ -390,9 +390,11 @@ def compute_affine_alignment(feat_flicker, feat_stable):
     Returns:
         aligned: (C, H, W)
         residual: (C, H, W)
-        r_affine: scalar — fraction of variance explained by affine
+        r_affine: scalar — fraction of variance explained by affine (global)
         gammas: (C,)
         betas: (C,)
+        per_channel_r2: (C,) — per-channel R² (1 - residual_c²/total_diff_c²)
+        per_channel_l2: (C,) — per-channel L2 distance (flicker vs stable)
     """
     C, H, W = feat_flicker.shape
     feat_flicker = feat_flicker.float()
@@ -401,6 +403,8 @@ def compute_affine_alignment(feat_flicker, feat_stable):
     aligned = torch.zeros_like(feat_stable)
     gammas = torch.zeros(C)
     betas = torch.zeros(C)
+    per_channel_r2 = torch.zeros(C)
+    per_channel_l2 = torch.zeros(C)
 
     for c in range(C):
         x = feat_flicker[c].flatten()  # (H*W,)
@@ -412,6 +416,19 @@ def compute_affine_alignment(feat_flicker, feat_stable):
         betas[c] = beta_c
         aligned[c] = gamma_c * feat_flicker[c] + beta_c
 
+        # Per-channel L2 distance
+        diff_c = feat_flicker[c] - feat_stable[c]
+        per_channel_l2[c] = diff_c.norm().item()
+
+        # Per-channel R²
+        residual_c = aligned[c] - feat_stable[c]
+        total_var_c = diff_c.norm() ** 2
+        residual_var_c = residual_c.norm() ** 2
+        if total_var_c > 1e-10:
+            per_channel_r2[c] = 1.0 - (residual_var_c / total_var_c).item()
+        else:
+            per_channel_r2[c] = 1.0
+
     residual = aligned - feat_stable
     total_diff = feat_flicker - feat_stable
     total_var = total_diff.norm() ** 2
@@ -422,7 +439,7 @@ def compute_affine_alignment(feat_flicker, feat_stable):
     else:
         r_affine = 1.0  # Identical features
 
-    return aligned, residual, r_affine, gammas, betas
+    return aligned, residual, r_affine, gammas, betas, per_channel_r2, per_channel_l2
 
 
 def compute_channel_stats(features_list):
@@ -457,18 +474,22 @@ def analyze_film_validity(feature_store, flicker_frames):
         'affine_alignment': {},
         'channel_stats': {},
         'variance_decomposition': {},
+        'per_channel_analysis': {},
+        'top_contributing_channels': {},
     }
 
-    # ── 4. Affine Alignment Test ──
+    # ── 4. Affine Alignment Test (also stores per-channel data) ──
     for t in flicker_frames:
         if t < 1 or t >= T:
             continue
         stable_t = t - 1
 
         # Pre-Mamba
-        _, residual_pre, r_pre, gammas_pre, betas_pre = compute_affine_alignment(pre_feats[t], pre_feats[stable_t])
+        _, residual_pre, r_pre, gammas_pre, betas_pre, pc_r2_pre, pc_l2_pre = \
+            compute_affine_alignment(pre_feats[t], pre_feats[stable_t])
         # Post-Mamba
-        _, residual_post, r_post, gammas_post, betas_post = compute_affine_alignment(post_feats[t], post_feats[stable_t])
+        _, residual_post, r_post, gammas_post, betas_post, pc_r2_post, pc_l2_post = \
+            compute_affine_alignment(post_feats[t], post_feats[stable_t])
 
         # L2 distance before/after alignment
         pre_l2_before = (pre_feats[t].float() - pre_feats[stable_t].float()).norm().item()
@@ -491,6 +512,31 @@ def analyze_film_validity(feature_store, flicker_frames):
             },
         }
 
+        # Store per-channel analysis (tensors for visualization, converted to list for JSON later)
+        results['per_channel_analysis'][str(t)] = {
+            'pre_mamba': {
+                'per_channel_l2': pc_l2_pre,      # (C,) tensor
+                'gammas': gammas_pre,               # (C,) tensor
+                'betas': betas_pre,                 # (C,) tensor
+                'per_channel_r2': pc_r2_pre,       # (C,) tensor
+            },
+            'post_mamba': {
+                'per_channel_l2': pc_l2_post,      # (C,) tensor
+                'gammas': gammas_post,               # (C,) tensor
+                'betas': betas_post,                 # (C,) tensor
+                'per_channel_r2': pc_r2_post,       # (C,) tensor
+            },
+        }
+
+        # Top contributing channels (by post-mamba L2 distance)
+        top_k = min(20, pc_l2_post.shape[0])
+        top_indices = pc_l2_post.argsort(descending=True)[:top_k]
+        results['top_contributing_channels'][str(t)] = {
+            'channel_ids': top_indices.tolist(),
+            'l2_values': pc_l2_post[top_indices].tolist(),
+            'r2_values': pc_r2_post[top_indices].tolist(),
+        }
+
     # ── 5. Channel Statistics Drift ──
     pre_means, pre_stds = compute_channel_stats(pre_feats)
     post_means, post_stds = compute_channel_stats(post_feats)
@@ -502,20 +548,14 @@ def analyze_film_validity(feature_store, flicker_frames):
         'post_stds': post_stds.numpy().tolist(),
     }
 
-    # ── 6. Variance Decomposition ──
+    # ── 6. Variance Decomposition (reuse block 4 results) ──
     for t in flicker_frames:
         if t < 1 or t >= T:
             continue
-        stable_t = t - 1
-
-        # Pre-Mamba decomposition
-        _, residual_pre, r_pre, _, _ = compute_affine_alignment(pre_feats[t], pre_feats[stable_t])
-        # Post-Mamba decomposition
-        _, residual_post, r_post, _, _ = compute_affine_alignment(post_feats[t], post_feats[stable_t])
-
+        # Reuse r_affine from affine_alignment (no duplicate compute_affine_alignment calls)
         results['variance_decomposition'][str(t)] = {
-            'pre_mamba_r_affine': r_pre,
-            'post_mamba_r_affine': r_post,
+            'pre_mamba_r_affine': results['affine_alignment'][str(t)]['pre_mamba']['r_affine'],
+            'post_mamba_r_affine': results['affine_alignment'][str(t)]['post_mamba']['r_affine'],
         }
 
     # Log summary
@@ -725,6 +765,133 @@ def visualize_part_b(film_results, feature_store, flicker_frames, results_dir, t
             fig.tight_layout()
             _save_fig(fig, os.path.join(out_dir, 'variance_decomposition.png'))
 
+    # ── Plot 4: per_channel_l2_ranking.png (top-20 channels heatmap) ──
+    per_ch = film_results.get('per_channel_analysis', {})
+    if flicker_frames and per_ch:
+        valid_frames = [t for t in flicker_frames if str(t) in per_ch]
+        if valid_frames:
+            # Collect post-mamba per-channel L2 for all flicker frames
+            all_l2 = torch.stack([per_ch[str(t)]['post_mamba']['per_channel_l2'] for t in valid_frames], dim=0)  # (N_frames, C)
+            # Rank channels by mean L2 across frames
+            mean_l2 = all_l2.mean(dim=0)  # (C,)
+            top20 = mean_l2.argsort(descending=True)[:20]
+
+            heatmap_data = all_l2[:, top20].numpy().T  # (20, N_frames)
+            ch_labels = [f'Ch {idx.item()}' for idx in top20]
+
+            fig, ax = plt.subplots(figsize=(max(8, len(valid_frames) * 1.2), 8))
+            im = ax.imshow(heatmap_data, aspect='auto', cmap='YlOrRd')
+            plt.colorbar(im, ax=ax, label='L2 Distance')
+            ax.set_xticks(range(len(valid_frames)))
+            ax.set_xticklabels([f'F{t}' for t in valid_frames], fontsize=9)
+            ax.set_yticks(range(len(ch_labels)))
+            ax.set_yticklabels(ch_labels, fontsize=8)
+            ax.set_xlabel('Flicker Frame')
+            ax.set_ylabel('Channel (ranked by mean L2)')
+            ax.set_title('Top-20 Contributing Channels: Per-Channel L2 Distance (Post-Mamba)')
+
+            # Annotate values
+            for i in range(heatmap_data.shape[0]):
+                for j in range(heatmap_data.shape[1]):
+                    val = heatmap_data[i, j]
+                    ax.text(j, i, f'{val:.1f}', ha='center', va='center', fontsize=7,
+                            color='white' if val > heatmap_data.max() * 0.6 else 'black')
+
+            fig.tight_layout()
+            _save_fig(fig, os.path.join(out_dir, 'per_channel_l2_ranking.png'))
+
+    # ── Plot 5: affine_params_distribution.png (gamma/beta scatter) ──
+    if flicker_frames and per_ch:
+        valid_frames = [t for t in flicker_frames if str(t) in per_ch]
+        if valid_frames:
+            # Subsample if too many frames (max 6 subplots)
+            max_cols = 6
+            if len(valid_frames) > max_cols:
+                indices = np.linspace(0, len(valid_frames) - 1, max_cols, dtype=int)
+                display_frames = [valid_frames[i] for i in indices]
+            else:
+                display_frames = valid_frames
+            n_cols = len(display_frames)
+
+            fig, axes = plt.subplots(2, n_cols, figsize=(4 * n_cols, 8), squeeze=False)
+
+            for col, t in enumerate(display_frames):
+                gammas = per_ch[str(t)]['post_mamba']['gammas'].numpy()
+                betas = per_ch[str(t)]['post_mamba']['betas'].numpy()
+                C = len(gammas)
+                ch_indices = np.arange(C)
+
+                # Top row: gamma distribution
+                ax_g = axes[0, col]
+                ax_g.scatter(ch_indices, gammas, s=3, alpha=0.5, c='steelblue')
+                ax_g.axhline(y=1.0, color='red', linestyle='--', alpha=0.7, label='gamma=1')
+                ax_g.set_title(f'F{t}: gamma', fontsize=10)
+                ax_g.set_xlabel('Channel')
+                ax_g.set_ylabel('gamma_c')
+                ax_g.grid(True, alpha=0.3)
+
+                # Annotate top-5 channels (furthest from 1.0)
+                gamma_dev = np.abs(gammas - 1.0)
+                top5_g = gamma_dev.argsort()[-5:][::-1]
+                for idx in top5_g:
+                    ax_g.annotate(f'{idx}', (idx, gammas[idx]), fontsize=7, color='red',
+                                  textcoords="offset points", xytext=(3, 3))
+
+                # Bottom row: beta distribution
+                ax_b = axes[1, col]
+                ax_b.scatter(ch_indices, betas, s=3, alpha=0.5, c='firebrick')
+                ax_b.axhline(y=0.0, color='red', linestyle='--', alpha=0.7, label='beta=0')
+                ax_b.set_title(f'F{t}: beta', fontsize=10)
+                ax_b.set_xlabel('Channel')
+                ax_b.set_ylabel('beta_c')
+                ax_b.grid(True, alpha=0.3)
+
+                # Annotate top-5 channels (furthest from 0.0)
+                beta_dev = np.abs(betas)
+                top5_b = beta_dev.argsort()[-5:][::-1]
+                for idx in top5_b:
+                    ax_b.annotate(f'{idx}', (idx, betas[idx]), fontsize=7, color='red',
+                                  textcoords="offset points", xytext=(3, 3))
+
+            fig.suptitle('Affine Parameters Distribution (Post-Mamba)', fontsize=13)
+            fig.tight_layout()
+            _save_fig(fig, os.path.join(out_dir, 'affine_params_distribution.png'))
+
+    # ── Plot 6: per_channel_r2.png (lowest R² channels bar chart) ──
+    if flicker_frames and per_ch:
+        valid_frames = [t for t in flicker_frames if str(t) in per_ch]
+        if valid_frames:
+            # Find top-20 lowest R² channels (post-mamba, averaged across frames)
+            all_r2 = torch.stack([per_ch[str(t)]['post_mamba']['per_channel_r2'] for t in valid_frames], dim=0)  # (N, C)
+            mean_r2 = all_r2.mean(dim=0)  # (C,)
+            bottom20 = mean_r2.argsort()[:20]  # lowest R² first
+
+            n_groups = len(valid_frames)
+            n_bars = len(bottom20)
+            x_pos = np.arange(n_bars)
+            width = 0.8 / max(n_groups, 1)
+
+            fig, ax = plt.subplots(figsize=(14, 6))
+            colors = plt.cm.Set2(np.linspace(0, 1, n_groups))
+
+            for gi, t in enumerate(valid_frames):
+                r2_vals = per_ch[str(t)]['post_mamba']['per_channel_r2'][bottom20].numpy()
+                offset = (gi - n_groups / 2 + 0.5) * width
+                ax.bar(x_pos + offset, r2_vals, width, label=f'F{t}', color=colors[gi], alpha=0.85)
+
+            ax.set_xticks(x_pos)
+            ax.set_xticklabels([f'Ch {idx.item()}' for idx in bottom20], fontsize=8, rotation=45)
+            ax.set_ylabel('Per-Channel R²')
+            ax.set_title('Top-20 Lowest R² Channels (Post-Mamba) — Affine alignment fails here')
+            ax.axhline(y=0.5, color='orange', linestyle='--', alpha=0.5, label='R²=0.5')
+            ax.axhline(y=0.8, color='green', linestyle='--', alpha=0.5, label='R²=0.8')
+            ax.legend(fontsize=8, loc='upper right')
+            ax.grid(True, alpha=0.3, axis='y')
+            ax.set_ylim(bottom=min(0, mean_r2[bottom20].min().item() - 0.05))
+
+            fig.tight_layout()
+            _save_fig(fig, os.path.join(out_dir, 'per_channel_r2.png'))
+
 
 def visualize_flicker_details(feature_store, flicker_frames, depths, results_dir):
     """Per-flicker-frame heatmaps."""
@@ -763,7 +930,7 @@ def visualize_flicker_details(feature_store, flicker_frames, depths, results_dir
         _save_fig(fig, os.path.join(out_dir, f'frame_{t:03d}_mamba_effect.png'))
 
         # ── affine residual heatmap ──
-        _, residual_post, _, _, _ = compute_affine_alignment(post_feats[t], post_feats[t - 1])
+        _, residual_post, _, _, _, _, _ = compute_affine_alignment(post_feats[t], post_feats[t - 1])
         residual_norm = residual_post.float().norm(dim=0)  # (h, w)
         fig, ax = plt.subplots(figsize=(8, 6))
         im = ax.imshow(residual_norm.numpy(), cmap='hot')
@@ -798,6 +965,24 @@ def visualize_flicker_details(feature_store, flicker_frames, depths, results_dir
 def write_summary(temporal_results, film_results, flicker_frames, diffs, results_dir):
     """Write summary.txt and feature_analysis.json."""
 
+    # ── Build per_channel_analysis for JSON (top-30 channels only) ──
+    per_channel_json = {}
+    per_ch = film_results.get('per_channel_analysis', {})
+    for t_str, data in per_ch.items():
+        per_channel_json[t_str] = {}
+        for stage in ['pre_mamba', 'post_mamba']:
+            sd = data[stage]
+            pc_l2 = sd['per_channel_l2']
+            # Top-30 by L2 distance
+            top30 = pc_l2.argsort(descending=True)[:30]
+            per_channel_json[t_str][stage] = {
+                'top30_channel_ids': top30.tolist(),
+                'top30_l2': pc_l2[top30].tolist(),
+                'top30_r2': sd['per_channel_r2'][top30].tolist(),
+                'top30_gammas': sd['gammas'][top30].tolist(),
+                'top30_betas': sd['betas'][top30].tolist(),
+            }
+
     # ── JSON ──
     json_data = {
         'temporal_stability': {
@@ -812,6 +997,8 @@ def write_summary(temporal_results, film_results, flicker_frames, diffs, results
             'affine_alignment': film_results['affine_alignment'],
             'variance_decomposition': film_results['variance_decomposition'],
         },
+        'per_channel_analysis': per_channel_json,
+        'top_contributing_channels': film_results.get('top_contributing_channels', {}),
         'flicker_frames': flicker_frames,
         'depth_temporal_diffs': diffs.tolist(),
     }
@@ -874,11 +1061,63 @@ def write_summary(temporal_results, film_results, flicker_frames, diffs, results
     else:
         lines.append("  (No flicker frames detected for FiLM analysis)")
 
+    # ── Part C: Per-Channel Analysis ──
+    lines.append("")
+    lines.append("Part C: Per-Channel Analysis")
+    if per_ch:
+        # Aggregate across all flicker frames (post-mamba)
+        valid_frames = [t for t in flicker_frames if str(t) in per_ch]
+        if valid_frames:
+            all_l2 = torch.stack([per_ch[str(t)]['post_mamba']['per_channel_l2'] for t in valid_frames], dim=0)
+            all_r2 = torch.stack([per_ch[str(t)]['post_mamba']['per_channel_r2'] for t in valid_frames], dim=0)
+            all_gammas = torch.stack([per_ch[str(t)]['post_mamba']['gammas'] for t in valid_frames], dim=0)
+            all_betas = torch.stack([per_ch[str(t)]['post_mamba']['betas'] for t in valid_frames], dim=0)
+
+            mean_l2 = all_l2.mean(dim=0)
+            mean_r2 = all_r2.mean(dim=0)
+            mean_gammas = all_gammas.mean(dim=0)
+            mean_betas = all_betas.mean(dim=0)
+
+            # Top-5 most contributing channels (by L2)
+            top5_l2 = mean_l2.argsort(descending=True)[:5]
+            lines.append("  Top-5 most contributing channels (by mean L2 distance):")
+            for rank, idx in enumerate(top5_l2):
+                lines.append(f"    #{rank+1}: Ch {idx.item()} — L2={mean_l2[idx].item():.3f}, "
+                             f"R²={mean_r2[idx].item():.3f}, γ={mean_gammas[idx].item():.3f}, β={mean_betas[idx].item():.3f}")
+            lines.append("")
+
+            # Top-5 channels where affine fails (lowest R²)
+            bottom5_r2 = mean_r2.argsort()[:5]
+            lines.append("  Top-5 channels where affine fails (lowest R²):")
+            for rank, idx in enumerate(bottom5_r2):
+                lines.append(f"    #{rank+1}: Ch {idx.item()} — R²={mean_r2[idx].item():.3f}, "
+                             f"L2={mean_l2[idx].item():.3f}, γ={mean_gammas[idx].item():.3f}, β={mean_betas[idx].item():.3f}")
+            lines.append("")
+
+            # Gamma/beta extreme channels
+            gamma_dev = (mean_gammas - 1.0).abs()
+            top5_gamma = gamma_dev.argsort(descending=True)[:5]
+            lines.append("  Top-5 extreme gamma channels (furthest from 1.0):")
+            for rank, idx in enumerate(top5_gamma):
+                lines.append(f"    #{rank+1}: Ch {idx.item()} — γ={mean_gammas[idx].item():.4f} (dev={gamma_dev[idx].item():.4f})")
+
+            beta_dev = mean_betas.abs()
+            top5_beta = beta_dev.argsort(descending=True)[:5]
+            lines.append("  Top-5 extreme beta channels (furthest from 0.0):")
+            for rank, idx in enumerate(top5_beta):
+                lines.append(f"    #{rank+1}: Ch {idx.item()} — β={mean_betas[idx].item():.4f}")
+        else:
+            lines.append("  (No valid flicker frames for per-channel analysis)")
+    else:
+        lines.append("  (No per-channel analysis data)")
+
     lines.append("")
     lines.append("Interpretation:")
     lines.append("  ① Pre-Mamba stable (sim~1.0) → DPT features are per-frame consistent → DPT freeze justified")
     lines.append("  ② Post-Mamba flickering or unresolved → temporal correction needed after Mamba")
     lines.append("  ③ R_affine high → frame differences are mostly channel-wise scale+shift → FiLM is the right tool")
+    lines.append("  ④ Low per-channel R² → these channels need spatial modulation, not just FiLM")
+    lines.append("  ⑤ Extreme γ/β → these channels dominate the flickering and are FiLM-correctable")
     lines.append("=" * 60)
 
     summary_path = os.path.join(results_dir, 'summary.txt')

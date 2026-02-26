@@ -1,5 +1,21 @@
 # Onepiece V2 Changelog
 
+## 2026-02-26: Per-Channel Feature Analysis 추가
+
+### analyze_dpt_features.py 확장
+- **파일**: `analyze_dpt_features.py`
+- **목적**: flickering frame 분석 시 개별 채널의 기여도를 정량적으로 분석, FiLM vs spatial modulation 연구 방향 결정 지원
+- **변경 사항**:
+  - `compute_affine_alignment()`: per-channel R² `(C,)`, per-channel L2 distance `(C,)` 반환값 추가
+  - `analyze_film_validity()`: per_channel_analysis, top_contributing_channels 결과 키 추가. Block 6 중복 compute_affine_alignment 호출 제거 → Block 4 결과 재사용
+  - `visualize_part_b()`: 3개 시각화 추가
+    - `per_channel_l2_ranking.png`: Top-20 채널 × flicker frames heatmap (Post-Mamba L2 distance)
+    - `affine_params_distribution.png`: gamma/beta 분포 scatter (top-5 극단값 annotate, max 6 subplots)
+    - `per_channel_r2.png`: Top-20 최저 R² 채널 grouped bar chart
+  - `write_summary()`: JSON에 per_channel_analysis (top-30 채널) 추가, summary.txt에 Part C 섹션 추가 (top-5 L2, top-5 lowest R², extreme gamma/beta)
+
+---
+
 ## 2026-02-25: DPT Feature Flickering Analysis Script
 
 ### analyze_dpt_features.py 추가
