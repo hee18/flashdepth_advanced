@@ -357,27 +357,9 @@ case $METHOD in
     vda)
         CONDA_ENV="vda"
         ;; 
-    depthanythingv2)
-        CONDA_ENV="depthanythingv2"
-        ;; 
     depthcrafter)
         CONDA_ENV="depthcrafter"
-        ;; 
-    metric3d)
-        CONDA_ENV="metric3d"
-        ;; 
-    unidepth)
-        CONDA_ENV="unidepth"
-        ;; 
-    zoedepth)
-        CONDA_ENV="zoedepth"
-        ;; 
-    depthpro)
-        CONDA_ENV="depthpro"
-        ;; 
-    cut3r)
-        CONDA_ENV="cut3r"
-        ;; 
+        ;;
 esac
 
 echo "Using conda environment: $CONDA_ENV"

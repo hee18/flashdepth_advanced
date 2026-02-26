@@ -375,14 +375,8 @@ CMD="$CMD --visualization $VISUALIZATION"
 
 # Get required conda environment
 case $METHOD in
-    vda)
-        CONDA_ENV="vda"
-        ;;
     depthanythingv2)
         CONDA_ENV="depthanythingv2"
-        ;;
-    depthcrafter)
-        CONDA_ENV="depthcrafter"
         ;;
     metric3d)
         CONDA_ENV="metric3d"
