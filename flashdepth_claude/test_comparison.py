@@ -549,19 +549,25 @@ class ComparisonTester:
         # Stack predictions
         pred_depths = torch.stack(pred_depths, dim=0)  # [T, 1, H, W]
 
-        # Downsample GT to match prediction resolution (prevents OOM on high-res datasets)
-        gt_depth_processed_cpu = gt_depth_processed[0].cpu()  # [T, 1, H, W]
+        # Valid-aware downsample GT on GPU before CPU transfer
+        # Avoids transferring full-res GT to CPU (critical for high-res datasets like ETH3D)
+        MAX_DEPTH = 70.0
+        gt_depth_gpu = gt_depth_processed[0]  # [T, 1, H, W] on GPU
         pred_H, pred_W = pred_depths.shape[2:]
-        gt_H, gt_W = gt_depth_processed_cpu.shape[2:]
-
+        gt_H, gt_W = gt_depth_gpu.shape[2:]
         if (gt_H != pred_H) or (gt_W != pred_W):
             logger.info(f"Downsampling GT from {gt_H}x{gt_W} to {pred_H}x{pred_W} to match prediction resolution")
-            gt_depth_processed_cpu = torch.nn.functional.interpolate(
-                gt_depth_processed_cpu,  # [T, 1, H, W]
-                size=(pred_H, pred_W),
-                mode='bilinear',
-                align_corners=False
+            valid_mask_ds = (gt_depth_gpu > 0) & (gt_depth_gpu < MAX_DEPTH)
+            gt_masked = gt_depth_gpu.clone()
+            gt_masked[~valid_mask_ds] = 0.0
+            gt_depth_gpu = torch.nn.functional.interpolate(
+                gt_masked, size=(pred_H, pred_W), mode='area'
             )
+            valid_ratio = torch.nn.functional.interpolate(
+                valid_mask_ds.float(), size=(pred_H, pred_W), mode='area'
+            )
+            gt_depth_gpu = gt_depth_gpu / (valid_ratio + 1e-8)
+            gt_depth_gpu[valid_ratio < 0.5] = 0.0  # mark as invalid
             # Also downsample images in batch for TC (flow must match depth resolution)
             if 'images' in batch:
                 batch['images'] = torch.nn.functional.interpolate(
@@ -570,12 +576,10 @@ class ComparisonTester:
                     mode='bilinear',
                     align_corners=False
                 ).unsqueeze(0)  # [1, T, 3, H, W]
+        gt_depth_processed_cpu = gt_depth_gpu.cpu()  # [T, 1, H, W] at pred resolution
 
         # Compute metrics
         pred_depths_cpu = pred_depths.cpu()
-
-        # Define MAX_DEPTH for valid mask creation (used in both regular and TAE computation)
-        MAX_DEPTH = 70.0
 
         # === TC-only mode: skip per-frame metrics, TAE; compute rTC only ===
         if self.test_mode == 'tc':
@@ -584,6 +588,7 @@ class ComparisonTester:
                 'num_frames': pred_depths.shape[0],
                 'abs_rel': 0.0, 'a1': 0.0, 'mae': 0.0, 'rmse': 0.0,
                 'tae': 0.0, 'tae_reproj': 0.0, 'tae_reproj_gt': 0.0,
+                'psr': 0.0, 'psr_max': 0.0,
             }
             T_tc = pred_depths.shape[0]
             if T_tc > 1:
@@ -647,6 +652,52 @@ class ComparisonTester:
             else:
                 metrics['rtc'] = 0.0
                 metrics['rtc_gt'] = 0.0
+
+            # === TAE in TC mode ===
+            T_tc_frames = pred_depths.shape[0]
+            dataset_name_for_tae = batch.get('dataset_name', 'unknown')
+            if isinstance(dataset_name_for_tae, (list, tuple)):
+                dataset_name_for_tae = dataset_name_for_tae[0]
+            dataset_name_for_tae = dataset_name_for_tae.lower() if isinstance(dataset_name_for_tae, str) else 'unknown'
+            if T_tc_frames > 1 and 'image_paths' in batch and self.reproj_tae_calculator.is_supported(dataset_name_for_tae):
+                try:
+                    image_paths_for_tae = batch['image_paths'][0]
+                    reproj_tae_result = self.reproj_tae_calculator.compute_tae(
+                        pred_depths_cpu[:, 0],
+                        gt_depth_processed_cpu[:, 0],
+                        dataset_name_for_tae,
+                        image_paths_for_tae
+                    )
+                    metrics['tae_reproj'] = reproj_tae_result.get('tae_reproj', 0.0)
+                    metrics['tae_reproj_gt'] = reproj_tae_result.get('tae_reproj_gt', 0.0)
+                    metrics['tae'] = reproj_tae_result.get('tae', 0.0)
+                    logger.info(f"Reprojection TAE: {metrics['tae_reproj']:.4f} (GT ref: {metrics['tae_reproj_gt']:.4f}), TAE diff: {metrics['tae']:.4f}")
+                except Exception as e:
+                    logger.warning(f"Failed to compute reprojection TAE: {e}")
+
+            # === PSR in TC mode ===
+            per_frame_scale_ratios_tc = []
+            for t in range(T_tc_frames):
+                pred_frame = pred_depths_cpu[t, 0]
+                gt_frame = gt_depth_processed_cpu[t, 0]
+                valid_mask = (gt_frame > 0) & (gt_frame < MAX_DEPTH) & (pred_frame > 0) & (pred_frame < MAX_DEPTH)
+                if valid_mask.sum() > 0:
+                    r_t = float(pred_frame[valid_mask].mean() / gt_frame[valid_mask].mean().clamp(min=1e-8))
+                    per_frame_scale_ratios_tc.append(r_t)
+                else:
+                    per_frame_scale_ratios_tc.append(per_frame_scale_ratios_tc[-1] if per_frame_scale_ratios_tc else 1.0)
+            if T_tc_frames > 1 and len(per_frame_scale_ratios_tc) > 1:
+                psr_values = [abs(per_frame_scale_ratios_tc[i] - per_frame_scale_ratios_tc[i-1]) for i in range(1, len(per_frame_scale_ratios_tc))]
+                metrics['psr'] = float(np.mean(psr_values))
+                metrics['psr_max'] = float(np.max(psr_values))
+                metrics['_per_frame_psr'] = [float(v) for v in psr_values]
+                metrics['_per_frame_scale_ratio'] = [float(v) for v in per_frame_scale_ratios_tc]
+            else:
+                metrics['psr'] = 0.0
+                metrics['psr_max'] = 0.0
+                metrics['_per_frame_psr'] = []
+                metrics['_per_frame_scale_ratio'] = []
+
             return metrics
 
         # Compute regular metrics if:
@@ -664,6 +715,7 @@ class ComparisonTester:
 
         if compute_regular_metrics:
             # Regular metrics computation (full image)
+            per_frame_scale_ratios = []
             for t in range(pred_depths.shape[0]):
                 pred_frame = pred_depths_cpu[t, 0]  # [H, W]
                 gt_frame = gt_depth_processed_cpu[t, 0]  # [H, W]
@@ -672,6 +724,13 @@ class ComparisonTester:
                 gt_valid_mask = (gt_frame > 0) & (gt_frame < MAX_DEPTH)
                 pred_valid_mask = (pred_frame > 0) & (pred_frame < MAX_DEPTH)
                 valid_mask = gt_valid_mask & pred_valid_mask
+
+                # PSR: compute per-frame scale ratio (mean_pred / mean_gt) on valid pixels
+                if valid_mask.sum() > 0:
+                    r_t = float(pred_frame[valid_mask].mean() / gt_frame[valid_mask].mean().clamp(min=1e-8))
+                    per_frame_scale_ratios.append(r_t)
+                else:
+                    per_frame_scale_ratios.append(per_frame_scale_ratios[-1] if per_frame_scale_ratios else 1.0)
 
                 if valid_mask.sum() > 0:
                     # Compute metrics based on depth mode
@@ -711,7 +770,12 @@ class ComparisonTester:
                 dataset_name_for_tae = dataset_name_for_tae[0]
             dataset_name_for_tae = dataset_name_for_tae.lower() if isinstance(dataset_name_for_tae, str) else 'unknown'
 
-            if len(pred_depths) > 1 and 'image_paths' in batch and self.reproj_tae_calculator.is_supported(dataset_name_for_tae):
+            if self.test_mode == 'ea':
+                # EA mode: skip TAE
+                metrics['tae_reproj'] = 0.0
+                metrics['tae_reproj_gt'] = 0.0
+                metrics['tae'] = 0.0
+            elif len(pred_depths) > 1 and 'image_paths' in batch and self.reproj_tae_calculator.is_supported(dataset_name_for_tae):
                 try:
                     image_paths_for_tae = batch['image_paths'][0]  # batch size is 1
                     reproj_tae_result = self.reproj_tae_calculator.compute_tae(
@@ -766,6 +830,29 @@ class ComparisonTester:
             else:
                 metrics['rtc'] = 0.0
                 metrics['rtc_gt'] = 0.0
+
+            # === Prediction Stability Ratio (PSR) ===
+            if self.test_mode == 'ea':
+                # EA mode: skip PSR
+                metrics['psr'] = 0.0
+                metrics['psr_max'] = 0.0
+                metrics['_per_frame_psr'] = []
+                metrics['_per_frame_scale_ratio'] = []
+            else:
+                T = pred_depths.shape[0]
+                if T > 1 and len(per_frame_scale_ratios) > 1:
+                    psr_values = []
+                    for i in range(1, len(per_frame_scale_ratios)):
+                        psr_values.append(abs(per_frame_scale_ratios[i] - per_frame_scale_ratios[i-1]))
+                    metrics['psr'] = float(np.mean(psr_values))
+                    metrics['psr_max'] = float(np.max(psr_values))
+                    metrics['_per_frame_psr'] = [float(v) for v in psr_values]
+                    metrics['_per_frame_scale_ratio'] = [float(v) for v in per_frame_scale_ratios]
+                else:
+                    metrics['psr'] = 0.0
+                    metrics['psr_max'] = 0.0
+                    metrics['_per_frame_psr'] = []
+                    metrics['_per_frame_scale_ratio'] = []
 
             metrics['fps'] = fps
 
@@ -1064,13 +1151,13 @@ class ComparisonTester:
 
         # Compute average metrics
         avg_metrics_raw = {}
-        for key in ['mae', 'rmse', 'abs_rel', 'sq_rel', 'rmse_log', 'a1', 'a2', 'a3', 'tae', 'tae_reproj', 'tae_reproj_gt', 'rtc', 'rtc_gt', 'fps']:
+        for key in ['mae', 'rmse', 'abs_rel', 'sq_rel', 'rmse_log', 'a1', 'a2', 'a3', 'tae', 'tae_reproj', 'tae_reproj_gt', 'rtc', 'rtc_gt', 'psr', 'psr_max', 'fps']:
             values = [r[key] for r in self.all_results if key in r]
             if len(values) > 0:
                 avg_metrics_raw[key] = float(np.mean(values))
 
         # Reorder metrics according to desired order
-        metric_order = ['abs_rel', 'a1', 'a2', 'a3', 'fps', 'tae', 'tae_reproj', 'tae_reproj_gt', 'rtc', 'rtc_gt', 'mae', 'rmse']
+        metric_order = ['abs_rel', 'a1', 'a2', 'a3', 'fps', 'tae', 'tae_reproj', 'tae_reproj_gt', 'rtc', 'rtc_gt', 'psr', 'psr_max', 'mae', 'rmse']
         avg_metrics = {}
         for key in metric_order:
             if key in avg_metrics_raw:

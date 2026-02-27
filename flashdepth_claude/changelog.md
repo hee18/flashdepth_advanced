@@ -1,5 +1,86 @@
 # Onepiece V2 Changelog
 
+## 2026-02-27: Valid-Aware GT Downsampling + GPU 선행 다운샘플 (4개 test script)
+
+### 변경 목적
+- GT depth를 pred 해상도로 bilinear downsample하면 invalid pixel(-1.0)이 인접 valid pixel과 혼합되어 fake positive 값 생성
+- 예: valid=3.5m + invalid=-1.0m → bilinear=1.25m (gt>0 체크 통과하지만 완전히 틀린 값)
+- ETH3D처럼 invalid pixel이 많고 downsample ratio가 큰 데이터셋에서 AbsRel 심각한 성능 저하
+- 고해상도 GT를 풀해상도로 CPU 전송 시 불필요한 메모리 부하 (ETH3D 6048×4032 × T frames)
+
+### test_onepiece.py, test_comparison.py, test_video_comparison.py
+- **GT downsample**: `mode='bilinear'` → valid-aware area downsample로 교체
+  - Invalid pixel을 0으로 마스킹 후 `mode='area'` interpolate
+  - Valid ratio로 보정 (`gt_down / valid_ratio`)
+  - 50% 미만 valid인 pixel은 invalid(0.0)으로 표시 → 이후 `gt > 0` 체크에서 자동 제외
+- **GPU 선행 다운샘플**: `.cpu()` 전에 GPU에서 다운샘플 수행
+  - 기존: GPU 풀해상도 → `.cpu()` → CPU 다운샘플
+  - 변경: GPU 풀해상도 → GPU 다운샘플 → `.cpu()` (pred 해상도만 전송)
+- **Images downsample**: bilinear 유지 (이미지는 invalid pixel 없음)
+
+### test_gear5.py
+- **GT downsample**: valid-aware area downsample 동일 적용
+- **GPU 선행 불필요**: GT가 batch에서 CPU로 직접 로드됨 (`.to(device)` 없음), GPU 전송 이슈 없음
+- `del gt_depth_inverse_100` 추가: metric 변환 후 풀해상도 inverse depth 즉시 해제
+
+## 2026-02-27: TC/EA 모드 temporal 메트릭 처리 통일 (4개 test script)
+
+### 변경 목적
+- `--test-mode tc`: temporal 메트릭만 계산 (rTC + TAE + PSR), accuracy 스킵
+- `--test-mode ea`: accuracy 메트릭만 계산, temporal 전부 스킵 (rTC + TAE + PSR)
+- 기존: tc는 rTC만, ea는 rTC만 스킵 → 불일치
+
+### test_onepiece.py, test_gear5.py, test_comparison.py, test_video_comparison.py
+- **TC 모드**: early-return 블록에 TAE + PSR 계산 추가 (rTC는 기존 유지)
+  - TAE: `reproj_tae_calculator.compute_tae()` 호출 (dataset 지원 시)
+  - PSR: lightweight per-frame scale ratio loop (`per_frame_scale_ratios_tc`)
+- **EA 모드**: TAE, PSR 블록에 `if self.test_mode == 'ea':` 가드 추가 → 0.0 설정
+- **run_docker.sh**: `--tc-threshold` 옵션 추가 (test_onepiece, test_gear5, test_gear5_bankai, test_original_flashdepth에 전달)
+
+## 2026-02-27: PSR (Prediction Stability Ratio) 메트릭 추가
+
+### test_onepiece.py
+- **파일**: `test_onepiece.py`
+- **목적**: Onepiece 테스트의 프레임간 스케일 안정성 정량화
+- **변경 사항**:
+  - Per-frame scale ratio (`r_t = mean(pred) / mean(gt)`) 계산 추가 (valid mask 기준, per-frame loop 내)
+  - PSR 블록: `psr = mean(|r_t - r_{t-1}|)`, `psr_max = max(|r_t - r_{t-1}|)` (rTC 블록 뒤)
+  - `metric_order` 2곳에 `psr`, `psr_max` 추가 (rtc_gt 뒤)
+  - `_per_frame_psr`, `_per_frame_scale_ratio` 상세 데이터 저장 (`_` prefix → JSON에만 포함)
+
+### test_gear5.py
+- **파일**: `test_gear5.py`
+- **목적**: Gear5 테스트의 프레임간 스케일 안정성 정량화
+- **변경 사항**:
+  - Per-frame scale ratio (`r_t = mean(pred) / mean(gt)`) 계산 추가 (valid mask 기준, per-frame loop 내)
+  - PSR 블록: `psr = mean(|r_t - r_{t-1}|)`, `psr_max = max(|r_t - r_{t-1}|)` (rTC 블록 뒤)
+  - `metric_order` 2곳에 `psr`, `psr_max` 추가 (rtc_gt 뒤)
+  - TC-only mode 초기 metrics dict에 `psr`, `psr_max` 기본값 추가
+  - `_per_frame_psr`, `_per_frame_scale_ratio` 상세 데이터 저장 (`_` prefix → JSON에만 포함)
+
+### test_comparison.py
+- **파일**: `test_comparison.py`
+- **목적**: 이미지 depth 예측의 프레임간 스케일 안정성 정량화
+- **변경 사항**:
+  - Per-frame scale ratio (`r_t = mean(pred) / mean(gt)`) 계산 추가 (valid mask 기준, per-frame loop 내)
+  - PSR 블록: `psr = mean(|r_t - r_{t-1}|)`, `psr_max = max(|r_t - r_{t-1}|)` (rTC 블록 뒤)
+  - `metric_order`에 `psr`, `psr_max` 추가 (rtc_gt 뒤)
+  - 평균 메트릭 키 리스트에 `psr`, `psr_max` 추가
+  - TC-only mode 초기 metrics dict에 `psr`, `psr_max` 기본값 추가
+  - `_per_frame_psr`, `_per_frame_scale_ratio` 상세 데이터 저장 (`_` prefix → JSON에만 포함)
+
+### test_video_comparison.py
+- **파일**: `test_video_comparison.py`
+- **목적**: 비디오 depth 예측의 프레임간 스케일 안정성 정량화
+- **변경 사항**:
+  - Per-frame scale ratio (`r_t = mean(pred) / mean(gt)`) 계산 추가 (valid mask 기준)
+  - PSR 블록: `psr = mean(|r_t - r_{t-1}|)`, `psr_max = max(|r_t - r_{t-1}|)`
+  - `metric_order`에 `psr`, `psr_max` 추가 (rtc_gt 뒤)
+  - 평균 메트릭 키 리스트에 `psr`, `psr_max` 추가
+  - `_per_frame_psr`, `_per_frame_scale_ratio` 상세 데이터 저장 (`_` prefix → JSON에만 포함)
+
+---
+
 ## 2026-02-26: Per-Channel Feature Analysis 추가
 
 ### analyze_dpt_features.py 확장

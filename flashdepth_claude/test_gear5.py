@@ -1072,7 +1072,7 @@ class Gear5Tester:
 
             # Reorder per-sequence results
             metric_order = ['abs_rel', 'a1', 'a2', 'a3', 'fps', 'tae', 'tae_reproj', 'tae_reproj_gt',
-                            'rtc', 'rtc_gt', 'mae', 'rmse',
+                            'rtc', 'rtc_gt', 'psr', 'psr_max', 'mae', 'rmse',
                             'pred_scale_mean', 'pred_shift_mean',
                             'pred_scale_max', 'pred_scale_min', 'pred_shift_max', 'pred_shift_min',
                             'optimal_scale_mean', 'optimal_shift_mean',
@@ -1846,25 +1846,29 @@ class Gear5Tester:
         del pred_depths_gpu, relative_depths_gpu, importance_maps_gpu, scales_gpu, shifts_gpu, canonical_pred_valid_gpu
         torch.cuda.empty_cache()
 
-        # Convert GT to metric depth for visualization
-        # GT is already in actual space (skip_gt_canonicalization=True in dataloader)
-        # Move to CPU first to avoid OOM for long sequences (urbansyn 1000 frames)
-        gt_depth_inverse_100_cpu = gt_depth_inverse_100[0]  # [T, 1, H, W] actual 100/m
-        gt_depth_metric = 100.0 / (gt_depth_inverse_100_cpu + 1e-8)  # [T, 1, H, W] actual meters directly
+        # Convert GT to metric depth
+        # GT is already on CPU (not moved to device in batch loading), no GPU→CPU transfer needed
+        gt_depth_metric = 100.0 / (gt_depth_inverse_100[0] + 1e-8)  # [T, 1, H, W] actual meters, CPU
+        del gt_depth_inverse_100  # Free full-res inverse depth CPU memory
 
-        # Compute metrics (both pred and GT are now in meters on CPU)
-        # Already on CPU, no need to call .cpu() again
+        # Compute metrics (both pred and GT are in meters on CPU)
         pred_depths_cpu = pred_depths
         gt_depth_metric_cpu = gt_depth_metric
 
         # Downsample GT to match prediction resolution if needed (prevents OOM on high-res datasets)
+        # Uses valid-aware area downsampling to prevent invalid pixels (-1.0 or 0.0) from
+        # contaminating valid neighbors during interpolation (critical for high downsample ratios)
+        MAX_DEPTH = 70.0
         if pred_depths_cpu.shape[-2:] != gt_depth_metric_cpu.shape[-2:]:
             pred_h, pred_w = pred_depths_cpu.shape[-2:]
             logger.info(f"Downsampling GT from {gt_depth_metric_cpu.shape[-2:]} to ({pred_h}, {pred_w})")
-            gt_depth_metric_cpu = F.interpolate(
-                gt_depth_metric_cpu, size=(pred_h, pred_w),
-                mode='bilinear', align_corners=False
-            )
+            valid_mask_ds = (gt_depth_metric_cpu > 0) & (gt_depth_metric_cpu < MAX_DEPTH)
+            gt_masked = gt_depth_metric_cpu.clone()
+            gt_masked[~valid_mask_ds] = 0.0
+            gt_depth_metric_cpu = F.interpolate(gt_masked, size=(pred_h, pred_w), mode='area')
+            valid_ratio = F.interpolate(valid_mask_ds.float(), size=(pred_h, pred_w), mode='area')
+            gt_depth_metric_cpu = gt_depth_metric_cpu / (valid_ratio + 1e-8)
+            gt_depth_metric_cpu[valid_ratio < 0.5] = 0.0  # mark as invalid
             # Also downsample images for TC (flow must match depth resolution)
             if images.shape[-2:] != (pred_h, pred_w):
                 images = F.interpolate(
@@ -1943,8 +1947,58 @@ class Gear5Tester:
                 metrics['_rtc_per_frame_ratio_stats'] = []
                 metrics['_rtc_best_frame_idx'] = 0
                 metrics['_rtc_worst_frame_idx'] = 0
+            # === TAE in TC mode ===
+            T_tc_frames = pred_depths.shape[0]
+            if T_tc_frames > 1 and 'image_paths' in batch and self.reproj_tae_calculator.is_supported(dataset_name):
+                try:
+                    image_paths_for_tae = batch['image_paths'][0]
+                    reproj_tae_result = self.reproj_tae_calculator.compute_tae(
+                        pred_depths[:, 0],
+                        gt_depth_metric[:, 0],
+                        dataset_name,
+                        image_paths_for_tae
+                    )
+                    metrics['tae_reproj'] = reproj_tae_result.get('tae_reproj', 0.0)
+                    metrics['tae_reproj_gt'] = reproj_tae_result.get('tae_reproj_gt', 0.0)
+                    metrics['tae'] = reproj_tae_result.get('tae', 0.0)
+                    metrics['_per_frame_tae'] = reproj_tae_result.get('per_frame_tae', [])
+                    per_frame_tae = metrics['_per_frame_tae']
+                    valid_tae = [x for x in per_frame_tae if not np.isnan(x)]
+                    if len(valid_tae) > 0:
+                        tae_mean = np.mean(valid_tae)
+                        metrics['_tae_spike_frames'] = [i for i, t in enumerate(per_frame_tae) if not np.isnan(t) and t > 2 * tae_mean]
+                    else:
+                        metrics['_tae_spike_frames'] = []
+                    logger.info(f"Reprojection TAE: pred={metrics['tae_reproj']:.4f}%, gt={metrics['tae_reproj_gt']:.4f}%, diff={metrics['tae']:.4f}%")
+                except Exception as e:
+                    logger.warning(f"Failed to compute reprojection TAE: {e}")
+
+            # === PSR in TC mode ===
+            per_frame_scale_ratios_tc = []
+            MAX_DEPTH_PSR = 70.0
+            for t in range(T_tc):
+                pred_frame = pred_depths_cpu[t, 0]
+                gt_frame = gt_depth_metric_cpu[t, 0]
+                valid_mask = (gt_frame > 0) & (gt_frame < MAX_DEPTH_PSR) & (pred_frame > 0) & (pred_frame < MAX_DEPTH_PSR)
+                if valid_mask.sum() > 0:
+                    r_t = float(pred_frame[valid_mask].mean() / gt_frame[valid_mask].mean().clamp(min=1e-8))
+                    per_frame_scale_ratios_tc.append(r_t)
+                else:
+                    per_frame_scale_ratios_tc.append(per_frame_scale_ratios_tc[-1] if per_frame_scale_ratios_tc else 1.0)
+            if T_tc > 1 and len(per_frame_scale_ratios_tc) > 1:
+                psr_values = [abs(per_frame_scale_ratios_tc[i] - per_frame_scale_ratios_tc[i-1]) for i in range(1, len(per_frame_scale_ratios_tc))]
+                metrics['psr'] = float(np.mean(psr_values))
+                metrics['psr_max'] = float(np.max(psr_values))
+                metrics['_per_frame_psr'] = [float(v) for v in psr_values]
+                metrics['_per_frame_scale_ratio'] = [float(v) for v in per_frame_scale_ratios_tc]
+            else:
+                metrics['psr'] = 0.0
+                metrics['psr_max'] = 0.0
+                metrics['_per_frame_psr'] = []
+                metrics['_per_frame_scale_ratio'] = []
             return metrics
 
+        per_frame_scale_ratios = []
         frame_metrics = []
         for t in range(pred_depths.shape[0]):
             # Get individual frames (already on CPU)
@@ -1957,6 +2011,13 @@ class Gear5Tester:
             gt_valid_mask = (gt_frame > 0) & (gt_frame < MAX_DEPTH)  # GT valid pixels
             pred_valid_mask = (pred_frame > 0) & (pred_frame < MAX_DEPTH)  # Filter extreme values
             valid_mask = gt_valid_mask & pred_valid_mask  # [H, W] bool tensor
+
+            # PSR: compute per-frame scale ratio (mean_pred / mean_gt) on valid pixels
+            if valid_mask.sum() > 0:
+                r_t = float(pred_frame[valid_mask].mean() / gt_frame[valid_mask].mean().clamp(min=1e-8))
+                per_frame_scale_ratios.append(r_t)
+            else:
+                per_frame_scale_ratios.append(per_frame_scale_ratios[-1] if per_frame_scale_ratios else 1.0)
 
             # Debug logging for first frame of first sequence
             if t == 0 and sequence_id == 0:
@@ -2072,7 +2133,14 @@ class Gear5Tester:
         # Compute Reprojection-based TAE (for datasets with camera poses)
         # Supported: sintel, eth3d, bonn, vkitti, waymo_seg
         # TAE = tae_reproj - tae_reproj_gt (pure prediction error, excluding occlusion baseline)
-        if len(pred_depths) > 1 and 'image_paths' in batch and self.reproj_tae_calculator.is_supported(dataset_name):
+        if self.test_mode == 'ea':
+            # EA mode: skip TAE
+            metrics['tae_reproj'] = 0.0
+            metrics['tae_reproj_gt'] = 0.0
+            metrics['tae'] = 0.0
+            metrics['_per_frame_tae'] = []
+            metrics['_tae_spike_frames'] = []
+        elif len(pred_depths) > 1 and 'image_paths' in batch and self.reproj_tae_calculator.is_supported(dataset_name):
             try:
                 image_paths_for_tae = batch['image_paths'][0]  # batch size is 1
                 reproj_tae_result = self.reproj_tae_calculator.compute_tae(
@@ -2151,6 +2219,29 @@ class Gear5Tester:
             metrics['_rtc_per_frame_ratio_stats'] = []
             metrics['_rtc_best_frame_idx'] = 0
             metrics['_rtc_worst_frame_idx'] = 0
+
+        # === Prediction Stability Ratio (PSR) ===
+        if self.test_mode == 'ea':
+            # EA mode: skip PSR
+            metrics['psr'] = 0.0
+            metrics['psr_max'] = 0.0
+            metrics['_per_frame_psr'] = []
+            metrics['_per_frame_scale_ratio'] = []
+        else:
+            T = pred_depths_cpu.shape[0]
+            if T > 1 and len(per_frame_scale_ratios) > 1:
+                psr_values = []
+                for i in range(1, len(per_frame_scale_ratios)):
+                    psr_values.append(abs(per_frame_scale_ratios[i] - per_frame_scale_ratios[i-1]))
+                metrics['psr'] = float(np.mean(psr_values))
+                metrics['psr_max'] = float(np.max(psr_values))
+                metrics['_per_frame_psr'] = [float(v) for v in psr_values]
+                metrics['_per_frame_scale_ratio'] = [float(v) for v in per_frame_scale_ratios]
+            else:
+                metrics['psr'] = 0.0
+                metrics['psr_max'] = 0.0
+                metrics['_per_frame_psr'] = []
+                metrics['_per_frame_scale_ratio'] = []
 
         # Add FPS to metrics
         metrics['fps'] = fps
@@ -3475,7 +3566,8 @@ class Gear5Tester:
                     aggregated_raw[key] = np.mean(values)
 
         # Reorder metrics: abs_rel, a1, a2, a3, fps, tae, tae_reproj, mae, rmse, then pred/optimal stats
-        metric_order = ['abs_rel', 'a1', 'a2', 'a3', 'fps', 'tae', 'tae_reproj', 'tae_reproj_gt', 'mae', 'rmse',
+        metric_order = ['abs_rel', 'a1', 'a2', 'a3', 'fps', 'tae', 'tae_reproj', 'tae_reproj_gt',
+                        'rtc', 'rtc_gt', 'psr', 'psr_max', 'mae', 'rmse',
                         'pred_scale_mean', 'pred_shift_mean',
                         'optimal_scale_mean', 'optimal_shift_mean']
         aggregated = {}

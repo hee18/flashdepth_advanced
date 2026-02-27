@@ -85,6 +85,7 @@ show_usage() {
     echo "  --no-shift            Disable shift (scale-only mode): shift is always 0, only scale is learned/evaluated"
     echo "  --max-depth METERS   Max valid depth threshold for infer_avante (default: 70.0)"
     echo "  --model-type TYPE    Model type for infer_avante: gear5 (default), onepiece"
+    echo "  --tc-threshold FLOAT rTC threshold for temporal consistency (default: 1.1)"
     echo ""
     echo "Note: Regularization losses are deprecated. Importance map now uses raw DINOv2 attention (frozen)."
     echo "Note: test_original_flashdepth now tests all sequences (use --limit-scenes N to limit)."
@@ -151,6 +152,7 @@ SECTION=""  # Frame section for infer_avante (e.g., "450,480" for frames 450-480
 MAX_DEPTH="70.0"  # Max valid depth threshold for infer_avante (meters)
 CBAR="false"  # Show colorbar next to depth visualization
 TEST_MODE=""  # Test mode: empty (full), tc (temporal consistency only)
+TC_THRESHOLD=""  # rTC threshold (default: 1.1 in test scripts)
 BANKAI_PHASE="auto"  # Bankai training phase: 1, 2, or "auto" (auto: Phase 1 until step 5000, then Phase 2)
 BANKAI_AUTO_STEP="5000"  # Step at which to transition from Phase 1 to Phase 2 in auto mode
 TGM_WEIGHT="0.3"  # TGM loss weight for Bankai mode
@@ -339,6 +341,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --ddp-gpus)
             DDP_GPUS="$2"
+            shift 2
+            ;;
+        --tc-threshold)
+            TC_THRESHOLD="$2"
             shift 2
             ;;
         --flicker-threshold)
@@ -686,6 +692,11 @@ case $COMMAND in
             TEST_CMD="$TEST_CMD --test-mode $TEST_MODE"
         fi
 
+        # Add tc-threshold if specified
+        if [ -n "$TC_THRESHOLD" ]; then
+            TEST_CMD="$TEST_CMD +tc_threshold=$TC_THRESHOLD"
+        fi
+
         CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm flashdepth $TEST_CMD
         ;;
 
@@ -900,6 +911,11 @@ case $COMMAND in
             TEST_CMD="$TEST_CMD --test-mode $TEST_MODE"
         fi
 
+        # Add tc-threshold if specified
+        if [ -n "$TC_THRESHOLD" ]; then
+            TEST_CMD="$TEST_CMD +tc_threshold=$TC_THRESHOLD"
+        fi
+
         CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm flashdepth $TEST_CMD
         ;;
 
@@ -1030,6 +1046,10 @@ case $COMMAND in
 
             if [ -n "$SEQ" ]; then
                 DOCKER_CMD="$DOCKER_CMD --seq $SEQ"
+            fi
+
+            if [ -n "$TC_THRESHOLD" ]; then
+                DOCKER_CMD="$DOCKER_CMD --tc-threshold $TC_THRESHOLD"
             fi
 
             eval $DOCKER_CMD 2>&1 | tee "${FINAL_RESULTS_DIR}/test.log"
@@ -1273,6 +1293,11 @@ case $COMMAND in
         # Add test-mode if specified
         if [ -n "$TEST_MODE" ]; then
             DOCKER_CMD="$DOCKER_CMD --test-mode $TEST_MODE"
+        fi
+
+        # Add tc-threshold if specified
+        if [ -n "$TC_THRESHOLD" ]; then
+            DOCKER_CMD="$DOCKER_CMD +tc_threshold=$TC_THRESHOLD"
         fi
 
         eval $DOCKER_CMD

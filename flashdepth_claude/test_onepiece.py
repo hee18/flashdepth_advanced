@@ -311,7 +311,7 @@ class OnepieceTester:
 
         # 1. test_results.json (aggregated)
         metric_order = ['abs_rel', 'a1', 'a2', 'a3', 'fps', 'tae', 'tae_reproj', 'tae_reproj_gt',
-                        'rtc', 'rtc_gt',
+                        'rtc', 'rtc_gt', 'psr', 'psr_max',
                         'mae', 'rmse',
                         'pred_scale_mean', 'pred_shift_mean',
                         'optimal_scale_mean', 'optimal_shift_mean']
@@ -512,21 +512,21 @@ class OnepieceTester:
         pred_depths_actual = metric_depth * de_ratio  # [1, T, H, W] in actual meters
 
         # GT in actual meters (already actual from skip_gt_canonicalization=True)
-        gt_depth_metric = 100.0 / (gt_depth_inverse_100[0] + 1e-8)  # [T, 1, H, W]
+        gt_depth_metric = 100.0 / (gt_depth_inverse_100[0] + 1e-8)  # [T, 1, H, W] on GPU
 
-        # Move to CPU for metrics
-        pred_depths_cpu = pred_depths_actual[0].unsqueeze(1).cpu()  # [T, 1, H, W]
-        gt_depth_metric_cpu = gt_depth_metric.cpu()  # [T, 1, H, W]
-        dfr_canonical_cpu = dfr_canonical[0].cpu()  # [T, H, W]
-
-        # Downsample GT to match prediction resolution (prevents OOM on high-res datasets)
-        if pred_depths_cpu.shape[-2:] != gt_depth_metric_cpu.shape[-2:]:
-            pred_h, pred_w = pred_depths_cpu.shape[-2:]
-            logger.info(f"Downsampling GT from {gt_depth_metric_cpu.shape[-2:]} to ({pred_h}, {pred_w})")
-            gt_depth_metric_cpu = F.interpolate(
-                gt_depth_metric_cpu, size=(pred_h, pred_w),
-                mode='bilinear', align_corners=False
-            )
+        # Valid-aware downsample on GPU before CPU transfer
+        # Avoids transferring full-res GT to CPU (critical for high-res datasets like ETH3D)
+        MAX_DEPTH = 70.0
+        pred_h, pred_w = pred_depths_actual.shape[-2:]
+        if gt_depth_metric.shape[-2:] != (pred_h, pred_w):
+            logger.info(f"Downsampling GT from {gt_depth_metric.shape[-2:]} to ({pred_h}, {pred_w})")
+            valid_mask_ds = (gt_depth_metric > 0) & (gt_depth_metric < MAX_DEPTH)
+            gt_masked = gt_depth_metric.clone()
+            gt_masked[~valid_mask_ds] = 0.0
+            gt_depth_metric = F.interpolate(gt_masked, size=(pred_h, pred_w), mode='area')
+            valid_ratio = F.interpolate(valid_mask_ds.float(), size=(pred_h, pred_w), mode='area')
+            gt_depth_metric = gt_depth_metric / (valid_ratio + 1e-8)
+            gt_depth_metric[valid_ratio < 0.5] = 0.0  # mark as invalid
             # Also downsample images for TC (flow must match depth resolution)
             if images.shape[-2:] != (pred_h, pred_w):
                 images = F.interpolate(
@@ -535,16 +535,17 @@ class OnepieceTester:
                     mode='bilinear', align_corners=False
                 ).unsqueeze(0)  # [1, T, 3, H, W]
 
-        MAX_DEPTH = 70.0
+        # Move to CPU for metrics (GT already at pred resolution)
+        pred_depths_cpu = pred_depths_actual[0].unsqueeze(1).cpu()  # [T, 1, H, W]
+        gt_depth_metric_cpu = gt_depth_metric.cpu()  # [T, 1, H, W]
+        dfr_canonical_cpu = dfr_canonical[0].cpu()  # [T, H, W]
 
-        # === TC-only mode: skip per-frame metrics, depth range, TAE ===
+        # === TC-only mode: skip per-frame metrics, depth range ===
         if self.test_mode == 'tc':
             metrics = {
                 'fps': float(fps), 'dataset': str(dataset_name), 'num_frames': T,
                 'abs_rel': 0.0, 'a1': 0.0, 'mae': 0.0, 'rmse': 0.0,
                 'pred_scale_mean': float(scale[0].mean()), 'pred_shift_mean': float(shift[0].mean()),
-                'tae': 0.0, 'tae_reproj': 0.0, 'tae_reproj_gt': 0.0,
-                '_per_frame_tae': [], '_tae_spike_frames': [],
             }
             # Compute rTC only
             if T > 1:
@@ -609,6 +610,66 @@ class OnepieceTester:
             # Offload SEA-RAFT to CPU for next sequence
             if self.flow_tc is not None:
                 self.flow_tc.offload_to_cpu()
+
+            # === TAE in TC mode ===
+            if T > 1 and isinstance(batch, dict) and 'image_paths' in batch and self.reproj_tae_calculator.is_supported(dataset_name):
+                try:
+                    image_paths_for_tae = batch['image_paths'][0]
+                    reproj_tae_result = self.reproj_tae_calculator.compute_tae(
+                        pred_depths_cpu[:, 0],
+                        gt_depth_metric_cpu[:, 0],
+                        dataset_name,
+                        image_paths_for_tae
+                    )
+                    metrics['tae_reproj'] = reproj_tae_result.get('tae_reproj', 0.0)
+                    metrics['tae_reproj_gt'] = reproj_tae_result.get('tae_reproj_gt', 0.0)
+                    metrics['tae'] = reproj_tae_result.get('tae', 0.0)
+                    metrics['_per_frame_tae'] = reproj_tae_result.get('per_frame_tae', [])
+                    per_frame_tae = metrics['_per_frame_tae']
+                    valid_tae = [x for x in per_frame_tae if not np.isnan(x)]
+                    if valid_tae:
+                        tae_mean = np.mean(valid_tae)
+                        metrics['_tae_spike_frames'] = [i for i, t in enumerate(per_frame_tae) if not np.isnan(t) and t > 2 * tae_mean]
+                    else:
+                        metrics['_tae_spike_frames'] = []
+                    logger.info(f"Reprojection TAE: pred={metrics['tae_reproj']:.4f}%, gt={metrics['tae_reproj_gt']:.4f}%, diff={metrics['tae']:.4f}%")
+                except Exception as e:
+                    logger.warning(f"Failed to compute reprojection TAE: {e}")
+                    metrics['tae_reproj'] = 0.0
+                    metrics['tae_reproj_gt'] = 0.0
+                    metrics['tae'] = 0.0
+                    metrics['_per_frame_tae'] = []
+                    metrics['_tae_spike_frames'] = []
+            else:
+                metrics['tae_reproj'] = 0.0
+                metrics['tae_reproj_gt'] = 0.0
+                metrics['tae'] = 0.0
+                metrics['_per_frame_tae'] = []
+                metrics['_tae_spike_frames'] = []
+
+            # === PSR in TC mode ===
+            per_frame_scale_ratios_tc = []
+            for t in range(T):
+                pred_frame = pred_depths_cpu[t, 0]
+                gt_frame = gt_depth_metric_cpu[t, 0]
+                valid_mask = (gt_frame > 0) & (gt_frame < MAX_DEPTH) & (pred_frame > 0) & (pred_frame < MAX_DEPTH)
+                if valid_mask.sum() > 0:
+                    r_t = float(pred_frame[valid_mask].mean() / gt_frame[valid_mask].mean().clamp(min=1e-8))
+                    per_frame_scale_ratios_tc.append(r_t)
+                else:
+                    per_frame_scale_ratios_tc.append(per_frame_scale_ratios_tc[-1] if per_frame_scale_ratios_tc else 1.0)
+            if T > 1 and len(per_frame_scale_ratios_tc) > 1:
+                psr_values = [abs(per_frame_scale_ratios_tc[i] - per_frame_scale_ratios_tc[i-1]) for i in range(1, len(per_frame_scale_ratios_tc))]
+                metrics['psr'] = float(np.mean(psr_values))
+                metrics['psr_max'] = float(np.max(psr_values))
+                metrics['_per_frame_psr'] = [float(v) for v in psr_values]
+                metrics['_per_frame_scale_ratio'] = [float(v) for v in per_frame_scale_ratios_tc]
+            else:
+                metrics['psr'] = 0.0
+                metrics['psr_max'] = 0.0
+                metrics['_per_frame_psr'] = []
+                metrics['_per_frame_scale_ratio'] = []
+
             return metrics
 
         # === Per-frame metrics ===
@@ -617,6 +678,7 @@ class OnepieceTester:
         per_frame_shifts = []
         per_frame_optimal_scales = []
         per_frame_optimal_shifts = []
+        per_frame_scale_ratios = []
         best_frame_idx = 0
         best_frame_abs_rel = float('inf')
         worst_frame_idx = 0
@@ -629,6 +691,13 @@ class OnepieceTester:
             gt_valid_mask = (gt_frame > 0) & (gt_frame < MAX_DEPTH)
             pred_valid_mask = (pred_frame > 0) & (pred_frame < MAX_DEPTH)
             valid_mask = gt_valid_mask & pred_valid_mask
+
+            # PSR: compute per-frame scale ratio (mean_pred / mean_gt) on valid pixels
+            if valid_mask.sum() > 0:
+                r_t = float(pred_frame[valid_mask].mean() / gt_frame[valid_mask].mean().clamp(min=1e-8))
+                per_frame_scale_ratios.append(r_t)
+            else:
+                per_frame_scale_ratios.append(per_frame_scale_ratios[-1] if per_frame_scale_ratios else 1.0)
 
             # Store per-frame scale/shift
             per_frame_scales.append(float(scale[0, t]))
@@ -739,7 +808,14 @@ class OnepieceTester:
         metrics['_depth_range_analysis'] = depth_range_metrics
 
         # === Reprojection TAE ===
-        if T > 1 and isinstance(batch, dict) and 'image_paths' in batch and self.reproj_tae_calculator.is_supported(dataset_name):
+        if self.test_mode == 'ea':
+            # EA mode: skip TAE
+            metrics['tae_reproj'] = 0.0
+            metrics['tae_reproj_gt'] = 0.0
+            metrics['tae'] = 0.0
+            metrics['_per_frame_tae'] = []
+            metrics['_tae_spike_frames'] = []
+        elif T > 1 and isinstance(batch, dict) and 'image_paths' in batch and self.reproj_tae_calculator.is_supported(dataset_name):
             try:
                 image_paths_for_tae = batch['image_paths'][0]
                 reproj_tae_result = self.reproj_tae_calculator.compute_tae(
@@ -813,6 +889,27 @@ class OnepieceTester:
             metrics['_rtc_per_frame_ratio_stats'] = []
             metrics['_rtc_best_frame_idx'] = 0
             metrics['_rtc_worst_frame_idx'] = 0
+
+        # === Prediction Stability Ratio (PSR) ===
+        if self.test_mode == 'ea':
+            # EA mode: skip PSR
+            metrics['psr'] = 0.0
+            metrics['psr_max'] = 0.0
+            metrics['_per_frame_psr'] = []
+            metrics['_per_frame_scale_ratio'] = []
+        elif T > 1 and len(per_frame_scale_ratios) > 1:
+            psr_values = []
+            for i in range(1, len(per_frame_scale_ratios)):
+                psr_values.append(abs(per_frame_scale_ratios[i] - per_frame_scale_ratios[i-1]))
+            metrics['psr'] = float(np.mean(psr_values))
+            metrics['psr_max'] = float(np.max(psr_values))
+            metrics['_per_frame_psr'] = [float(v) for v in psr_values]
+            metrics['_per_frame_scale_ratio'] = [float(v) for v in per_frame_scale_ratios]
+        else:
+            metrics['psr'] = 0.0
+            metrics['psr_max'] = 0.0
+            metrics['_per_frame_psr'] = []
+            metrics['_per_frame_scale_ratio'] = []
 
         logger.info(
             f"  AbsRel={metrics.get('abs_rel', 0):.4f}, MAE={metrics.get('mae', 0):.4f}, "
@@ -1496,7 +1593,7 @@ class OnepieceTester:
 
         # Reorder
         metric_order = ['abs_rel', 'a1', 'a2', 'a3', 'fps', 'tae', 'tae_reproj', 'tae_reproj_gt',
-                        'rtc', 'rtc_gt',
+                        'rtc', 'rtc_gt', 'psr', 'psr_max',
                         'mae', 'rmse',
                         'pred_scale_mean', 'pred_shift_mean',
                         'optimal_scale_mean', 'optimal_shift_mean']
