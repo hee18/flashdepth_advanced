@@ -1009,10 +1009,11 @@ class OnepieceTrainer:
                     ).squeeze(1).view(B, T, gt_inverse.shape[-2], gt_inverse.shape[-1])
                     metric_depth = pred_inverse  # update for later use
 
-                # Valid mask (gear5 pattern): gt > 0 AND pred > 0 only
+                # Valid mask (gear5 pattern): gt > 0 AND actual_valid_masks
                 gt_valid = (gt_inverse > 0)
-                pred_valid = (pred_inverse > 0)
-                valid_mask = gt_valid & pred_valid
+                if actual_valid_masks.ndim == 3:
+                    actual_valid_masks = actual_valid_masks.unsqueeze(1)
+                valid_mask = gt_valid & actual_valid_masks
             else:
                 # Metric mode (original)
                 gt_depth_meters = 1.0 / (gt_depth.squeeze(2).float().clamp(min=1e-8))

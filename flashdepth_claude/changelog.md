@@ -1,5 +1,16 @@
 # Onepiece V2 Changelog
 
+## 2026-03-05: validation inverse 모드 valid_mask 불일치 수정
+
+### 변경 목적
+- validation inverse 모드에서 `actual_valid_masks`가 빠져 있어 training과 불일치
+- training inverse: `gt > 0 & actual_valid_masks`, validation inverse: `gt > 0 & pred > 0`만 사용하던 버그
+
+### 변경 파일
+- **train_onepiece.py**: validation inverse 모드 valid_mask를 training과 동일하게 `gt_valid & actual_valid_masks`로 수정
+
+---
+
 ## 2026-03-05: DepthPro half precision → TAE dtype mismatch 수정
 
 ### 변경 목적
