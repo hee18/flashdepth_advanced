@@ -1058,10 +1058,11 @@ class Gear5Tester:
             logger.info("="*80)
             logger.info(format_metrics(avg_metrics))
 
-            # TC-only mode: save temporal_consistency.json and return
+            # TC-only mode: save temporal_consistency.json + tc_summary.json and return
             if self.test_mode == 'tc':
                 self._save_temporal_consistency(all_metrics)
-                logger.info("TC-only mode: saved temporal_consistency.json")
+                self._save_tc_summary(all_metrics)
+                logger.info("TC-only mode: saved temporal_consistency.json, tc_summary.json")
                 return
 
             # Save overall results
@@ -1855,29 +1856,31 @@ class Gear5Tester:
         pred_depths_cpu = pred_depths
         gt_depth_metric_cpu = gt_depth_metric
 
-        # Downsample GT to match prediction resolution if needed (prevents OOM on high-res datasets)
-        # Uses valid-aware area downsampling to prevent invalid pixels (-1.0 or 0.0) from
-        # contaminating valid neighbors during interpolation (critical for high downsample ratios)
+        # Resolution handling: keep GT at original resolution, upsample pred for metrics
         MAX_DEPTH = 70.0
-        if pred_depths_cpu.shape[-2:] != gt_depth_metric_cpu.shape[-2:]:
-            pred_h, pred_w = pred_depths_cpu.shape[-2:]
-            logger.info(f"Downsampling GT from {gt_depth_metric_cpu.shape[-2:]} to ({pred_h}, {pred_w})")
-            valid_mask_ds = (gt_depth_metric_cpu > 0) & (gt_depth_metric_cpu < MAX_DEPTH)
-            gt_masked = gt_depth_metric_cpu.clone()
-            gt_masked[~valid_mask_ds] = 0.0
-            gt_depth_metric_cpu = F.interpolate(gt_masked, size=(pred_h, pred_w), mode='area')
-            valid_ratio = F.interpolate(valid_mask_ds.float(), size=(pred_h, pred_w), mode='area')
-            gt_depth_metric_cpu = gt_depth_metric_cpu / (valid_ratio + 1e-8)
-            gt_depth_metric_cpu[valid_ratio < 0.5] = 0.0  # mark as invalid
-            # Also downsample images for TC (flow must match depth resolution)
+        pred_h, pred_w = pred_depths_cpu.shape[-2:]
+        gt_h, gt_w = gt_depth_metric_cpu.shape[-2:]
+        need_upsample = (gt_h, gt_w) != (pred_h, pred_w)
+
+        if need_upsample:
+            logger.info(f"Resolution mismatch: pred ({pred_h},{pred_w}) vs GT ({gt_h},{gt_w}). "
+                        f"Will upsample pred to GT resolution for metrics.")
+            # GT at pred resolution for TC, visualization, PSR
+            ds_lower = dataset_name.lower() if isinstance(dataset_name, str) else 'unknown'
+            is_sparse_ds = any(s in ds_lower for s in ['eth3d', 'waymo_seg'])
+            interp_mode = 'nearest' if is_sparse_ds else 'bilinear'
+            interp_kwargs = {} if is_sparse_ds else {'align_corners': False}
+            gt_at_pred_res_cpu = F.interpolate(
+                gt_depth_metric_cpu, size=(pred_h, pred_w), mode=interp_mode, **interp_kwargs
+            )
+            # Ensure images match pred resolution for TC flow estimation
             if images.shape[-2:] != (pred_h, pred_w):
                 images = F.interpolate(
-                    images[0],  # [T, 3, H, W]
-                    size=(pred_h, pred_w),
+                    images[0], size=(pred_h, pred_w),
                     mode='bilinear', align_corners=False
-                ).unsqueeze(0)  # [1, T, 3, H, W]
-            # Sync gt_depth_metric so all downstream code uses consistent resolution
-            gt_depth_metric = gt_depth_metric_cpu
+                ).unsqueeze(0)
+        else:
+            gt_at_pred_res_cpu = gt_depth_metric_cpu
 
         # === TC-only mode: skip per-frame metrics, depth range, TAE ===
         if self.test_mode == 'tc':
@@ -1896,7 +1899,7 @@ class Gear5Tester:
                         device=self.device, thr=self.tc_threshold, max_depth=MAX_DEPTH_TC
                     )
                 tc_result = self.flow_tc.compute_rtc(
-                    images[0], pred_depths_cpu, gt_depths=gt_depth_metric_cpu
+                    images[0], pred_depths_cpu, gt_depths=gt_at_pred_res_cpu
                 )
                 metrics['rtc'] = tc_result['rtc']
                 metrics['rtc_gt'] = tc_result['rtc_gt']
@@ -1915,12 +1918,12 @@ class Gear5Tester:
                     per_frame_rtc_gt = tc_result['per_frame_rtc_gt']
 
                     self.flow_tc.save_visualization(
-                        pred_depths_cpu, gt_depth_metric_cpu, rtc_worst, sequence_id,
+                        pred_depths_cpu, gt_at_pred_res_cpu, rtc_worst, sequence_id,
                         self.save_dir, per_frame_rtc[rtc_worst], label='worst',
                         dataset_name=dataset_name
                     )
                     self.flow_tc.save_visualization(
-                        pred_depths_cpu, gt_depth_metric_cpu, rtc_best, sequence_id,
+                        pred_depths_cpu, gt_at_pred_res_cpu, rtc_best, sequence_id,
                         self.save_dir, per_frame_rtc[rtc_best], label='best',
                         dataset_name=dataset_name
                     )
@@ -1947,17 +1950,27 @@ class Gear5Tester:
                 metrics['_rtc_per_frame_ratio_stats'] = []
                 metrics['_rtc_best_frame_idx'] = 0
                 metrics['_rtc_worst_frame_idx'] = 0
-            # === TAE in TC mode ===
+            # === TAE in TC mode (at GT resolution) ===
             T_tc_frames = pred_depths.shape[0]
             if T_tc_frames > 1 and 'image_paths' in batch and self.reproj_tae_calculator.is_supported(dataset_name):
                 try:
                     image_paths_for_tae = batch['image_paths'][0]
+                    if need_upsample:
+                        pred_at_gt_res = torch.stack([
+                            F.interpolate(pred_depths_cpu[t:t+1], size=(gt_h, gt_w),
+                                          mode='bilinear', align_corners=True)[0]
+                            for t in range(T_tc_frames)
+                        ], dim=0)
+                    else:
+                        pred_at_gt_res = pred_depths_cpu
                     reproj_tae_result = self.reproj_tae_calculator.compute_tae(
-                        pred_depths[:, 0],
-                        gt_depth_metric[:, 0],
+                        pred_at_gt_res[:, 0],
+                        gt_depth_metric_cpu[:, 0],
                         dataset_name,
                         image_paths_for_tae
                     )
+                    if need_upsample:
+                        del pred_at_gt_res
                     metrics['tae_reproj'] = reproj_tae_result.get('tae_reproj', 0.0)
                     metrics['tae_reproj_gt'] = reproj_tae_result.get('tae_reproj_gt', 0.0)
                     metrics['tae'] = reproj_tae_result.get('tae', 0.0)
@@ -1973,12 +1986,12 @@ class Gear5Tester:
                 except Exception as e:
                     logger.warning(f"Failed to compute reprojection TAE: {e}")
 
-            # === PSR in TC mode ===
+            # === PSR in TC mode (at pred resolution) ===
             per_frame_scale_ratios_tc = []
             MAX_DEPTH_PSR = 70.0
             for t in range(T_tc):
                 pred_frame = pred_depths_cpu[t, 0]
-                gt_frame = gt_depth_metric_cpu[t, 0]
+                gt_frame = gt_at_pred_res_cpu[t, 0]
                 valid_mask = (gt_frame > 0) & (gt_frame < MAX_DEPTH_PSR) & (pred_frame > 0) & (pred_frame < MAX_DEPTH_PSR)
                 if valid_mask.sum() > 0:
                     r_t = float(pred_frame[valid_mask].mean() / gt_frame[valid_mask].mean().clamp(min=1e-8))
@@ -2001,16 +2014,20 @@ class Gear5Tester:
         per_frame_scale_ratios = []
         frame_metrics = []
         for t in range(pred_depths.shape[0]):
-            # Get individual frames (already on CPU)
-            pred_frame = pred_depths_cpu[t, 0]  # [H, W]
-            gt_frame = gt_depth_metric_cpu[t, 0]  # [H, W]
+            # Main metrics at GT resolution (upsample pred per-frame)
+            gt_frame = gt_depth_metric_cpu[t, 0]  # [gt_h, gt_w]
+            if need_upsample:
+                pred_frame = F.interpolate(
+                    pred_depths_cpu[t:t+1], size=(gt_h, gt_w),
+                    mode='bilinear', align_corners=True
+                )[0, 0]  # [gt_h, gt_w]
+            else:
+                pred_frame = pred_depths_cpu[t, 0]  # [H, W]
 
-            # Create valid mask for this frame (like train_gear3 validation)
-            # Use same MAX_DEPTH as Gear3Visualizer (70m)
             MAX_DEPTH = 70.0
-            gt_valid_mask = (gt_frame > 0) & (gt_frame < MAX_DEPTH)  # GT valid pixels
-            pred_valid_mask = (pred_frame > 0) & (pred_frame < MAX_DEPTH)  # Filter extreme values
-            valid_mask = gt_valid_mask & pred_valid_mask  # [H, W] bool tensor
+            gt_valid_mask = (gt_frame > 0) & (gt_frame < MAX_DEPTH)
+            pred_valid_mask = (pred_frame > 0) & (pred_frame < MAX_DEPTH)
+            valid_mask = gt_valid_mask & pred_valid_mask
 
             # PSR: compute per-frame scale ratio (mean_pred / mean_gt) on valid pixels
             if valid_mask.sum() > 0:
@@ -2102,9 +2119,14 @@ class Gear5Tester:
             range_pixel_counts = []
 
             for t in range(pred_depths_cpu.shape[0]):
-                pred_frame = pred_depths_cpu[t, 0]
                 gt_frame = gt_depth_metric_cpu[t, 0]
-                # Range mask (filter both GT and pred, consistent with overall metrics)
+                if need_upsample:
+                    pred_frame = F.interpolate(
+                        pred_depths_cpu[t:t+1], size=(gt_h, gt_w),
+                        mode='bilinear', align_corners=True
+                    )[0, 0]
+                else:
+                    pred_frame = pred_depths_cpu[t, 0]
                 MAX_DEPTH = 70.0
                 range_mask = (gt_frame >= depth_min) & (gt_frame < depth_max) & (gt_frame > 0) & (pred_frame > 0) & (pred_frame < MAX_DEPTH)
                 if range_mask.sum() > 0:
@@ -2143,12 +2165,22 @@ class Gear5Tester:
         elif len(pred_depths) > 1 and 'image_paths' in batch and self.reproj_tae_calculator.is_supported(dataset_name):
             try:
                 image_paths_for_tae = batch['image_paths'][0]  # batch size is 1
+                if need_upsample:
+                    pred_at_gt_res = torch.stack([
+                        F.interpolate(pred_depths_cpu[t:t+1], size=(gt_h, gt_w),
+                                      mode='bilinear', align_corners=True)[0]
+                        for t in range(pred_depths_cpu.shape[0])
+                    ], dim=0)
+                else:
+                    pred_at_gt_res = pred_depths_cpu
                 reproj_tae_result = self.reproj_tae_calculator.compute_tae(
-                    pred_depths[:, 0],  # [T, H, W]
-                    gt_depth_metric[:, 0],  # [T, H, W]
+                    pred_at_gt_res[:, 0],  # [T, gt_h, gt_w]
+                    gt_depth_metric_cpu[:, 0],  # [T, gt_h, gt_w]
                     dataset_name,
                     image_paths_for_tae
                 )
+                if need_upsample:
+                    del pred_at_gt_res
                 metrics['tae_reproj'] = reproj_tae_result.get('tae_reproj', 0.0)
                 metrics['tae_reproj_gt'] = reproj_tae_result.get('tae_reproj_gt', 0.0)
                 metrics['tae'] = reproj_tae_result.get('tae', 0.0)  # pred - gt
@@ -2199,7 +2231,7 @@ class Gear5Tester:
                     device=self.device, thr=self.tc_threshold, max_depth=MAX_DEPTH_TC
                 )
             tc_result = self.flow_tc.compute_rtc(
-                images[0], pred_depths_cpu, gt_depths=gt_depth_metric_cpu
+                images[0], pred_depths_cpu, gt_depths=gt_at_pred_res_cpu
             )
             metrics['rtc'] = tc_result['rtc']
             metrics['rtc_gt'] = tc_result['rtc_gt']
@@ -2266,10 +2298,10 @@ class Gear5Tester:
         per_frame_optimal_shifts = []
 
         if self.no_inverse:
-            # Depth-space: fit gt_depth = scale * rel_depth + shift
+            # Depth-space: fit gt_depth = scale * rel_depth + shift (at pred resolution)
             for t in range(relative_depths.shape[0]):
                 rel_depth_frame = 100.0 / (relative_depths[t, 0].clamp(min=1e-6))  # [H, W] — 100 factor preserved
-                gt_frame = gt_depth_metric_cpu[t, 0]  # [H, W] metric depth (meters)
+                gt_frame = gt_at_pred_res_cpu[t, 0]  # [H, W] metric depth (meters)
                 valid_mask = (gt_frame > 0) & (gt_frame < MAX_DEPTH) & (rel_depth_frame > 0)
 
                 if valid_mask.sum() > 100:
@@ -2296,11 +2328,11 @@ class Gear5Tester:
                 per_frame_optimal_scales.append(opt_scale)
                 per_frame_optimal_shifts.append(opt_shift)
         else:
-            # Inverse depth space: fit gt_inverse = scale * relative_inv + shift
+            # Inverse depth space: fit gt_inverse = scale * relative_inv + shift (at pred resolution)
             MIN_INVERSE = 100.0 / MAX_DEPTH  # Minimum valid inverse depth (corresponds to MAX_DEPTH)
             for t in range(relative_depths.shape[0]):
                 relative_frame = relative_depths[t, 0]  # [H, W] relative inverse depth
-                gt_frame = gt_depth_metric_cpu[t, 0]  # [H, W] metric depth
+                gt_frame = gt_at_pred_res_cpu[t, 0]  # [H, W] metric depth
                 gt_inverse = 100.0 / (gt_frame + 1e-8)  # Convert GT to inverse depth (100/m)
 
                 # Valid mask: GT in valid range, relative depth positive
@@ -2375,7 +2407,7 @@ class Gear5Tester:
                 # Compute metrics for each frame
                 for t in range(T_seg):
                     pred_frame = pred_depths_cpu[t, 0].numpy()  # [H, W]
-                    gt_frame = gt_depth_metric_cpu[t, 0].numpy()  # [H, W]
+                    gt_frame = gt_at_pred_res_cpu[t, 0].numpy()  # [H, W]
                     seg_mask_frame = seg_masks_np[t]  # [H, W]
 
                     # Resize segmentation to match pred/GT if needed
@@ -2424,7 +2456,7 @@ class Gear5Tester:
 
                 for t in range(T_fg):
                     pred_frame = pred_depths_cpu[t, 0].numpy()  # [H, W]
-                    gt_frame = gt_depth_metric_cpu[t, 0].numpy()  # [H, W]
+                    gt_frame = gt_at_pred_res_cpu[t, 0].numpy()  # [H, W]
 
                     # Extract scene and frame from image path
                     image_path = image_paths[t]
@@ -2469,18 +2501,18 @@ class Gear5Tester:
                 metrics['fg_wise'] = {}
 
         # Recreate valid_mask for visualization (on CPU)
-        valid_mask = (gt_depth_metric > 0)  # [T, 1, H, W] on CPU
+        valid_mask = (gt_at_pred_res_cpu > 0)  # [T, 1, pred_h, pred_w] on CPU
 
         # Visualize
         if self.enable_visualization and self.config.eval.get('save_grid', True):
             self._visualize_sequence(
-                images[0], pred_depths, gt_depth_metric, importance_maps,
+                images[0], pred_depths, gt_at_pred_res_cpu, importance_maps,
                 valid_mask, sequence_id, metrics, fps, focal_lengths[0]
             )
 
             # Save error heatmaps (only when visualization enabled)
             self._save_error_heatmaps(
-                pred_depths_cpu, gt_depth_metric_cpu, sequence_id, metrics
+                pred_depths_cpu, gt_at_pred_res_cpu, sequence_id, metrics
             )
 
         # Save video (GIF or MP4)
@@ -2493,7 +2525,7 @@ class Gear5Tester:
             # Use original model resolution for images (following FlashDepth approach)
             # save_gifs_as_grid/save_grid_to_mp4 will handle downsampling to save_res
             save_video_util(
-                images[0], pred_depths, gt_depth_metric, valid_mask, sequence_id,
+                images[0], pred_depths, gt_at_pred_res_cpu, valid_mask, sequence_id,
                 save_dir=self.save_dir,
                 config=self.config
             )
@@ -2548,7 +2580,7 @@ class Gear5Tester:
 
             self._save_best_frame_visualizations(
                 images[0, best_frame_idx],  # [3, H, W]
-                gt_depth_metric[best_frame_idx, 0],  # [H, W]
+                gt_at_pred_res_cpu[best_frame_idx, 0],  # [H, W]
                 model_outputs,
                 sequence_id,
                 actual_frame_number,  # Use actual frame number, not batch index
@@ -2585,7 +2617,7 @@ class Gear5Tester:
 
             self._save_worst_frame_visualizations(
                 images[0, worst_frame_idx],
-                gt_depth_metric[worst_frame_idx, 0],
+                gt_at_pred_res_cpu[worst_frame_idx, 0],
                 worst_model_outputs,
                 sequence_id,
                 worst_actual_frame,
@@ -2607,12 +2639,12 @@ class Gear5Tester:
                 per_frame_rtc_gt = metrics['_per_frame_rtc_gt']
 
                 self.flow_tc.save_visualization(
-                    pred_depths_cpu, gt_depth_metric_cpu, rtc_worst, sequence_id,
+                    pred_depths_cpu, gt_at_pred_res_cpu, rtc_worst, sequence_id,
                     self.save_dir, per_frame_rtc[rtc_worst], label='worst',
                     dataset_name=dataset_name
                 )
                 self.flow_tc.save_visualization(
-                    pred_depths_cpu, gt_depth_metric_cpu, rtc_best, sequence_id,
+                    pred_depths_cpu, gt_at_pred_res_cpu, rtc_best, sequence_id,
                     self.save_dir, per_frame_rtc[rtc_best], label='best',
                     dataset_name=dataset_name
                 )
@@ -2655,7 +2687,7 @@ class Gear5Tester:
             self._export_figure_frames(
                 images=images[0],  # [T, 3, H, W]
                 pred_depths=pred_depths_cpu,  # [T, 1, H, W] (model output resolution)
-                gt_depths=gt_depth_metric_cpu,  # [T, 1, H, W] (downsampled to match pred)
+                gt_depths=gt_at_pred_res_cpu,  # [T, 1, H, W] at pred resolution
                 best_frame_idx=export_frame_idx,
                 sequence_id=sequence_id,
                 dataset_name=dataset_name,
@@ -3548,6 +3580,38 @@ class Gear5Tester:
         with open(tc_path, 'w') as f:
             json.dump(tc_output, f, indent=2, default=str)
         logger.info(f"Temporal consistency saved to {tc_path}")
+
+    def _save_tc_summary(self, all_metrics):
+        """Save tc_summary.json with rTC + TAE + PSR (dataset aggregate + per-sequence)."""
+        per_sequence = []
+        for r in all_metrics:
+            per_sequence.append({
+                'sequence_id': r.get('sequence_id', -1),
+                'rtc': r.get('rtc', 0.0),
+                'rtc_gt': r.get('rtc_gt', 0.0),
+                'tae': r.get('tae', 0.0),
+                'tae_reproj': r.get('tae_reproj', 0.0),
+                'tae_reproj_gt': r.get('tae_reproj_gt', 0.0),
+                'psr': r.get('psr', 0.0),
+                'psr_max': r.get('psr_max', 0.0),
+                'fps': r.get('fps', 0.0),
+            })
+
+        # Aggregate (mean over sequences with valid values)
+        agg = {}
+        for key in ['rtc', 'rtc_gt', 'tae', 'tae_reproj', 'tae_reproj_gt', 'psr', 'psr_max', 'fps']:
+            vals = [s[key] for s in per_sequence if s[key] != 0.0]
+            agg[key] = float(np.mean(vals)) if vals else 0.0
+
+        summary = {
+            'aggregated': agg,
+            'per_sequence': per_sequence,
+        }
+
+        path = self.save_dir / "tc_summary.json"
+        with open(path, 'w') as f:
+            json.dump(summary, f, indent=2)
+        logger.info(f"TC summary saved to {path}")
 
     def _aggregate_metrics(self, all_metrics):
         """Aggregate metrics across sequences"""

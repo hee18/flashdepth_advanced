@@ -6,6 +6,7 @@ config_dir: null
 inference: false
 load: null
 no_shift: false                  # Scale-only mode (zero out shift)
+train_mode: "metric"             # Training mode: "metric" (meters) or "inverse" (1/m)
 
 # Dataset Configuration
 dataset:

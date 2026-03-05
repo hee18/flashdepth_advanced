@@ -70,13 +70,16 @@ GAP [B*T, 256]     GStdP [B*T, 256]     (preserve dpt_features for FiLM)
     (output_conv)                        |
             |                            v
             v                       scale (softplus, init≈100)
-    relative_depth [B*T, H, W]     shift (sigmoid, range [0, 1.0])
+    relative_depth [B*T, H, W]     shift (mode-dependent)
             |                            |
             +----------------------------+
             |
             v
-    depth_from_rel = 1.0 / relative_depth
-    metric_depth = scale * depth_from_rel + shift
+    [Metric mode]
+      depth_from_rel = 1.0 / relative_depth
+      metric_depth = scale * depth_from_rel + shift     (meters)
+    [Inverse mode]
+      pred_inverse = scale * relative_depth + shift     (1/m)
 ```
 
 ---
@@ -140,12 +143,13 @@ beta = beta_raw            (zero at init)
 
 ### 3. OnepieceMetricHead (`flashdepth/onepiece_modules.py`)
 
-Modulated spatial features에서 scale/shift를 예측하는 Conv-based head.
+Modulated spatial features에서 scale/shift를 예측하는 Conv-based head. `train_mode`에 따라 동작 변경.
 
 ```python
 OnepieceMetricHead(
     dpt_dim=256,         # Input feature channels
-    hidden_dim=64        # Hidden layer channels
+    hidden_dim=64,       # Hidden layer channels
+    train_mode="metric"  # "metric" or "inverse"
 )
 ```
 
@@ -160,13 +164,23 @@ Conv2d(256, 64, 1) → ReLU → Conv2d(64, 2, 1)
 spatial_mean → [B*T, 2]
     |                           |
     v                           v
-softplus(raw_scale).clamp(max=1000)   1.0 * sigmoid(raw_shift)
-= scale (positive, max 1000)          = shift (range [0, 1.0])
+softplus(raw_scale)        mode-dependent shift:
+.clamp(max=1000)             metric:  sigmoid(raw) * 1.0  → [0, 1.0]
+                             inverse: raw_shift (unconstrained, gear5 style)
 ```
 
-**Initialization**:
-- **Scale**: `softplus(100.0) ≈ 100.0` — scale이 old 100x factor를 흡수
-- **Shift**: `1.0 * sigmoid(-5) ≈ 0.007 ≈ 0`
+**Mode-specific initialization**:
+
+| Mode | Scale init | Shift init | Scale 의미 | Shift 범위 |
+|------|-----------|-----------|-----------|-----------|
+| **metric** | `softplus(100.0) ≈ 100` | `sigmoid(-5) ≈ 0` | meters 공간, 100x 흡수 | [0, 1.0] |
+| **inverse** | `softplus(0.5) ≈ 1.0` | `0.0` | 1/m 공간 | unconstrained (clamped in model.py) |
+
+**Inverse mode shift clamping** (in `model.py`):
+```python
+shift_lower_bound = -scale * (1.0 / 300.0)  # 최대 300m까지 허용
+shift_clamped = torch.clamp(shift, min=shift_lower_bound, max=1.0)
+```
 
 ### 4. FiLM Spatial Modulation
 
@@ -255,11 +269,20 @@ DPT feature의 temporal consistency를 optical flow 기반으로 강제.
 
 ### Depth Valid Range
 
+**Metric mode** (train_mode="metric"):
+
 | Stage | GT Valid | Pred Valid | 비고 |
 |-------|---------|-----------|------|
 | **Training** | `gt_inverse > 0` | `metric_depth > 0` & `< 1000m` | + `actual_valid_masks` AND |
 | **Validation** | `gt > 0` & `< 70m` | `pred > 0` & `< 70m` | test와 동일 기준 |
 | **Test (메트릭)** | `gt > 0` & `< 70m` | `pred > 0` & `< 70m` | 미터 공간 기준 |
+
+**Inverse mode** (train_mode="inverse", gear5 패턴):
+
+| Stage | GT Valid | Pred Valid | 비고 |
+|-------|---------|-----------|------|
+| **Training** | `gt_inverse > 0` | — (pred 체크 없음) | + `actual_valid_masks` AND |
+| **Validation** | `gt_inverse > 0` | `pred_inverse > 0` | 임계값 없음 |
 
 ---
 
@@ -399,6 +422,47 @@ Checkpoint loading: `unified_global_mamba`, `onepiece_metric_head`, `onepiece_fi
 
 `sintel`, `waymo_seg`, `eth3d`, `urbansyn`, `unreal4k`, `bonn`
 
+### Test Resolutions (Per-Dataset)
+
+| Dataset | Original Resolution | Test Resolution |
+|---------|-------------------|-----------------|
+| sintel | 1024×436 | 1022×434 |
+| eth3d | 6048×4032 | 784×518 |
+| waymo_seg | 1920×1280 | 784×518 |
+| urbansyn | 2048×1024 | 1036×518 |
+| unreal4k | 3840×2160 | 922×518 |
+| bonn | 640×480 | 692×518 |
+
+### Dual-Resolution Metric Computation (4개 test script 공통)
+
+**적용**: test_onepiece.py, test_gear5.py, test_comparison.py, test_video_comparison.py
+
+**문제**: GT를 pred 해상도로 downsample하면 sparse GT(eth3d, waymo_seg)가 파괴됨. Valid-aware area downsample의 `valid_ratio < 0.5` threshold가 lidar (~5% density)에서 거의 모든 pixel을 무효화.
+
+**해결**: 업계 표준(KITTI, Depth Anything V2, MiDaS)처럼 pred를 GT 해상도로 upsample하여 메트릭 계산.
+
+```
+표준 메트릭 (MAE, RMSE, AbsRel, δ1 등) — GT 해상도:
+  pred_depths_cpu [T, 1, pred_h, pred_w]  →  per-frame F.interpolate(bilinear) → [gt_h, gt_w]
+  gt_depth_metric_cpu [T, 1, gt_h, gt_w]  (원본 해상도 유지)
+
+TAE — GT 해상도:
+  pred_at_gt_res (전체 프레임 upsample 후 TAE 계산, 즉시 del)
+
+rTC / PSR / Visualization — pred 해상도:
+  gt_at_pred_res_cpu [T, 1, pred_h, pred_w]
+    - sparse datasets (eth3d, waymo_seg): nearest interpolation
+    - dense datasets: bilinear interpolation
+```
+
+### Sparse Dataset Detection
+
+Dataset name 기반 (gt_density 사용 안 함):
+```python
+is_sparse = any(s in dataset_name.lower() for s in ['eth3d', 'waymo_seg'])
+```
+- Dense dataset에서 sky가 많을 경우 gt_density < 0.5가 되어 잘못 sparse 판정되는 문제 방지
+
 ### Evaluation Metrics
 
 | Metric | Description |
@@ -411,6 +475,15 @@ Checkpoint loading: `unified_global_mamba`, `onepiece_metric_head`, `onepiece_fi
 | delta_3 | < 1.25^3 |
 | TAE (reproj) | Temporal Alignment Error (reprojection 기반) |
 | FPS | Frames per second |
+
+### FPS Measurement
+
+gear5 스타일: 단일 forward pass, warmup 프레임 제외.
+```python
+warmup_frames = min(5 if 'eth3d' else 10, T)
+outputs = model.forward_with_onepiece_streaming(images, phase=2)
+fps = (T - warmup_frames) / inference_time
+```
 
 ### De-canonicalization
 
@@ -448,7 +521,7 @@ metric_depth = scale * depth_from_rel + shift       # metric depth (meters)
 |------|----------|
 | Per-frame PNG | `frames/seq{N}/frame_{T}.png` (Image, GT, Pred) |
 | Error heatmaps | `error_heatmaps/seq{N}/error_{T}.png` (scale/shift overlay) |
-| Best/worst frame | 3x3 grid with depth distribution |
+| Best/worst frame | 3x3 grid with GT valid mask, depth distribution |
 | Video/GIF | Sequence animation (skip for urbansyn, unreal4k) |
 
 ---

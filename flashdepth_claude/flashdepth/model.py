@@ -111,6 +111,8 @@ class FlashDepth(nn.Module):
             onepiece_mamba_layers = kwargs.get('unified_mamba_layers', 4)
             onepiece_d_state = kwargs.get('unified_mamba_d_state', 64)
             onepiece_d_conv = kwargs.get('unified_mamba_d_conv', 4)
+            onepiece_train_mode = kwargs.get('train_mode', 'metric')
+            self.onepiece_train_mode = onepiece_train_mode
 
             # GAP(256) + GStdP(256) = 512 for ViT-L
             gap_dim = dpt_dim  # 256 for ViT-L
@@ -130,12 +132,14 @@ class FlashDepth(nn.Module):
                 dpt_dim=gap_dim
             )
             self.onepiece_metric_head = OnepieceMetricHead(
-                dpt_dim=gap_dim
+                dpt_dim=gap_dim,
+                train_mode=onepiece_train_mode
             )
             logging.info(
                 f"Onepiece V2 initialized: pooled_dim={pooled_dim}, "
                 f"mamba_layers={onepiece_mamba_layers}, "
-                f"d_state={onepiece_d_state}, d_conv={onepiece_d_conv}"
+                f"d_state={onepiece_d_state}, d_conv={onepiece_d_conv}, "
+                f"train_mode={onepiece_train_mode}"
             )
            
 
@@ -535,13 +539,21 @@ class FlashDepth(nn.Module):
 
         # ===== Step 6b: Metric Head (full graph for TGM) =====
         scale, shift = self.onepiece_metric_head(modulated)
-        if no_shift:
-            shift = torch.zeros_like(shift)
 
-        # ===== Step 7: Metric conversion (full graph for TGM) =====
-        # depth = scale / relative_depth + shift (scale init ≈ 100 absorbs the old 100.0 factor)
-        depth_from_rel = 1.0 / (relative_depth + 1e-8)
-        metric_depth = scale.unsqueeze(-1) * depth_from_rel + shift.unsqueeze(-1)
+        # ===== Step 7: Depth conversion (full graph for TGM) =====
+        if getattr(self, 'onepiece_train_mode', 'metric') == 'inverse':
+            # Inverse mode: pred_inverse = scale * relative_depth + shift (1/m space)
+            shift_lower_bound = -scale * (1.0 / 300.0)
+            shift_clamped = torch.clamp(shift, min=shift_lower_bound, max=1.0)
+            if no_shift:
+                shift_clamped = torch.zeros_like(shift_clamped)
+            metric_depth = scale.unsqueeze(-1) * relative_depth + shift_clamped.unsqueeze(-1)
+        else:
+            # Metric mode: depth = scale / relative_depth + shift (meters, scale init ≈ 100)
+            if no_shift:
+                shift = torch.zeros_like(shift)
+            depth_from_rel = 1.0 / (relative_depth + 1e-8)
+            metric_depth = scale.unsqueeze(-1) * depth_from_rel + shift.unsqueeze(-1)
 
         # Reshape and return
         return {
@@ -613,12 +625,19 @@ class FlashDepth(nn.Module):
 
             # Step 7: MetricHead → scale, shift
             scale, shift = self.onepiece_metric_head(modulated)
-            if no_shift:
-                shift = torch.zeros_like(shift)
 
-            # Step 8: Metric depth conversion (scale init ≈ 100 absorbs the old 100.0 factor)
-            depth_from_relative = 1.0 / (relative_depth + 1e-8)
-            metric_depth = scale.unsqueeze(-1) * depth_from_relative + shift.unsqueeze(-1)
+            # Step 8: Depth conversion
+            if getattr(self, 'onepiece_train_mode', 'metric') == 'inverse':
+                shift_lower_bound = -scale * (1.0 / 300.0)
+                shift_clamped = torch.clamp(shift, min=shift_lower_bound, max=1.0)
+                if no_shift:
+                    shift_clamped = torch.zeros_like(shift_clamped)
+                metric_depth = scale.unsqueeze(-1) * relative_depth + shift_clamped.unsqueeze(-1)
+            else:
+                if no_shift:
+                    shift = torch.zeros_like(shift)
+                depth_from_relative = 1.0 / (relative_depth + 1e-8)
+                metric_depth = scale.unsqueeze(-1) * depth_from_relative + shift.unsqueeze(-1)
 
             all_metric_depth.append(metric_depth)
             all_scale.append(scale.squeeze(-1))
@@ -636,6 +655,83 @@ class FlashDepth(nn.Module):
             'metric_depth': metric_depth,            # [B, T, H, W]
             'scale': scale,                          # [B, T]
             'shift': shift,                          # [B, T]
+        }
+
+    def start_onepiece_sequence(self):
+        """Reset Mamba hidden state for a new video sequence (streaming inference)."""
+        if not self.use_onepiece:
+            raise ValueError("Onepiece is not enabled. Set use_onepiece=True.")
+        self.unified_global_mamba.start_new_sequence()
+
+    def forward_onepiece_single_frame(self, frame, patch_h=None, patch_w=None, no_shift=False):
+        """
+        Single-frame streaming inference for Onepiece model.
+
+        Must call start_onepiece_sequence() once before processing a new sequence.
+        Each call maintains Mamba temporal state across frames.
+
+        Args:
+            frame: [B, 3, H, W] single frame tensor (on GPU)
+            patch_h: patch grid height (default: H // patch_size)
+            patch_w: patch grid width (default: W // patch_size)
+            no_shift: If True, zero out shift (scale-only mode)
+
+        Returns:
+            dict with: relative_depth [B, H, W], metric_depth [B, H, W],
+                       scale [B], shift [B]
+        """
+        H, W = frame.shape[-2:]
+        if patch_h is None:
+            patch_h = H // self.patch_size
+        if patch_w is None:
+            patch_w = W // self.patch_size
+
+        # Step 1: DINOv2 encoder (always frozen)
+        with torch.no_grad():
+            encoder_features = self.pretrained.get_intermediate_layers(
+                frame, self.intermediate_layer_idx[self.encoder]
+            )
+
+        # Step 2: DPT (always frozen)
+        with torch.no_grad():
+            dpt_features = self.depth_head(encoder_features, patch_h, patch_w)  # [B, 256, h, w]
+
+        # Step 3: GAP + GStdP
+        gap = F.adaptive_avg_pool2d(dpt_features, 1).squeeze(-1).squeeze(-1)  # [B, 256]
+        gstd = dpt_features.std(dim=(-2, -1))  # [B, 256]
+        global_token = torch.cat([gap, gstd], dim=-1).unsqueeze(1)  # [B, 1, 512]
+
+        # Step 4: Mamba streaming (single frame with hidden state)
+        refined = self.unified_global_mamba.forward_single_frame(global_token).squeeze(1)  # [B, 512]
+
+        # Step 5: FiLM
+        gamma, beta = self.onepiece_film_generator(refined)
+        modulated = gamma.unsqueeze(-1).unsqueeze(-1) * dpt_features + beta.unsqueeze(-1).unsqueeze(-1)
+
+        # Step 6: final_head → relative depth
+        relative_depth = self.final_head(modulated, patch_h, patch_w)  # [B, H, W]
+
+        # Step 7: MetricHead → scale, shift
+        scale, shift = self.onepiece_metric_head(modulated)
+
+        # Step 8: Depth conversion
+        if getattr(self, 'onepiece_train_mode', 'metric') == 'inverse':
+            shift_lower_bound = -scale * (1.0 / 300.0)
+            shift_clamped = torch.clamp(shift, min=shift_lower_bound, max=1.0)
+            if no_shift:
+                shift_clamped = torch.zeros_like(shift_clamped)
+            metric_depth = scale.unsqueeze(-1) * relative_depth + shift_clamped.unsqueeze(-1)
+        else:
+            if no_shift:
+                shift = torch.zeros_like(shift)
+            depth_from_relative = 1.0 / (relative_depth + 1e-8)
+            metric_depth = scale.unsqueeze(-1) * depth_from_relative + shift.unsqueeze(-1)
+
+        return {
+            'relative_depth': relative_depth,       # [B, H, W]
+            'metric_depth': metric_depth,            # [B, H, W]
+            'scale': scale.squeeze(-1),              # [B]
+            'shift': shift.squeeze(-1),              # [B]
         }
 
     def final_head(self, x, patch_h, patch_w):

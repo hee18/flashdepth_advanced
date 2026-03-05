@@ -111,6 +111,9 @@ class OnepieceTrainer:
         # No-shift mode
         self.no_shift = config.get('no_shift', False)
 
+        # Training mode: "metric" (meters space) or "inverse" (1/m space)
+        self.train_mode = config.get('train_mode', 'metric')
+
         # Device setup
         self.device = f"cuda:{local_rank}"
         torch.cuda.set_device(local_rank)
@@ -128,6 +131,7 @@ class OnepieceTrainer:
             self.logger.info(f"  Auto phase transition: Phase 1 → Phase 2 at step {self.auto_transition_step}")
             self.logger.info(f"  Phase 2 warmup: {self.phase2_warmup_steps} steps")
             self.logger.info(f"  No-shift (scale only): {self.no_shift}")
+            self.logger.info(f"  Train mode: {self.train_mode}")
             self.logger.info(f"  Training on {world_size} GPU(s)")
 
         # Initialize model
@@ -239,6 +243,7 @@ class OnepieceTrainer:
         model_config['batch_size'] = self.config.training.batch_size
         model_config['use_metric_head'] = False  # Don't use original GSP head
         model_config['use_onepiece'] = True
+        model_config['train_mode'] = self.train_mode
 
         model = FlashDepth(**model_config)
 
@@ -737,17 +742,25 @@ class OnepieceTrainer:
             scale = outputs['scale']  # [B, T]
             shift = outputs['shift']  # [B, T]
 
-            # Convert GT: inverse depth (1/m) → metric depth (m)
-            gt_depth_inverse_100 = gt_depth * 100.0
-            gt_depth_metric = 100.0 / (gt_depth_inverse_100.squeeze(2) + 1e-8)
+            if self.train_mode == 'inverse':
+                # Inverse mode: metric_depth is already 1/m (pred_inverse)
+                gt_inverse = gt_depth.squeeze(2)  # already 1/m
+                gt_depth_metric = 1.0 / gt_inverse.clamp(min=1e-8)  # → meters for vis
+                pred_metric_vis = 1.0 / metric_depth.clamp(min=1e-8)  # → meters for vis
+                canonical_gt_valid = (gt_inverse > 0)
+                canonical_pred_valid = (metric_depth > 0)
+            else:
+                # Metric mode: metric_depth is meters
+                gt_depth_inverse_100 = gt_depth * 100.0
+                gt_depth_metric = 100.0 / (gt_depth_inverse_100.squeeze(2) + 1e-8)
+                pred_metric_vis = metric_depth
 
-            # Canonical valid masks (70m threshold)
-            MIN_INVERSE_DEPTH = 100.0 / 70.0
-            canonical_gt_valid = (gt_depth_inverse_100.squeeze(2) > MIN_INVERSE_DEPTH)
-            MAX_DEPTH_OUTLIER = 200.0
-            MIN_INVERSE_OUTLIER = 100.0 / MAX_DEPTH_OUTLIER
-            pred_inverse = 100.0 / (metric_depth + 1e-8)
-            canonical_pred_valid = (pred_inverse > MIN_INVERSE_OUTLIER)
+                MIN_INVERSE_DEPTH = 100.0 / 70.0
+                canonical_gt_valid = (gt_depth_inverse_100.squeeze(2) > MIN_INVERSE_DEPTH)
+                MAX_DEPTH_OUTLIER = 200.0
+                MIN_INVERSE_OUTLIER = 100.0 / MAX_DEPTH_OUTLIER
+                pred_inverse = 100.0 / (metric_depth + 1e-8)
+                canonical_pred_valid = (pred_inverse > MIN_INVERSE_OUTLIER)
 
             # First frame for visualization
             sample_batch = (
@@ -759,7 +772,7 @@ class OnepieceTrainer:
             )
 
             model_outputs_cpu = {
-                'pred_depth': metric_depth[:1, :1].float().cpu(),
+                'pred_depth': pred_metric_vis[:1, :1].float().cpu(),
                 'canonical_gt_valid': canonical_gt_valid[:1, :1].cpu(),
                 'canonical_pred_valid': canonical_pred_valid[:1, :1].cpu(),
                 'scale': scale[:1, :1].cpu(),
@@ -817,36 +830,68 @@ class OnepieceTrainer:
 
         # Compute loss (outside autocast)
         with torch.amp.autocast('cuda', enabled=False):
-            gt_depth_meters = 1.0 / (gt_depth.squeeze(2).clamp(min=1e-8))
+            if self.train_mode == 'inverse':
+                # Inverse mode: metric_depth is already 1/m (pred_inverse)
+                pred_inverse = metric_depth.float()
+                gt_inverse = gt_depth.squeeze(2).float()  # already 1/m
 
-            if metric_depth.shape[-2:] != gt_depth_meters.shape[-2:]:
-                BT = B * T
-                metric_depth = F.interpolate(
-                    metric_depth.view(BT, 1, metric_depth.shape[-2], metric_depth.shape[-1]),
-                    size=gt_depth_meters.shape[-2:],
-                    mode='bilinear', align_corners=True
-                ).squeeze(1).view(B, T, gt_depth_meters.shape[-2], gt_depth_meters.shape[-1])
+                # Resize if needed
+                if pred_inverse.shape[-2:] != gt_inverse.shape[-2:]:
+                    BT = B * T
+                    pred_inverse = F.interpolate(
+                        pred_inverse.view(BT, 1, pred_inverse.shape[-2], pred_inverse.shape[-1]),
+                        size=gt_inverse.shape[-2:],
+                        mode='bilinear', align_corners=True
+                    ).squeeze(1).view(B, T, gt_inverse.shape[-2], gt_inverse.shape[-1])
 
-            gt_valid = (gt_depth.squeeze(2) > 0)
-            pred_valid = (metric_depth > 0) & (metric_depth < 1000.0)
-            if actual_valid_masks.ndim == 3:
-                actual_valid_masks = actual_valid_masks.unsqueeze(1)
-            valid_mask = gt_valid & pred_valid & actual_valid_masks
+                # Valid mask (gear5 pattern): gt > 0 AND actual_valid_masks only
+                gt_valid = (gt_inverse > 0)
+                if actual_valid_masks.ndim == 3:
+                    actual_valid_masks = actual_valid_masks.unsqueeze(1)
+                valid_mask = gt_valid & actual_valid_masks
 
-            # Convert to inverse depth space for LogL1/TGM losses
-            pred_inverse = 1.0 / metric_depth.float().clamp(min=1e-8)
-            gt_inverse = gt_depth.squeeze(2).float()  # already 1/m
+                total_loss, loss_components = self.loss_fn(
+                    metric_depth=pred_inverse,
+                    gt_depth=gt_inverse,
+                    valid_mask=valid_mask.float(),
+                    modulated_features=modulated_features.float() if self.current_phase == 2 else None,
+                    images=images.float() if self.current_phase == 2 else None,
+                    flow_estimator=self.flow_estimator if self.current_phase == 2 else None,
+                    phase=self.current_phase,
+                    return_components=True
+                )
+            else:
+                # Metric mode (original)
+                gt_depth_meters = 1.0 / (gt_depth.squeeze(2).clamp(min=1e-8))
 
-            total_loss, loss_components = self.loss_fn(
-                metric_depth=pred_inverse,
-                gt_depth=gt_inverse,
-                valid_mask=valid_mask.float(),
-                modulated_features=modulated_features.float() if self.current_phase == 2 else None,
-                images=images.float() if self.current_phase == 2 else None,
-                flow_estimator=self.flow_estimator if self.current_phase == 2 else None,
-                phase=self.current_phase,
-                return_components=True
-            )
+                if metric_depth.shape[-2:] != gt_depth_meters.shape[-2:]:
+                    BT = B * T
+                    metric_depth = F.interpolate(
+                        metric_depth.view(BT, 1, metric_depth.shape[-2], metric_depth.shape[-1]),
+                        size=gt_depth_meters.shape[-2:],
+                        mode='bilinear', align_corners=True
+                    ).squeeze(1).view(B, T, gt_depth_meters.shape[-2], gt_depth_meters.shape[-1])
+
+                gt_valid = (gt_depth.squeeze(2) > 0)
+                pred_valid = (metric_depth > 0) & (metric_depth < 1000.0)
+                if actual_valid_masks.ndim == 3:
+                    actual_valid_masks = actual_valid_masks.unsqueeze(1)
+                valid_mask = gt_valid & pred_valid & actual_valid_masks
+
+                # Convert to inverse depth space for LogL1/TGM losses
+                pred_inverse = 1.0 / metric_depth.float().clamp(min=1e-8)
+                gt_inverse = gt_depth.squeeze(2).float()  # already 1/m
+
+                total_loss, loss_components = self.loss_fn(
+                    metric_depth=pred_inverse,
+                    gt_depth=gt_inverse,
+                    valid_mask=valid_mask.float(),
+                    modulated_features=modulated_features.float() if self.current_phase == 2 else None,
+                    images=images.float() if self.current_phase == 2 else None,
+                    flow_estimator=self.flow_estimator if self.current_phase == 2 else None,
+                    phase=self.current_phase,
+                    return_components=True
+                )
 
         # Backward pass
         self.optimizer.zero_grad()
@@ -950,38 +995,71 @@ class OnepieceTrainer:
                 shift = outputs['shift']
 
             # Compute validation loss
-            gt_depth_meters = 1.0 / (gt_depth.squeeze(2).float().clamp(min=1e-8))
+            if self.train_mode == 'inverse':
+                # Inverse mode: metric_depth is already 1/m
+                pred_inverse = metric_depth.float()
+                gt_inverse = gt_depth.squeeze(2).float()  # already 1/m
 
-            if metric_depth.shape[-2:] != gt_depth_meters.shape[-2:]:
-                metric_depth = F.interpolate(
-                    metric_depth.view(B * T, 1, metric_depth.shape[-2], metric_depth.shape[-1]),
-                    size=gt_depth_meters.shape[-2:],
-                    mode='bilinear', align_corners=True
-                ).squeeze(1).view(B, T, gt_depth_meters.shape[-2], gt_depth_meters.shape[-1])
+                # Resize if needed
+                if pred_inverse.shape[-2:] != gt_inverse.shape[-2:]:
+                    pred_inverse = F.interpolate(
+                        pred_inverse.view(B * T, 1, pred_inverse.shape[-2], pred_inverse.shape[-1]),
+                        size=gt_inverse.shape[-2:],
+                        mode='bilinear', align_corners=True
+                    ).squeeze(1).view(B, T, gt_inverse.shape[-2], gt_inverse.shape[-1])
+                    metric_depth = pred_inverse  # update for later use
 
-            # Validation uses 70m threshold to match test evaluation
-            VAL_MAX_DEPTH = 70.0
-            gt_valid = (gt_depth.squeeze(2) > 0) & (gt_depth_meters < VAL_MAX_DEPTH)
-            pred_valid = (metric_depth > 0) & (metric_depth < VAL_MAX_DEPTH)
-            if actual_valid_masks.ndim == 3:
-                actual_valid_masks = actual_valid_masks.unsqueeze(1)
-            valid_mask = gt_valid & pred_valid & actual_valid_masks
+                # Valid mask (gear5 pattern): gt > 0 AND pred > 0 only
+                gt_valid = (gt_inverse > 0)
+                pred_valid = (pred_inverse > 0)
+                valid_mask = gt_valid & pred_valid
+            else:
+                # Metric mode (original)
+                gt_depth_meters = 1.0 / (gt_depth.squeeze(2).float().clamp(min=1e-8))
+
+                if metric_depth.shape[-2:] != gt_depth_meters.shape[-2:]:
+                    metric_depth = F.interpolate(
+                        metric_depth.view(B * T, 1, metric_depth.shape[-2], metric_depth.shape[-1]),
+                        size=gt_depth_meters.shape[-2:],
+                        mode='bilinear', align_corners=True
+                    ).squeeze(1).view(B, T, gt_depth_meters.shape[-2], gt_depth_meters.shape[-1])
+
+                VAL_MAX_DEPTH = 70.0
+                gt_valid = (gt_depth.squeeze(2) > 0) & (gt_depth_meters < VAL_MAX_DEPTH)
+                pred_valid = (metric_depth > 0) & (metric_depth < VAL_MAX_DEPTH)
+                if actual_valid_masks.ndim == 3:
+                    actual_valid_masks = actual_valid_masks.unsqueeze(1)
+                valid_mask = gt_valid & pred_valid & actual_valid_masks
 
             if valid_mask.sum() > 0:
-                # Log L1 loss
-                pred_valid_vals = metric_depth.float()[valid_mask]
-                gt_valid_vals = gt_depth_meters.float()[valid_mask]
-                epsilon = 1e-8
-                avg_depth_loss = F.l1_loss(
-                    torch.log(pred_valid_vals.clamp(min=epsilon)),
-                    torch.log(gt_valid_vals.clamp(min=epsilon))
-                )
+                if self.train_mode == 'inverse':
+                    # LogL1 in 1/m space directly
+                    pred_valid_vals = pred_inverse[valid_mask]
+                    gt_valid_vals = gt_inverse[valid_mask]
+                    epsilon = 1e-8
+                    avg_depth_loss = F.l1_loss(
+                        torch.log(pred_valid_vals.clamp(min=epsilon)),
+                        torch.log(gt_valid_vals.clamp(min=epsilon))
+                    )
+                else:
+                    # Log L1 loss in meters space
+                    pred_valid_vals = metric_depth.float()[valid_mask]
+                    gt_valid_vals = gt_depth_meters.float()[valid_mask]
+                    epsilon = 1e-8
+                    avg_depth_loss = F.l1_loss(
+                        torch.log(pred_valid_vals.clamp(min=epsilon)),
+                        torch.log(gt_valid_vals.clamp(min=epsilon))
+                    )
 
                 # TGM loss (if temporal frames available)
                 avg_tgm_loss = torch.tensor(0.0)
                 if T > 1:
-                    pred_inverse = 1.0 / metric_depth.float().clamp(min=1e-8)
-                    gt_inverse = gt_depth.squeeze(2).float()
+                    if self.train_mode == 'inverse':
+                        # Already have pred_inverse and gt_inverse
+                        pass
+                    else:
+                        pred_inverse = 1.0 / metric_depth.float().clamp(min=1e-8)
+                        gt_inverse = gt_depth.squeeze(2).float()
                     pred_diff = pred_inverse[:, 1:] - pred_inverse[:, :-1]
                     gt_diff = gt_inverse[:, 1:] - gt_inverse[:, :-1]
                     temporal_valid = valid_mask[:, 1:] & valid_mask[:, :-1]
@@ -1026,15 +1104,22 @@ class OnepieceTrainer:
 
                 if seq_idx_in_dataset in vis_config['sequences'] and seq_idx_in_dataset not in vis_config['saved']:
                     try:
-                        # Compute metric depth for vis WITHOUT clamp (preserves -1.0 for non-LiDAR, like Gear5)
-                        gt_depth_metric_vis = (1.0 / (gt_depth.squeeze(2)[:1, :1].float() + 1e-8)).cpu()
-                        pred_metric_vis = metric_depth[:1, :1].float().cpu()
-
-                        MIN_INVERSE_DEPTH = 100.0 / 70.0
-                        gt_inv_100 = gt_depth.squeeze(2)[:1, :1] * 100.0
-                        canonical_gt_valid = (gt_inv_100 > MIN_INVERSE_DEPTH)
-                        pred_inv = 100.0 / (metric_depth[:1, :1] + 1e-8)
-                        canonical_pred_valid = (pred_inv > 100.0 / 200.0)
+                        if self.train_mode == 'inverse':
+                            # Inverse mode: metric_depth is 1/m → convert to meters for vis
+                            gt_inverse_vis = gt_depth.squeeze(2)[:1, :1].float()
+                            gt_depth_metric_vis = (1.0 / gt_inverse_vis.clamp(min=1e-8)).cpu()
+                            pred_metric_vis = (1.0 / metric_depth[:1, :1].float().clamp(min=1e-8)).cpu()
+                            canonical_gt_valid = (gt_inverse_vis > 0)
+                            canonical_pred_valid = (metric_depth[:1, :1] > 0)
+                        else:
+                            # Metric mode: metric_depth is meters
+                            gt_depth_metric_vis = (1.0 / (gt_depth.squeeze(2)[:1, :1].float() + 1e-8)).cpu()
+                            pred_metric_vis = metric_depth[:1, :1].float().cpu()
+                            MIN_INVERSE_DEPTH = 100.0 / 70.0
+                            gt_inv_100 = gt_depth.squeeze(2)[:1, :1] * 100.0
+                            canonical_gt_valid = (gt_inv_100 > MIN_INVERSE_DEPTH)
+                            pred_inv = 100.0 / (metric_depth[:1, :1] + 1e-8)
+                            canonical_pred_valid = (pred_inv > 100.0 / 200.0)
 
                         sample_batch = (
                             images[:1, :1].float().cpu(),

@@ -83,6 +83,7 @@ show_usage() {
     echo "  --section START,END  Frame section for infer_avante (e.g., --section 450,480 for frames 450-480)"
     echo "  --no-inverse          Apply scale/shift in depth space instead of inverse depth space"
     echo "  --no-shift            Disable shift (scale-only mode): shift is always 0, only scale is learned/evaluated"
+    echo "  --train-mode MODE    Training mode for onepiece: 'metric' (default) or 'inverse'"
     echo "  --max-depth METERS   Max valid depth threshold for infer_avante (default: 70.0)"
     echo "  --model-type TYPE    Model type for infer_avante: gear5 (default), onepiece"
     echo "  --tc-threshold FLOAT rTC threshold for temporal consistency (default: 1.1)"
@@ -160,6 +161,7 @@ USE_LOG_SPACE="true"  # Use log space for depth/TGM loss (--no-log-space to disa
 DDP_GPUS="0,1"  # GPU IDs for DDP training (e.g., "0,1" or "1,2")
 NO_INVERSE="false"  # Apply scale/shift in depth space instead of inverse depth (--no-inverse)
 NO_SHIFT="false"  # Disable shift, scale-only mode (--no-shift)
+TRAIN_MODE="metric"  # Training mode for onepiece: metric (default) or inverse
 MODEL_TYPE="gear5"  # Model type for infer_avante: gear5 (default), onepiece
 FLICKER_THRESHOLD="3.0"  # MAD multiplier for analyze_features flicker detection
 FLICKER_FRAMES=""  # Manual flicker frames for analyze_features (e.g., "10,25")
@@ -334,6 +336,10 @@ while [[ $# -gt 0 ]]; do
         --no-shift)
             NO_SHIFT="true"
             shift
+            ;;
+        --train-mode)
+            TRAIN_MODE="$2"
+            shift; shift
             ;;
         --model-type)
             MODEL_TYPE="$2"
@@ -1155,6 +1161,7 @@ case $COMMAND in
         echo "  - GPU: $GPU_ID (--gpu, default: 0)"
         echo "  - Total iterations: $TOTAL_ITERS (--epochs, default: 60001)"
         echo "  - No-shift: $NO_SHIFT (--no-shift, default: false)"
+        echo "  - Train mode: $TRAIN_MODE (--train-mode, default: metric)"
         echo "  - WandB: $WANDB (--wandb, default: true)"
         echo "  - WandB name: ${WANDB_NAME:-auto} (--wandb-name)"
         echo "  - Checkpoint: ${FLASHDEPTH_CHECKPOINT:-config default} (--flashdepth-checkpoint)"
@@ -1170,6 +1177,7 @@ case $COMMAND in
             training.iterations=$TOTAL_ITERS \
             training.wandb=$WANDB \
             no_shift=$NO_SHIFT \
+            train_mode=$TRAIN_MODE \
             +results_dir=$RESULTS_DIR"
 
         if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
@@ -1194,6 +1202,7 @@ case $COMMAND in
         echo "  - GPUs: $DDP_GPUS (--ddp-gpus, default: 0,1)"
         echo "  - Total iterations: $TOTAL_ITERS (--epochs, default: 60001)"
         echo "  - No-shift: $NO_SHIFT (--no-shift, default: false)"
+        echo "  - Train mode: $TRAIN_MODE (--train-mode, default: metric)"
         echo "  - WandB: $WANDB (--wandb, default: true)"
         echo "  - WandB name: ${WANDB_NAME:-auto} (--wandb-name)"
         echo "  - Checkpoint: ${FLASHDEPTH_CHECKPOINT:-config default} (--flashdepth-checkpoint)"
@@ -1218,6 +1227,7 @@ case $COMMAND in
             training.iterations=$TOTAL_ITERS \
             training.wandb=$WANDB \
             no_shift=$NO_SHIFT \
+            train_mode=$TRAIN_MODE \
             +results_dir=$RESULTS_DIR"
 
         if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then

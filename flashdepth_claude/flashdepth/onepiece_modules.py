@@ -209,14 +209,17 @@ class OnepieceMetricHead(nn.Module):
     Conv-based scale/shift prediction from spatial features.
 
     Conv2d(dpt_dim, hidden_dim, 1) → ReLU → Conv2d(hidden_dim, 2, 1)
-    → spatial mean → softplus(scale), 1.0*sigmoid(shift)
+    → spatial mean → softplus(scale), shift
 
-    Init: scale≈100 (softplus bias=100.0), shift≈0 (sigmoid bias=-5)
+    Modes:
+        - "metric": scale≈100, shift=sigmoid(raw)*1.0 ∈ [0, 1.0]
+        - "inverse": scale≈1.0, shift=raw (unconstrained, gear5 style)
     """
 
-    def __init__(self, dpt_dim=256, hidden_dim=64):
+    def __init__(self, dpt_dim=256, hidden_dim=64, train_mode="metric"):
         super().__init__()
         self.dpt_dim = dpt_dim
+        self.train_mode = train_mode
 
         self.conv = nn.Sequential(
             nn.Conv2d(dpt_dim, hidden_dim, 1),
@@ -235,14 +238,20 @@ class OnepieceMetricHead(nn.Module):
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
 
-        # Scale/Shift initialization on last conv
+        # Mode-specific initialization on last conv
         with torch.no_grad():
-            # Channel 0 = scale: softplus(100.0) ≈ 100.0 (softplus(x)≈x for x>>1)
-            self.conv[-1].bias.data[0] = 100.0
-            # Channel 1 = shift: 1.0 * sigmoid(-5) ≈ 0.007 ≈ 0
-            self.conv[-1].bias.data[1] = -5.0
-
-        logger.info("OnepieceMetricHead initialized: scale≈100.0, shift≈0.0")
+            if self.train_mode == "inverse":
+                # Channel 0 = scale: softplus(0.5) ≈ 1.0
+                self.conv[-1].bias.data[0] = 0.5
+                # Channel 1 = shift: raw=0.0 (unconstrained)
+                self.conv[-1].bias.data[1] = 0.0
+                logger.info("OnepieceMetricHead initialized (inverse): scale≈1.0, shift≈0.0")
+            else:
+                # Channel 0 = scale: softplus(100.0) ≈ 100.0 (softplus(x)≈x for x>>1)
+                self.conv[-1].bias.data[0] = 100.0
+                # Channel 1 = shift: 1.0 * sigmoid(-5) ≈ 0.007 ≈ 0
+                self.conv[-1].bias.data[1] = -5.0
+                logger.info("OnepieceMetricHead initialized (metric): scale≈100.0, shift≈0.0")
 
     def forward(self, modulated_features):
         """
@@ -250,14 +259,18 @@ class OnepieceMetricHead(nn.Module):
             modulated_features: [B*T, dpt_dim, h, w] FiLM-modulated DPT features
 
         Returns:
-            scale: [B*T, 1] positive scale values (init ≈ 100)
-            shift: [B*T, 1] shift values in [0, 1.0]
+            scale: [B*T, 1] positive scale values
+            shift: [B*T, 1] shift values
         """
         out = self.conv(modulated_features)  # [B*T, 2, h, w]
         out = out.mean(dim=(-2, -1))  # [B*T, 2] spatial mean
         raw_scale, raw_shift = out[:, 0:1], out[:, 1:2]
 
         scale = F.softplus(raw_scale).clamp(max=1000.0)  # Positive, capped at 1000
-        shift = 1.0 * torch.sigmoid(raw_shift)  # Range [0, 1.0]
+
+        if self.train_mode == "inverse":
+            shift = raw_shift  # Unconstrained (gear5 style)
+        else:
+            shift = 1.0 * torch.sigmoid(raw_shift)  # Range [0, 1.0]
 
         return scale, shift

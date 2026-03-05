@@ -753,6 +753,7 @@ class ComparisonDataset(Dataset):
         images = []
         depths = []
         depth_paths = []  # Track depth file paths for completed depth loading
+        image_paths = []  # Track image file paths for TAE computation
         intrinsics_list = []
         segmentations = [] if self.objwise_enabled else None
 
@@ -775,6 +776,7 @@ class ComparisonDataset(Dataset):
                 frame_data = {
                     'image': image,
                     'depth': depth,
+                    'image_path': frame['image'],  # Original image file path (for TAE)
                     'depth_path': frame['depth'],  # Original depth file path
                     'intrinsics': intrinsics
                 }
@@ -859,6 +861,7 @@ class ComparisonDataset(Dataset):
             images.append(image)
             depths.append(depth)
             depth_paths.append(frame_data['depth_path'])  # Collect depth file paths
+            image_paths.append(frame_data['image_path'])  # Collect image file paths for TAE
             intrinsics_list.append(intrinsics)
 
             if seg is not None:
@@ -875,6 +878,7 @@ class ComparisonDataset(Dataset):
         batch = {
             'images': torch.stack(images),  # [T, 3, H, W]
             'depths': torch.stack(depths),  # [T, H, W]
+            'image_paths': image_paths,  # List[str] - image file paths for TAE computation
             'depth_paths': depth_paths,  # List[str] - depth file paths for completed depth loading
             'intrinsics': intrinsics_tensor,  # [T, 4]
             'focal_lengths': focal_lengths_actual,  # [T] - actual fx for compatibility
@@ -1659,6 +1663,7 @@ def comparison_collate_fn(batch):
     result = {
         'images': item['images'].unsqueeze(0),  # [1, T, 3, H, W]
         'depths': item['depths'].unsqueeze(0),  # [1, T, H, W]
+        'image_paths': [item.get('image_paths', [])],  # [[str, ...]] - wrapped in list for batch dim (TAE)
         'depth_paths': item.get('depth_paths', None),  # List[str] - for completed depth loading
         'intrinsics': item['intrinsics'].unsqueeze(0),  # [1, T, 4]
         'focal_lengths': item['focal_lengths'].unsqueeze(0),  # [1, T] - actual fx

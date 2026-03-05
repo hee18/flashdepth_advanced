@@ -1,5 +1,176 @@
 # Onepiece V2 Changelog
 
+## 2026-03-05: DepthPro half precision → TAE dtype mismatch 수정
+
+### 변경 목적
+- DepthPro adapter가 `precision=torch.half`로 모델을 생성하여 inference 출력이 float16
+- reprojection TAE에서 intrinsics/poses(float32)와 matmul 시 `float != c10::Half` RuntimeError 발생
+- DAv2 등 다른 모델은 float32 출력이라 문제 없었음
+
+### 변경 파일
+- **test_comparison.py**: `pred_depths_cpu` 생성 시 `.float()` 캐스팅 추가 → half precision 모델에서도 TAE 정상 계산
+
+---
+
+## 2026-03-04: tc_summary.json 추가 + ComparisonDataset image_paths 수정
+
+### 변경 목적
+- TC 모드 결과(rTC, TAE, PSR)를 하나의 간결한 JSON 파일로 통합 저장
+- ComparisonDataset에서 `image_paths` 누락으로 TAE=0 출력되던 버그 수정
+
+### 변경 파일
+- **test_onepiece.py, test_gear5.py, test_comparison.py, test_video_comparison.py**: `_save_tc_summary()` 메서드 추가. TC-only 모드에서 `temporal_consistency.json`과 함께 `tc_summary.json` 저장. 데이터셋 aggregate + per-sequence 결과 포함.
+- **dataloaders/comparison_dataset.py**: `frame_data`에 `image_path` 추가, batch dict에 `image_paths` 리스트 포함, collate 함수 업데이트 → TAE 계산 가능하도록 수정.
+
+---
+
+## 2026-03-04: Dual-Resolution 메트릭 계산 전체 확장 (test_gear5, test_comparison, test_video_comparison)
+
+### 변경 목적
+- 2026-03-03에 test_onepiece.py에 적용한 GT 해상도 메트릭 계산 패턴을 나머지 3개 test script에 동일 적용
+- Sparse GT(eth3d, waymo_seg) downsample 시 valid pixel 소실 문제를 전체 테스트에서 해결
+- 업계 표준(KITTI, Depth Anything V2, MiDaS): pred를 GT 해상도로 upsample하여 메트릭 계산
+
+### test_gear5.py
+- **GT downsample 제거**: valid-aware area downsample → GT 원본 해상도 유지
+- **`gt_at_pred_res_cpu`**: TC/시각화/PSR용 GT를 pred 해상도로 별도 생성 (sparse: nearest, dense: bilinear)
+- **Per-frame pred upsample**: 메트릭/depth range/TAE에서 per-frame `F.interpolate(pred, gt_size)` 적용
+- **TAE at GT resolution**: pred를 GT 해상도로 upsample 후 TAE 계산, 사용 후 즉시 `del`
+- **시각화/object-wise/fgwise**: `gt_at_pred_res_cpu` 사용으로 통일
+
+### test_comparison.py
+- **GT CPU only**: GT를 GPU에서 downsample하지 않고 바로 CPU 전송 → GPU 메모리 절약
+- **Pred 즉시 CPU**: per-frame 추론 후 `pred_depth_t.cpu()`로 즉시 CPU 이동
+- **Per-frame pred upsample**: regular/object-wise/fgwise 메트릭에서 GT 해상도 계산
+- **TAE at GT resolution**: TC-mode와 full-mode 모두 적용
+- **rTC/PSR/시각화**: `gt_at_pred_res_cpu` 사용
+
+### test_video_comparison.py
+- **즉시 메모리 해제**: `del images_unnorm` + `empty_cache()`, pred도 추론 직후 CPU 이동
+- **GT CPU only**: test_comparison.py와 동일 패턴
+- **Per-frame pred upsample**: regular/object-wise/fgwise 메트릭에서 GT 해상도 계산
+- **TAE at GT resolution**: TC-mode와 full-mode 모두 적용
+- **rTC/PSR/시각화**: `gt_at_pred_res_cpu` 사용
+
+### 지표별 해상도 전략 (4개 test script 공통)
+| 지표 | 해상도 | 이유 |
+|------|--------|------|
+| 표준 메트릭 (MAE, RMSE, AbsRel, δ1 등) | GT 해상도 | Sparse GT 보존 |
+| TAE | GT 해상도 | GT depth를 직접 reprojection에 사용 |
+| rTC | pred 해상도 | SEA-RAFT 내부 long edge 960 cap, pred-to-pred 비교 |
+| PSR | pred 해상도 | pred 값 기반 scale ratio |
+| 시각화 | pred 해상도 | 표시 목적 |
+
+---
+
+## 2026-03-04: Inverse Depth Training Mode 추가
+
+### 변경 목적
+- gear5처럼 1/m 공간에서 직접 scale/shift를 학습하는 inverse 모드 추가
+- 기존 metric 모드(미터 공간)와 config로 전환 가능: `train_mode: "inverse"` or `"metric"`
+- gear5의 *100 스케일링은 사용하지 않고 순수 1/m 공간에서 동작
+
+### 변경 파일
+
+**configs/onepiece/config.yaml, config_l.yaml, config_s.yaml**
+- `train_mode: "metric"` 설정 추가 (default)
+
+**flashdepth/onepiece_modules.py**
+- `OnepieceMetricHead.__init__`: `train_mode` 파라미터 추가
+- `_initialize_weights`: 모드별 초기화 (metric: scale≈100, inverse: scale≈1.0)
+- `forward`: 모드별 shift 처리 (metric: sigmoid [0,1], inverse: unconstrained)
+
+**flashdepth/model.py**
+- `__init__`: `train_mode`를 모델에 저장, MetricHead에 전달
+- `forward_with_onepiece` Step 7: inverse 분기 추가 (`pred_inverse = scale * relative_depth + shift`)
+- `forward_with_onepiece_streaming` Step 8: 동일 분기
+- `forward_onepiece_single_frame` Step 8: 동일 분기
+- Inverse shift clamp: `min=-scale*(1/300), max=1.0`
+
+**train_onepiece.py**
+- `__init__`: `self.train_mode` 저장, 로깅 추가
+- `_setup_model`: `model_config['train_mode']` 전달
+- `_save_training_visualization`: inverse 분기 (1/m → meters 변환, valid mask 간소화)
+- `train_step`: inverse 분기 (pred 체크 없는 valid mask, 직접 1/m 공간 loss)
+- `validate`: inverse 분기 (gt>0 & pred>0 only, 70m 임계값 제거)
+- Validation visualization: inverse 분기
+
+**run_docker.sh**
+- `TRAIN_MODE="metric"` 변수 추가
+- `--train-mode` CLI 플래그 파싱
+- `train_onepiece`, `train_onepiece_ddp` 섹션에 `train_mode=$TRAIN_MODE` 전달
+
+### gear5 vs onepiece inverse 차이
+- GT 공간: gear5=100/m, onepiece=1/m (*100 없음)
+- Shift lower bound: gear5=-scale*(100/300), onepiece=-scale*(1/300)
+- Shift upper bound: gear5=없음, onepiece=1.0
+- TGM: gear5=TGMTemporalLoss(multi-scale), onepiece=단순 diff
+
+## 2026-03-03: Dual-Resolution 메트릭 계산 + Sparse 감지 수정 + 시각화 개선 (test_onepiece.py)
+
+### 변경 목적
+- eth3d/waymo_seg에서 valid-aware GT downsampling이 sparse GT를 파괴하여 메트릭이 완전히 망가지는 문제 수정
+- waymo: lidar ~5% density → valid_ratio < 0.5 threshold에 의해 거의 모든 GT pixel 무효화 → rmse==mae (1 valid pixel)
+- eth3d: SfM sparse depth, 6048×4032 → 784×518 downsample에서 동일 문제
+- sintel은 dense (~95% coverage)이라 영향 없었음
+
+### test_onepiece.py
+
+**1. Dual-Resolution 메트릭 계산 (lines 515-552)**
+- 기존: GT를 pred 해상도로 valid-aware area downsample → sparse GT 파괴
+- 변경: Original FlashDepth처럼 pred를 GT 해상도로 per-frame upsample하여 메트릭 계산
+  - `pred_depths_cpu`: pred 해상도 (TC/TAE/visualization용)
+  - `gt_depth_metric_cpu`: GT 원본 해상도 (메트릭 계산용)
+  - `gt_at_pred_res_cpu`: GT를 pred 해상도로 downsample (TC/TAE/visualization용)
+    - sparse datasets (eth3d, waymo_seg): nearest interpolation
+    - dense datasets: bilinear interpolation
+
+**2. Per-frame 메트릭 루프 (lines 698+)**
+- `need_upsample` 체크 후 per-frame F.interpolate(pred, gt_size, bilinear, align_corners=True)
+- GT 해상도에서 valid mask 생성 및 메트릭 계산
+- OOM 방지: per-frame CPU 처리 (전체 시퀀스 upsample 대신)
+
+**3. Depth range analysis (lines 807+)**
+- 동일한 per-frame upsample 패턴 적용
+
+**4. Sparse mode 감지 수정 (lines 1099-1100, 1209-1225)**
+- 기존: `gt_density < 0.5` → dense dataset(sintel ambush_2 등)에서 sky가 많으면 잘못 sparse 판정
+- 변경: `any(s in dataset_name.lower() for s in ['eth3d', 'waymo_seg'])` → dataset name 기반
+
+**5. FPS 측정 방식 변경 (lines 467-497)**
+- 기존: 별도 warmup 호출 + 전체 T frame 재실행 (Mamba state reset)
+- 변경: gear5 스타일 단일 forward pass, FPS = (T - warmup_frames) / time
+
+**6. Best/worst frame 시각화 개선 (lines 1267-1272)**
+- Row 2: Scale/Shift temporal plot → GT Valid Mask (gear5 스타일)
+- dataset_name 기반 sparse 감지 + proper pred_show_mask
+
+**7. TC/TAE/Visualization 참조 변경**
+- 모든 TC, TAE, visualization 호출에서 `gt_depth_metric_cpu` → `gt_at_pred_res_cpu`로 교체
+- `gt_depth_metric_cpu`는 per-frame 메트릭 계산에서만 사용 (GT 해상도)
+
+### docs/Onepiece.md
+- Testing 섹션에 Test Resolutions, Dual-Resolution, Sparse Detection, FPS 측정 항목 추가
+
+## 2026-03-03: GPU 메모리 최적화 - 시퀀스 간 캐시 정리 + 풀해상도 텐서 해제 (test_comparison, test_video_comparison)
+
+### 변경 목적
+- ETH3D 등 고해상도 데이터셋(4135×6205)에서 30프레임 처리 시 OOM 발생
+- 원인: 시퀀스 간 `torch.cuda.empty_cache()` 미호출 → Reserved 메모리 누적 (Seq0: 14GB → Seq4: 50GB → OOM)
+- GT/images downsample 후에도 원본 풀해상도 GPU 텐서가 해제되지 않음
+
+### test_comparison.py
+- **시퀀스 간 GPU 캐시 정리**: `test()` 루프에 `finally: torch.cuda.empty_cache()` 추가
+- **풀해상도 텐서 해제**: GT downsample + CPU 전송 후 `del gt_depth_gpu, gt_depths, gt_depth_processed` + `empty_cache()`
+- **images downsample 방식 변경**: `batch['images']`(CPU) 대신 `images`(GPU) 기준으로 F.interpolate → 원본 GPU 텐서 덮어쓰기 (test_onepiece 패턴)
+- **CPU 재할당**: `pred_depths`, `gt_depth_processed`를 CPU 버전으로 재할당하여 이후 visualization/export에서 사용
+- fgwise 코드에서 삭제된 `gt_depths` 참조를 `gt_depth_processed_cpu`로 수정
+
+### test_video_comparison.py
+- **동일 패턴 적용**: images GPU downsample, 풀해상도 텐서 해제, CPU 재할당
+- **`del images_unnorm`**: 추론 완료 후 불필요한 GPU 텐서 즉시 해제
+- **`empty_cache()` → `finally` 블록 이동**: 에러 발생 시에도 GPU 메모리 정리 보장
+
 ## 2026-02-27: Valid-Aware GT Downsampling + GPU 선행 다운샘플 (4개 test script)
 
 ### 변경 목적

@@ -7,6 +7,7 @@ config_dir: null
 inference: false
 load: configs/flashdepth-s/iter_14001.pth
 no_shift: false                  # Scale-only mode (zero out shift)
+train_mode: "metric"             # Training mode: "metric" (meters) or "inverse" (1/m)
 
 # Dataset Configuration
 dataset:
