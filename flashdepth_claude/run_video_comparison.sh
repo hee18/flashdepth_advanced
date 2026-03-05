@@ -41,6 +41,7 @@ AMP_DTYPE="bf16"
 LIMIT_SCENES="" # New: Limit NuScenes scenes
 TEST_MODE=""  # Test mode: empty (full), tc (temporal consistency only)
 TC_THRESHOLD=""  # Threshold for rTC metric (default: 1.25)
+MAX_DEPTH=""  # Max depth for evaluation (default: 80)
 
 # Help function
 show_help() {
@@ -80,6 +81,7 @@ Options:
   --limit-scenes <n>       For NuScenes, limit the number of scenes to process (e.g., 50)
   --test-mode <mode>       Test mode: tc (temporal consistency only)
   --tc-threshold <float>   Threshold for rTC metric (default: 1.25)
+  --max-depth <float>      Max depth for evaluation in meters (default: 80)
   --help                   Show this help message
 
 Examples:
@@ -195,6 +197,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --tc-threshold)
             TC_THRESHOLD="$2"
+            shift 2
+            ;;
+        --max-depth)
+            MAX_DEPTH="$2"
             shift 2
             ;;
         --help)
@@ -336,6 +342,10 @@ fi
 
 if [ -n "$TC_THRESHOLD" ]; then
     CMD="$CMD --tc-threshold $TC_THRESHOLD"
+fi
+
+if [ -n "$MAX_DEPTH" ]; then
+    CMD="$CMD --max-depth $MAX_DEPTH"
 fi
 
 if [ -n "$SEQ" ]; then

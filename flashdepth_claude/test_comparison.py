@@ -144,6 +144,7 @@ class ComparisonTester:
         # Flow-based temporal consistency (lazy-loaded)
         self.flow_tc = None
         self.tc_threshold = config.get('tc_threshold', 1.1)
+        self.max_depth = config.get('max_depth', 80.0)
         self.test_mode = config.get('test_mode', None)
 
         # Load model
@@ -360,11 +361,16 @@ class ComparisonTester:
                 import traceback
                 traceback.print_exc()
                 continue
+            finally:
+                # Clear GPU cache between sequences to prevent memory accumulation
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
-        # TC-only mode: save temporal_consistency.json only and return
+        # TC-only mode: save temporal_consistency.json + tc_summary.json and return
         if self.test_mode == 'tc':
             self._save_temporal_consistency(self.all_results)
-            logger.info("TC-only mode: saved temporal_consistency.json")
+            self._save_tc_summary(self.all_results)
+            logger.info("TC-only mode: saved temporal_consistency.json, tc_summary.json")
             return
 
         # Aggregate and save results
@@ -442,7 +448,7 @@ class ComparisonTester:
             if focal_lengths is not None:
                 focal_lengths = focal_lengths.to(self.device)
 
-        # Storage for predictions
+        # Storage for predictions (immediately move to CPU per-frame)
         pred_depths = []
 
         # FPS measurement
@@ -523,8 +529,8 @@ class ComparisonTester:
                 gpu_mem_reserved = torch.cuda.memory_reserved(self.device) / 1e9
                 logger.info(f"GPU Memory after frame 0: Allocated={gpu_mem_allocated:.2f}GB, Reserved={gpu_mem_reserved:.2f}GB")
 
-            # Store prediction
-            pred_depths.append(pred_depth_t)
+            # Store prediction (immediately move to CPU to save GPU memory)
+            pred_depths.append(pred_depth_t.cpu())
 
             # Release intermediate tensors to prevent memory accumulation
             # Critical for long sequences (e.g., unreal4k 250 frames)
@@ -546,44 +552,52 @@ class ComparisonTester:
         else:
             fps = 0
 
-        # Stack predictions
-        pred_depths = torch.stack(pred_depths, dim=0)  # [T, 1, H, W]
+        # Stack predictions (already on CPU from per-frame transfer)
+        pred_depths = torch.stack(pred_depths, dim=0)  # [T, 1, H, W] CPU
+        pred_depths_cpu = pred_depths.float()  # Ensure float32 (DepthPro outputs half)
 
-        # Downsample GT to match prediction resolution (prevents OOM on high-res datasets)
-        gt_depth_processed_cpu = gt_depth_processed[0].cpu()  # [T, 1, H, W]
-        pred_H, pred_W = pred_depths.shape[2:]
-        gt_H, gt_W = gt_depth_processed_cpu.shape[2:]
+        # === Resolution handling (upsample pred to GT resolution for metrics) ===
+        MAX_DEPTH = self.max_depth
+        gt_depth_metric_cpu = gt_depth_processed[0].cpu()  # [T, 1, gt_H, gt_W] CPU (no GPU downsample)
+        pred_H, pred_W = pred_depths_cpu.shape[2:]
+        gt_H, gt_W = gt_depth_metric_cpu.shape[2:]
+        need_upsample = (gt_H, gt_W) != (pred_H, pred_W)
 
-        if (gt_H != pred_H) or (gt_W != pred_W):
-            logger.info(f"Downsampling GT from {gt_H}x{gt_W} to {pred_H}x{pred_W} to match prediction resolution")
-            gt_depth_processed_cpu = torch.nn.functional.interpolate(
-                gt_depth_processed_cpu,  # [T, 1, H, W]
-                size=(pred_H, pred_W),
-                mode='bilinear',
-                align_corners=False
+        if need_upsample:
+            logger.info(f"Resolution mismatch: pred ({pred_H},{pred_W}) vs GT ({gt_H},{gt_W}). "
+                        f"Will upsample pred to GT resolution for metrics.")
+
+        # GT at pred resolution (for TC, visualization, PSR)
+        if need_upsample:
+            ds_lower = self.dataset_name.lower() if isinstance(self.dataset_name, str) else 'unknown'
+            is_sparse_ds = any(s in ds_lower for s in ['eth3d', 'waymo_seg'])
+            interp_mode = 'nearest' if is_sparse_ds else 'bilinear'
+            interp_kwargs = {} if is_sparse_ds else {'align_corners': False}
+            gt_at_pred_res_cpu = F.interpolate(
+                gt_depth_metric_cpu, size=(pred_H, pred_W), mode=interp_mode, **interp_kwargs
             )
-            # Also downsample images in batch for TC (flow must match depth resolution)
-            if 'images' in batch:
-                batch['images'] = torch.nn.functional.interpolate(
-                    batch['images'][0],  # [T, 3, H, W]
-                    size=(pred_H, pred_W),
-                    mode='bilinear',
-                    align_corners=False
-                ).unsqueeze(0)  # [1, T, 3, H, W]
+            # Ensure images match pred resolution for TC flow estimation
+            if images.shape[-2:] != (pred_H, pred_W):
+                images = F.interpolate(
+                    images[0], size=(pred_H, pred_W),
+                    mode='bilinear', align_corners=False
+                ).unsqueeze(0)
+                batch['images'] = images.cpu()
+        else:
+            gt_at_pred_res_cpu = gt_depth_metric_cpu  # Same tensor, no copy needed
 
-        # Compute metrics
-        pred_depths_cpu = pred_depths.cpu()
-
-        # Define MAX_DEPTH for valid mask creation (used in both regular and TAE computation)
-        MAX_DEPTH = 70.0
+        # Free GPU tensors
+        del gt_depths, gt_depth_processed
+        torch.cuda.empty_cache()
 
         # === TC-only mode: skip per-frame metrics, TAE; compute rTC only ===
         if self.test_mode == 'tc':
             metrics = {
                 'fps': float(fps), 'dataset': str(batch.get('dataset_name', 'unknown')),
-                'num_frames': pred_depths.shape[0],
+                'num_frames': pred_depths_cpu.shape[0],
                 'abs_rel': 0.0, 'a1': 0.0, 'mae': 0.0, 'rmse': 0.0,
                 'tae': 0.0, 'tae_reproj': 0.0, 'tae_reproj_gt': 0.0,
+                'psr': 0.0, 'psr_max': 0.0,
             }
             T_tc = pred_depths.shape[0]
             if T_tc > 1:
@@ -594,7 +608,7 @@ class ComparisonTester:
                 images_for_tc = batch['images'][0] if 'images' in batch else None
                 if images_for_tc is not None:
                     tc_result = self.flow_tc.compute_rtc(
-                        images_for_tc, pred_depths_cpu, gt_depths=gt_depth_processed_cpu
+                        images_for_tc, pred_depths_cpu, gt_depths=gt_at_pred_res_cpu
                     )
                     metrics['rtc'] = tc_result['rtc']
                     metrics['rtc_gt'] = tc_result['rtc_gt']
@@ -614,12 +628,12 @@ class ComparisonTester:
                         per_frame_rtc_gt = tc_result['per_frame_rtc_gt']
 
                         self.flow_tc.save_visualization(
-                            pred_depths_cpu, gt_depth_processed_cpu, rtc_worst, sequence_id,
+                            pred_depths_cpu, gt_at_pred_res_cpu, rtc_worst, sequence_id,
                             self.save_dir, per_frame_rtc[rtc_worst], label='worst',
                             dataset_name=self.dataset_name
                         )
                         self.flow_tc.save_visualization(
-                            pred_depths_cpu, gt_depth_processed_cpu, rtc_best, sequence_id,
+                            pred_depths_cpu, gt_at_pred_res_cpu, rtc_best, sequence_id,
                             self.save_dir, per_frame_rtc[rtc_best], label='best',
                             dataset_name=self.dataset_name
                         )
@@ -647,6 +661,63 @@ class ComparisonTester:
             else:
                 metrics['rtc'] = 0.0
                 metrics['rtc_gt'] = 0.0
+
+            # === TAE in TC mode ===
+            T_tc_frames = pred_depths.shape[0]
+            dataset_name_for_tae = batch.get('dataset_name', 'unknown')
+            if isinstance(dataset_name_for_tae, (list, tuple)):
+                dataset_name_for_tae = dataset_name_for_tae[0]
+            dataset_name_for_tae = dataset_name_for_tae.lower() if isinstance(dataset_name_for_tae, str) else 'unknown'
+            if T_tc_frames > 1 and 'image_paths' in batch and self.reproj_tae_calculator.is_supported(dataset_name_for_tae):
+                try:
+                    image_paths_for_tae = batch['image_paths'][0]
+                    # TAE at GT resolution
+                    if need_upsample:
+                        pred_at_gt_res = torch.stack([
+                            F.interpolate(pred_depths_cpu[t:t+1], size=(gt_H, gt_W),
+                                          mode='bilinear', align_corners=True)[0]
+                            for t in range(T_tc_frames)
+                        ], dim=0)
+                    else:
+                        pred_at_gt_res = pred_depths_cpu
+                    reproj_tae_result = self.reproj_tae_calculator.compute_tae(
+                        pred_at_gt_res[:, 0],
+                        gt_depth_metric_cpu[:, 0],
+                        dataset_name_for_tae,
+                        image_paths_for_tae
+                    )
+                    if need_upsample:
+                        del pred_at_gt_res
+                    metrics['tae_reproj'] = reproj_tae_result.get('tae_reproj', 0.0)
+                    metrics['tae_reproj_gt'] = reproj_tae_result.get('tae_reproj_gt', 0.0)
+                    metrics['tae'] = reproj_tae_result.get('tae', 0.0)
+                    logger.info(f"Reprojection TAE: {metrics['tae_reproj']:.4f} (GT ref: {metrics['tae_reproj_gt']:.4f}), TAE diff: {metrics['tae']:.4f}")
+                except Exception as e:
+                    logger.warning(f"Failed to compute reprojection TAE: {e}")
+
+            # === PSR in TC mode (at pred resolution) ===
+            per_frame_scale_ratios_tc = []
+            for t in range(T_tc_frames):
+                pred_frame = pred_depths_cpu[t, 0]
+                gt_frame = gt_at_pred_res_cpu[t, 0]
+                valid_mask = (gt_frame > 0) & (gt_frame < MAX_DEPTH) & (pred_frame > 0) & (pred_frame < MAX_DEPTH)
+                if valid_mask.sum() > 0:
+                    r_t = float(pred_frame[valid_mask].mean() / gt_frame[valid_mask].mean().clamp(min=1e-8))
+                    per_frame_scale_ratios_tc.append(r_t)
+                else:
+                    per_frame_scale_ratios_tc.append(per_frame_scale_ratios_tc[-1] if per_frame_scale_ratios_tc else 1.0)
+            if T_tc_frames > 1 and len(per_frame_scale_ratios_tc) > 1:
+                psr_values = [abs(per_frame_scale_ratios_tc[i] - per_frame_scale_ratios_tc[i-1]) for i in range(1, len(per_frame_scale_ratios_tc))]
+                metrics['psr'] = float(np.mean(psr_values))
+                metrics['psr_max'] = float(np.max(psr_values))
+                metrics['_per_frame_psr'] = [float(v) for v in psr_values]
+                metrics['_per_frame_scale_ratio'] = [float(v) for v in per_frame_scale_ratios_tc]
+            else:
+                metrics['psr'] = 0.0
+                metrics['psr_max'] = 0.0
+                metrics['_per_frame_psr'] = []
+                metrics['_per_frame_scale_ratio'] = []
+
             return metrics
 
         # Compute regular metrics if:
@@ -663,15 +734,30 @@ class ComparisonTester:
             logger.info(f"[OBJWISE DEBUG] Sequence {sequence_id}: dataset_name={dataset_name_raw}")
 
         if compute_regular_metrics:
-            # Regular metrics computation (full image)
+            # Regular metrics computation (at GT resolution)
+            per_frame_scale_ratios = []
             for t in range(pred_depths.shape[0]):
-                pred_frame = pred_depths_cpu[t, 0]  # [H, W]
-                gt_frame = gt_depth_processed_cpu[t, 0]  # [H, W]
+                # Main metrics at GT resolution (upsample pred per-frame)
+                gt_frame = gt_depth_metric_cpu[t, 0]  # [gt_H, gt_W]
+                if need_upsample:
+                    pred_frame = F.interpolate(
+                        pred_depths_cpu[t:t+1], size=(gt_H, gt_W),
+                        mode='bilinear', align_corners=True
+                    )[0, 0]  # [gt_H, gt_W]
+                else:
+                    pred_frame = pred_depths_cpu[t, 0]  # [H, W]
 
                 # Create valid mask
                 gt_valid_mask = (gt_frame > 0) & (gt_frame < MAX_DEPTH)
                 pred_valid_mask = (pred_frame > 0) & (pred_frame < MAX_DEPTH)
                 valid_mask = gt_valid_mask & pred_valid_mask
+
+                # PSR: compute per-frame scale ratio (mean_pred / mean_gt) on valid pixels
+                if valid_mask.sum() > 0:
+                    r_t = float(pred_frame[valid_mask].mean() / gt_frame[valid_mask].mean().clamp(min=1e-8))
+                    per_frame_scale_ratios.append(r_t)
+                else:
+                    per_frame_scale_ratios.append(per_frame_scale_ratios[-1] if per_frame_scale_ratios else 1.0)
 
                 if valid_mask.sum() > 0:
                     # Compute metrics based on depth mode
@@ -711,15 +797,31 @@ class ComparisonTester:
                 dataset_name_for_tae = dataset_name_for_tae[0]
             dataset_name_for_tae = dataset_name_for_tae.lower() if isinstance(dataset_name_for_tae, str) else 'unknown'
 
-            if len(pred_depths) > 1 and 'image_paths' in batch and self.reproj_tae_calculator.is_supported(dataset_name_for_tae):
+            if self.test_mode == 'ea':
+                # EA mode: skip TAE
+                metrics['tae_reproj'] = 0.0
+                metrics['tae_reproj_gt'] = 0.0
+                metrics['tae'] = 0.0
+            elif len(pred_depths) > 1 and 'image_paths' in batch and self.reproj_tae_calculator.is_supported(dataset_name_for_tae):
                 try:
                     image_paths_for_tae = batch['image_paths'][0]  # batch size is 1
+                    # TAE at GT resolution
+                    if need_upsample:
+                        pred_at_gt_res = torch.stack([
+                            F.interpolate(pred_depths_cpu[t:t+1], size=(gt_H, gt_W),
+                                          mode='bilinear', align_corners=True)[0]
+                            for t in range(pred_depths_cpu.shape[0])
+                        ], dim=0)
+                    else:
+                        pred_at_gt_res = pred_depths_cpu
                     reproj_tae_result = self.reproj_tae_calculator.compute_tae(
-                        pred_depths_cpu[:, 0],  # [T, H, W]
-                        gt_depth_processed_cpu[:, 0],  # [T, H, W]
+                        pred_at_gt_res[:, 0],  # [T, gt_H, gt_W]
+                        gt_depth_metric_cpu[:, 0],  # [T, gt_H, gt_W]
                         dataset_name_for_tae,
                         image_paths_for_tae
                     )
+                    if need_upsample:
+                        del pred_at_gt_res
                     metrics['tae_reproj'] = reproj_tae_result.get('tae_reproj', 0.0)
                     metrics['tae_reproj_gt'] = reproj_tae_result.get('tae_reproj_gt', 0.0)
                     metrics['tae'] = reproj_tae_result.get('tae', 0.0)  # tae_reproj - tae_reproj_gt
@@ -743,13 +845,13 @@ class ComparisonTester:
             elif len(pred_depths) > 1:
                 if self.flow_tc is None:
                     self.flow_tc = FlowTemporalConsistency(
-                        device=self.device, thr=self.tc_threshold, max_depth=70.0
+                        device=self.device, thr=self.tc_threshold, max_depth=self.max_depth
                     )
                 # Get images for flow estimation
                 images_for_tc = batch['images'][0] if 'images' in batch else None
                 if images_for_tc is not None:
                     tc_result = self.flow_tc.compute_rtc(
-                        images_for_tc, pred_depths_cpu, gt_depths=gt_depth_processed_cpu
+                        images_for_tc, pred_depths_cpu, gt_depths=gt_at_pred_res_cpu
                     )
                     metrics['rtc'] = tc_result['rtc']
                     metrics['rtc_gt'] = tc_result['rtc_gt']
@@ -766,6 +868,29 @@ class ComparisonTester:
             else:
                 metrics['rtc'] = 0.0
                 metrics['rtc_gt'] = 0.0
+
+            # === Prediction Stability Ratio (PSR) ===
+            if self.test_mode == 'ea':
+                # EA mode: skip PSR
+                metrics['psr'] = 0.0
+                metrics['psr_max'] = 0.0
+                metrics['_per_frame_psr'] = []
+                metrics['_per_frame_scale_ratio'] = []
+            else:
+                T = pred_depths.shape[0]
+                if T > 1 and len(per_frame_scale_ratios) > 1:
+                    psr_values = []
+                    for i in range(1, len(per_frame_scale_ratios)):
+                        psr_values.append(abs(per_frame_scale_ratios[i] - per_frame_scale_ratios[i-1]))
+                    metrics['psr'] = float(np.mean(psr_values))
+                    metrics['psr_max'] = float(np.max(psr_values))
+                    metrics['_per_frame_psr'] = [float(v) for v in psr_values]
+                    metrics['_per_frame_scale_ratio'] = [float(v) for v in per_frame_scale_ratios]
+                else:
+                    metrics['psr'] = 0.0
+                    metrics['psr_max'] = 0.0
+                    metrics['_per_frame_psr'] = []
+                    metrics['_per_frame_scale_ratio'] = []
 
             metrics['fps'] = fps
 
@@ -789,8 +914,17 @@ class ComparisonTester:
                 per_frame_aggregated = []  # For best frame selection
 
                 for t in range(len(seg_masks_np)):
-                    pred_frame = pred_depths_cpu[t, 0].numpy()
-                    gt_frame = gt_depth_processed_cpu[t, 0].numpy()
+                    # Object-wise metrics at GT resolution
+                    gt_frame = gt_depth_metric_cpu[t, 0]
+                    if need_upsample:
+                        pred_frame = F.interpolate(
+                            pred_depths_cpu[t:t+1], size=(gt_H, gt_W),
+                            mode='bilinear', align_corners=True
+                        )[0, 0]
+                    else:
+                        pred_frame = pred_depths_cpu[t, 0]
+                    pred_frame = pred_frame.numpy()
+                    gt_frame = gt_frame.numpy()
                     seg_mask_frame = seg_masks_np[t]
 
                     # Resize segmentation if needed
@@ -875,8 +1009,17 @@ class ComparisonTester:
                 T_fg = min(len(image_paths), pred_depths.shape[0])
 
                 for t in range(T_fg):
-                    pred_frame = pred_depths[t, 0].cpu().numpy() if isinstance(pred_depths, torch.Tensor) else pred_depths[t, 0]
-                    gt_frame = gt_depths[t, 0].cpu().numpy() if isinstance(gt_depths, torch.Tensor) else gt_depths[t, 0]
+                    # FG-wise metrics at GT resolution
+                    gt_frame = gt_depth_metric_cpu[t, 0]
+                    if need_upsample:
+                        pred_frame = F.interpolate(
+                            pred_depths_cpu[t:t+1], size=(gt_H, gt_W),
+                            mode='bilinear', align_corners=True
+                        )[0, 0]
+                    else:
+                        pred_frame = pred_depths_cpu[t, 0]
+                    pred_frame = pred_frame.numpy()
+                    gt_frame = gt_frame.numpy()
 
                     # Extract scene and frame from image path
                     image_path = image_paths[t]
@@ -938,8 +1081,8 @@ class ComparisonTester:
                     seg_masks_for_viz = batch['segmentations'][0]  # [T, H, W]
 
                 visualize_sequence_simplified(
-                    images[0], pred_depths, gt_depth_processed[0],
-                    valid_mask=(gt_depth_processed[0] > 0),
+                    images[0], pred_depths, gt_at_pred_res_cpu,
+                    valid_mask=(gt_at_pred_res_cpu > 0),
                     sequence_id=sequence_id,
                     metrics=metrics,
                     fps=fps,
@@ -1007,7 +1150,7 @@ class ComparisonTester:
 
             visualize_best_frame_simplified(
                 image=images[0, best_frame_idx],  # [3, H, W]
-                gt_depth=gt_depth_processed[0, best_frame_idx, 0],  # [H, W]
+                gt_depth=gt_at_pred_res_cpu[best_frame_idx, 0],  # [H, W] at pred resolution
                 pred_depth=pred_depths[best_frame_idx, 0],  # [H, W]
                 metrics=frame_viz_metrics,
                 save_dir=self.save_dir,
@@ -1047,7 +1190,7 @@ class ComparisonTester:
             self._export_figure_frames(
                 images[0],  # [T, 3, H, W]
                 pred_depths,  # [T, 1, H, W]
-                gt_depth_processed[0],  # [T, 1, H, W]
+                gt_at_pred_res_cpu,  # [T, 1, H, W] at pred resolution
                 best_frame_idx=export_frame_idx,
                 sequence_id=sequence_id,
                 dataset_name=dataset_name,
@@ -1064,13 +1207,13 @@ class ComparisonTester:
 
         # Compute average metrics
         avg_metrics_raw = {}
-        for key in ['mae', 'rmse', 'abs_rel', 'sq_rel', 'rmse_log', 'a1', 'a2', 'a3', 'tae', 'tae_reproj', 'tae_reproj_gt', 'rtc', 'rtc_gt', 'fps']:
+        for key in ['mae', 'rmse', 'abs_rel', 'sq_rel', 'rmse_log', 'a1', 'a2', 'a3', 'tae', 'tae_reproj', 'tae_reproj_gt', 'rtc', 'rtc_gt', 'psr', 'psr_max', 'fps']:
             values = [r[key] for r in self.all_results if key in r]
             if len(values) > 0:
                 avg_metrics_raw[key] = float(np.mean(values))
 
         # Reorder metrics according to desired order
-        metric_order = ['abs_rel', 'a1', 'a2', 'a3', 'fps', 'tae', 'tae_reproj', 'tae_reproj_gt', 'rtc', 'rtc_gt', 'mae', 'rmse']
+        metric_order = ['abs_rel', 'a1', 'a2', 'a3', 'fps', 'tae', 'tae_reproj', 'tae_reproj_gt', 'rtc', 'rtc_gt', 'psr', 'psr_max', 'mae', 'rmse']
         avg_metrics = {}
         for key in metric_order:
             if key in avg_metrics_raw:
@@ -1266,6 +1409,38 @@ class ComparisonTester:
             json.dump(tc_output, f, indent=2, default=str)
         logger.info(f"Temporal consistency saved to {tc_path}")
 
+    def _save_tc_summary(self, all_results):
+        """Save tc_summary.json with rTC + TAE + PSR (dataset aggregate + per-sequence)."""
+        per_sequence = []
+        for r in all_results:
+            per_sequence.append({
+                'sequence_id': r.get('sequence_id', -1),
+                'rtc': r.get('rtc', 0.0),
+                'rtc_gt': r.get('rtc_gt', 0.0),
+                'tae': r.get('tae', 0.0),
+                'tae_reproj': r.get('tae_reproj', 0.0),
+                'tae_reproj_gt': r.get('tae_reproj_gt', 0.0),
+                'psr': r.get('psr', 0.0),
+                'psr_max': r.get('psr_max', 0.0),
+                'fps': r.get('fps', 0.0),
+            })
+
+        # Aggregate (mean over sequences with valid values)
+        agg = {}
+        for key in ['rtc', 'rtc_gt', 'tae', 'tae_reproj', 'tae_reproj_gt', 'psr', 'psr_max', 'fps']:
+            vals = [s[key] for s in per_sequence if s[key] != 0.0]
+            agg[key] = float(np.mean(vals)) if vals else 0.0
+
+        summary = {
+            'aggregated': agg,
+            'per_sequence': per_sequence,
+        }
+
+        path = self.save_dir / "tc_summary.json"
+        with open(path, 'w') as f:
+            json.dump(summary, f, indent=2)
+        logger.info(f"TC summary saved to {path}")
+
     def _export_figure_frames(self, images, pred_depths, gt_depths, best_frame_idx, sequence_id, dataset_name, depth_paths=None):
         """
         Export individual frames around best_frame (±4 frames, total 9 frames).
@@ -1346,7 +1521,7 @@ class ComparisonTester:
             pred_depth = pred_depths[t, 0].cpu().numpy()  # [H, W] in meters
 
             # Compute gt_valid mask and determine sparse/dense FIRST
-            MAX_DEPTH = 70.0
+            MAX_DEPTH = self.max_depth
             gt_valid = (gt_depth_sparse > 0) & (gt_depth_sparse < MAX_DEPTH)
             gt_density = gt_valid.sum() / gt_valid.size
             is_sparse = gt_density < 0.5
@@ -1628,6 +1803,8 @@ def main():
                        help='Test mode: tc (temporal consistency only), ea (error & accuracy only, skip rTC)')
     parser.add_argument('--tc-threshold', type=float, default=1.1,
                        help='Threshold for rTC metric (default: 1.1)')
+    parser.add_argument('--max-depth', type=float, default=80.0,
+                       help='Maximum depth threshold in meters for valid mask filtering (default: 80.0)')
 
     args = parser.parse_args()
 
@@ -1728,7 +1905,8 @@ def main():
         'amp_dtype': args.amp_dtype,
         'limit_scenes': args.limit_scenes,
         'test_mode': args.test_mode,
-        'tc_threshold': args.tc_threshold
+        'tc_threshold': args.tc_threshold,
+        'max_depth': args.max_depth
     }
 
     # Create tester and run (seq_list filtering handled by ComparisonDataset)

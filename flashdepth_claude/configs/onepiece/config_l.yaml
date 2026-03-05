@@ -1,18 +1,12 @@
-# Onepiece Configuration - ViT-L variant
-# Unified Global Mamba (CLS+GAP → 1280-dim) for metric depth estimation
-# Architecture: Frozen FlashDepth + Trainable UnifiedGlobalMamba + OnepieceMetricHead
+# Onepiece V3 Configuration - ViT-L variant
+# Spatial Mamba + Dual-Stream Architecture for metric depth estimation
 
 # General Settings
 config_variant: l
 config_dir: null
 inference: false
 load: configs/flashdepth-l/iter_10001.pth
-no_shift: false                  # Scale-only mode (zero out shift)
-
-# CLS layer selection (1-indexed, maps to intermediate_layer_idx)
-# ViT-L: [4, 11, 17, 23] → Layer 1=block4, Layer 2=block11, Layer 3=block17, Layer 4=block23
-# Default [2, 4] → blocks [11, 23]
-cls_layers: [2, 4]
+train_mode: metric               # "metric" or "inverse"
 
 # Dataset Configuration
 dataset:
@@ -34,12 +28,11 @@ training:
   iterations: 40001
   gradient_accumulation: 1
   wandb: false
-  wandb_name: "onepiece_l"
+  wandb_name: "onepiece_v3_l"
   start_with_val: false
   weight_decay: 1.0e-6
-  gear3_lr: 1.0e-4           # Base LR for onepiece params
   lr:
-    onepiece: 1.0e-4          # UnifiedGlobalMamba + OnepieceMetricHead
+    onepiece: 1.0e-4          # SpatialMamba + ConvMetricHead
     dpt: 1.0e-5               # 1/10 of onepiece (Phase 2)
     warmup_steps: 500
 
@@ -48,15 +41,16 @@ model:
   vit_size: "vitl"
   patch_size: 14
   attn_class: "MemEffAttention"
-  use_mamba: false             # No Spatial Mamba in Onepiece
+  use_mamba: false             # No FlashDepth Mamba
   use_hydra: false
   use_transformer_rnn: false
   use_xlstm: false
-  # Onepiece-specific
+  # Onepiece V3 Spatial Mamba config
   use_onepiece: true
-  unified_mamba_layers: 2
-  unified_mamba_d_state: 64
-  unified_mamba_d_conv: 4
+  spatial_mamba_layers: 4
+  spatial_mamba_d_state: 256
+  spatial_mamba_d_conv: 4
+  spatial_mamba_downsample: 0.1
 
 # Hybrid Model Configuration
 hybrid_configs:
@@ -72,17 +66,17 @@ hybrid_configs:
 loss:
   log_l1_weight: 1.0
   tgm_weight: 1.0
-  feat_cons_weight: 0.01
+  ofc_weight: 0.01
   use_log_space: true
 
-# Scene Cut Detection
+# Scene Cut Detection (inference only)
 scene_cut:
   tau: 0.05
   k: 80
 
 # Phase Transition
 phase:
-  auto_transition_step: 5000
+  auto_transition_step: 1500
   phase2_warmup_steps: 500
 
 # Evaluation Configuration
@@ -105,5 +99,5 @@ eval:
 
 # Flow Estimation
 flow:
-  model: "sea_raft"            # NO fallback -- fail if Sea-RAFT unavailable
+  model: "sea_raft"
   checkpoint: "third_party/SEA-RAFT/models/Tartan-C-T-TSKH-spring540x960-M.pth"

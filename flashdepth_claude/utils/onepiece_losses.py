@@ -1,12 +1,12 @@
 """
-Onepiece Loss Functions.
+Onepiece V3 Loss Functions.
 
-Combined loss: L_total = L_log_l1 + L_tgm + L_feat_cons (1:1:0.01 default)
+Combined loss: L_total = L_log_l1 + L_tgm + L_ofc (1:1:0.01 default)
 
 Components:
     - L_log_l1: Reuses LogL1Loss from gear_losses (metric depth space)
-    - L_tgm: Reuses TGMTemporalLoss from gear_losses × scene_cut_weight
-    - L_feat_cons: NEW WarpFeatureConsistencyLoss × scene_cut_weight
+    - L_tgm: Reuses TGMTemporalLoss from gear_losses
+    - L_ofc: OpticalFlowConsistencyLoss on post-Mamba features (DPT + mamba residual)
 """
 
 import torch
@@ -19,17 +19,21 @@ from .gear_losses import LogL1Loss, TGMTemporalLoss
 logger = logging.getLogger(__name__)
 
 
-class WarpFeatureConsistencyLoss(nn.Module):
+class OpticalFlowConsistencyLoss(nn.Module):
     """
-    Warp-based Feature Consistency Loss.
+    Optical Flow Consistency Loss (OFC).
 
-    Uses optical flow to warp DPT features from frame t-1 to frame t,
+    Uses optical flow to warp post-Mamba features from frame t-1 to frame t,
     then computes confidence-weighted L2 distance.
 
-    L_feat = mean(confidence * ||feat_t - warp(feat_{t-1}, flow)||^2) × scene_cut_weight
+    L_ofc = mean(confidence * ||feat_t - warp(feat_{t-1}, flow)||^2)
 
-    Features: DPT path_1 [B*T, 256, h, w] downsampled to [B*T, 256, h/4, w/4] for efficiency.
+    Features: post_mamba [B*T, 256, h, w] downsampled to [B*T, 256, h/4, w/4] for efficiency.
     Flow: Computed on original images, resized to match feature resolution.
+
+    Gradient flow: OFC on post_mamba_features = DPT + upsample(final_layer(mamba_out))
+        → Gradient → DPT (trainable in Phase 2)
+        → Gradient → final_layer → Mamba blocks
     """
 
     def __init__(self, feature_downsample=4):
@@ -40,33 +44,32 @@ class WarpFeatureConsistencyLoss(nn.Module):
         super().__init__()
         self.feature_downsample = feature_downsample
 
-    def forward(self, dpt_features, images, flow_estimator, scene_cut_weights=None):
+    def forward(self, post_mamba_features, images, flow_estimator, scene_cut_weights=None):
         """
         Args:
-            dpt_features: [B, T, 256, h, w] DPT path_1 features
+            post_mamba_features: [B, T, 256, h, w] post-Mamba features (DPT + mamba residual)
             images: [B, T, 3, H, W] original video frames (0-1 normalized)
             flow_estimator: FlowEstimator instance (frozen Sea-RAFT)
-            scene_cut_weights: [B, T-1] temporal weights from SceneCutDetector (optional)
+            scene_cut_weights: [B, T-1] temporal weights (optional, unused in V3 training)
 
         Returns:
-            loss: scalar feature consistency loss
+            loss: scalar optical flow consistency loss
         """
-        B, T, C, h, w = dpt_features.shape
+        B, T, C, h, w = post_mamba_features.shape
 
         if T < 2:
-            return torch.tensor(0.0, device=dpt_features.device)
+            return torch.tensor(0.0, device=post_mamba_features.device)
 
         # Downsample features for efficiency
         feat_h = h // self.feature_downsample
         feat_w = w // self.feature_downsample
 
         # Reshape for pooling: [B*T, C, h, w]
-        feats_flat = dpt_features.view(B * T, C, h, w)
-        feats_down = F.adaptive_avg_pool2d(feats_flat, (feat_h, feat_w))  # [B*T, C, feat_h, feat_w]
+        feats_flat = post_mamba_features.view(B * T, C, h, w)
+        feats_down = F.adaptive_avg_pool2d(feats_flat, (feat_h, feat_w))
         feats_down = feats_down.view(B, T, C, feat_h, feat_w)
 
         # Compute optical flow on original images
-        # flow: [B, T-1, 2, H, W], confidence: [B, T-1, 1, H, W]
         flows, confidences = flow_estimator.estimate_flow_batch(images)
 
         # Resize flow to feature resolution
@@ -103,88 +106,87 @@ class WarpFeatureConsistencyLoss(nn.Module):
             flow = flows_resized[:, t]         # [B, 2, feat_h, feat_w]
             conf = confidences_resized[:, t]   # [B, 1, feat_h, feat_w]
 
-            # Create sampling grid: grid + flow
-            # grid_sample expects grid in [-1, 1]
+            # Create sampling grid
             grid_y, grid_x = torch.meshgrid(
                 torch.linspace(-1, 1, feat_h, device=flow.device),
                 torch.linspace(-1, 1, feat_w, device=flow.device),
                 indexing='ij'
             )
-            grid = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0).expand(B, -1, -1, -1)  # [B, h, w, 2]
+            grid = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0).expand(B, -1, -1, -1)
 
             # Convert flow to normalized coordinates
             flow_norm = torch.zeros_like(flow)
-            flow_norm[:, 0] = flow[:, 0] / (feat_w / 2.0)  # u → x in [-1, 1]
-            flow_norm[:, 1] = flow[:, 1] / (feat_h / 2.0)  # v → y in [-1, 1]
-            flow_norm = flow_norm.permute(0, 2, 3, 1)  # [B, h, w, 2]
+            flow_norm[:, 0] = flow[:, 0] / (feat_w / 2.0)
+            flow_norm[:, 1] = flow[:, 1] / (feat_h / 2.0)
+            flow_norm = flow_norm.permute(0, 2, 3, 1)
 
             # Warp previous features using flow
-            warp_grid = grid + flow_norm  # [B, h, w, 2]
+            warp_grid = grid + flow_norm
             warped_feat = F.grid_sample(
                 feat_prev, warp_grid,
                 mode='bilinear', padding_mode='border', align_corners=True
-            )  # [B, C, feat_h, feat_w]
+            )
 
             # Confidence-weighted L2 loss
-            diff = (feat_t - warped_feat) ** 2  # [B, C, feat_h, feat_w]
-            weighted_diff = conf * diff.mean(dim=1, keepdim=True)  # [B, 1, feat_h, feat_w]
+            diff = (feat_t - warped_feat) ** 2
+            weighted_diff = conf * diff.mean(dim=1, keepdim=True)
 
             pair_loss = weighted_diff.mean()
 
-            # Apply scene cut weight
+            # Apply scene cut weight if provided
             if scene_cut_weights is not None:
-                weight = scene_cut_weights[:, t].mean()  # Average across batch
+                weight = scene_cut_weights[:, t].mean()
                 pair_loss = pair_loss * weight
 
             total_loss = total_loss + pair_loss
             num_pairs += 1
 
         if num_pairs == 0:
-            return torch.tensor(0.0, device=dpt_features.device)
+            return torch.tensor(0.0, device=post_mamba_features.device)
 
         return total_loss / num_pairs
 
 
 class OnepieceCombinedLoss(nn.Module):
     """
-    Combined loss for Onepiece training.
+    Combined loss for Onepiece V3 training.
 
-    L_total = w1 * L_log_l1 + w2 * L_tgm + w3 * L_feat_cons
+    L_total = w1 * L_log_l1 + w2 * L_tgm + w3 * L_ofc
 
     Default weights: 1:1:0.01
     """
 
-    def __init__(self, log_l1_weight=1.0, tgm_weight=1.0, feat_cons_weight=1.0,
+    def __init__(self, log_l1_weight=1.0, tgm_weight=1.0, ofc_weight=1.0,
                  use_log_space=True):
         super().__init__()
 
         self.log_l1_weight = log_l1_weight
         self.tgm_weight = tgm_weight
-        self.feat_cons_weight = feat_cons_weight
+        self.ofc_weight = ofc_weight
 
         self.log_l1_loss = LogL1Loss(use_log_space=use_log_space)
         self.tgm_loss = TGMTemporalLoss(use_log_space=use_log_space)
-        self.feat_cons_loss = WarpFeatureConsistencyLoss()
+        self.ofc_loss = OpticalFlowConsistencyLoss()
 
         logger.info(
             f"OnepieceCombinedLoss: log_l1={log_l1_weight}, "
-            f"tgm={tgm_weight}, feat_cons={feat_cons_weight}"
+            f"tgm={tgm_weight}, ofc={ofc_weight}"
         )
 
     def forward(self, pred_depth, gt_depth, valid_mask=None,
-                dpt_features=None, images=None, flow_estimator=None,
+                post_mamba_features=None, images=None, flow_estimator=None,
                 scene_cut_weights=None, return_components=True):
         """
         Compute combined loss.
 
         Args:
-            pred_depth: [B, T, H, W] predicted metric depth (inverse, 100/m)
-            gt_depth: [B, T, H, W] ground truth metric depth (inverse, 100/m)
+            pred_depth: [B, T, H, W] predicted depth (inverse, 100/m)
+            gt_depth: [B, T, H, W] ground truth depth (inverse, 100/m)
             valid_mask: [B, T, H, W] validity mask
-            dpt_features: [B, T, 256, h, w] DPT features (for feat_cons)
+            post_mamba_features: [B, T, 256, h, w] post-Mamba features (for OFC)
             images: [B, T, 3, H, W] original images (for flow estimation)
-            flow_estimator: FlowEstimator instance (for feat_cons)
-            scene_cut_weights: [B, T-1] temporal weights from SceneCutDetector
+            flow_estimator: FlowEstimator instance (for OFC)
+            scene_cut_weights: [B, T-1] temporal weights (optional)
             return_components: If True, return individual loss components
 
         Returns:
@@ -194,37 +196,37 @@ class OnepieceCombinedLoss(nn.Module):
         # 1. Log L1 Loss (per-frame, no scene cut weighting)
         l_log_l1 = self.log_l1_loss(pred_depth, gt_depth, valid_mask)
 
-        # 2. TGM Loss (temporal, with per-pair scene cut weighting)
+        # 2. TGM Loss (temporal)
         if self.tgm_weight > 0 and pred_depth.shape[1] >= 2:
             l_tgm = self.tgm_loss(pred_depth, gt_depth, valid_mask,
                                    scene_cut_weights=scene_cut_weights)
         else:
             l_tgm = torch.tensor(0.0, device=pred_depth.device)
 
-        # 3. Feature Consistency Loss (needs flow estimator and features)
-        if (self.feat_cons_weight > 0 and
-                dpt_features is not None and
+        # 3. OFC Loss (needs flow estimator and post-Mamba features)
+        if (self.ofc_weight > 0 and
+                post_mamba_features is not None and
                 images is not None and
                 flow_estimator is not None and
                 pred_depth.shape[1] >= 2):
-            l_feat_cons = self.feat_cons_loss(
-                dpt_features, images, flow_estimator, scene_cut_weights
+            l_ofc = self.ofc_loss(
+                post_mamba_features, images, flow_estimator, scene_cut_weights
             )
         else:
-            l_feat_cons = torch.tensor(0.0, device=pred_depth.device)
+            l_ofc = torch.tensor(0.0, device=pred_depth.device)
 
         # Combined loss
         total_loss = (
             self.log_l1_weight * l_log_l1 +
             self.tgm_weight * l_tgm +
-            self.feat_cons_weight * l_feat_cons
+            self.ofc_weight * l_ofc
         )
 
         if return_components:
             components = {
                 'log_l1_loss': l_log_l1.item(),
                 'tgm_loss': l_tgm.item(),
-                'feat_cons_loss': l_feat_cons.item() if torch.is_tensor(l_feat_cons) else l_feat_cons,
+                'ofc_loss': l_ofc.item() if torch.is_tensor(l_ofc) else l_ofc,
             }
             return total_loss, components
 

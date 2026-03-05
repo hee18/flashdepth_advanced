@@ -101,7 +101,7 @@ show_usage() {
     echo "  --section START,END  Frame section for infer_avante (e.g., --section 450,480 for frames 450-480)"
     echo "  --no-inverse          Apply scale/shift in depth space instead of inverse depth space"
     echo "  --no-shift            Disable shift (scale-only mode): shift is always 0, only scale is learned/evaluated"
-    echo "  --max-depth METERS   Max valid depth threshold for infer_avante (default: 70.0)"
+    echo "  --max-depth METERS   Max valid depth threshold (default: 80.0)"
     echo "  --model-type TYPE    Model type for infer_avante: gear5 (default), onepiece"
     echo ""
     echo "Note: Regularization losses are deprecated. Importance map now uses raw DINOv2 attention (frozen)."
@@ -190,7 +190,7 @@ BEST_FIGURE="false"  # Export best_frame ±4 frames (9 total) as individual imag
 FRAME=""  # Specific frame to export ±4 frames
 FGWISE_FLAG="false"  # Enable FG-wise (foreground-wise) evaluation using ViT attention masks
 SECTION=""  # Frame section for infer_avante (e.g., "450,480" for frames 450-480)
-MAX_DEPTH="70.0"  # Max valid depth threshold for infer_avante (meters)
+MAX_DEPTH="80.0"  # Max valid depth threshold (meters)
 CBAR="false"  # Show colorbar next to depth visualization
 TEST_MODE=""  # Test mode: empty (full), tc (temporal consistency only)
 BANKAI_PHASE="auto"  # Bankai training phase: 1, 2, or "auto" (auto: Phase 1 until step 5000, then Phase 2)
@@ -1948,7 +1948,7 @@ case $COMMAND in
         ;;
 
     train_onepiece)
-        echo "Starting Onepiece training (Single GPU)..."
+        echo "Starting Onepiece V3 training (Single GPU)..."
         echo "Configuration:"
         echo "  - Config variant: $CONFIG_VARIANT (--config-variant, default: l)"
         echo "  - Config file: configs/onepiece/config_$CONFIG_VARIANT.yaml"
@@ -1956,8 +1956,6 @@ case $COMMAND in
         echo "  - Workers: $WORKERS (--workers, default: 8)"
         echo "  - GPU: $GPU_ID (--gpu, default: 0)"
         echo "  - Total iterations: $TOTAL_ITERS (--epochs, default: 60001)"
-        echo "  - CLS layers: $CLS_LAYERS (--cls-layer, default: 2,4)"
-        echo "  - No-shift: $NO_SHIFT (--no-shift, default: false)"
         echo "  - WandB: $WANDB (--wandb, default: true)"
         echo "  - WandB name: ${WANDB_NAME:-auto} (--wandb-name)"
         echo "  - Checkpoint: ${FLASHDEPTH_CHECKPOINT:-config default} (--flashdepth-checkpoint)"
@@ -1972,8 +1970,6 @@ case $COMMAND in
             training.workers=$WORKERS \
             training.iterations=$TOTAL_ITERS \
             training.wandb=$WANDB \
-            cls_layers='[$CLS_LAYERS]' \
-            no_shift=$NO_SHIFT \
             +results_dir=$RESULTS_DIR"
 
         if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
@@ -1988,7 +1984,7 @@ case $COMMAND in
         ;;
 
     train_onepiece_ddp)
-        echo "Starting Onepiece training (Multi-GPU DDP)..."
+        echo "Starting Onepiece V3 training (Multi-GPU DDP)..."
         echo "Configuration:"
         echo "  - Config variant: $CONFIG_VARIANT (--config-variant, default: l)"
         echo "  - Config file: configs/onepiece/config_$CONFIG_VARIANT.yaml"
@@ -1997,8 +1993,6 @@ case $COMMAND in
         echo "  - Workers: $WORKERS (--workers, default: 8)"
         echo "  - GPUs: $DDP_GPUS (--ddp-gpus, default: 0,1)"
         echo "  - Total iterations: $TOTAL_ITERS (--epochs, default: 60001)"
-        echo "  - CLS layers: $CLS_LAYERS (--cls-layer, default: 2,4)"
-        echo "  - No-shift: $NO_SHIFT (--no-shift, default: false)"
         echo "  - WandB: $WANDB (--wandb, default: true)"
         echo "  - WandB name: ${WANDB_NAME:-auto} (--wandb-name)"
         echo "  - Checkpoint: ${FLASHDEPTH_CHECKPOINT:-config default} (--flashdepth-checkpoint)"
@@ -2022,8 +2016,6 @@ case $COMMAND in
             training.workers=$WORKERS \
             training.iterations=$TOTAL_ITERS \
             training.wandb=$WANDB \
-            cls_layers='[$CLS_LAYERS]' \
-            no_shift=$NO_SHIFT \
             +results_dir=$RESULTS_DIR"
 
         if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
@@ -2048,8 +2040,6 @@ case $COMMAND in
         echo "  - GPU: $GPU_ID (--gpu, default: 0)"
         echo "  - Video length: $VID_LEN (--vid-len, default: 50)"
         echo "  - Frame interval: $FRAME_INTERVAL (--frame-interval, default: 1)"
-        echo "  - CLS layers: $CLS_LAYERS (--cls-layer, default: 2,4)"
-        echo "  - No-shift: $NO_SHIFT (--no-shift, default: false)"
         echo "  - Checkpoint: ${GEAR_CHECKPOINT:-config default} (--gear-checkpoint)"
         echo "  - Results directory: $RESULTS_DIR (--results-dir)"
         echo "  - Dataset: ${ONEPIECE_TEST_DATASET:-all (default)}"
@@ -2064,8 +2054,6 @@ case $COMMAND in
             --config-name config_$CONFIG_VARIANT \
             dataset.data_root=/data/datasets \
             dataset.video_length=$VID_LEN \
-            cls_layers='[$CLS_LAYERS]' \
-            no_shift=$NO_SHIFT \
             +frame_interval=$FRAME_INTERVAL \
             +results_dir=$RESULTS_DIR"
 
@@ -2101,6 +2089,11 @@ case $COMMAND in
         # Add test-mode if specified
         if [ -n "$TEST_MODE" ]; then
             DOCKER_CMD="$DOCKER_CMD --test-mode $TEST_MODE"
+        fi
+
+        # Add max-depth if specified
+        if [ -n "$MAX_DEPTH" ]; then
+            DOCKER_CMD="$DOCKER_CMD --max-depth $MAX_DEPTH"
         fi
 
         eval $DOCKER_CMD

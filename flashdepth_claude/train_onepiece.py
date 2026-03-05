@@ -1,23 +1,24 @@
 """
-Onepiece Training Script: Unified Global Mamba for Metric Depth Estimation
+Onepiece V3 Training Script: Spatial Mamba + Dual-Stream Architecture
 
 Architecture:
-    CLS(1024) + DPT GAP(256) → Unified Global Mamba(1280-dim, 2 layers) →
-    Path A: Metric Head → Scale/Shift
-    Path B: FiLM → γ,β → Spatial modulation of DPT features
+    DPT features → SpatialMamba (downsample→Mamba→final_layer→upsample+add)
+        → Relative stream: post_mamba → final_head → relative depth
+        → Metric stream: mamba_raw → ConvMetricHead → scale, shift
 
 Training Phases:
-    Phase 1 (0 ~ 5K steps): Metric Alignment
-        Trainable: UnifiedGlobalMamba + OnepieceMetricHead (~6.2M params)
-        Frozen: DINOv2, DPT, output_conv
+    Phase 1 (0 ~ 1500 steps): Metric Alignment
+        Trainable: ConvMetricHead only
+        Frozen: DINOv2, DPT, SpatialMamba (zero-init → no-op), output_conv
 
-    Phase 2 (5K+ steps): Full Video Optimization
-        Additional unfreeze: DPT + output_conv (LR = 1/10)
-        500-step warmup for newly unfrozen params
+    Phase 2 (1500+ steps): Full Video Optimization
+        Trainable: SpatialMamba + ConvMetricHead + DPT + output_conv
+        500-step warmup for newly unfrozen DPT params (LR = 1/10)
 
 Loss:
-    L_total = L_log_l1 + L_tgm + L_feat_cons (1:1:0.01)
-    Scene cut detection: CLS cosine distance (tau=0.05, k=80)
+    L_total = L_log_l1 + L_tgm + L_ofc (1:1:0.01)
+    Phase 1: LogL1 + TGM only (skip OFC)
+    Phase 2: LogL1 + TGM + OFC (on post-Mamba features)
 
 Data:
     Gear5 8-element batch format, video_length=8, resolution=518
@@ -85,14 +86,14 @@ def init_distributed():
 
 class OnepieceTrainer:
     """
-    Trainer for Onepiece unified metric depth estimation.
+    Trainer for Onepiece V3 metric depth estimation.
 
     Phase 1 (0 ~ auto_transition_step):
-        Trainable: UnifiedGlobalMamba + OnepieceMetricHead
-        Frozen: DINOv2, DPT, output_conv
+        Trainable: ConvMetricHead only
+        Frozen: DINOv2, DPT, SpatialMamba (zero-init → no-op), output_conv
 
     Phase 2 (auto_transition_step+):
-        Additional unfreeze: DPT + output_conv
+        Trainable: SpatialMamba + ConvMetricHead + DPT + output_conv
         500-step warmup for newly unfrozen params (LR = 1/10 of base)
     """
 
@@ -103,12 +104,12 @@ class OnepieceTrainer:
         self.local_rank = local_rank
 
         # Phase configuration
-        self.auto_transition_step = config.phase.get('auto_transition_step', 5000)
+        self.auto_transition_step = config.phase.get('auto_transition_step', 1500)
         self.phase2_warmup_steps = config.phase.get('phase2_warmup_steps', 500)
         self.current_phase = 1  # Start with Phase 1
 
-        # No-shift mode
-        self.no_shift = config.get('no_shift', False)
+        # Train mode: metric or inverse
+        self.train_mode = config.get('train_mode', 'metric')
 
         # Device setup
         self.device = f"cuda:{local_rank}"
@@ -123,10 +124,10 @@ class OnepieceTrainer:
         self._setup_logging()
 
         if rank == 0:
-            self.logger.info(f"=== ONEPIECE TRAINING ===")
+            self.logger.info(f"=== ONEPIECE V3 TRAINING ===")
             self.logger.info(f"  Auto phase transition: Phase 1 → Phase 2 at step {self.auto_transition_step}")
             self.logger.info(f"  Phase 2 warmup: {self.phase2_warmup_steps} steps")
-            self.logger.info(f"  No-shift (scale only): {self.no_shift}")
+            self.logger.info(f"  Train mode: {self.train_mode}")
             self.logger.info(f"  Training on {world_size} GPU(s)")
 
         # Initialize model
@@ -146,7 +147,7 @@ class OnepieceTrainer:
         self.loss_fn = OnepieceCombinedLoss(
             log_l1_weight=loss_config.get('log_l1_weight', 1.0),
             tgm_weight=loss_config.get('tgm_weight', 1.0),
-            feat_cons_weight=loss_config.get('feat_cons_weight', 1.0),
+            ofc_weight=loss_config.get('ofc_weight', loss_config.get('feat_cons_weight', 1.0)),
             use_log_space=loss_config.get('use_log_space', True)
         )
 
@@ -232,40 +233,6 @@ class OnepieceTrainer:
         """Get canonical focal length (fixed at 500.0 for 518x518 resolution)."""
         return 500.0
 
-    def _setup_cls_layers(self, model):
-        """Parse cls_layers config and compute encoder indices for multi-layer CLS averaging."""
-        cls_layers = self.config.get('cls_layers', [2, 4])
-
-        # Convert OmegaConf ListConfig to plain Python list
-        if isinstance(cls_layers, ListConfig):
-            cls_layers = OmegaConf.to_container(cls_layers)
-
-        # Ensure it's a flat list of integers
-        if isinstance(cls_layers, (list, tuple)):
-            cls_layers = [int(x) for x in cls_layers]
-        else:
-            cls_layers = [int(cls_layers)]
-
-        # Validate cls_layers (must be 1-4)
-        for layer in cls_layers:
-            if layer < 1 or layer > 4:
-                raise ValueError(f"cls_layers must be between 1 and 4, got {layer}")
-
-        # Convert user's 1-indexed layer numbers to 0-indexed encoder_indices
-        # cls_layers=[2,4] → encoder_indices=[1,3] → target_blocks=[11,23] for ViT-L
-        intermediate_idx = model.intermediate_layer_idx[model.encoder]
-        encoder_indices = [layer - 1 for layer in cls_layers]
-        target_blocks = [intermediate_idx[idx] for idx in encoder_indices]
-
-        if self.rank == 0:
-            self.logger.info(f"CLS layer selection: user specified layers {cls_layers}")
-            self.logger.info(f"  → encoder_indices: {encoder_indices}")
-            self.logger.info(f"  → target_blocks: {target_blocks} (actual ViT block indices)")
-
-        self.cls_layers = cls_layers
-        self.encoder_indices = encoder_indices
-        self.target_blocks = target_blocks
-
     def _setup_model(self):
         """Initialize FlashDepth with Onepiece modules."""
         model_config = dict(self.config.model)
@@ -273,15 +240,19 @@ class OnepieceTrainer:
         model_config['use_metric_head'] = False  # Don't use original GSP head
         model_config['use_onepiece'] = True
 
-        # Scene cut config
+        # Spatial Mamba config
+        model_config['spatial_mamba_layers'] = self.config.model.get('spatial_mamba_layers', 4)
+        model_config['spatial_mamba_d_state'] = self.config.model.get('spatial_mamba_d_state', 256)
+        model_config['spatial_mamba_d_conv'] = self.config.model.get('spatial_mamba_d_conv', 4)
+        model_config['spatial_mamba_downsample'] = self.config.model.get('spatial_mamba_downsample', 0.1)
+        model_config['onepiece_train_mode'] = self.train_mode
+
+        # Scene cut config (inference only, but still needed for the detector)
         scene_cut_config = self.config.get('scene_cut', {})
         model_config['scene_cut_tau'] = scene_cut_config.get('tau', 0.05)
         model_config['scene_cut_k'] = scene_cut_config.get('k', 80)
 
         model = FlashDepth(**model_config)
-
-        # Setup CLS layer selection (before moving to device)
-        self._setup_cls_layers(model)
 
         # Load pre-trained FlashDepth checkpoint
         checkpoint_path = self.config.get('load')
@@ -305,7 +276,8 @@ class OnepieceTrainer:
             loaded_dict = {}
             excluded_keys = []
             for k, v in state_dict.items():
-                if any(x in k for x in ['unified_global_mamba', 'onepiece_metric_head', 'scene_cut_detector']):
+                if any(x in k for x in ['spatial_mamba', 'onepiece_metric_head', 'scene_cut_detector',
+                                         'unified_global_mamba']):
                     excluded_keys.append(k)
                 else:
                     loaded_dict[k] = v
@@ -351,13 +323,13 @@ class OnepieceTrainer:
         return self.model.module if isinstance(self.model, DDP) else self.model
 
     def _configure_parameters_phase1(self):
-        """Phase 1: Only UnifiedGlobalMamba + OnepieceMetricHead trainable."""
+        """Phase 1: Only ConvMetricHead trainable. SpatialMamba frozen (zero-init → no-op)."""
         model = self._get_model()
         frozen_count = 0
         trainable_count = 0
 
         for name, param in model.named_parameters():
-            if 'unified_global_mamba' in name or 'onepiece_metric_head' in name:
+            if 'onepiece_metric_head' in name:
                 param.requires_grad = True
                 trainable_count += param.numel()
             else:
@@ -366,11 +338,11 @@ class OnepieceTrainer:
 
         if self.rank == 0:
             self.logger.info(f"=== Phase 1 Parameters ===")
-            self.logger.info(f"  Frozen: {frozen_count:,} (ViT + DPT + output_conv)")
-            self.logger.info(f"  Trainable: {trainable_count:,} (UnifiedGlobalMamba + OnepieceMetricHead)")
+            self.logger.info(f"  Frozen: {frozen_count:,} (ViT + DPT + SpatialMamba + output_conv)")
+            self.logger.info(f"  Trainable: {trainable_count:,} (ConvMetricHead only)")
 
     def _configure_parameters_phase2(self):
-        """Phase 2: Additionally unfreeze DPT + output_conv."""
+        """Phase 2: SpatialMamba + ConvMetricHead + DPT + output_conv trainable."""
         model = self._get_model()
         frozen_count = 0
         trainable_onepiece = 0
@@ -378,7 +350,7 @@ class OnepieceTrainer:
         trainable_output_conv = 0
 
         for name, param in model.named_parameters():
-            if 'unified_global_mamba' in name or 'onepiece_metric_head' in name:
+            if 'spatial_mamba' in name or 'onepiece_metric_head' in name:
                 param.requires_grad = True
                 trainable_onepiece += param.numel()
             elif 'depth_head' in name and 'output_conv' not in name:
@@ -398,7 +370,7 @@ class OnepieceTrainer:
         if self.rank == 0:
             self.logger.info(f"=== Phase 2 Parameters ===")
             self.logger.info(f"  Frozen: {frozen_count:,} (ViT encoder)")
-            self.logger.info(f"  Trainable Onepiece: {trainable_onepiece:,}")
+            self.logger.info(f"  Trainable Onepiece (SpatialMamba + MetricHead): {trainable_onepiece:,}")
             self.logger.info(f"  Trainable DPT: {trainable_dpt:,}")
             self.logger.info(f"  Trainable output_conv: {trainable_output_conv:,}")
             self.logger.info(f"  Total trainable: {trainable_onepiece + trainable_dpt + trainable_output_conv:,}")
@@ -413,7 +385,7 @@ class OnepieceTrainer:
                 continue
             # Keep onepiece modules in train mode
             if any(keyword in name for keyword in [
-                'unified_global_mamba', 'onepiece_metric_head',
+                'spatial_mamba', 'onepiece_metric_head',
                 'scene_cut_detector'
             ]):
                 continue
@@ -527,7 +499,7 @@ class OnepieceTrainer:
             for name, param in model.named_parameters():
                 if not param.requires_grad:
                     continue
-                if 'unified_global_mamba' in name or 'onepiece_metric_head' in name:
+                if 'spatial_mamba' in name or 'onepiece_metric_head' in name:
                     onepiece_params.append(param)
                 elif 'output_conv' in name:
                     output_conv_params.append(param)
@@ -672,8 +644,8 @@ class OnepieceTrainer:
                 postfix['l1'] = f'{loss_dict["log_l1_loss"]:.4f}'
             if 'tgm_loss' in loss_dict:
                 postfix['tgm'] = f'{loss_dict["tgm_loss"]:.4f}'
-            if 'feat_cons_loss' in loss_dict:
-                postfix['fc'] = f'{loss_dict["feat_cons_loss"]:.4f}'
+            if 'ofc_loss' in loss_dict:
+                postfix['ofc'] = f'{loss_dict["ofc_loss"]:.4f}'
             pbar.set_postfix(postfix)
 
             # WandB logging
@@ -695,16 +667,12 @@ class OnepieceTrainer:
                     log_parts.append(f"L1={loss_dict['log_l1_loss']:.4f}")
                 if 'tgm_loss' in loss_dict:
                     log_parts.append(f"TGM={loss_dict['tgm_loss']:.4f}")
-                if 'feat_cons_loss' in loss_dict:
-                    log_parts.append(f"FC={loss_dict['feat_cons_loss']:.4f}")
+                if 'ofc_loss' in loss_dict:
+                    log_parts.append(f"OFC={loss_dict['ofc_loss']:.4f}")
                 if 'mean_scale' in loss_dict:
                     log_parts.append(f"scale={loss_dict['mean_scale']:.4f}")
                 if 'mean_shift' in loss_dict:
                     log_parts.append(f"shift={loss_dict['mean_shift']:.6f}")
-                if 'mean_d_cls' in loss_dict:
-                    log_parts.append(f"D_cls={loss_dict['mean_d_cls']:.4f}")
-                if 'mean_w_temporal' in loss_dict:
-                    log_parts.append(f"W_t={loss_dict['mean_w_temporal']:.4f}")
                 log_parts.append(f"phase={self.current_phase}")
                 self.logger.info(" | ".join(log_parts))
 
@@ -772,8 +740,7 @@ class OnepieceTrainer:
 
             with torch.no_grad():
                 outputs = model.forward_with_onepiece(
-                    (images,), phase=self.current_phase, no_shift=self.no_shift,
-                    cls_layer_indices=self.encoder_indices
+                    (images,), phase=self.current_phase
                 )
 
             metric_depth = outputs['metric_depth']  # [B, T, H, W]
@@ -850,18 +817,14 @@ class OnepieceTrainer:
         # Forward pass with BFloat16 autocast
         with torch.amp.autocast('cuda', dtype=torch.bfloat16):
             outputs = model.forward_with_onepiece(
-                (images,), phase=self.current_phase, no_shift=self.no_shift,
-                cls_layer_indices=self.encoder_indices
+                (images,), phase=self.current_phase
             )
 
-            relative_depth = outputs['relative_depth']   # [B, T, H, W]
-            metric_depth = outputs['metric_depth']        # [B, T, H, W]
-            scale = outputs['scale']                      # [B, T]
-            shift = outputs['shift']                      # [B, T]
-            dpt_features = outputs['dpt_features']        # [B, T, 256, h, w]
-            cls_tokens = outputs['cls_tokens']            # [B, T, 1024]
-            scene_cut_weights = outputs['scene_cut_weights']  # [B, T-1]
-            d_cls = outputs['d_cls']                      # [B, T-1]
+            relative_depth = outputs['relative_depth']           # [B, T, H, W]
+            metric_depth = outputs['metric_depth']                # [B, T, H, W]
+            scale = outputs['scale']                              # [B, T]
+            shift = outputs['shift']                              # [B, T]
+            post_mamba_features = outputs['post_mamba_features']  # [B, T, 256, h, w]
 
         # Compute loss (outside autocast)
         with torch.amp.autocast('cuda', enabled=False):
@@ -880,30 +843,30 @@ class OnepieceTrainer:
                 actual_valid_masks = actual_valid_masks.unsqueeze(1)
             valid_mask = gt_valid & pred_valid & actual_valid_masks
 
+            # Both modes compute loss in inverse depth space (100/m)
             pred_inverse = 100.0 / metric_depth.float().clamp(min=1e-8)
             gt_inverse = gt_depth.squeeze(2).float() * 100.0
 
-            # Phase 1: skip feat_cons (DPT frozen → no gradient, wastes compute)
+            # Phase 1: LogL1 + TGM only (skip OFC, all frozen except MetricHead)
             if self.current_phase == 1:
                 total_loss, loss_components = self.loss_fn(
                     pred_depth=pred_inverse,
                     gt_depth=gt_inverse,
                     valid_mask=valid_mask.float(),
-                    dpt_features=None,
+                    post_mamba_features=None,
                     images=None,
                     flow_estimator=None,
-                    scene_cut_weights=scene_cut_weights,
                     return_components=True
                 )
             else:
+                # Phase 2: LogL1 + TGM + OFC (on post-Mamba features)
                 total_loss, loss_components = self.loss_fn(
                     pred_depth=pred_inverse,
                     gt_depth=gt_inverse,
                     valid_mask=valid_mask.float(),
-                    dpt_features=dpt_features.float(),
+                    post_mamba_features=post_mamba_features.float(),
                     images=images.float(),
                     flow_estimator=self.flow_estimator,
-                    scene_cut_weights=scene_cut_weights,
                     return_components=True
                 )
 
@@ -920,10 +883,6 @@ class OnepieceTrainer:
             'mean_shift': shift.mean().item(),
         }
         result.update(loss_components)
-
-        if d_cls.numel() > 0:
-            result['mean_d_cls'] = d_cls.mean().item()
-            result['mean_w_temporal'] = scene_cut_weights.mean().item()
 
         return result
 
@@ -1002,15 +961,12 @@ class OnepieceTrainer:
                 H, W = images.shape[3], images.shape[4]
 
                 outputs = model.forward_with_onepiece(
-                    (images,), phase=self.current_phase, no_shift=self.no_shift,
-                    cls_layer_indices=self.encoder_indices
+                    (images,), phase=self.current_phase
                 )
 
                 metric_depth = outputs['metric_depth']
                 scale = outputs['scale']
                 shift = outputs['shift']
-                dpt_features = outputs['dpt_features']
-                scene_cut_weights = outputs['scene_cut_weights']
 
             # Compute validation loss
             gt_depth_meters = 1.0 / (gt_depth.squeeze(2).float().clamp(min=1e-8))
@@ -1022,8 +978,8 @@ class OnepieceTrainer:
                     mode='bilinear', align_corners=True
                 ).squeeze(1).view(B, T, gt_depth_meters.shape[-2], gt_depth_meters.shape[-1])
 
-            # Validation uses 70m threshold to match test evaluation
-            VAL_MAX_DEPTH = 70.0
+            # Validation uses 80m threshold to match test evaluation
+            VAL_MAX_DEPTH = 80.0
             gt_valid = (gt_depth.squeeze(2) > 0) & (gt_depth_meters < VAL_MAX_DEPTH)
             pred_valid = (metric_depth > 0) & (metric_depth < VAL_MAX_DEPTH)
             if actual_valid_masks.ndim == 3:
@@ -1048,12 +1004,7 @@ class OnepieceTrainer:
                     pred_diff = pred_inverse[:, 1:] - pred_inverse[:, :-1]
                     gt_diff = gt_inverse[:, 1:] - gt_inverse[:, :-1]
                     temporal_valid = valid_mask[:, 1:] & valid_mask[:, :-1]
-                    if scene_cut_weights is not None and scene_cut_weights.numel() > 0:
-                        w = scene_cut_weights.unsqueeze(-1).unsqueeze(-1)
-                        w = w.expand_as(temporal_valid)
-                        temporal_valid_w = temporal_valid.float() * w.float()
-                    else:
-                        temporal_valid_w = temporal_valid.float()
+                    temporal_valid_w = temporal_valid.float()
                     if temporal_valid_w.sum() > 0:
                         tgm_error = (pred_diff - gt_diff).abs()
                         avg_tgm_loss = (tgm_error * temporal_valid_w).sum() / temporal_valid_w.sum().clamp(min=1)
@@ -1133,7 +1084,7 @@ class OnepieceTrainer:
             total_processed += 1
 
             # Memory cleanup
-            del images, gt_depth, metric_depth, dpt_features
+            del images, gt_depth, metric_depth
             torch.cuda.empty_cache()
 
         # Compute averages

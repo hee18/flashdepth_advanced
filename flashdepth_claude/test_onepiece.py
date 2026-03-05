@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Test script for Onepiece: Unified Global Mamba Metric Depth Estimation
+Test script for Onepiece V3: Spatial Mamba + Dual-Stream Metric Depth Estimation
 
 Tests on: sintel, waymo_seg, eth3d, urbansyn, unreal4k, bonn
 Metrics: MAE, RMSE, AbsRel, d1/d2/d3, TAE (reprojection), FPS
@@ -62,8 +62,8 @@ class OnepieceTester:
         self.config = config
         self.device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
-        # No-shift mode
-        self.no_shift = config.get('no_shift', False)
+        # Max depth for evaluation
+        self.max_depth = config.get('max_depth', 80.0)
 
         # Save directory
         save_dir_str = config.get('results_dir', config.eval.outfolder)
@@ -114,56 +114,25 @@ class OnepieceTester:
         # Test mode: None (full), 'tc' (temporal consistency only), 'ea' (error & accuracy only)
         self.test_mode = config.get('test_mode', None)
 
-    def _setup_cls_layers(self, model):
-        """Parse cls_layers config and compute encoder indices for multi-layer CLS averaging."""
-        cls_layers = self.config.get('cls_layers', [2, 4])
-
-        # Convert OmegaConf ListConfig to plain Python list
-        if isinstance(cls_layers, ListConfig):
-            cls_layers = OmegaConf.to_container(cls_layers)
-
-        # Ensure it's a flat list of integers
-        if isinstance(cls_layers, (list, tuple)):
-            cls_layers = [int(x) for x in cls_layers]
-        elif isinstance(cls_layers, str):
-            cls_layers = cls_layers.strip('[]').split(',')
-            cls_layers = [int(x.strip()) for x in cls_layers if x.strip()]
-        else:
-            cls_layers = [int(cls_layers)]
-
-        # Validate cls_layers (must be 1-4)
-        for layer in cls_layers:
-            if layer < 1 or layer > 4:
-                raise ValueError(f"cls_layers must be between 1 and 4, got {layer}")
-
-        # Convert user's 1-indexed layer numbers to 0-indexed encoder_indices
-        intermediate_idx = model.intermediate_layer_idx[model.encoder]
-        encoder_indices = [layer - 1 for layer in cls_layers]
-        target_blocks = [intermediate_idx[idx] for idx in encoder_indices]
-
-        logger.info(f"CLS layer selection: user specified layers {cls_layers}")
-        logger.info(f"  → encoder_indices: {encoder_indices}")
-        logger.info(f"  → target_blocks: {target_blocks} (actual ViT block indices)")
-
-        self.cls_layers = cls_layers
-        self.encoder_indices = encoder_indices
-        self.target_blocks = target_blocks
-
     def _setup_model(self):
-        """Load trained Onepiece model."""
+        """Load trained Onepiece V3 model."""
         model_config = dict(self.config.model)
         model_config['batch_size'] = 1
         model_config['use_metric_head'] = False
         model_config['use_onepiece'] = True
+
+        # Spatial Mamba config
+        model_config['spatial_mamba_layers'] = self.config.model.get('spatial_mamba_layers', 4)
+        model_config['spatial_mamba_d_state'] = self.config.model.get('spatial_mamba_d_state', 256)
+        model_config['spatial_mamba_d_conv'] = self.config.model.get('spatial_mamba_d_conv', 4)
+        model_config['spatial_mamba_downsample'] = self.config.model.get('spatial_mamba_downsample', 0.1)
+        model_config['onepiece_train_mode'] = self.config.get('train_mode', 'metric')
 
         scene_cut_config = self.config.get('scene_cut', {})
         model_config['scene_cut_tau'] = scene_cut_config.get('tau', 0.05)
         model_config['scene_cut_k'] = scene_cut_config.get('k', 80)
 
         model = FlashDepth(**model_config)
-
-        # Setup CLS layer selection
-        self._setup_cls_layers(model)
 
         checkpoint_path = self.config.get('load')
         if checkpoint_path and os.path.exists(checkpoint_path):
@@ -503,7 +472,7 @@ class OnepieceTester:
         if actual_valid_mask is not None:
             canonical_gt_valid = actual_valid_mask.unsqueeze(2)
         else:
-            MIN_INVERSE_CANONICAL = 100.0 / 70.0
+            MIN_INVERSE_CANONICAL = 100.0 / self.max_depth
             canonical_gt_valid = (gt_depth_inverse_100 > MIN_INVERSE_CANONICAL)
 
         # === FPS Measurement ===
@@ -515,10 +484,7 @@ class OnepieceTester:
             # Warmup: run warmup_frames to JIT-compile CUDA kernels (excluded from FPS)
             if T > warmup_frames:
                 warmup_images = images[:, :warmup_frames]
-                _ = self.model.forward_with_onepiece_streaming(
-                    warmup_images, phase=2, no_shift=self.no_shift,
-                    cls_layer_indices=self.encoder_indices
-                )
+                _ = self.model.forward_with_onepiece_streaming(warmup_images)
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()
 
@@ -526,10 +492,7 @@ class OnepieceTester:
             torch.cuda.synchronize()
             start_time = time.time()
 
-            outputs = self.model.forward_with_onepiece_streaming(
-                images, phase=2, no_shift=self.no_shift,
-                cls_layer_indices=self.encoder_indices
-            )
+            outputs = self.model.forward_with_onepiece_streaming(images)
 
             torch.cuda.synchronize()
             end_time = time.time()
@@ -546,7 +509,7 @@ class OnepieceTester:
         relative_depth_out = outputs['relative_depth'].float()  # [B, T, H, W] (canonical inv depth)
         scale = outputs['scale'].float()  # [B, T]
         shift = outputs['shift'].float()  # [B, T]
-        d_cls = outputs['d_cls'].float()  # [B, T-1]
+        reset_frames = outputs.get('reset_frames', [])  # list of frame indices
 
         # depth_from_relative in canonical meters (same input space as model's scale/shift)
         dfr_canonical = 100.0 / (relative_depth_out + 1e-8)  # [B, T, H, W]
@@ -580,7 +543,7 @@ class OnepieceTester:
                     mode='bilinear', align_corners=False
                 ).unsqueeze(0)  # [1, T, 3, H, W]
 
-        MAX_DEPTH = 70.0
+        MAX_DEPTH = self.max_depth
 
         # === TC-only mode: skip per-frame metrics, depth range, TAE ===
         if self.test_mode == 'tc':
@@ -749,13 +712,13 @@ class OnepieceTester:
         metrics['_per_frame_optimal_scales'] = per_frame_optimal_scales
         metrics['_per_frame_optimal_shifts'] = per_frame_optimal_shifts
 
-        # D_cls stats
-        if d_cls.numel() > 0:
-            metrics['mean_d_cls'] = float(d_cls.mean())
-            metrics['max_d_cls'] = float(d_cls.max())
+        # Reset frames info (from SCD at inference)
+        if reset_frames:
+            metrics['reset_frames'] = reset_frames
+            metrics['num_resets'] = len(reset_frames)
 
         # === Depth range analysis ===
-        depth_ranges = [(0, 10), (10, 30), (30, 70)]
+        depth_ranges = [(0, 10), (10, 30), (30, int(self.max_depth))]
         depth_range_metrics = {}
         for depth_min, depth_max in depth_ranges:
             range_name = f"{depth_min}-{depth_max}m"
@@ -979,7 +942,7 @@ class OnepieceTester:
         """Save depth sequence as GIF/MP4."""
         try:
             from utils.gear_video_utils import save_video as save_video_util
-            valid_mask = (gt_depths > 0) & (gt_depths < 70.0)
+            valid_mask = (gt_depths > 0) & (gt_depths < self.max_depth)
             save_video_util(
                 images, pred_depths, gt_depths, valid_mask, sequence_id,
                 save_dir=self.save_dir, config=self.config
@@ -990,7 +953,7 @@ class OnepieceTester:
     def _visualize_sequence(self, images, pred_depths, gt_depths, sequence_id, metrics):
         """Save per-frame PNGs: 1x3 grid (Image, GT, Pred)."""
         T = images.shape[0]
-        MAX_DEPTH = 70.0
+        MAX_DEPTH = self.max_depth
         seq_dir = self.save_dir / "frames" / f"seq{sequence_id:04d}"
         seq_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1056,7 +1019,7 @@ class OnepieceTester:
     def _save_error_heatmaps(self, pred_depths, gt_depths, sequence_id, metrics=None):
         """Save per-frame error heatmaps with scale/shift overlay."""
         T = pred_depths.shape[0]
-        MAX_DEPTH = 70.0
+        MAX_DEPTH = self.max_depth
         heatmap_dir = self.save_dir / "error_heatmaps" / f"seq{sequence_id:04d}"
         heatmap_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1110,9 +1073,9 @@ class OnepieceTester:
         3x3 grid (no importance/FG/BG row):
             Row 1: Input, GT Depth, Pred Depth
             Row 2: Scale/Shift Plot, Error Map, Metrics Panel
-            Row 3: Depth Distribution (colspan=2), D_cls Plot
+            Row 3: Depth Distribution (colspan=2), Reset Frames
         """
-        MAX_DEPTH = 70.0
+        MAX_DEPTH = self.max_depth
         vis_dir = self.save_dir / f"{frame_type}_frames"
         vis_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1228,7 +1191,7 @@ class OnepieceTester:
         ax6.set_title('Metrics', fontsize=12, fontweight='bold')
         ax6.axis('off')
 
-        # Row 3: Depth Distribution + D_cls
+        # Row 3: Depth Distribution + Reset Frames
         ax7 = fig.add_subplot(gs[2, :2])
         if valid_mask.sum() > 0:
             gt_vals = gt[valid_mask]
@@ -1244,16 +1207,15 @@ class OnepieceTester:
         ax7.set_title('Depth Distribution', fontsize=12, fontweight='bold')
 
         ax8 = fig.add_subplot(gs[2, 2])
-        d_cls_vals = seq_metrics.get('_d_cls_values', None)
-        if d_cls_vals is not None and len(d_cls_vals) > 0:
-            ax8.plot(range(len(d_cls_vals)), d_cls_vals, 'purple', linewidth=1)
-            ax8.set_xlabel('Frame pair')
-            ax8.set_ylabel('D_cls')
-            ax8.grid(True, alpha=0.3)
-        else:
-            ax8.text(0.5, 0.5, f'D_cls: {seq_metrics.get("mean_d_cls", "N/A")}',
-                    ha='center', va='center', transform=ax8.transAxes, fontsize=12)
-        ax8.set_title('CLS Distance', fontsize=12, fontweight='bold')
+        reset_frames_list = seq_metrics.get('reset_frames', [])
+        num_resets = seq_metrics.get('num_resets', 0)
+        info_text = f'Resets: {num_resets}'
+        if reset_frames_list:
+            info_text += f'\nFrames: {reset_frames_list}'
+        ax8.text(0.5, 0.5, info_text,
+                ha='center', va='center', transform=ax8.transAxes, fontsize=12)
+        ax8.set_title('Scene Cut Resets', fontsize=12, fontweight='bold')
+        ax8.axis('off')
 
         save_path = vis_dir / f"{frame_type}_frame_seq{sequence_id:04d}_{t}_absrel_{abs_rel_frame:.4f}.png"
         plt.savefig(save_path, dpi=100, bbox_inches='tight')
@@ -1277,7 +1239,7 @@ class OnepieceTester:
         import matplotlib
 
         T = images.shape[0]
-        MAX_DEPTH = 70.0
+        MAX_DEPTH = self.max_depth
 
         # Determine frame range with frame_interval support
         frame_interval = self.frame_interval if self.frame_interval is not None else 1
@@ -1610,6 +1572,11 @@ def main(config: DictConfig):
         else:
             OmegaConf.update(config, 'frame', frame_indices, force_add=True)
 
+    # Apply --max-depth if passed via sys.argv preprocessing
+    max_depth_arg = getattr(main, '_max_depth_arg', None)
+    if max_depth_arg is not None:
+        OmegaConf.update(config, 'max_depth', float(max_depth_arg), force_add=True)
+
     tester = OnepieceTester(config)
     tester.test()
 
@@ -1617,9 +1584,10 @@ def main(config: DictConfig):
 if __name__ == "__main__":
     import sys
 
-    # Handle --test-mode and --frame flags BEFORE Hydra processes arguments
+    # Handle --test-mode, --frame, --max-depth flags BEFORE Hydra processes arguments
     test_mode = None
     frame_arg = None
+    max_depth_arg = None
     new_argv = []
     i = 0
     while i < len(sys.argv):
@@ -1635,6 +1603,12 @@ if __name__ == "__main__":
         elif sys.argv[i].startswith('--frame='):
             frame_arg = sys.argv[i].split('=', 1)[1]
             i += 1
+        elif sys.argv[i] == '--max-depth' and i + 1 < len(sys.argv):
+            max_depth_arg = sys.argv[i + 1]
+            i += 2
+        elif sys.argv[i].startswith('--max-depth='):
+            max_depth_arg = sys.argv[i].split('=', 1)[1]
+            i += 1
         else:
             new_argv.append(sys.argv[i])
             i += 1
@@ -1643,5 +1617,6 @@ if __name__ == "__main__":
     # Store as function attributes so main() can access them
     main._test_mode = test_mode
     main._frame_arg = frame_arg
+    main._max_depth_arg = max_depth_arg
 
     main()

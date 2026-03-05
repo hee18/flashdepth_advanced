@@ -1,13 +1,15 @@
 """
-Onepiece Core Modules for FlashDepth-Metric.
+Onepiece V3 Core Modules for FlashDepth-Metric.
 
-Architecture:
-    CLS(1024) + DPT GAP(256) → Unified Global Mamba(1280) → Metric Head + FiLM
+Architecture (Dual-Stream):
+    DPT features → SpatialMamba (downsample→Mamba→final_layer→upsample+add)
+        → Relative stream: post_mamba [B*T, 256, h, w] → final_head → relative depth
+        → Metric stream: mamba_raw [B*T, 256, h', w'] → ConvMetricHead → scale, shift
 
 Components:
-    1. UnifiedGlobalMamba: 2-layer Mamba2 on concatenated CLS+GAP tokens (1280-dim)
-    2. OnepieceMetricHead: Scale/Shift prediction + FiLM spatial guidance
-    3. SceneCutDetector: CLS cosine distance for scene cut detection
+    1. SpatialMamba: FlashDepth-style spatial Mamba on 1/10 downsampled DPT features
+    2. ConvMetricHead: Conv-based scale/shift prediction from low-res Mamba output
+    3. SceneCutDetector: CLS cosine distance for scene cut detection (inference only)
 """
 
 import torch
@@ -15,66 +17,134 @@ import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass, field
 import logging
+from einops import rearrange
 
 from .mamba import MambaBlock, InferenceParams
 
 logger = logging.getLogger(__name__)
 
 
-class UnifiedGlobalMamba(nn.Module):
+# ============================================================================
+# V1/V2 modules — commented out for reference
+# ============================================================================
+
+# class UnifiedGlobalMamba(nn.Module):
+#     """
+#     V1: Unified Global Mamba on CLS + GAP concatenated tokens (1280-dim).
+#     Replaced by SpatialMamba in V3.
+#     """
+#     def __init__(self, d_input, num_layers=2, d_state=64, d_conv=4,
+#                  expand=2, headdim=64, max_batch_size=8):
+#         super().__init__()
+#         d_model = self._find_valid_mamba_dim(d_input, expand, headdim)
+#         self.d_input = d_input
+#         self.d_model = d_model
+#         self.num_layers = num_layers
+#         if d_input != d_model:
+#             self.input_proj = nn.Linear(d_input, d_model)
+#             self.output_proj = nn.Linear(d_model, d_input)
+#         else:
+#             self.input_proj = None
+#             self.output_proj = None
+#         nheads = d_model * expand // headdim
+#         assert nheads % 8 == 0
+#         self.blocks = nn.ModuleList([
+#             MambaBlock(d_model=d_model, layer_idx=i, expand=expand,
+#                        d_state=d_state, d_conv=d_conv, headdim=headdim, use_hydra=False)
+#             for i in range(num_layers)
+#         ])
+#         self.max_seqlen = 60000
+#         self.max_batch_size = max_batch_size
+#         self.inference_params = None
+#
+#     @staticmethod
+#     def _find_valid_mamba_dim(d_input, expand, headdim):
+#         unit = headdim * 8 // expand
+#         d_model = ((d_input + unit - 1) // unit) * unit
+#         return d_model
+#
+#     def start_new_sequence(self):
+#         self.inference_params = InferenceParams(
+#             max_seqlen=self.max_seqlen, max_batch_size=self.max_batch_size)
+#
+#     def forward(self, x):
+#         B, T, D = x.shape
+#         if self.input_proj is not None:
+#             x = self.input_proj(x)
+#         for block in self.blocks:
+#             x = block(x, inference_params=None)
+#         if self.output_proj is not None:
+#             x = self.output_proj(x)
+#         return x
+#
+#     def forward_single_frame(self, x):
+#         if self.inference_params is None:
+#             self.start_new_sequence()
+#         if self.input_proj is not None:
+#             x = self.input_proj(x)
+#         for block in self.blocks:
+#             x = block(x, inference_params=self.inference_params)
+#         if self.output_proj is not None:
+#             x = self.output_proj(x)
+#         self.inference_params.seqlen_offset += x.shape[1]
+#         return x
+
+# class OnepieceMetricHead(nn.Module):
+#     """
+#     V1: MLP-based scale/shift + FiLM from refined global token (1280-dim).
+#     Replaced by ConvMetricHead in V3.
+#     """
+#     def __init__(self, input_dim=1280, dpt_dim=256, hidden_dim=512):
+#         super().__init__()
+#         self.input_dim = input_dim
+#         self.dpt_dim = dpt_dim
+#         self.scale_shift_mlp = nn.Sequential(
+#             nn.Linear(input_dim, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, 2))
+#         self.film_generator = nn.Sequential(
+#             nn.Linear(dpt_dim, dpt_dim), nn.ReLU(), nn.Linear(dpt_dim, dpt_dim * 2))
+#
+#     def forward(self, refined_global):
+#         scale_shift = self.scale_shift_mlp(refined_global)
+#         raw_scale, raw_shift = scale_shift[:, 0:1], scale_shift[:, 1:2]
+#         scale = F.softplus(raw_scale)
+#         shift = 0.1 * torch.sigmoid(raw_shift)
+#         refined_gap = refined_global[:, -self.dpt_dim:]
+#         film_out = self.film_generator(refined_gap)
+#         gamma_raw, beta = film_out.chunk(2, dim=-1)
+#         gamma = 1.0 + gamma_raw
+#         return scale, shift, gamma, beta
+
+
+# ============================================================================
+# V3 modules
+# ============================================================================
+
+class SpatialMamba(nn.Module):
     """
-    Unified Global Mamba: Temporal processing on CLS + GAP concatenated tokens.
+    Spatial Mamba for temporal processing of DPT features.
+    Reuses FlashDepth's architecture: downsample → Mamba blocks → final_layer → upsample + add.
 
-    ViT-L: CLS(1024) + GAP(256) = 1280-dim → d_model=1280 (valid for Mamba2)
-    ViT-S: CLS(384) + GAP(64) = 448-dim → projected to d_model=512 (448 is not Mamba2-valid)
-
-    Uses 2 MambaBlock layers with expand=2, headdim=64.
-    Constraint: d_model * expand / headdim must be multiple of 8.
-
-    When d_input != d_model, input/output projection layers are added automatically.
-
-    Two forward modes:
-        - forward(x): Batch mode for training (parallel scan on full [B, T, D])
-        - forward_single_frame(x): Streaming mode for inference (per-frame with hidden state)
-
-    NOTE - Architectural option (not yet implemented):
-        Current ViT-L uses d_model=1280 (46.36M params) for 514 output values (2 scale/shift + 512 FiLM).
-        Alternative: project CLS 1024→256 before concat → d_input=512, d_model=512 (~5.4M per 2 layers).
-        This would reduce Mamba params by ~6x while keeping the same output dimensionality.
-        See Onepiece.md "Architectural Option: CLS Dimension Reduction" for details.
+    Input: DPT features [B*T, dpt_dim, h, w]
+    Output: post_mamba [B*T, dpt_dim, h, w] = DPT + upsample(final_layer(mamba_out))
+            mamba_raw [B*T, dpt_dim, h', w'] = low-res Mamba output (for MetricHead)
     """
 
-    def __init__(self, d_input, num_layers=2, d_state=64, d_conv=4,
-                 expand=2, headdim=64, max_batch_size=8):
+    def __init__(self, dpt_dim=256, num_layers=4, d_state=256, d_conv=4,
+                 expand=2, headdim=64, downsample_factor=0.1, max_batch_size=8):
         super().__init__()
 
-        # Find valid Mamba2 dimension >= d_input
-        d_model = self._find_valid_mamba_dim(d_input, expand, headdim)
+        # ViT-S override (matching FlashDepth MambaModel)
+        if dpt_dim == 64:
+            expand = 4
+            headdim = 32
 
-        self.d_input = d_input
-        self.d_model = d_model
-        self.num_layers = num_layers
+        self.dpt_dim = dpt_dim
+        self.downsample_factor = downsample_factor
 
-        # Add projection layers if raw concat dim is not Mamba2-valid
-        if d_input != d_model:
-            self.input_proj = nn.Linear(d_input, d_model)
-            self.output_proj = nn.Linear(d_model, d_input)
-            logger.info(f"UnifiedGlobalMamba: projection {d_input} → {d_model} → {d_input}")
-        else:
-            self.input_proj = None
-            self.output_proj = None
-
-        # Validate dimensions
-        nheads = d_model * expand // headdim
-        assert nheads % 8 == 0, (
-            f"d_model({d_model}) * expand({expand}) / headdim({headdim}) = {nheads}, "
-            f"must be multiple of 8"
-        )
-
-        # Mamba blocks
+        # Mamba blocks (flat list, single DPT layer insertion point)
         self.blocks = nn.ModuleList([
             MambaBlock(
-                d_model=d_model,
+                d_model=dpt_dim,
                 layer_idx=i,
                 expand=expand,
                 d_state=d_state,
@@ -85,186 +155,223 @@ class UnifiedGlobalMamba(nn.Module):
             for i in range(num_layers)
         ])
 
+        # final_layer: GELU + Linear with ZERO INIT (identity at init)
+        self.final_layer = nn.Sequential(
+            nn.GELU(),
+            nn.Linear(dpt_dim, dpt_dim)
+        )
+        nn.init.zeros_(self.final_layer[1].weight)
+        nn.init.zeros_(self.final_layer[1].bias)
+
         # Inference state
         self.max_seqlen = 60000
         self.max_batch_size = max_batch_size
         self.inference_params = None
 
         logger.info(
-            f"UnifiedGlobalMamba: d_input={d_input}, d_model={d_model}, layers={num_layers}, "
+            f"SpatialMamba: dpt_dim={dpt_dim}, layers={num_layers}, "
             f"d_state={d_state}, d_conv={d_conv}, expand={expand}, headdim={headdim}, "
-            f"nheads={nheads}"
+            f"downsample={downsample_factor}"
         )
 
-    @staticmethod
-    def _find_valid_mamba_dim(d_input, expand, headdim):
-        """Find nearest d_model >= d_input satisfying Mamba2 nheads constraint."""
-        # Constraint: (d_model * expand / headdim) % 8 == 0
-        # → d_model must be multiple of (headdim * 8 / expand)
-        unit = headdim * 8 // expand
-        d_model = ((d_input + unit - 1) // unit) * unit
-        return d_model
-
     def start_new_sequence(self):
-        """Reset hidden state for new video sequence (inference mode)."""
+        """Reset Mamba hidden state for new video sequence."""
         self.inference_params = InferenceParams(
             max_seqlen=self.max_seqlen,
             max_batch_size=self.max_batch_size
         )
 
-    def forward(self, x):
+    def forward(self, dpt_features, B, T):
         """
-        Batch forward for training.
+        Batch training mode (per-frame loop with hidden state, matching FlashDepth).
 
         Args:
-            x: [B, T, d_input] concatenated CLS + GAP tokens
+            dpt_features: [B*T, dpt_dim, h, w] DPT path_1 features
+            B: batch size
+            T: number of frames
 
         Returns:
-            out: [B, T, d_input] temporally refined tokens
+            post_mamba: [B*T, dpt_dim, h, w] = DPT + upsample(final_layer(mamba_out))
+            mamba_raw_spatial: [B*T, dpt_dim, h', w'] = low-res Mamba output
         """
-        B, T, D = x.shape
-        assert D == self.d_input, f"Expected d_input={self.d_input}, got {D}"
+        BT, c, h, w = dpt_features.shape
+        assert BT == B * T, f"Expected {B*T}, got {BT}"
 
-        # Project to Mamba2-valid dimension if needed
-        if self.input_proj is not None:
-            x = self.input_proj(x)
+        # Save original for residual add
+        original = rearrange(dpt_features, '(b t) c h w -> b t c h w', b=B, t=T)
 
-        for block in self.blocks:
-            x = block(x, inference_params=None)
+        # Downsample
+        h_down = max(int(h * self.downsample_factor), 1)
+        w_down = max(int(w * self.downsample_factor), 1)
+        down = F.adaptive_avg_pool2d(dpt_features, (h_down, w_down))  # [B*T, c, h', w']
 
-        # Project back to original dimension
-        if self.output_proj is not None:
-            x = self.output_proj(x)
+        # Reshape for per-frame processing: [B, T, h'*w', c]
+        down_seq = rearrange(down, '(b t) c h w -> b t (h w) c', b=B, t=T)
 
-        return x
+        # Initialize fresh inference params for training
+        self.start_new_sequence()
 
-    def forward_single_frame(self, x):
+        # Per-frame Mamba processing (matching FlashDepth pattern)
+        mamba_outs = []
+        for i in range(T):
+            x = down_seq[:, i]  # [B, h'*w', c]
+            for block in self.blocks:
+                x = block(x, inference_params=self.inference_params)
+            self.inference_params.seqlen_offset += x.shape[1]
+            mamba_outs.append(x)
+
+        mamba_out = torch.stack(mamba_outs, dim=1)  # [B, T, h'*w', c]
+
+        # Raw spatial output for MetricHead (before final_layer)
+        mamba_raw_spatial = rearrange(
+            mamba_out, 'b t (h w) c -> (b t) c h w', h=h_down, w=w_down
+        )
+
+        # Upsample + final_layer + residual add (matching FlashDepth dpt_features_to_mamba)
+        post_mamba_list = []
+        for i in range(T):
+            # Upsample low-res mamba output to original DPT resolution
+            frame_raw = rearrange(
+                mamba_out[:, i], 'b (h w) c -> b c h w', h=h_down, w=w_down
+            )
+            upsampled = F.interpolate(frame_raw, (h, w), mode='bilinear', align_corners=True)
+
+            # Apply final_layer (zero-init → identity at start)
+            up_flat = rearrange(upsampled, 'b c h w -> b (h w) c')
+            final_out = self.final_layer(up_flat)
+            final_spatial = rearrange(final_out, 'b (h w) c -> b c h w', h=h, w=w)
+
+            # Residual add with original DPT features
+            post = final_spatial + original[:, i]
+            post_mamba_list.append(post)
+
+        post_mamba = torch.stack(post_mamba_list, dim=1)  # [B, T, c, h, w]
+        post_mamba = rearrange(post_mamba, 'b t c h w -> (b t) c h w')
+
+        return post_mamba, mamba_raw_spatial
+
+    def forward_single_frame(self, dpt_features_single):
         """
-        Single-frame forward for streaming inference.
+        Streaming inference mode. Single frame with hidden state.
 
         Args:
-            x: [B, 1, d_input] single frame token
+            dpt_features_single: [B, dpt_dim, h, w]
 
         Returns:
-            out: [B, 1, d_input] refined token
+            post_mamba: [B, dpt_dim, h, w]
+            mamba_raw_spatial: [B, dpt_dim, h', w']
         """
         if self.inference_params is None:
             self.start_new_sequence()
 
-        # Project to Mamba2-valid dimension if needed
-        if self.input_proj is not None:
-            x = self.input_proj(x)
+        B, c, h, w = dpt_features_single.shape
 
+        # Save original for residual
+        original = dpt_features_single
+
+        # Downsample
+        h_down = max(int(h * self.downsample_factor), 1)
+        w_down = max(int(w * self.downsample_factor), 1)
+        down = F.adaptive_avg_pool2d(dpt_features_single, (h_down, w_down))
+
+        # Reshape: [B, h'*w', c]
+        x = rearrange(down, 'b c h w -> b (h w) c')
+
+        # Mamba blocks with hidden state
         for block in self.blocks:
             x = block(x, inference_params=self.inference_params)
-
-        # Project back to original dimension
-        if self.output_proj is not None:
-            x = self.output_proj(x)
-
         self.inference_params.seqlen_offset += x.shape[1]
-        return x
+
+        # Raw spatial output for MetricHead
+        mamba_raw_spatial = rearrange(x, 'b (h w) c -> b c h w', h=h_down, w=w_down)
+
+        # Upsample + final_layer + residual
+        upsampled = F.interpolate(mamba_raw_spatial, (h, w), mode='bilinear', align_corners=True)
+        up_flat = rearrange(upsampled, 'b c h w -> b (h w) c')
+        final_out = self.final_layer(up_flat)
+        final_spatial = rearrange(final_out, 'b (h w) c -> b c h w', h=h, w=w)
+
+        post_mamba = final_spatial + original
+
+        return post_mamba, mamba_raw_spatial
 
 
-class OnepieceMetricHead(nn.Module):
+class ConvMetricHead(nn.Module):
     """
-    Metric Head with dual output paths:
-        Path A: Scale/Shift prediction from refined global token (1280-dim)
-        Path B: FiLM spatial guidance from refined GAP position (256-dim)
+    Conv-based scale/shift prediction from low-res Mamba output.
 
-    Scale: softplus(raw_scale) → always positive
-    Shift: 0.1 * sigmoid(raw_shift) → range [0, 0.1]
-    FiLM: gamma = 1 + gamma_raw (residual), beta = beta_raw
+    Input: [B*T, dpt_dim, h', w'] (Mamba raw output, NOT upsampled)
+    Output: scale [B*T, 1], shift [B*T, 1]
+
+    Pipeline: Conv1x1(dpt_dim→hidden) → ReLU → Conv1x1(hidden→2) → GAP → scale/shift
     """
 
-    def __init__(self, input_dim=1280, dpt_dim=256, hidden_dim=512):
+    def __init__(self, dpt_dim=256, hidden_dim=64, train_mode="metric"):
         super().__init__()
+        self.train_mode = train_mode
 
-        self.input_dim = input_dim
-        self.dpt_dim = dpt_dim
-
-        # Path A: Scale/Shift prediction
-        self.scale_shift_mlp = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
+        self.conv = nn.Sequential(
+            nn.Conv2d(dpt_dim, hidden_dim, 1),
             nn.ReLU(),
-            nn.Linear(hidden_dim, 2)  # [raw_scale, raw_shift]
+            nn.Conv2d(hidden_dim, 2, 1)
         )
 
-        # Path B: FiLM generator (from GAP-position slice of refined global)
-        self.film_generator = nn.Sequential(
-            nn.Linear(dpt_dim, dpt_dim),
-            nn.ReLU(),
-            nn.Linear(dpt_dim, dpt_dim * 2)  # [gamma, beta] each dpt_dim
-        )
-
-        # Initialize weights
         self._initialize_weights()
 
+        logger.info(f"ConvMetricHead: dpt_dim={dpt_dim}, hidden={hidden_dim}, mode={train_mode}")
+
     def _initialize_weights(self):
-        """Initialize for stable training start."""
-        # Xavier init for all linear layers
+        """Initialize for stable training start (matching V1 OnepieceMetricHead)."""
         for module in self.modules():
-            if isinstance(module, nn.Linear):
+            if isinstance(module, nn.Conv2d):
                 nn.init.xavier_uniform_(module.weight)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
 
-        # Scale/Shift initialization
+        # Scale/Shift initialization on final conv
         with torch.no_grad():
-            # Scale bias: softplus(x) ≈ 1.0 when x ≈ 0.5413
-            # Start with scale ≈ 1.0
-            self.scale_shift_mlp[-1].bias.data[0] = 0.5413  # softplus(0.5413) ≈ 1.0
+            # Scale bias: softplus(0.5413) ≈ 1.0
+            self.conv[-1].bias.data[0] = 0.5413
+            # Shift bias: 0.1 * sigmoid(-5) ≈ 0
+            self.conv[-1].bias.data[1] = -5.0
 
-            # Shift bias: 0.1 * sigmoid(x) = 0 when x → -inf, but we want ~0
-            # sigmoid(-5) ≈ 0.0067, so 0.1 * 0.0067 ≈ 0.0007 ≈ 0
-            self.scale_shift_mlp[-1].bias.data[1] = -5.0
+        logger.info("ConvMetricHead initialized: scale≈1.0, shift≈0.0")
 
-        # FiLM zero-init: gamma=0 → 1+0=1 (identity), beta=0
-        with torch.no_grad():
-            nn.init.zeros_(self.film_generator[-1].weight)
-            nn.init.zeros_(self.film_generator[-1].bias)
-
-        logger.info("OnepieceMetricHead initialized: scale≈1.0, shift≈0.0, FiLM=identity")
-
-    def forward(self, refined_global):
+    def forward(self, mamba_raw):
         """
         Args:
-            refined_global: [B*T, 1280] refined global tokens from UnifiedGlobalMamba
+            mamba_raw: [B*T, dpt_dim, h', w'] low-res Mamba output
 
         Returns:
             scale: [B*T, 1] positive scale values
-            shift: [B*T, 1] shift values in [0, 0.1]
-            gamma: [B*T, dpt_dim] FiLM multiplicative factor (centered at 1)
-            beta: [B*T, dpt_dim] FiLM additive factor
+            shift: [B*T, 1] shift values
         """
-        # Path A: Scale/Shift
-        scale_shift = self.scale_shift_mlp(refined_global)  # [B*T, 2]
-        raw_scale, raw_shift = scale_shift[:, 0:1], scale_shift[:, 1:2]
+        out = self.conv(mamba_raw)  # [B*T, 2, h', w']
+
+        # Global average pooling
+        out = F.adaptive_avg_pool2d(out, 1).squeeze(-1).squeeze(-1)  # [B*T, 2]
+        raw_scale, raw_shift = out[:, 0:1], out[:, 1:2]
 
         scale = F.softplus(raw_scale)  # Always positive
-        shift = 0.1 * torch.sigmoid(raw_shift)  # Range [0, 0.1]
 
-        # Path B: FiLM from GAP-position slice (last 256 dims of 1280)
-        refined_gap = refined_global[:, -self.dpt_dim:]  # [B*T, 256]
-        film_out = self.film_generator(refined_gap)  # [B*T, 512]
-        gamma_raw, beta = film_out.chunk(2, dim=-1)  # Each [B*T, 256]
+        if self.train_mode == "metric":
+            shift = 0.1 * torch.sigmoid(raw_shift)  # Range [0, 0.1]
+        else:  # inverse mode
+            shift = raw_shift  # Unconstrained
 
-        gamma = 1.0 + gamma_raw  # Residual: identity when gamma_raw=0
-
-        return scale, shift, gamma, beta
+        return scale, shift
 
 
 class SceneCutDetector(nn.Module):
     """
     Scene Cut Detector using CLS token cosine distance.
+    Used at inference only (not in training forward pass for V3).
 
     D_cls = 1 - cos_sim(CLS_t, CLS_{t-1})
     W_temporal = 1 - sigmoid(k * (D_cls - tau))
 
-    When D_cls < tau: W_temporal ≈ 1.0 (same scene, keep temporal loss)
-    When D_cls > tau: W_temporal ≈ 0.0 (scene cut, suppress temporal loss)
-
-    Applied to TGM loss and Feature Consistency loss (NOT Log L1, which is per-frame).
+    When D_cls < tau: W_temporal ≈ 1.0 (same scene, keep temporal state)
+    When D_cls > tau: W_temporal ≈ 0.0 (scene cut, reset Mamba state)
     """
 
     def __init__(self, tau=0.05, k=80):
@@ -276,7 +383,7 @@ class SceneCutDetector(nn.Module):
     def forward(self, cls_tokens):
         """
         Args:
-            cls_tokens: [B, T, 1024] CLS tokens per frame
+            cls_tokens: [B, T, embed_dim] CLS tokens per frame
 
         Returns:
             temporal_weights: [B, T-1] weights (1.0=keep, 0.0=cut)
@@ -291,13 +398,13 @@ class SceneCutDetector(nn.Module):
             )
 
         # Compute cosine similarity between consecutive frames
-        cls_t = F.normalize(cls_tokens[:, 1:], dim=-1)    # [B, T-1, D]
+        cls_t = F.normalize(cls_tokens[:, 1:], dim=-1)      # [B, T-1, D]
         cls_t_prev = F.normalize(cls_tokens[:, :-1], dim=-1)  # [B, T-1, D]
 
         cos_sim = (cls_t * cls_t_prev).sum(dim=-1)  # [B, T-1]
         d_cls = 1.0 - cos_sim  # Cosine distance [0, 2]
 
         # Soft thresholding
-        temporal_weights = 1.0 - torch.sigmoid(self.k * (d_cls - self.tau))  # [B, T-1]
+        temporal_weights = 1.0 - torch.sigmoid(self.k * (d_cls - self.tau))
 
         return temporal_weights, d_cls
