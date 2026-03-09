@@ -476,59 +476,88 @@ class OnepieceTester:
             MIN_INVERSE_CANONICAL = 100.0 / self.max_depth
             canonical_gt_valid = (gt_depth_inverse_100 > MIN_INVERSE_CANONICAL)
 
-        # === FPS Measurement ===
-        warmup_frames = min(5, T)
+        # === Per-frame streaming inference ===
+        base_dataset_name = dataset_name.split('/')[0] if isinstance(dataset_name, str) else 'unknown'
+        if base_dataset_name == 'eth3d':
+            warmup_frames = min(5, T)
+        else:
+            warmup_frames = min(10, T)
 
-        # Forward pass (streaming mode - frame-by-frame with Mamba state)
+        pred_depths_list = []
+        rel_depths_list = []
+        per_frame_scales_raw = []
+        per_frame_shifts_raw = []
+        reset_frames = []
         start_time = None
+        prev_cls = None
+
         with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-            # Warmup: run warmup_frames to JIT-compile CUDA kernels (excluded from FPS)
-            if T > warmup_frames:
-                warmup_images = images[:, :warmup_frames]
-                _ = self.model.forward_with_onepiece_streaming(warmup_images)
-                torch.cuda.synchronize()
-                torch.cuda.empty_cache()
+            # Reset Mamba state for new sequence
+            self.model.spatial_mamba.start_new_sequence()
 
-            # Timed forward pass (streaming, frame-by-frame)
-            torch.cuda.synchronize()
-            start_time = time.time()
+            for t in range(T):
+                frame = images[0, t].unsqueeze(0)  # [1, 3, H, W]
 
-            outputs = self.model.forward_with_onepiece_streaming(images)
+                # Start timing after warmup
+                if t == warmup_frames:
+                    torch.cuda.synchronize()
+                    start_time = time.time()
 
-            torch.cuda.synchronize()
-            end_time = time.time()
+                outputs_t = self.model.forward_onepiece_single_frame(frame, prev_cls=prev_cls)
+                prev_cls = outputs_t['cls_token']
 
-        # FPS (warmup was a separate pre-run, timed pass processes all T frames)
+                if outputs_t.get('is_reset', False):
+                    reset_frames.append(t)
+
+                # De-canonicalize: canonical → actual meters
+                de_ratio_t = de_canonical_ratio_metric[0, t]
+                pred_metric_t = outputs_t['metric_depth'].float() * de_ratio_t  # [1, H, W]
+                rel_depth_t = outputs_t['relative_depth'].float()[0]  # [H, W]
+
+                per_frame_scales_raw.append(float(outputs_t['scale']))
+                per_frame_shifts_raw.append(float(outputs_t['shift']))
+
+                # FPS window: keep on GPU for accurate timing; otherwise CPU
+                if t >= warmup_frames:
+                    pred_depths_list.append(pred_metric_t)  # GPU
+                    rel_depths_list.append(rel_depth_t)  # GPU
+                else:
+                    pred_depths_list.append(pred_metric_t.cpu())
+                    rel_depths_list.append(rel_depth_t.cpu())
+
+                del outputs_t, pred_metric_t, rel_depth_t
+
+        # End timing
+        torch.cuda.synchronize()
+        end_time = time.time()
+
+        # FPS calculation
         if start_time is not None:
             inference_time = end_time - start_time
-            fps = T / inference_time if T > 0 and inference_time > 0 else 0
+            timed_frames = T - warmup_frames
+            fps = timed_frames / inference_time if timed_frames > 0 and inference_time > 0 else 0
             if fps > 0:
-                logger.info(f"Inference time: {inference_time:.4f}s for {T} frames (warmup {warmup_frames} pre-run excluded)")
+                logger.info(f"Inference time: {inference_time:.4f}s for {timed_frames} frames (warmup {warmup_frames} excluded)")
                 logger.info(f"FPS: {fps:.2f} frames/second")
         else:
             fps = 0
-            logger.warning(f"Too few frames ({T}) for FPS measurement")
+            logger.warning(f"Too few frames ({T}) for FPS measurement (need > {warmup_frames})")
 
-        metric_depth = outputs['metric_depth'].float()  # [B, T, H, W] (canonical space)
-        relative_depth_out = outputs['relative_depth'].float()  # [B, T, H, W] (canonical inv depth)
-        scale = outputs['scale'].float()  # [B, T]
-        shift = outputs['shift'].float()  # [B, T]
-        reset_frames = outputs.get('reset_frames', [])  # list of frame indices
-
-        # depth_from_relative in canonical meters (same input space as model's scale/shift)
-        dfr_canonical = 100.0 / (relative_depth_out + 1e-8)  # [B, T, H, W]
-
-        # De-canonicalize prediction: canonical → actual
-        # metric_depth is in canonical meters, multiply by de_canonical_ratio_metric
-        de_ratio = de_canonical_ratio_metric.unsqueeze(-1).unsqueeze(-1)  # [1, T, 1, 1]
-        pred_depths_actual = metric_depth * de_ratio  # [1, T, H, W] in actual meters
+        # Stack results and move to CPU
+        # Each pred_metric_t is [1, H, W] (B=1), stack → [T, 1, H, W]
+        pred_depths_cpu = torch.stack(
+            [p.cpu() if p.is_cuda else p for p in pred_depths_list], dim=0
+        )  # [T, 1, pred_h, pred_w]
+        dfr_canonical_cpu = 1.0 / (torch.stack(
+            [r.cpu() if r.is_cuda else r for r in rel_depths_list], dim=0
+        ) + 1e-8)  # [T, pred_h, pred_w]  (depth from relative in canonical meters)
+        scale = torch.tensor(per_frame_scales_raw).unsqueeze(0)  # [1, T]
+        shift = torch.tensor(per_frame_shifts_raw).unsqueeze(0)  # [1, T]
+        del pred_depths_list, rel_depths_list
+        torch.cuda.empty_cache()
 
         # GT in actual meters (already actual from skip_gt_canonicalization=True)
         gt_depth_metric = 100.0 / (gt_depth_inverse_100[0] + 1e-8)  # [T, 1, H, W]
-
-        # Move to CPU for metrics
-        pred_depths_cpu = pred_depths_actual[0].unsqueeze(1).cpu()  # [T, 1, pred_h, pred_w]
-        dfr_canonical_cpu = dfr_canonical[0].cpu()  # [T, H, W]
 
         # === Resolution handling (upsample pred to GT resolution for metrics) ===
         MAX_DEPTH = self.max_depth
