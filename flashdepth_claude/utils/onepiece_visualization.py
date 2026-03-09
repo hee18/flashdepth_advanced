@@ -264,7 +264,7 @@ class OnepieceVisualizer:
                         transform=ax6.transAxes, bbox=dict(boxstyle="round", facecolor='lightgreen'))
                 y_pos -= 0.10
 
-            # Depth metrics
+            # Depth metrics (2 per line)
             if valid_mask_metrics.sum() > 0:
                 pred_tensor = torch.from_numpy(pred_depth_frame).float()
                 gt_tensor = torch.from_numpy(gt_depth_frame).float()
@@ -272,22 +272,19 @@ class OnepieceVisualizer:
                 metrics = MetricDepthMetrics.compute_metric_depth_metrics(
                     pred_tensor, gt_tensor, valid_tensor
                 )
-                ax6.text(0.05, y_pos, f'AbsRel: {metrics["abs_rel"]:.4f}', fontsize=10,
+                ax6.text(0.05, y_pos, f'AbsRel: {metrics["abs_rel"]:.4f}', fontsize=9,
                         transform=ax6.transAxes, bbox=dict(boxstyle="round", facecolor='lightcoral'))
-                y_pos -= 0.08
-                ax6.text(0.05, y_pos, f'Delta_1: {metrics["a1"]:.4f}', fontsize=10,
+                ax6.text(0.52, y_pos, f'Delta_1: {metrics["a1"]:.4f}', fontsize=9,
                         transform=ax6.transAxes, bbox=dict(boxstyle="round", facecolor='lightgreen'))
                 y_pos -= 0.08
-                ax6.text(0.05, y_pos, f'Delta_2: {metrics["a2"]:.4f}', fontsize=10,
+                ax6.text(0.05, y_pos, f'Delta_2: {metrics["a2"]:.4f}', fontsize=9,
                         transform=ax6.transAxes, bbox=dict(boxstyle="round", facecolor='lightgreen'))
-                y_pos -= 0.08
-                ax6.text(0.05, y_pos, f'Delta_3: {metrics["a3"]:.4f}', fontsize=10,
+                ax6.text(0.52, y_pos, f'Delta_3: {metrics["a3"]:.4f}', fontsize=9,
                         transform=ax6.transAxes, bbox=dict(boxstyle="round", facecolor='lightgreen'))
                 y_pos -= 0.08
                 ax6.text(0.05, y_pos, f'RMSE: {metrics["rmse"]:.3f}m', fontsize=9,
                         transform=ax6.transAxes, bbox=dict(boxstyle="round", facecolor='wheat'))
-                y_pos -= 0.08
-                ax6.text(0.05, y_pos, f'MAE: {metrics.get("mae", 0):.3f}m', fontsize=9,
+                ax6.text(0.52, y_pos, f'MAE: {metrics.get("mae", 0):.3f}m', fontsize=9,
                         transform=ax6.transAxes, bbox=dict(boxstyle="round", facecolor='lightblue'))
                 y_pos -= 0.08
 
@@ -307,13 +304,16 @@ class OnepieceVisualizer:
                     ax6.text(0.05, y_pos, f'Log L1: {log_l1_val:.4f}', fontsize=9,
                             transform=ax6.transAxes, bbox=dict(boxstyle="round", facecolor='lightsalmon'))
                     y_pos -= 0.08
-                if 'tgm_loss' in loss_dict and loss_dict['tgm_loss'] > 0:
-                    ax6.text(0.05, y_pos, f'TGM: {loss_dict["tgm_loss"]:.4f}', fontsize=9,
-                            transform=ax6.transAxes, bbox=dict(boxstyle="round", facecolor='lightskyblue'))
-                    y_pos -= 0.08
-                if 'feat_cons_loss' in loss_dict and loss_dict.get('feat_cons_loss', 0) > 0:
-                    ax6.text(0.05, y_pos, f'FeatCons: {loss_dict["feat_cons_loss"]:.4f}', fontsize=9,
-                            transform=ax6.transAxes, bbox=dict(boxstyle="round", facecolor='lightyellow'))
+                # TGM and OFC on same line
+                tgm_val = loss_dict.get('tgm_loss', 0)
+                ofc_val = loss_dict.get('ofc_loss', 0)
+                if tgm_val > 0 or ofc_val > 0:
+                    if tgm_val > 0:
+                        ax6.text(0.05, y_pos, f'TGM: {tgm_val:.4f}', fontsize=9,
+                                transform=ax6.transAxes, bbox=dict(boxstyle="round", facecolor='lightskyblue'))
+                    if ofc_val > 0:
+                        ax6.text(0.52, y_pos, f'OFC: {ofc_val:.4f}', fontsize=9,
+                                transform=ax6.transAxes, bbox=dict(boxstyle="round", facecolor='lightyellow'))
                     y_pos -= 0.08
 
             ax6.set_title('Depth Metrics & Training Info', fontsize=14, fontweight='bold')

@@ -968,7 +968,7 @@ class OnepieceTrainer:
                 scale = outputs['scale']
                 shift = outputs['shift']
 
-            # Compute validation loss
+            # Compute validation loss (same space as training: inverse depth 100/m)
             gt_depth_meters = 1.0 / (gt_depth.squeeze(2).float().clamp(min=1e-8))
 
             if metric_depth.shape[-2:] != gt_depth_meters.shape[-2:]:
@@ -987,32 +987,28 @@ class OnepieceTrainer:
             valid_mask = gt_valid & pred_valid & actual_valid_masks
 
             if valid_mask.sum() > 0:
-                # Log L1 loss
-                pred_valid_vals = metric_depth.float()[valid_mask]
-                gt_valid_vals = gt_depth_meters.float()[valid_mask]
-                epsilon = 1e-8
-                avg_depth_loss = F.l1_loss(
-                    torch.log(pred_valid_vals.clamp(min=epsilon)),
-                    torch.log(gt_valid_vals.clamp(min=epsilon))
+                # Use same loss_fn as training (inverse depth 100/m space)
+                pred_inverse = 100.0 / metric_depth.float().clamp(min=1e-8)
+                gt_inverse = gt_depth.squeeze(2).float() * 100.0
+
+                # LogL1 + TGM via self.loss_fn (matches training exactly)
+                val_total_loss, val_components = self.loss_fn(
+                    pred_depth=pred_inverse,
+                    gt_depth=gt_inverse,
+                    valid_mask=valid_mask.float(),
+                    post_mamba_features=None,
+                    images=None,
+                    flow_estimator=None,
+                    return_components=True
                 )
 
-                # TGM loss (if temporal frames available)
-                avg_tgm_loss = torch.tensor(0.0)
-                if T > 1:
-                    pred_inverse = 100.0 / metric_depth.float().clamp(min=1e-8)
-                    gt_inverse = gt_depth.squeeze(2).float() * 100.0
-                    pred_diff = pred_inverse[:, 1:] - pred_inverse[:, :-1]
-                    gt_diff = gt_inverse[:, 1:] - gt_inverse[:, :-1]
-                    temporal_valid = valid_mask[:, 1:] & valid_mask[:, :-1]
-                    temporal_valid_w = temporal_valid.float()
-                    if temporal_valid_w.sum() > 0:
-                        tgm_error = (pred_diff - gt_diff).abs()
-                        avg_tgm_loss = (tgm_error * temporal_valid_w).sum() / temporal_valid_w.sum().clamp(min=1)
+                avg_depth_loss = val_components['log_l1_loss']
+                avg_tgm_loss = val_components['tgm_loss']
+                avg_loss = val_total_loss.item()
 
-                avg_loss = avg_depth_loss + avg_tgm_loss
-                total_loss += avg_loss.item()
-                total_depth_loss += avg_depth_loss.item()
-                total_tgm_loss += avg_tgm_loss.item()
+                total_loss += avg_loss
+                total_depth_loss += avg_depth_loss
+                total_tgm_loss += avg_tgm_loss
                 num_batches += 1
 
                 # Per-dataset tracking
@@ -1020,9 +1016,9 @@ class OnepieceTrainer:
                     dataset_losses[current_dataset] = []
                     dataset_depth_losses[current_dataset] = []
                     dataset_tgm_losses[current_dataset] = []
-                dataset_losses[current_dataset].append(avg_loss.item())
-                dataset_depth_losses[current_dataset].append(avg_depth_loss.item())
-                dataset_tgm_losses[current_dataset].append(avg_tgm_loss.item() if torch.is_tensor(avg_tgm_loss) else avg_tgm_loss)
+                dataset_losses[current_dataset].append(avg_loss)
+                dataset_depth_losses[current_dataset].append(avg_depth_loss)
+                dataset_tgm_losses[current_dataset].append(avg_tgm_loss)
 
             # Validation visualization
             if self.val_visualizer and current_dataset in self.val_vis_config:
@@ -1058,9 +1054,9 @@ class OnepieceTrainer:
                         }
 
                         val_loss_dict = {
-                            'val_loss': avg_loss.item() if valid_mask.sum() > 0 else 0.0,
-                            'depth_loss': avg_depth_loss.item() if valid_mask.sum() > 0 else 0.0,
-                            'tgm_loss': avg_tgm_loss.item() if torch.is_tensor(avg_tgm_loss) else 0.0,
+                            'val_loss': avg_loss if valid_mask.sum() > 0 else 0.0,
+                            'depth_loss': avg_depth_loss if valid_mask.sum() > 0 else 0.0,
+                            'tgm_loss': avg_tgm_loss if valid_mask.sum() > 0 else 0.0,
                         }
 
                         self.val_visualizer.create_validation_summary(

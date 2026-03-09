@@ -1,5 +1,38 @@
 # Changelog
 
+## 2026-03-09: Validation Loss 통일 + test_onepiece 해상도 처리 개선
+
+### Validation Loss 통일 (`train_onepiece.py`)
+- Validation의 LogL1/TGM loss를 training과 동일한 `self.loss_fn` (OnepieceCombinedLoss) 사용으로 변경
+  - 기존: validation은 metric meters space에서 inline LogL1 + raw inverse space inline TGM (single scale, no trimming)
+  - 변경: training과 동일한 inverse depth 100/m space에서 LogL1Loss + TGMTemporalLoss (log-space, multi-scale, trimmed MAE)
+- Valid mask는 validation용 80m threshold 유지 (test evaluation과 일치)
+
+### Visualization 개선 (`utils/onepiece_visualization.py`)
+- Depth Metrics 2개씩 한 줄에 배치 (AbsRel+Delta1, Delta2+Delta3, RMSE+MAE)
+- TGM과 OFC를 같은 줄에 배치, `feat_cons_loss` → `ofc_loss`로 변경
+
+### test_onepiece.py 해상도 처리 개선
+- 기존: GT를 pred 해상도로 downsample → pred 해상도에서 metric 계산
+- 변경: pred를 GT 해상도로 upsample → GT 해상도에서 metric 계산 (GT 정보 보존)
+- `gt_at_pred_res_cpu` 추가: TC, visualization용 (pred 해상도)
+- `gt_depth_metric_cpu` 유지: per-frame metrics, depth range analysis, TAE, optimal scale/shift용 (GT 해상도)
+- Sparse dataset (eth3d, waymo_seg) 감지 → nearest interpolation 사용
+- GPU 메모리 관리: `del gt_depth_metric` (GPU tensor) 즉시 해제
+
+### test_onepiece.py 기능 추가 (onepiece2 포팅)
+- **PSR (Prediction Stability Ratio)**: TC 모드/Full 모드 모두 추가. per-frame scale ratio → 인접 프레임 차이 평균
+- **TC-only 모드 TAE 계산**: 기존 0.0 하드코딩 → 실제 reprojection TAE 계산
+- **`ea` test mode**: Error Analysis only. TAE/rTC/PSR 스킵 → accuracy metric만 빠르게 측정
+- **`_save_tc_summary()`**: rTC + TAE + PSR 통합 요약 JSON 저장
+- **`metric_order`**: `psr`, `psr_max` 추가
+- **FPS 로깅 개선**: warmup 정보 포함한 상세 로깅
+
+### test_onepiece.py Visualization 개선
+- Row 2: Scale/Shift plot → **GT Valid Mask** (density % 표시)
+- Row 3: Reset Frames 패널 제거 → Depth Distribution colspan=full
+- Sparse 감지: density heuristic (0.5) → **dataset 이름 기반** (eth3d, waymo_seg)
+
 ## 2026-03-05: Onepiece V3 — Spatial Mamba + Dual-Stream Architecture
 
 Major architectural rewrite from V1 (global token Mamba) to V3 (spatial Mamba).
