@@ -23,7 +23,6 @@ DATA_ROOT="/data/datasets"  # Docker internal path
 GPU_ID=0
 WORKERS=4
 VID_LEN=50
-OBJWISE=false
 CHECKPOINT=""
 RESULTS_DIR=""
 # New options for depth mode and model-specific settings
@@ -64,7 +63,6 @@ Options:
   --gpu <id>               GPU device ID (default: 0)
   --workers <n>            Number of data loading workers (default: 4)
   --vid-len <n>            Video sequence length (default: 50)
-  --objwise                Enable object-wise evaluation
   --only-clone <true|false> For VKITTI: use only 'clone' condition (default: true)
   --checkpoint <path>      Model checkpoint path
   --results-dir <path>     Results directory
@@ -130,10 +128,6 @@ while [[ $# -gt 0 ]]; do
         --vid-len)
             VID_LEN="$2"
             shift 2
-            ;; 
-        --objwise)
-            OBJWISE=true
-            shift
             ;; 
         --only-clone)
             ONLY_CLONE="$2"
@@ -215,6 +209,33 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# === Dataset vid-len defaults ===
+get_vid_len_for_dataset() {
+    local ds="$1"
+    case "$ds" in
+        eth3d)       echo 30 ;;
+        sintel)      echo 50 ;;
+        bonn)        echo 50 ;;
+        waymo_seg|waymo) echo 200 ;;
+        vkitti)      echo 200 ;;
+        unreal4k)    echo 500 ;;
+        urbansyn)    echo 50 ;;
+        *)           echo 50 ;;
+    esac
+}
+
+get_workers_for_dataset() {
+    local ds="$1"
+    case "$ds" in
+        eth3d|unreal4k) echo 1 ;;
+        waymo_seg|waymo) echo 2 ;;
+        sintel|vkitti)  echo 4 ;;
+        *)              echo 4 ;;
+    esac
+}
+
+ALL_DATASETS="eth3d sintel waymo_seg vkitti unreal4k"
+
 # Validate method (VIDEO MODELS ONLY)
 case $METHOD in
     vda|depthcrafter)
@@ -224,7 +245,7 @@ case $METHOD in
         echo "   This script supports VIDEO MODELS ONLY: vda, depthcrafter"
         echo "   For image models (metric3d, unidepth, depthpro, etc.), use ./run_comparison.sh instead"
         exit 1
-        ;; 
+        ;;
 esac
 
 # Build method name with version
@@ -233,9 +254,124 @@ if [ -n "$VERSION" ]; then
     METHOD_NAME="${METHOD}_${VERSION}"
 fi
 
-# Set default results directory
+# Determine max-depth suffix for results dir
+if [ -n "$MAX_DEPTH" ]; then
+    MAX_DEPTH_SUFFIX="_${MAX_DEPTH}"
+else
+    MAX_DEPTH_SUFFIX=""
+fi
+
+# === Handle "all" datasets ===
+if [ "$DATASET" = "all" ]; then
+    USER_VID_LEN_SET=false
+    for arg in "$@"; do
+        if [ "$arg" = "--vid-len" ]; then
+            USER_VID_LEN_SET=true
+            break
+        fi
+    done
+
+    echo "========================================"
+    echo "Batch Evaluation Mode: $METHOD_NAME on ALL datasets"
+    echo "========================================"
+    echo "Datasets: $ALL_DATASETS"
+    echo "GPU: $GPU_ID"
+    if [ -n "$MAX_DEPTH" ]; then
+        echo "Max Depth: $MAX_DEPTH"
+    fi
+    echo "========================================"
+    echo "Press Ctrl+C to abort all runs"
+    echo ""
+
+    BATCH_ABORT=false
+    trap 'echo ""; echo "⚠️  Ctrl+C received — aborting batch..."; BATCH_ABORT=true' INT
+
+    TOTAL_RUNS=0
+    COMPLETED_RUNS=0
+    FAILED_RUNS=0
+    for ds in $ALL_DATASETS; do
+        TOTAL_RUNS=$((TOTAL_RUNS + 1))
+    done
+
+    for ds in $ALL_DATASETS; do
+        if [ "$BATCH_ABORT" = true ]; then
+            break
+        fi
+
+        COMPLETED_RUNS=$((COMPLETED_RUNS + 1))
+
+        if [ "$USER_VID_LEN_SET" = false ]; then
+            CUR_VID_LEN=$(get_vid_len_for_dataset "$ds")
+        else
+            CUR_VID_LEN=$VID_LEN
+        fi
+        CUR_WORKERS=$(get_workers_for_dataset "$ds")
+
+        # model/version/dataset or model/dataset
+        if [ -n "$VERSION" ]; then
+            CUR_RESULTS_DIR="refer_test/test_results/${METHOD}/${VERSION}/${ds}${MAX_DEPTH_SUFFIX}"
+        else
+            CUR_RESULTS_DIR="refer_test/test_results/${METHOD}/${ds}${MAX_DEPTH_SUFFIX}"
+        fi
+
+        echo ""
+        echo "========================================"
+        echo "[$COMPLETED_RUNS/$TOTAL_RUNS] $METHOD_NAME on $ds (vid-len=$CUR_VID_LEN)"
+        echo "  Results: $CUR_RESULTS_DIR"
+        echo "========================================"
+
+        RUN_ARGS="--dataset $ds --gpu $GPU_ID --workers $CUR_WORKERS --vid-len $CUR_VID_LEN --results-dir $CUR_RESULTS_DIR"
+        if [ -n "$MAX_DEPTH" ]; then
+            RUN_ARGS="$RUN_ARGS --max-depth $MAX_DEPTH"
+        fi
+        if [ -n "$TEST_MODE" ]; then
+            RUN_ARGS="$RUN_ARGS --test-mode $TEST_MODE"
+        fi
+        if [ -n "$TC_THRESHOLD" ]; then
+            RUN_ARGS="$RUN_ARGS --tc-threshold $TC_THRESHOLD"
+        fi
+        if [ "$VISUALIZATION" != "true" ]; then
+            RUN_ARGS="$RUN_ARGS --visualization $VISUALIZATION"
+        fi
+        if [ "$AMP" = true ]; then
+            RUN_ARGS="$RUN_ARGS --amp --amp-dtype $AMP_DTYPE"
+        fi
+        if [ "$METRIC_MODE" = true ]; then
+            RUN_ARGS="$RUN_ARGS --metric"
+        fi
+        if [ "$INDOOR" = true ]; then
+            RUN_ARGS="$RUN_ARGS --indoor"
+        fi
+
+        if bash "$0" "$METHOD" $RUN_ARGS; then
+            echo "✅ [$COMPLETED_RUNS/$TOTAL_RUNS] $METHOD_NAME on $ds completed"
+        else
+            echo "❌ [$COMPLETED_RUNS/$TOTAL_RUNS] $METHOD_NAME on $ds FAILED"
+            FAILED_RUNS=$((FAILED_RUNS + 1))
+        fi
+    done
+
+    trap - INT
+
+    echo ""
+    echo "========================================"
+    if [ "$BATCH_ABORT" = true ]; then
+        echo "Batch ABORTED by user (Ctrl+C)"
+    fi
+    echo "Batch Evaluation Summary"
+    echo "  Total: $TOTAL_RUNS, Completed: $((TOTAL_RUNS - FAILED_RUNS)), Failed: $FAILED_RUNS"
+    echo "========================================"
+    exit 0
+fi
+
+# Set default results directory (single dataset)
+# model/version/dataset or model/dataset
 if [ -z "$RESULTS_DIR" ]; then
-    RESULTS_DIR="refer_test/test_results/${METHOD_NAME}/${DATASET}"
+    if [ -n "$VERSION" ]; then
+        RESULTS_DIR="refer_test/test_results/${METHOD}/${VERSION}/${DATASET}${MAX_DEPTH_SUFFIX}"
+    else
+        RESULTS_DIR="refer_test/test_results/${METHOD}/${DATASET}${MAX_DEPTH_SUFFIX}"
+    fi
 fi
 
 # Print configuration
@@ -251,7 +387,6 @@ echo "Depth Mode: $DEPTH_MODE"
 echo "GPU: $GPU_ID"
 echo "Workers: $WORKERS"
 echo "Video Length: $VID_LEN"
-echo "Object-wise: $OBJWISE"
 if [[ "$DATASET" == *"vkitti"* ]]; then
     echo "Only Clone (VKITTI): $ONLY_CLONE"
 fi
@@ -298,10 +433,6 @@ CMD="$CMD --depth-mode $DEPTH_MODE"
 
 if [ -n "$VERSION" ]; then
     CMD="$CMD --version $VERSION"
-fi
-
-if [ "$OBJWISE" = true ]; then
-    CMD="$CMD --objwise"
 fi
 
 if [[ "$DATASET" == *"vkitti"* ]]; then

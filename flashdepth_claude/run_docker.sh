@@ -54,10 +54,6 @@ show_usage() {
     echo "  train_onepiece_ddp   Start Onepiece training with 2 GPUs"
     echo "  test_onepiece        Start Onepiece testing"
     echo "  infer_avante         Run Gear5 inference on avante_images (custom dataset)"
-    echo "  test_gear2_objwise  Start Gear2 object-wise evaluation (Waymo segmentation)"
-    echo "  test_gear3_objwise  Start Gear3 object-wise evaluation (Waymo segmentation)"
-    echo "  test_gear4_objwise  Start Gear4 object-wise evaluation"
-    echo "  test_gear5_objwise  Start Gear5 object-wise evaluation"
     echo "  test_original_flashdepth  Test original FlashDepth (without Gear modules) for comparison"
     echo "  shell       Start interactive shell in container"
     echo "  clean       Remove containers and images"
@@ -129,11 +125,6 @@ show_usage() {
     echo "  $0 test_gear4 --vid-len 25 --frame-interval 5  # Custom video length and interval"
     echo "  $0 test_gear4 --dataset waymo --gpu 2  # Test on Waymo dataset"
     echo "  $0 test_gear4 --vid-len 200 --no-video --gpu 2  # Fast testing without video generation"
-    echo "  $0 test_gear2_objwise --dataset waymo_seg --config-variant l --gpu 0  # Object-wise evaluation on Waymo"
-    echo "  $0 test_gear3_objwise --dataset waymo_seg --config-variant l --gpu 1  # Object-wise evaluation on Waymo"
-    echo "  $0 test_gear4_objwise --dataset waymo_seg --config-variant l --gpu 2  # Gear4 object-wise"
-    echo "  $0 test_gear5_objwise --dataset waymo_seg --gpu 0  # Gear5 object-wise evaluation"
-    echo "  $0 test_gear5_objwise --dataset urbansyn --gpu 1  # Gear5 object-wise evaluation on UrbanSyn"
     echo "  $0 train_gear5 --gpu 0  # Gear5 training with GRU (default)"
     echo "  $0 train_gear5 --mamba --gpu 0  # Gear5 training with Mamba2 for temporal modeling"
     echo "  $0 test_gear5 --gpu 0  # Test Gear5 with GRU"
@@ -206,7 +197,7 @@ MODEL_TYPE="gear5"  # Model type for infer_avante: gear5 (default), onepiece
 USER_BATCH_SIZE=""  # Track if user explicitly set batch size
 while [[ $# -gt 0 ]]; do
     case $1 in
-        build|train|test|train_gear2|train_gear2_ddp|test_gear2|train_gear3|train_gear3_ddp|test_gear3|train_gear4|train_gear4_ddp|test_gear4|train_gear5|train_gear5_ddp|test_gear5|train_gear5_bankai|train_gear5_bankai_ddp|test_gear5_bankai|train_gear5_film|train_gear5_film_ddp|test_gear5_film|train_onepiece|train_onepiece_ddp|test_onepiece|infer_avante|test_gear2_objwise|test_gear3_objwise|test_gear4_objwise|test_gear5_objwise|test_original_flashdepth|shell|clean|logs)
+        build|train|test|train_gear2|train_gear2_ddp|test_gear2|train_gear3|train_gear3_ddp|test_gear3|train_gear4|train_gear4_ddp|test_gear4|train_gear5|train_gear5_ddp|test_gear5|train_gear5_bankai|train_gear5_bankai_ddp|test_gear5_bankai|train_gear5_film|train_gear5_film_ddp|test_gear5_film|train_onepiece|train_onepiece_ddp|test_onepiece|infer_avante|test_original_flashdepth|shell|clean|logs)
             COMMAND="$1"
             shift
             ;;
@@ -266,10 +257,6 @@ while [[ $# -gt 0 ]]; do
         --dataset)
             OBJWISE_DATASET="$2"
             shift 2
-            ;;
-        --objwise)
-            OBJWISE_FLAG="true"
-            shift
             ;;
         --fgwise)
             FGWISE_FLAG="true"
@@ -945,10 +932,6 @@ case $COMMAND in
         # Build test_gear2 command with config variant
         TEST_CMD="python test_gear2.py --config-path configs/gear2 --config-name config_$CONFIG_VARIANT dataset.data_root=/data/datasets training.workers=$WORKERS +results_dir=$RESULTS_DIR +gpu=$GPU_ID"
 
-        # Add --objwise flag if requested
-        if [ "$OBJWISE_FLAG" == "true" ]; then
-            TEST_CMD="$TEST_CMD --objwise"
-        fi
 
         # Override dataset if specified
         if [ -n "$OBJWISE_DATASET" ]; then
@@ -1010,10 +993,6 @@ case $COMMAND in
         # Build test_gear3 command with config variant
         TEST_CMD="python test_gear3.py --config-path configs/gear3 --config-name config_$CONFIG_VARIANT dataset.data_root=/data/datasets training.workers=$WORKERS +results_dir=$RESULTS_DIR +gpu=$GPU_ID"
 
-        # Add --objwise flag if requested
-        if [ "$OBJWISE_FLAG" == "true" ]; then
-            TEST_CMD="$TEST_CMD --objwise"
-        fi
 
         # Override dataset if specified
         if [ -n "$OBJWISE_DATASET" ]; then
@@ -1075,10 +1054,6 @@ case $COMMAND in
         # Build test_gear4 command with config variant
         TEST_CMD="python test_gear4.py --config-path configs/gear4 --config-name config_$CONFIG_VARIANT dataset.data_root=/data/datasets training.workers=$WORKERS +results_dir=$RESULTS_DIR +gpu=$GPU_ID"
 
-        # Add --objwise flag if requested
-        if [ "$OBJWISE_FLAG" == "true" ]; then
-            TEST_CMD="$TEST_CMD --objwise"
-        fi
 
         # Override dataset if specified
         if [ -n "$OBJWISE_DATASET" ]; then
@@ -1132,54 +1107,6 @@ case $COMMAND in
             echo "No running container found. Starting new container..."
             docker compose run --rm flashdepth /bin/bash
         fi
-        ;;
-
-    test_gear2_objwise)
-        # DEPRECATED: Use test_gear2 --objwise instead
-        echo "⚠️  WARNING: 'test_gear2_objwise' is deprecated!"
-        echo "   Please use: ./run_docker.sh test_gear2 --objwise --dataset $OBJWISE_DATASET"
-        echo ""
-        echo "Redirecting to new command format..."
-        echo ""
-
-        # Redirect to new format
-        OBJWISE_FLAG="true"
-        OBJWISE_DATASET=${OBJWISE_DATASET:-waymo_seg}
-
-        # Call test_gear2 with objwise flag
-        exec "$0" test_gear2 --objwise --dataset "$OBJWISE_DATASET" "${@:2}"
-        ;;
-
-    test_gear3_objwise)
-        # DEPRECATED: Use test_gear3 --objwise instead
-        echo "⚠️  WARNING: 'test_gear3_objwise' is deprecated!"
-        echo "   Please use: ./run_docker.sh test_gear3 --objwise --dataset $OBJWISE_DATASET"
-        echo ""
-        echo "Redirecting to new command format..."
-        echo ""
-
-        # Redirect to new format
-        OBJWISE_FLAG="true"
-        OBJWISE_DATASET=${OBJWISE_DATASET:-waymo_seg}
-
-        # Call test_gear3 with objwise flag
-        exec "$0" test_gear3 --objwise --dataset "$OBJWISE_DATASET" "${@:2}"
-        ;;
-
-    test_gear4_objwise)
-        # DEPRECATED: Use test_gear4 --objwise instead
-        echo "⚠️  WARNING: 'test_gear4_objwise' is deprecated!"
-        echo "   Please use: ./run_docker.sh test_gear4 --objwise --dataset $OBJWISE_DATASET"
-        echo ""
-        echo "Redirecting to new command format..."
-        echo ""
-
-        # Redirect to new format
-        OBJWISE_FLAG="true"
-        OBJWISE_DATASET=${OBJWISE_DATASET:-waymo_seg}
-
-        # Call test_gear4 with objwise flag
-        exec "$0" test_gear4 --objwise --dataset "$OBJWISE_DATASET" "${@:2}"
         ;;
 
     train_gear5)
@@ -1444,10 +1371,6 @@ case $COMMAND in
             cls_layers='[$CLS_LAYERS]' \
             +config_dir=configs/gear5/$CONFIG_VARIANT"
 
-        # Add --objwise flag if requested
-        if [ "$OBJWISE_FLAG" == "true" ]; then
-            TEST_CMD="$TEST_CMD --objwise"
-        fi
 
         # Add --fgwise flag if requested (use + prefix to add new config key)
         if [ "$FGWISE_FLAG" == "true" ]; then
@@ -1677,10 +1600,6 @@ case $COMMAND in
             cls_layers='[$CLS_LAYERS]' \
             +config_dir=configs/gear5/$CONFIG_VARIANT"
 
-        # Add --objwise flag if requested
-        if [ "$OBJWISE_FLAG" == "true" ]; then
-            TEST_CMD="$TEST_CMD --objwise"
-        fi
 
         # Add dataset override if specified
         if [ -n "$OBJWISE_DATASET" ]; then
@@ -2033,70 +1952,212 @@ case $COMMAND in
         # Determine test dataset (default: all datasets)
         ONEPIECE_TEST_DATASET="${OBJWISE_DATASET:-}"
 
-        echo "Starting Onepiece testing..."
-        echo "Configuration:"
-        echo "  - Config variant: $CONFIG_VARIANT (--config-variant, default: l)"
-        echo "  - Config file: configs/onepiece/config_$CONFIG_VARIANT.yaml"
-        echo "  - GPU: $GPU_ID (--gpu, default: 0)"
-        echo "  - Video length: $VID_LEN (--vid-len, default: 50)"
-        echo "  - Frame interval: $FRAME_INTERVAL (--frame-interval, default: 1)"
-        echo "  - Checkpoint: ${GEAR_CHECKPOINT:-config default} (--gear-checkpoint)"
-        echo "  - Results directory: $RESULTS_DIR (--results-dir)"
-        echo "  - Dataset: ${ONEPIECE_TEST_DATASET:-all (default)}"
-        echo "  - No-video: $NO_VIDEO (--no-video, default: false)"
-        if [ -n "$TEST_MODE" ]; then
-            echo "  - Test mode: $TEST_MODE"
+        # === Dataset vid-len defaults for onepiece ===
+        _onepiece_vid_len() {
+            case "$1" in
+                eth3d)       echo 30 ;;
+                sintel)      echo 50 ;;
+                bonn)        echo 50 ;;
+                waymo_seg|waymo) echo 200 ;;
+                vkitti)      echo 200 ;;
+                unreal4k)    echo 500 ;;
+                urbansyn)    echo 50 ;;
+                *)           echo 50 ;;
+            esac
+        }
+
+        _onepiece_workers() {
+            case "$1" in
+                eth3d|unreal4k) echo 1 ;;
+                waymo_seg|waymo) echo 2 ;;
+                sintel|vkitti)  echo 4 ;;
+                *)              echo 4 ;;
+            esac
+        }
+
+        # === Handle --dataset all ===
+        if [ "$ONEPIECE_TEST_DATASET" = "all" ]; then
+            ALL_ONEPIECE_DATASETS="eth3d sintel waymo_seg vkitti unreal4k"
+
+            # Check if user explicitly set --vid-len
+            USER_VID_LEN_SET=false
+            for arg in "${BASH_ARGV[@]}"; do
+                if [ "$arg" = "--vid-len" ]; then
+                    USER_VID_LEN_SET=true
+                    break
+                fi
+            done
+
+            # Max-depth suffix
+            if [ "$MAX_DEPTH" != "80.0" ] && [ -n "$MAX_DEPTH" ]; then
+                MD_SUFFIX="_${MAX_DEPTH}"
+            else
+                MD_SUFFIX=""
+            fi
+
+            # Base results dir from user (strip trailing dataset name if present)
+            BASE_RESULTS_DIR="$RESULTS_DIR"
+
+            echo "========================================"
+            echo "Onepiece Batch Testing: ALL datasets"
+            echo "========================================"
+            echo "Datasets: $ALL_ONEPIECE_DATASETS"
+            echo "GPU: $GPU_ID"
+            echo "Base results dir: $BASE_RESULTS_DIR"
+            echo "========================================"
+            echo "Press Ctrl+C to abort all runs"
+            echo ""
+
+            BATCH_ABORT=false
+            trap 'echo ""; echo "⚠️  Ctrl+C received — aborting batch..."; BATCH_ABORT=true' INT
+
+            TOTAL_RUNS=0
+            COMPLETED_RUNS=0
+            FAILED_RUNS=0
+            for ds in $ALL_ONEPIECE_DATASETS; do
+                TOTAL_RUNS=$((TOTAL_RUNS + 1))
+            done
+
+            for ds in $ALL_ONEPIECE_DATASETS; do
+                if [ "$BATCH_ABORT" = true ]; then
+                    break
+                fi
+
+                COMPLETED_RUNS=$((COMPLETED_RUNS + 1))
+
+                if [ "$USER_VID_LEN_SET" = false ]; then
+                    CUR_VID_LEN=$(_onepiece_vid_len "$ds")
+                else
+                    CUR_VID_LEN=$VID_LEN
+                fi
+                CUR_WORKERS=$(_onepiece_workers "$ds")
+
+                # Results dir: base_dir/../dataset_name (replace last path component)
+                CUR_RESULTS_DIR="${BASE_RESULTS_DIR%/*}/${ds}${MD_SUFFIX}"
+
+                echo ""
+                echo "========================================"
+                echo "[$COMPLETED_RUNS/$TOTAL_RUNS] Onepiece on $ds (vid-len=$CUR_VID_LEN, workers=$CUR_WORKERS)"
+                echo "  Results: $CUR_RESULTS_DIR"
+                echo "========================================"
+
+                DOCKER_CMD="CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm flashdepth python test_onepiece.py \
+                    --config-path configs/onepiece \
+                    --config-name config_$CONFIG_VARIANT \
+                    dataset.data_root=/data/datasets \
+                    dataset.video_length=$CUR_VID_LEN \
+                    training.workers=$CUR_WORKERS \
+                    +frame_interval=$FRAME_INTERVAL \
+                    +results_dir=$CUR_RESULTS_DIR \
+                    eval.test_datasets=[$ds]"
+
+                if [ -n "$GEAR_CHECKPOINT" ]; then
+                    DOCKER_CMD="$DOCKER_CMD load=$GEAR_CHECKPOINT"
+                fi
+                if [ "$NO_VIDEO" == "true" ]; then
+                    DOCKER_CMD="$DOCKER_CMD eval.out_video=false"
+                fi
+                if [ -n "$SEQ" ]; then
+                    DOCKER_CMD="$DOCKER_CMD +seq_list='[$SEQ]'"
+                fi
+                if [ "$BEST_FIGURE" == "true" ]; then
+                    DOCKER_CMD="$DOCKER_CMD +best_figure=true"
+                fi
+                if [ -n "$FRAME" ]; then
+                    DOCKER_CMD="$DOCKER_CMD --frame $FRAME"
+                fi
+                if [ -n "$TEST_MODE" ]; then
+                    DOCKER_CMD="$DOCKER_CMD --test-mode $TEST_MODE"
+                fi
+                if [ -n "$MAX_DEPTH" ]; then
+                    DOCKER_CMD="$DOCKER_CMD --max-depth $MAX_DEPTH"
+                fi
+
+                if eval $DOCKER_CMD; then
+                    echo "✅ [$COMPLETED_RUNS/$TOTAL_RUNS] Onepiece on $ds completed"
+                else
+                    echo "❌ [$COMPLETED_RUNS/$TOTAL_RUNS] Onepiece on $ds FAILED"
+                    FAILED_RUNS=$((FAILED_RUNS + 1))
+                fi
+            done
+
+            trap - INT
+
+            echo ""
+            echo "========================================"
+            if [ "$BATCH_ABORT" = true ]; then
+                echo "Batch ABORTED by user (Ctrl+C)"
+            fi
+            echo "Onepiece Batch Testing Summary"
+            echo "  Total: $TOTAL_RUNS, Completed: $((TOTAL_RUNS - FAILED_RUNS)), Failed: $FAILED_RUNS"
+            echo "========================================"
+        else
+            # === Single dataset mode (original behavior) ===
+            echo "Starting Onepiece testing..."
+            echo "Configuration:"
+            echo "  - Config variant: $CONFIG_VARIANT (--config-variant, default: l)"
+            echo "  - Config file: configs/onepiece/config_$CONFIG_VARIANT.yaml"
+            echo "  - GPU: $GPU_ID (--gpu, default: 0)"
+            echo "  - Video length: $VID_LEN (--vid-len, default: 50)"
+            echo "  - Frame interval: $FRAME_INTERVAL (--frame-interval, default: 1)"
+            echo "  - Checkpoint: ${GEAR_CHECKPOINT:-config default} (--gear-checkpoint)"
+            echo "  - Results directory: $RESULTS_DIR (--results-dir)"
+            echo "  - Dataset: ${ONEPIECE_TEST_DATASET:-all (default)}"
+            echo "  - No-video: $NO_VIDEO (--no-video, default: false)"
+            if [ -n "$TEST_MODE" ]; then
+                echo "  - Test mode: $TEST_MODE"
+            fi
+            echo ""
+
+            DOCKER_CMD="CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm flashdepth python test_onepiece.py \
+                --config-path configs/onepiece \
+                --config-name config_$CONFIG_VARIANT \
+                dataset.data_root=/data/datasets \
+                dataset.video_length=$VID_LEN \
+                +frame_interval=$FRAME_INTERVAL \
+                +results_dir=$RESULTS_DIR"
+
+            if [ -n "$GEAR_CHECKPOINT" ]; then
+                DOCKER_CMD="$DOCKER_CMD load=$GEAR_CHECKPOINT"
+            fi
+
+            # Filter to specific dataset if --dataset is provided
+            if [ -n "$ONEPIECE_TEST_DATASET" ]; then
+                DOCKER_CMD="$DOCKER_CMD eval.test_datasets=[$ONEPIECE_TEST_DATASET]"
+            fi
+
+            # Disable video (GIF) generation if --no-video flag is set
+            if [ "$NO_VIDEO" == "true" ]; then
+                DOCKER_CMD="$DOCKER_CMD eval.out_video=false"
+            fi
+
+            # Add seq_list if specified (e.g., --seq 0,4)
+            if [ -n "$SEQ" ]; then
+                DOCKER_CMD="$DOCKER_CMD +seq_list='[$SEQ]'"
+            fi
+
+            # Add best_figure export if specified (--best-figure)
+            if [ "$BEST_FIGURE" == "true" ]; then
+                DOCKER_CMD="$DOCKER_CMD +best_figure=true"
+            fi
+
+            # Add frame export if specified (--frame N or --frame N,M)
+            if [ -n "$FRAME" ]; then
+                DOCKER_CMD="$DOCKER_CMD --frame $FRAME"
+            fi
+
+            # Add test-mode if specified
+            if [ -n "$TEST_MODE" ]; then
+                DOCKER_CMD="$DOCKER_CMD --test-mode $TEST_MODE"
+            fi
+
+            # Add max-depth if specified
+            if [ -n "$MAX_DEPTH" ]; then
+                DOCKER_CMD="$DOCKER_CMD --max-depth $MAX_DEPTH"
+            fi
+
+            eval $DOCKER_CMD
         fi
-        echo ""
-
-        DOCKER_CMD="CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm flashdepth python test_onepiece.py \
-            --config-path configs/onepiece \
-            --config-name config_$CONFIG_VARIANT \
-            dataset.data_root=/data/datasets \
-            dataset.video_length=$VID_LEN \
-            +frame_interval=$FRAME_INTERVAL \
-            +results_dir=$RESULTS_DIR"
-
-        if [ -n "$GEAR_CHECKPOINT" ]; then
-            DOCKER_CMD="$DOCKER_CMD load=$GEAR_CHECKPOINT"
-        fi
-
-        # Filter to specific dataset if --dataset is provided
-        if [ -n "$ONEPIECE_TEST_DATASET" ]; then
-            DOCKER_CMD="$DOCKER_CMD eval.test_datasets=[$ONEPIECE_TEST_DATASET]"
-        fi
-
-        # Disable video (GIF) generation if --no-video flag is set
-        if [ "$NO_VIDEO" == "true" ]; then
-            DOCKER_CMD="$DOCKER_CMD eval.out_video=false"
-        fi
-
-        # Add seq_list if specified (e.g., --seq 0,4)
-        if [ -n "$SEQ" ]; then
-            DOCKER_CMD="$DOCKER_CMD +seq_list='[$SEQ]'"
-        fi
-
-        # Add best_figure export if specified (--best-figure)
-        if [ "$BEST_FIGURE" == "true" ]; then
-            DOCKER_CMD="$DOCKER_CMD +best_figure=true"
-        fi
-
-        # Add frame export if specified (--frame N or --frame N,M)
-        if [ -n "$FRAME" ]; then
-            DOCKER_CMD="$DOCKER_CMD --frame $FRAME"
-        fi
-
-        # Add test-mode if specified
-        if [ -n "$TEST_MODE" ]; then
-            DOCKER_CMD="$DOCKER_CMD --test-mode $TEST_MODE"
-        fi
-
-        # Add max-depth if specified
-        if [ -n "$MAX_DEPTH" ]; then
-            DOCKER_CMD="$DOCKER_CMD --max-depth $MAX_DEPTH"
-        fi
-
-        eval $DOCKER_CMD
         ;;
 
     "")

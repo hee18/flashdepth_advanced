@@ -729,6 +729,7 @@ class ComparisonDataset(Dataset):
                 'depths': Tensor [T, H, W] - GT depth in meters
                 'intrinsics': Tensor [T, 4] - Camera intrinsics [fx, fy, cx, cy]
                 'scene_name': str - Scene identifier
+                'image_paths': List[str] - Image file paths (for TAE computation)
         """
         sequence = self.sequences[idx]
 
@@ -753,6 +754,7 @@ class ComparisonDataset(Dataset):
         images = []
         depths = []
         depth_paths = []  # Track depth file paths for completed depth loading
+        image_paths = []  # Track image file paths for TAE computation
         intrinsics_list = []
         segmentations = [] if self.objwise_enabled else None
 
@@ -776,6 +778,7 @@ class ComparisonDataset(Dataset):
                     'image': image,
                     'depth': depth,
                     'depth_path': frame['depth'],  # Original depth file path
+                    'image_path': frame['image'],  # Original image file path
                     'intrinsics': intrinsics
                 }
 
@@ -859,6 +862,7 @@ class ComparisonDataset(Dataset):
             images.append(image)
             depths.append(depth)
             depth_paths.append(frame_data['depth_path'])  # Collect depth file paths
+            image_paths.append(frame_data['image_path'])
             intrinsics_list.append(intrinsics)
 
             if seg is not None:
@@ -876,6 +880,7 @@ class ComparisonDataset(Dataset):
             'images': torch.stack(images),  # [T, 3, H, W]
             'depths': torch.stack(depths),  # [T, H, W]
             'depth_paths': depth_paths,  # List[str] - depth file paths for completed depth loading
+            'image_paths': [image_paths],  # List[List[str]] - wrapped for batch dim (batch_size=1)
             'intrinsics': intrinsics_tensor,  # [T, 4]
             'focal_lengths': focal_lengths_actual,  # [T] - actual fx for compatibility
             'focal_lengths_actual': focal_lengths_actual,  # [T] - actual fx
@@ -1660,6 +1665,7 @@ def comparison_collate_fn(batch):
         'images': item['images'].unsqueeze(0),  # [1, T, 3, H, W]
         'depths': item['depths'].unsqueeze(0),  # [1, T, H, W]
         'depth_paths': item.get('depth_paths', None),  # List[str] - for completed depth loading
+        'image_paths': item.get('image_paths', None),  # List[List[str]] - for TAE computation
         'intrinsics': item['intrinsics'].unsqueeze(0),  # [1, T, 4]
         'focal_lengths': item['focal_lengths'].unsqueeze(0),  # [1, T] - actual fx
         'focal_lengths_actual': item['focal_lengths_actual'].unsqueeze(0),  # [1, T] - actual fx
