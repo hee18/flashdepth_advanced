@@ -1971,7 +1971,8 @@ class Gear5Tester:
                         pred_at_gt_res[:, 0],
                         gt_depth_metric_cpu[:, 0],
                         dataset_name,
-                        image_paths_for_tae
+                        image_paths_for_tae,
+                        max_depth=MAX_DEPTH
                     )
                     if need_upsample:
                         del pred_at_gt_res
@@ -2181,7 +2182,8 @@ class Gear5Tester:
                     pred_at_gt_res[:, 0],  # [T, gt_h, gt_w]
                     gt_depth_metric_cpu[:, 0],  # [T, gt_h, gt_w]
                     dataset_name,
-                    image_paths_for_tae
+                    image_paths_for_tae,
+                    max_depth=MAX_DEPTH
                 )
                 if need_upsample:
                     del pred_at_gt_res

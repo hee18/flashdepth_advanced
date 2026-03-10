@@ -116,6 +116,8 @@ def inference(cfg, process_dict):
     savepath = os.path.join(cfg.config_dir, cfg.eval.outfolder)
     os.makedirs(savepath, exist_ok=True)
 
+    inverse_value = cfg.eval.get('inverse', False)
+
     eval_args = {
         'save_depth_npy': cfg.eval.save_depth_npy,
         'save_vis_map': cfg.eval.save_vis_map,
@@ -123,29 +125,31 @@ def inference(cfg, process_dict):
         'out_mp4': cfg.eval.out_mp4,
         'use_mamba': cfg.model.use_mamba,
         'resolution': cfg.eval.save_res,
+        'inverse_colormap': inverse_value,
         'print_time': True,
         'loss_type': cfg.training.loss_type,
         'use_all_frames': True,
         'use_metrics': False,
-        'dummy_timing': cfg.eval.dummy_timing,
-        'inverse': cfg.eval.get('inverse', False)
+        'dummy_timing': cfg.eval.dummy_timing
     }
 
-    
     if cfg.eval.dummy_timing:
         test_dataloader = [torch.randn(1, 105, 3, 1148, 2044)]*3
 
     elif cfg.eval.random_input is not None:
         dataset = RandomDataset(root_dir=cfg.eval.random_input, resolution=cfg.dataset.resolution, large_dir=cfg.eval.large_dir)
-        test_dataloader = DataLoader(dataset, batch_size=1, num_workers=0, 
-                                 shuffle=False, drop_last=False) 
-        
+        num_workers = cfg.eval.get('num_workers', 0)
+        test_dataloader = DataLoader(dataset, batch_size=1, num_workers=num_workers,
+                                 shuffle=False, drop_last=False)
+
     else:
-        dataset = CombinedDataset(root_dir=cfg.dataset.data_root, enable_dataset_flags=cfg.eval.test_datasets, 
-                                  split='test', resolution=cfg.eval.test_dataset_resolution)
-        test_dataloader = DataLoader(dataset, batch_size=1, num_workers=0, 
-                                 shuffle=False, drop_last=False) 
-        
+        dataset = CombinedDataset(root_dir=cfg.dataset.data_root, enable_dataset_flags=cfg.eval.test_datasets,
+                                  split='test', resolution=cfg.eval.test_dataset_resolution,
+                                  video_length=cfg.dataset.video_length)
+        num_workers = cfg.eval.get('num_workers', 0)
+        test_dataloader = DataLoader(dataset, batch_size=1, num_workers=num_workers,
+                                 shuffle=False, drop_last=False)
+
 
     for test_idx, batch in enumerate(tqdm(test_dataloader)):
         if isinstance(batch, list) or isinstance(batch, tuple):
@@ -169,25 +173,30 @@ def inference(cfg, process_dict):
         with torch.cuda.amp.autocast(dtype=torch.bfloat16):
             _, img_grid = model(
                 batch,
+                use_mamba=eval_args['use_mamba'],
                 gif_path=f'{savepath}/{os.path.basename(cfg.config_dir.rstrip("/"))}_{train_step}_{test_idx}.gif',
-                **eval_args
+                resolution=eval_args['resolution'],
+                out_mp4=eval_args['out_mp4'],
+                save_depth_npy=eval_args['save_depth_npy'],
+                save_vis_map=eval_args['save_vis_map'],
+                inverse_colormap=eval_args['inverse_colormap'],
+                print_time=eval_args['print_time'],
+                loss_type=eval_args['loss_type'],
+                use_all_frames=eval_args['use_all_frames'],
+                use_metrics=eval_args['use_metrics'],
+                dummy_timing=eval_args['dummy_timing']
                 )
 
         if cfg.eval.save_grid:
             img_grid.save(f'{savepath}/{os.path.basename(cfg.config_dir.rstrip("/"))}_{train_step}_{test_idx}.png')
 
         # Only test first sequence if first_seq_only is enabled (for FPS measurement)
-        try:
-            first_seq_only = cfg.eval.first_seq_only if hasattr(cfg.eval, 'first_seq_only') else False
-        except:
-            first_seq_only = False
-
+        first_seq_only = cfg.eval.get('first_seq_only', False)
         if first_seq_only:
             logging.info("First sequence only mode: stopping after first sequence")
             break
 
 
-    
 
 def main(cfg, process_dict):
 
@@ -255,10 +264,10 @@ def main(cfg, process_dict):
             vis_training = train_idx+1 if train_idx<10 else vis_training
             if cfg.model.use_mamba:    
                 loss, grid = model.module.train_sequence((video, gt_depth), loss_type=cfg.training.loss_type, timestep=train_step,
-                 vis_training=vis_training, savedir=os.path.join(cfg.config_dir, 'train_vis_debug'))
+                 vis_training=vis_training, savedir=os.path.join(cfg.config_dir, 'train_vis'))
             else:
                 loss, grid = model.module.train_single((video, gt_depth), loss_type=cfg.training.loss_type, 
-                vis_training=vis_training, savedir=os.path.join(cfg.config_dir, 'train_vis_debug'))
+                vis_training=vis_training, savedir=os.path.join(cfg.config_dir, 'train_vis'))
 
             if vis_training and grid is not None:
                 # shape: time, channels, height, width (https://docs.wandb.ai/guides/track/log/media/)

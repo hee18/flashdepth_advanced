@@ -168,6 +168,7 @@ RUN for env in depthanythingv2 vda depthcrafter metric3d unidepth zoedepth depth
             scipy \
             h5py \
             pandas \
+            pyarrow \
             tqdm \
             nuscenes-devkit \
             ultralytics; \

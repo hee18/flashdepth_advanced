@@ -783,7 +783,8 @@ class ReprojectionTAECalculator:
         gt_depths: torch.Tensor,
         dataset_name: str,
         image_paths: List[str],
-        valid_masks: Optional[List[torch.Tensor]] = None
+        valid_masks: Optional[List[torch.Tensor]] = None,
+        max_depth: float = 70.0
     ) -> Dict[str, float]:
         """
         Compute reprojection TAE for a sequence.
@@ -828,7 +829,8 @@ class ReprojectionTAECalculator:
             result = compute_reprojection_tae(
                 pred_depths, gt_depths,
                 intrinsics, poses,
-                valid_masks
+                valid_masks,
+                max_depth=max_depth
             )
             result['tae_reproj_supported'] = True
 

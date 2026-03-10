@@ -310,33 +310,19 @@ class ComparisonTester:
             gpu_mem_total = torch.cuda.get_device_properties(self.device).total_memory / 1e9
             logger.info(f"GPU: {gpu_name} (Total Memory: {gpu_mem_total:.1f}GB)")
 
-        # Get inputs
-        if 'images' in batch:
-            # ComparisonDataset or SegmentationDataset format (original resolution)
-            images = batch['images'].to(self.device)  # [1, T, 3, H, W]
-            H, W = images.shape[-2:]
-            logger.info(f"Sequence {sequence_id}: Processing {images.shape[1]} frames at {H}x{W} resolution")
+        # Get inputs - ComparisonDataset format (metric depth in meters, original resolution)
+        images = batch['images'].to(self.device)  # [1, T, 3, H, W]
+        H, W = images.shape[-2:]
+        logger.info(f"Sequence {sequence_id}: Processing {images.shape[1]} frames at {H}x{W} resolution")
 
-            # Handle different depth key names
-            # ComparisonDataset: 'depths' (plural)
-            # SegmentationDataset: 'depth' (singular)
-            if 'depths' in batch:
-                gt_depths = batch['depths'].to(self.device)  # [1, T, H, W] - ComparisonDataset (meters)
-            else:
-                gt_depths = batch['depth'].to(self.device)  # [1, T, H, W] - SegmentationDataset (inverse depth)
+        gt_depths = batch['depths'].to(self.device)  # [1, T, H, W] - metric depth (meters)
 
-            intrinsics = batch.get('intrinsics', None)
-            if intrinsics is not None:
-                intrinsics = intrinsics.to(self.device)  # [1, T, 4] - fx, fy, cx, cy
+        intrinsics = batch.get('intrinsics', None)
+        if intrinsics is not None:
+            intrinsics = intrinsics.to(self.device)  # [1, T, 4] - fx, fy, cx, cy
 
-            # Get depth file paths for completed depth loading (visualization)
-            depth_paths = batch.get('depth_paths', None)  # List[str] or None
-        else:
-            # Legacy CombinedDataset format (resized)
-            images = batch['image'].to(self.device)  # [1, T, 3, H, W]
-            gt_depths = batch['depth'].to(self.device)  # [1, T, H, W] - inverse depth!
-            intrinsics = None
-            depth_paths = None  # Not available in legacy format
+        # Get depth file paths for completed depth loading (visualization)
+        depth_paths = batch.get('depth_paths', None)  # List[str] or None
 
         # Ensure proper dimensions
         if images.ndim == 4:
@@ -353,13 +339,11 @@ class ComparisonTester:
         else:
             gt_depth_processed = gt_depths # Already [1, T, 1, H, W]
 
-
         # Get focal lengths (for models that need them)
         if intrinsics is not None:
             focal_lengths = intrinsics[:, :, 0]  # [1, T] - fx values
         else:
-            # Try focal_lengths_actual first (SegmentationDataset), then focal_lengths (legacy)
-            focal_lengths = batch.get('focal_lengths_actual', batch.get('focal_lengths', None))
+            focal_lengths = batch.get('focal_lengths', None)
             if focal_lengths is not None:
                 focal_lengths = focal_lengths.to(self.device)
 
@@ -397,21 +381,7 @@ class ComparisonTester:
                 import time
                 start_time = time.time()
 
-            img_t = images[0, t]  # [3, H, W]
-
-            # Check if image is ImageNet normalized (from segmentation datasets)
-            # ComparisonDataset returns [0, 1] range
-            # Segmentation datasets return ImageNet normalized
-            is_imagenet_normalized = (img_t.min() < -2.0 or img_t.max() > 2.0)
-
-            # Unnormalize if needed (most models expect [0, 1] range)
-            if is_imagenet_normalized:
-                # Unnormalize ImageNet: x_original = x * std + mean
-                mean = torch.tensor([0.485, 0.456, 0.406], device=img_t.device).view(3, 1, 1)
-                std = torch.tensor([0.229, 0.224, 0.225], device=img_t.device).view(3, 1, 1)
-                img_t_unnorm = img_t * std + mean  # Back to [0, 1] range
-            else:
-                img_t_unnorm = img_t
+            img_t = images[0, t]  # [3, H, W] - already [0, 1] range from ComparisonDataset
 
             # Prepare intrinsics for this frame
             # ComparisonDataset provides full intrinsics [fx, fy, cx, cy]
@@ -429,12 +399,12 @@ class ComparisonTester:
                 amp_dtype = torch.bfloat16 if self.config.get('amp_dtype', 'bf16') == 'bf16' else torch.float16
                 with torch.amp.autocast('cuda', dtype=amp_dtype):
                     pred_depth_t = self.adapter.inference(
-                        img_t_unnorm.unsqueeze(0),  # [1, 3, H, W] in [0, 1] range
+                        img_t.unsqueeze(0),  # [1, 3, H, W] in [0, 1] range
                         intrinsics=frame_intrinsics
                     )  # Returns [1, H, W] in meters
             else:
                 pred_depth_t = self.adapter.inference(
-                    img_t_unnorm.unsqueeze(0),  # [1, 3, H, W] in [0, 1] range
+                    img_t.unsqueeze(0),  # [1, 3, H, W] in [0, 1] range
                     intrinsics=frame_intrinsics
                 )  # Returns [1, H, W] in meters
 
@@ -450,8 +420,6 @@ class ComparisonTester:
             # Release intermediate tensors to prevent memory accumulation
             # Critical for long sequences (e.g., unreal4k 250 frames)
             del pred_depth_t
-            if is_imagenet_normalized:
-                del mean, std
 
             # End timing
             if t == T - 1 and start_time is not None:
@@ -599,7 +567,8 @@ class ComparisonTester:
                         pred_at_gt_res[:, 0],
                         gt_depth_metric_cpu[:, 0],
                         dataset_name_for_tae,
-                        image_paths_for_tae
+                        image_paths_for_tae,
+                        max_depth=MAX_DEPTH
                     )
                     if need_upsample:
                         del pred_at_gt_res
@@ -719,7 +688,8 @@ class ComparisonTester:
                     pred_at_gt_res[:, 0],  # [T, gt_H, gt_W]
                     gt_depth_metric_cpu[:, 0],  # [T, gt_H, gt_W]
                     dataset_name_for_tae,
-                    image_paths_for_tae
+                    image_paths_for_tae,
+                    max_depth=MAX_DEPTH
                 )
                 if need_upsample:
                     del pred_at_gt_res
@@ -882,7 +852,8 @@ class ComparisonTester:
                     focal_lengths=focal_lengths[0] if focal_lengths is not None else None,
                     frame_interval=self.frame_interval,  # Pass frame interval for visualization
                     depth_paths=depth_paths,  # For completed depth visualization (ETH3D/Waymo)
-                    dataset_name=dataset_name_lower  # e.g., 'eth3d', 'waymo_seg'
+                    dataset_name=dataset_name_lower,  # e.g., 'eth3d', 'waymo_seg'
+                    max_depth=MAX_DEPTH
                 )
             else:
                 logger.info(f"Skipping sequence visualization for {dataset_name} (high resolution dataset)")
@@ -924,7 +895,8 @@ class ComparisonTester:
                 frame_idx=best_frame_idx,
                 dataset_name=dataset_name,
                 focal_length=frame_focal_length,
-                gt_depth_path=depth_paths[best_frame_idx] if depth_paths and best_frame_idx < len(depth_paths) else None
+                gt_depth_path=depth_paths[best_frame_idx] if depth_paths and best_frame_idx < len(depth_paths) else None,
+                max_depth=MAX_DEPTH
             )
 
         # Export individual frames if --best-figure or --frame option is enabled

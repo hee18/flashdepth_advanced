@@ -284,7 +284,7 @@ if [ "$DATASET" = "all" ]; then
     echo ""
 
     BATCH_ABORT=false
-    trap 'echo ""; echo "⚠️  Ctrl+C received — aborting batch..."; BATCH_ABORT=true' INT
+    trap 'echo ""; echo "⚠️  Ctrl+C received — aborting..."; exit 130' INT
 
     TOTAL_RUNS=0
     COMPLETED_RUNS=0

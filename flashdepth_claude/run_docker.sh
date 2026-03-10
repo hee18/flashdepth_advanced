@@ -102,6 +102,8 @@ show_usage() {
     echo ""
     echo "Note: Regularization losses are deprecated. Importance map now uses raw DINOv2 attention (frozen)."
     echo "Note: test_original_flashdepth now tests all sequences (use --limit-scenes N to limit)."
+    echo "      Supports --dataset all to batch-test on eth3d, sintel, waymo_seg, vkitti, unreal4k."
+    echo "      Supports --max-depth METERS for eval_aligned (default: 80.0)."
     echo "      Supports --seq N (e.g., --seq 0,4) and --frame N for eval visualization."
     echo ""
     echo "Examples:"
@@ -135,6 +137,7 @@ show_usage() {
     echo "  $0 test_original_flashdepth --config flashdepth-s --gpu 0  # Use ViT-S variant (smaller/faster)"
     echo "  $0 test_original_flashdepth --config flashdepth-s --no-video --gpu 0  # Skip MP4 and .npy saving (faster testing)"
     echo "  CHECKPOINT=/app/configs/flashdepth-s/iter_14001.pth $0 test_original_flashdepth --config flashdepth-s  # ViT-S with matching checkpoint"
+    echo "  $0 test_original_flashdepth --dataset all --max-depth 80 --gpu 0  # Batch test all datasets with max-depth 80"
     echo "  $0 train --results-dir train_results/results_2  # Custom results directory"
     echo "  $0 shell                              # Interactive development"
     echo ""
@@ -1693,163 +1696,314 @@ case $COMMAND in
                 ;;
         esac
 
-        # Use custom results dir if provided, otherwise default to test_results/${TEST_DATASET}_original_${CONFIG_VARIANT}
-        # NOTE: FlashDepth automatically appends /${TEST_DATASET}/ to outfolder, so we need to handle this
-        if [ "$RESULTS_DIR" = "train_results/results_1" ]; then
-            # Default value not changed by user, use dataset and config specific default
-            # FlashDepth will create: test_results/original_${CONFIG_VARIANT}/${TEST_DATASET}/
-            OUTFOLDER="/app/test_results/original_${CONFIG_VARIANT}"
-            LOCAL_OUTFOLDER="test_results/original_${CONFIG_VARIANT}"
-            FINAL_RESULTS_DIR="${LOCAL_OUTFOLDER}/${TEST_DATASET}"
-        else
-            # User provided custom results dir
-            # Remove trailing slash and dataset name if present to avoid duplication
-            CLEAN_RESULTS_DIR="${RESULTS_DIR%/}"  # Remove trailing slash
-            CLEAN_RESULTS_DIR="${CLEAN_RESULTS_DIR%/$TEST_DATASET}"  # Remove dataset suffix if present
+        # Determine max-depth for eval_aligned (default: 80.0)
+        EVAL_MAX_DEPTH="${MAX_DEPTH:-80.0}"
 
-            # If it's a relative path, prefix with /app/ to save to host
-            if [[ "$CLEAN_RESULTS_DIR" != /* ]]; then
-                OUTFOLDER="/app/$CLEAN_RESULTS_DIR"
-            else
-                OUTFOLDER="$CLEAN_RESULTS_DIR"
-            fi
-            LOCAL_OUTFOLDER="${OUTFOLDER#/app/}"
-            FINAL_RESULTS_DIR="${LOCAL_OUTFOLDER}/${TEST_DATASET}"
-        fi
+        # Map CONFIG_VARIANT to human-readable name for results dir
+        case "$CONFIG_VARIANT" in
+            l)      CONFIG_DIR_NAME="large" ;;
+            s)      CONFIG_DIR_NAME="small" ;;
+            hybrid) CONFIG_DIR_NAME="hybrid" ;;
+        esac
+
+        # Max-depth suffix for results dir (remove trailing .0 for clean paths)
+        MD_DISPLAY=$(echo "$EVAL_MAX_DEPTH" | sed 's/\.0$//')
+        MD_SUFFIX="_${MD_DISPLAY}"
 
         # Determine visualization settings based on NO_VIDEO flag
         # --no-video: Disable MP4 generation but still save .npy depth files for eval_aligned
         if [ "$NO_VIDEO" = "true" ]; then
             OUT_VIDEO="false"
+            OUT_MP4="false"
             SAVE_DEPTH="true"  # Keep .npy saving for eval_aligned
             VIS_STATUS="LIMITED (no MP4, .npy depth files saved for eval_aligned)"
         else
             OUT_VIDEO="true"
+            OUT_MP4="true"
             SAVE_DEPTH="true"
             VIS_STATUS="ENABLED (MP4 + .npy depth files)"
         fi
 
-        echo "Testing Original FlashDepth (inference mode)..."
-        echo "Configuration:"
-        echo "  - Config variant: $CONFIG_VARIANT ($FLASHDEPTH_CONFIG)"
-        echo "  - Dataset: $TEST_DATASET (all sequences)"
-        echo "  - Resolution: $RESOLUTION"
-        echo "  - GPU: $GPU_ID"
-        echo "  - Checkpoint: $CHECKPOINT"
-        echo "  - Results directory: $FINAL_RESULTS_DIR"
-        echo "  - Inverse colormap: $INVERSE"
-        echo "  - Visualization: $VIS_STATUS"
-        echo "  - DataLoader workers: $WORKERS"
-        if [ -n "$TEST_MODE" ]; then
-            echo "  - Test mode: $TEST_MODE"
-        fi
-        echo "  - Log file: ${FINAL_RESULTS_DIR}/test.log"
-        echo ""
+        # === Dataset-specific vid-len and workers defaults ===
+        _original_vid_len() {
+            case "$1" in
+                eth3d)       echo 30 ;;
+                sintel)      echo 50 ;;
+                waymo_seg|waymo) echo 200 ;;
+                vkitti)      echo 200 ;;
+                unreal4k)    echo 500 ;;
+                *)           echo 50 ;;
+            esac
+        }
 
-        # Create output directory on host
-        mkdir -p "$FINAL_RESULTS_DIR"
+        _original_workers() {
+            case "$1" in
+                eth3d|unreal4k) echo 1 ;;
+                waymo_seg|waymo) echo 2 ;;
+                sintel|vkitti)  echo 4 ;;
+                *)              echo 4 ;;
+            esac
+        }
 
-        # Use test_video_comparison.py for special test modes (e.g., tc)
-        if [ -n "$TEST_MODE" ]; then
-            echo "Running FlashDepth via test_video_comparison.py (--test-mode $TEST_MODE)..."
+        # === Helper function: run single dataset for original FlashDepth ===
+        _run_original_flashdepth_single() {
+            local CUR_DATASET="$1"
+            local CUR_VID_LEN="$2"
+            local CUR_WORKERS="$3"
 
-            DOCKER_CMD="CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm flashdepth python test_video_comparison.py \
-                --method flashdepth \
-                --dataset $TEST_DATASET \
-                --data-root /data/datasets \
-                --checkpoint $CHECKPOINT \
-                --results-dir /app/$FINAL_RESULTS_DIR \
-                --gpu 0 \
-                --video-length $VID_LEN \
-                --workers $WORKERS \
-                --depth-mode metric \
-                --test-mode $TEST_MODE"
-
-            if [ -n "$LIMIT_SCENES" ]; then
-                DOCKER_CMD="$DOCKER_CMD --limit-scenes $LIMIT_SCENES"
+            # Results dir: test_results/original/{large|hybrid}/{dataset}_{max-depth}
+            # FlashDepth train.py appends /{dataset}/ to outfolder automatically,
+            # so we use a temp outfolder and move contents up after inference.
+            local CUR_DIR_NAME="${CUR_DATASET}${MD_SUFFIX}"
+            if [ "$RESULTS_DIR" = "train_results/results_1" ]; then
+                local CUR_OUTFOLDER="/app/test_results/original/${CONFIG_DIR_NAME}/${CUR_DIR_NAME}"
+                local CUR_LOCAL_OUTFOLDER="test_results/original/${CONFIG_DIR_NAME}/${CUR_DIR_NAME}"
+            else
+                local CLEAN_DIR="${RESULTS_DIR%/}"
+                if [[ "$CLEAN_DIR" != /* ]]; then
+                    local CUR_OUTFOLDER="/app/$CLEAN_DIR"
+                else
+                    local CUR_OUTFOLDER="$CLEAN_DIR"
+                fi
+                local CUR_LOCAL_OUTFOLDER="${CUR_OUTFOLDER#/app/}"
             fi
+            local CUR_FINAL_DIR="$CUR_LOCAL_OUTFOLDER"
 
-            if [ -n "$SEQ" ]; then
-                DOCKER_CMD="$DOCKER_CMD --seq $SEQ"
-            fi
+            mkdir -p "$CUR_FINAL_DIR"
 
-            eval $DOCKER_CMD 2>&1 | tee "${FINAL_RESULTS_DIR}/test.log"
+            echo "  - Dataset: $CUR_DATASET"
+            echo "  - Video length: $CUR_VID_LEN"
+            echo "  - Workers: $CUR_WORKERS"
+            echo "  - Results: $CUR_FINAL_DIR"
 
-            echo ""
-            echo "✓ Test complete! Results saved to:"
-            echo "  - Temporal consistency: ${FINAL_RESULTS_DIR}/temporal_consistency.json"
-            echo "  - Full log: ${FINAL_RESULTS_DIR}/test.log"
-        else
-            # Original train.py inference pipeline
-            # Build base command
-            TEST_CMD="cd /FlashDepth && torchrun --nproc_per_node=1 train.py \
-              --config-path configs/$FLASHDEPTH_CONFIG \
-              inference=true \
-              eval.test_datasets=[$TEST_DATASET] \
-              eval.metrics=true \
-              dataset.data_root=/data/datasets \
-              eval.outfolder=$OUTFOLDER \
-              load=$CHECKPOINT \
-              +eval.inverse=$INVERSE \
-              eval.compile=false \
-              eval.out_video=$OUT_VIDEO \
-              eval.save_depth_npy=$SAVE_DEPTH \
-              eval.num_workers=$WORKERS \
-              eval.test_dataset_resolution=$RESOLUTION"
+            # Use test_video_comparison.py for special test modes (e.g., tc)
+            if [ -n "$TEST_MODE" ]; then
+                echo "Running FlashDepth via test_video_comparison.py (--test-mode $TEST_MODE)..."
 
-            # Add limit_scenes if specified
-            if [ -n "$LIMIT_SCENES" ]; then
-                TEST_CMD="$TEST_CMD \
-              +eval.limit_scenes=$LIMIT_SCENES"
-            fi
+                DOCKER_CMD="CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm flashdepth python test_video_comparison.py \
+                    --method flashdepth \
+                    --dataset $CUR_DATASET \
+                    --data-root /data/datasets \
+                    --checkpoint $CHECKPOINT \
+                    --results-dir /app/$CUR_FINAL_DIR \
+                    --gpu 0 \
+                    --video-length $CUR_VID_LEN \
+                    --workers $CUR_WORKERS \
+                    --depth-mode relative \
+                    --max-depth $EVAL_MAX_DEPTH \
+                    --test-mode $TEST_MODE"
 
-            # Run test and save log
-            echo "Running FlashDepth inference on $TEST_DATASET..."
-            CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm flashdepth bash -c "$TEST_CMD" 2>&1 | tee "${FINAL_RESULTS_DIR}/test.log"
-
-            # Parse log and save as JSON
-            echo ""
-            echo "Parsing results to JSON..."
-            python3 utils/parse_flashdepth_results.py "${FINAL_RESULTS_DIR}/test.log" "$FINAL_RESULTS_DIR"
-
-            # Run scale/shift alignment evaluation (.npy files are always saved now)
-            if [ -d "$FINAL_RESULTS_DIR" ]; then
-                echo ""
-                echo "Running scale/shift alignment evaluation..."
-
-                # Build eval command with optional --seq and --frame
-                EVAL_CMD="python3 scripts/eval_flashdepth_with_alignment.py \
-                    --pred-dir \"$FINAL_RESULTS_DIR\" \
-                    --dataset \"$TEST_DATASET\" \
-                    --data-root /home/cvlab/hsy/Datasets \
-                    --max-depth 70.0 \
-                    --output-dir \"${FINAL_RESULTS_DIR}/eval_aligned\""
+                if [ -n "$LIMIT_SCENES" ]; then
+                    DOCKER_CMD="$DOCKER_CMD --limit-scenes $LIMIT_SCENES"
+                fi
 
                 if [ -n "$SEQ" ]; then
-                    EVAL_CMD="$EVAL_CMD --seq \"$SEQ\""
+                    DOCKER_CMD="$DOCKER_CMD --seq $SEQ"
                 fi
 
-                if [ -n "$FRAME" ]; then
-                    EVAL_CMD="$EVAL_CMD --frame $FRAME"
-                fi
+                eval $DOCKER_CMD 2>&1 | tee "${CUR_FINAL_DIR}/test.log"
 
-                eval "$EVAL_CMD" 2>&1 | tee -a "${FINAL_RESULTS_DIR}/eval_aligned.log" || echo "Warning: Alignment evaluation failed (GT may not be available for this dataset)"
+                echo ""
+                echo "✓ Test complete! Results saved to:"
+                echo "  - Temporal consistency: ${CUR_FINAL_DIR}/temporal_consistency.json"
+                echo "  - TC summary: ${CUR_FINAL_DIR}/tc_summary.json"
+                echo "  - Full log: ${CUR_FINAL_DIR}/test.log"
             else
-                echo "Warning: Results directory not found: $FINAL_RESULTS_DIR"
+                # Original train.py inference pipeline
+                TEST_CMD="cd /FlashDepth && torchrun --nproc_per_node=1 train.py \
+                  --config-path configs/$FLASHDEPTH_CONFIG \
+                  inference=true \
+                  eval.test_datasets=[$CUR_DATASET] \
+                  eval.metrics=true \
+                  dataset.data_root=/data/datasets \
+                  dataset.video_length=$CUR_VID_LEN \
+                  eval.outfolder=$CUR_OUTFOLDER \
+                  load=$CHECKPOINT \
+                  +eval.inverse=$INVERSE \
+                  eval.compile=false \
+                  eval.out_video=$OUT_VIDEO \
+                  eval.out_mp4=$OUT_MP4 \
+                  eval.save_depth_npy=$SAVE_DEPTH \
+                  ++eval.num_workers=$CUR_WORKERS \
+                  eval.test_dataset_resolution=$RESOLUTION"
+
+                if [ -n "$LIMIT_SCENES" ]; then
+                    TEST_CMD="$TEST_CMD \
+                  +eval.limit_scenes=$LIMIT_SCENES"
+                fi
+
+                echo "Running FlashDepth inference on $CUR_DATASET..."
+                CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm flashdepth bash -c "$TEST_CMD" 2>&1 | tee "${CUR_FINAL_DIR}/test.log"
+
+                # train.py auto-appends /{dataset}/ to outfolder — flatten it
+                local NESTED_DIR="${CUR_FINAL_DIR}/${CUR_DATASET}"
+                if [ -d "$NESTED_DIR" ]; then
+                    mv "$NESTED_DIR"/* "$CUR_FINAL_DIR"/ 2>/dev/null || true
+                    rmdir "$NESTED_DIR" 2>/dev/null || true
+                fi
+
+                echo ""
+                echo "Parsing results to JSON..."
+                python3 utils/parse_flashdepth_results.py "${CUR_FINAL_DIR}/test.log" "$CUR_FINAL_DIR"
+
+                # Run scale/shift alignment evaluation
+                if [ -d "$CUR_FINAL_DIR" ]; then
+                    echo ""
+                    echo "Running scale/shift alignment evaluation (max-depth=${EVAL_MAX_DEPTH})..."
+
+                    EVAL_CMD="python3 scripts/eval_flashdepth_with_alignment.py \
+                        --pred-dir \"$CUR_FINAL_DIR\" \
+                        --dataset \"$CUR_DATASET\" \
+                        --data-root /data/datasets \
+                        --max-depth $EVAL_MAX_DEPTH \
+                        --output-dir \"${CUR_FINAL_DIR}/eval_aligned\""
+
+                    if [ -n "$SEQ" ]; then
+                        EVAL_CMD="$EVAL_CMD --seq \"$SEQ\""
+                    fi
+
+                    if [ -n "$FRAME" ]; then
+                        EVAL_CMD="$EVAL_CMD --frame $FRAME"
+                    fi
+
+                    CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm flashdepth bash -c "$EVAL_CMD" 2>&1 | tee -a "${CUR_FINAL_DIR}/eval_aligned.log" || echo "Warning: Alignment evaluation failed (GT may not be available for this dataset)"
+                else
+                    echo "Warning: Results directory not found: $CUR_FINAL_DIR"
+                fi
+
+                echo ""
+                echo "✓ Test on $CUR_DATASET complete! Results saved to:"
+                echo "  - FPS Summary: ${CUR_FINAL_DIR}/fps_results.json"
+                echo "  - Per-sequence FPS: ${CUR_FINAL_DIR}/per_sequence_fps.json"
+                echo "  - Full log: ${CUR_FINAL_DIR}/test.log"
+                echo "  - Depth files (.npy): ${CUR_FINAL_DIR}/*/*.npy"
+                echo "  - Aligned evaluation: ${CUR_FINAL_DIR}/eval_aligned/"
+                echo "    - eval_results.json (overall metrics with scale/shift)"
+                echo "    - per_sequence_scale_shift.json (per-sequence s,t values)"
+                if [ "$NO_VIDEO" != "true" ]; then
+                    echo "  - MP4 videos: ${CUR_FINAL_DIR}/*/*.mp4"
+                fi
             fi
+        }
+
+        # Check if user explicitly set --vid-len
+        USER_VID_LEN_SET=false
+        for arg in "${BASH_ARGV[@]}"; do
+            if [ "$arg" = "--vid-len" ]; then
+                USER_VID_LEN_SET=true
+                break
+            fi
+        done
+
+        # Check if user explicitly set --workers
+        USER_WORKERS_SET=false
+        for arg in "${BASH_ARGV[@]}"; do
+            if [ "$arg" = "--workers" ]; then
+                USER_WORKERS_SET=true
+                break
+            fi
+        done
+
+        # === Handle --dataset all ===
+        if [ "$TEST_DATASET" = "all" ]; then
+            ALL_FLASHDEPTH_DATASETS="eth3d sintel waymo_seg vkitti unreal4k"
+
+            echo "========================================"
+            echo "Original FlashDepth Batch Testing: ALL datasets"
+            echo "========================================"
+            echo "Datasets: $ALL_FLASHDEPTH_DATASETS"
+            echo "Config variant: $CONFIG_VARIANT ($FLASHDEPTH_CONFIG)"
+            echo "GPU: $GPU_ID"
+            echo "Checkpoint: $CHECKPOINT"
+            echo "Max depth: $EVAL_MAX_DEPTH"
+            echo "Resolution: $RESOLUTION"
+            echo "Visualization: $VIS_STATUS"
+            echo "Results base: test_results/original/${CONFIG_DIR_NAME}/"
+            echo "========================================"
+            echo "Press Ctrl+C to abort all runs"
+            echo ""
+
+            BATCH_ABORT=false
+            trap 'echo ""; echo "⚠️  Ctrl+C received — aborting..."; exit 130' INT
+
+            TOTAL_RUNS=0
+            COMPLETED_RUNS=0
+            FAILED_RUNS=0
+            for ds in $ALL_FLASHDEPTH_DATASETS; do
+                TOTAL_RUNS=$((TOTAL_RUNS + 1))
+            done
+
+            for ds in $ALL_FLASHDEPTH_DATASETS; do
+                if [ "$BATCH_ABORT" = true ]; then
+                    break
+                fi
+
+                COMPLETED_RUNS=$((COMPLETED_RUNS + 1))
+
+                # Determine vid-len and workers for this dataset
+                if [ "$USER_VID_LEN_SET" = false ]; then
+                    CUR_VID_LEN=$(_original_vid_len "$ds")
+                else
+                    CUR_VID_LEN=$VID_LEN
+                fi
+                if [ "$USER_WORKERS_SET" = false ]; then
+                    CUR_WORKERS=$(_original_workers "$ds")
+                else
+                    CUR_WORKERS=$WORKERS
+                fi
+
+                echo ""
+                echo "========================================"
+                echo "[$COMPLETED_RUNS/$TOTAL_RUNS] Original FlashDepth on $ds (vid-len=$CUR_VID_LEN, workers=$CUR_WORKERS)"
+                echo "========================================"
+
+                if _run_original_flashdepth_single "$ds" "$CUR_VID_LEN" "$CUR_WORKERS"; then
+                    echo "✅ [$COMPLETED_RUNS/$TOTAL_RUNS] Original FlashDepth on $ds completed"
+                else
+                    echo "❌ [$COMPLETED_RUNS/$TOTAL_RUNS] Original FlashDepth on $ds FAILED"
+                    FAILED_RUNS=$((FAILED_RUNS + 1))
+                fi
+            done
+
+            trap - INT
 
             echo ""
-            echo "✓ Test complete! Results saved to:"
-            echo "  - FPS Summary: ${FINAL_RESULTS_DIR}/fps_results.json"
-            echo "  - Per-sequence FPS: ${FINAL_RESULTS_DIR}/per_sequence_fps.json"
-            echo "  - Full log: ${FINAL_RESULTS_DIR}/test.log"
-            echo "  - Depth files (.npy): ${FINAL_RESULTS_DIR}/*/*.npy"
-            echo "  - Aligned evaluation: ${FINAL_RESULTS_DIR}/eval_aligned/"
-            echo "    - eval_results.json (overall metrics with scale/shift)"
-            echo "    - per_sequence_scale_shift.json (per-sequence s,t values)"
-            if [ "$NO_VIDEO" != "true" ]; then
-                echo "  - MP4 videos: ${FINAL_RESULTS_DIR}/*/*.mp4"
+            echo "========================================"
+            if [ "$BATCH_ABORT" = true ]; then
+                echo "Batch ABORTED by user (Ctrl+C)"
             fi
+            echo "Original FlashDepth Batch Testing Summary"
+            echo "  Total: $TOTAL_RUNS, Completed: $((TOTAL_RUNS - FAILED_RUNS)), Failed: $FAILED_RUNS"
+            echo "========================================"
+        else
+            # === Single dataset mode ===
+            # Determine vid-len and workers
+            if [ "$USER_VID_LEN_SET" = false ]; then
+                CUR_VID_LEN=$(_original_vid_len "$TEST_DATASET")
+            else
+                CUR_VID_LEN=$VID_LEN
+            fi
+            if [ "$USER_WORKERS_SET" = false ]; then
+                CUR_WORKERS=$(_original_workers "$TEST_DATASET")
+            else
+                CUR_WORKERS=$WORKERS
+            fi
+
+            echo "Testing Original FlashDepth (inference mode)..."
+            echo "Configuration:"
+            echo "  - Config variant: $CONFIG_VARIANT ($FLASHDEPTH_CONFIG)"
+            echo "  - Resolution: $RESOLUTION"
+            echo "  - GPU: $GPU_ID"
+            echo "  - Checkpoint: $CHECKPOINT"
+            echo "  - Max depth: $EVAL_MAX_DEPTH"
+            echo "  - Inverse colormap: $INVERSE"
+            echo "  - Visualization: $VIS_STATUS"
+            if [ -n "$TEST_MODE" ]; then
+                echo "  - Test mode: $TEST_MODE"
+            fi
+            echo ""
+
+            _run_original_flashdepth_single "$TEST_DATASET" "$CUR_VID_LEN" "$CUR_WORKERS"
         fi
         ;;
 
@@ -2009,7 +2163,7 @@ case $COMMAND in
             echo ""
 
             BATCH_ABORT=false
-            trap 'echo ""; echo "⚠️  Ctrl+C received — aborting batch..."; BATCH_ABORT=true' INT
+            trap 'echo ""; echo "⚠️  Ctrl+C received — aborting..."; exit 130' INT
 
             TOTAL_RUNS=0
             COMPLETED_RUNS=0

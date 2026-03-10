@@ -33,7 +33,7 @@ def visualize_sequence_simplified(images, pred_depths, gt_depths, valid_mask,
                                    sequence_id, metrics, fps, save_dir,
                                    frame_interval=None, focal_lengths=None, config=None,
                                    seg_masks=None, objwise_enabled=False, object_classes=None,
-                                   depth_paths=None, dataset_name=None):
+                                   depth_paths=None, dataset_name=None, max_depth=80.0):
     """
     Create simplified sequence visualization (3-row grid without importance maps)
 
@@ -88,7 +88,7 @@ def visualize_sequence_simplified(images, pred_depths, gt_depths, valid_mask,
         axes[0, col].axis('off')
 
         # Row 1: Predicted metric depth
-        MAX_DEPTH = 70.0
+        MAX_DEPTH = max_depth
         pred = pred_depths[t, 0].cpu().numpy()
         gt = gt_depths[t, 0].cpu().numpy()
 
@@ -198,7 +198,7 @@ def visualize_best_frame_simplified(image, gt_depth, pred_depth, metrics,
                                      save_dir, sequence_id, frame_idx,
                                      dataset_name=None, focal_length=None,
                                      seg_mask=None, objwise_enabled=False, object_classes=None, class_names_dict=None,
-                                     gt_depth_path=None):
+                                     gt_depth_path=None, max_depth=80.0):
     """
     Save improved best frame visualization (3×3 grid with Valid/Object Mask and Depth Distribution)
 
@@ -243,7 +243,7 @@ def visualize_best_frame_simplified(image, gt_depth, pred_depth, metrics,
                           height_ratios=[1, 1, 1],
                           hspace=0.35, wspace=0.3)
 
-    MAX_DEPTH = 70.0
+    MAX_DEPTH = max_depth
 
     # ==================== Row 0: Input, GT, Pred ====================
 
@@ -366,7 +366,7 @@ def visualize_best_frame_simplified(image, gt_depth, pred_depth, metrics,
         valid_mask_vis = gt_valid.astype(np.uint8)
         gt_valid_ratio = gt_valid.sum() / gt_valid.size
         ax_valid.imshow(valid_mask_vis, cmap='gray', vmin=0, vmax=1)
-        ax_valid.set_title(f'Valid Mask (GT ≤70m)\n{gt_valid_ratio*100:.1f}% valid',
+        ax_valid.set_title(f'Valid Mask (GT ≤{MAX_DEPTH:.0f}m)\n{gt_valid_ratio*100:.1f}% valid',
                           fontsize=12, fontweight='bold', pad=8)
 
     ax_valid.axis('off')
@@ -448,7 +448,7 @@ def visualize_best_frame_simplified(image, gt_depth, pred_depth, metrics,
 
         ax_dist.set_xlabel('Depth (m)', fontsize=10)
         ax_dist.set_ylabel('Density', fontsize=10)
-        ax_dist.set_title('Depth Distribution (Valid Pixels ≤70m)', fontsize=12, fontweight='bold')
+        ax_dist.set_title(f'Depth Distribution (Valid Pixels ≤{MAX_DEPTH:.0f}m)', fontsize=12, fontweight='bold')
         ax_dist.legend(fontsize=9, loc='upper right')
         ax_dist.grid(True, alpha=0.3)
     else:

@@ -620,9 +620,9 @@ if command -v docker &> /dev/null && [ -f "docker-compose.yml" ]; then
     echo "Command: $CMD"
     echo ""
 
-    # Run with Docker
+    # Run with Docker (ensure pyarrow for Waymo parquet support)
     CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm comparison \
-        bash -c "source /opt/conda/etc/profile.d/conda.sh && conda activate $CONDA_ENV && exec $CMD"
+        bash -c "source /opt/conda/etc/profile.d/conda.sh && conda activate $CONDA_ENV && pip install -q pyarrow 2>/dev/null; exec $CMD"
 else
     echo "Running directly (no Docker)..."
     echo "Command: $CMD"

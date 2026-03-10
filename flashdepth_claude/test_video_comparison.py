@@ -157,8 +157,9 @@ class VideoComparisonTester:
         # Define which methods output relative depth vs metric depth
         relative_depth_methods = {
             'depthcrafter': 'DepthCrafter always outputs relative depth (0-1 normalized)',
+            'flashdepth': 'FlashDepth outputs relative depth (requires scale/shift alignment)',
         }
-        
+
         # VideoDepthAnything depends on the metric flag
         if method == 'vda' and not metric_flag:
             relative_depth_methods['vda'] = 'VideoDepthAnything without --metric flag outputs relative depth'
@@ -183,11 +184,13 @@ class VideoComparisonTester:
             )
 
             if method == 'depthcrafter':
-                error_msg += f"  python test_comparison.py --method depthcrafter --depth-mode relative --dataset {{dataset}}\n"
+                error_msg += f"  python test_video_comparison.py --method depthcrafter --depth-mode relative --dataset {{dataset}}\n"
             elif method == 'vda':
-                error_msg += f"  python test_comparison.py --method vda --depth-mode relative --dataset {{dataset}}\n"
+                error_msg += f"  python test_video_comparison.py --method vda --depth-mode relative --dataset {{dataset}}\n"
                 error_msg += f"  # OR for metric VideoDepthAnything:\n"
-                error_msg += f"  python test_comparison.py --method vda --metric --depth-mode metric --dataset {{dataset}}\n"
+                error_msg += f"  python test_video_comparison.py --method vda --metric --depth-mode metric --dataset {{dataset}}\n"
+            elif method == 'flashdepth':
+                error_msg += f"  python test_video_comparison.py --method flashdepth --depth-mode relative --dataset {{dataset}}\n"
 
             error_msg += f"{'='*80}\n"
 
@@ -271,10 +274,16 @@ class VideoComparisonTester:
                 metrics['sequence_id'] = sequence_id
                 self.all_results.append(metrics)
 
-                logger.info(f"Sequence {sequence_id}: "
-                           f"AbsRel={metrics['abs_rel']:.4f}, "
-                           f"δ1={metrics['a1']:.4f}, "
-                           f"TAE={metrics['tae']:.4f}")
+                if self.test_mode == 'tc':
+                    logger.info(f"Sequence {sequence_id}: "
+                               f"rTC={metrics.get('rtc', 0):.4f}, "
+                               f"PSR={metrics.get('psr', 0):.4f}, "
+                               f"TAE={metrics.get('tae', 0):.4f}")
+                else:
+                    logger.info(f"Sequence {sequence_id}: "
+                               f"AbsRel={metrics.get('abs_rel', 0):.4f}, "
+                               f"δ1={metrics.get('a1', 0):.4f}, "
+                               f"TAE={metrics.get('tae', 0):.4f}")
 
             except Exception as e:
                 logger.error(f"Error processing sequence {sequence_id}: {e}")
@@ -305,33 +314,19 @@ class VideoComparisonTester:
             gpu_mem_total = torch.cuda.get_device_properties(self.device).total_memory / 1e9
             logger.info(f"GPU: {gpu_name} (Total Memory: {gpu_mem_total:.1f}GB)")
 
-        # Get inputs
-        if 'images' in batch:
-            # ComparisonDataset or SegmentationDataset format (original resolution)
-            images = batch['images'].to(self.device)  # [1, T, 3, H, W]
-            H, W = images.shape[-2:]
-            logger.info(f"Sequence {sequence_id}: Processing {images.shape[1]} frames at {H}x{W} resolution")
+        # Get inputs - ComparisonDataset format (metric depth in meters, original resolution)
+        images = batch['images'].to(self.device)  # [1, T, 3, H, W]
+        H, W = images.shape[-2:]
+        logger.info(f"Sequence {sequence_id}: Processing {images.shape[1]} frames at {H}x{W} resolution")
 
-            # Handle different depth key names
-            # ComparisonDataset: 'depths' (plural)
-            # SegmentationDataset: 'depth' (singular)
-            if 'depths' in batch:
-                gt_depths = batch['depths'].to(self.device)  # [1, T, H, W] - ComparisonDataset (meters)
-            else:
-                gt_depths = batch['depth'].to(self.device)  # [1, T, H, W] - SegmentationDataset (inverse depth)
+        gt_depths = batch['depths'].to(self.device)  # [1, T, H, W] - metric depth (meters)
 
-            intrinsics = batch.get('intrinsics', None)
-            if intrinsics is not None:
-                intrinsics = intrinsics.to(self.device)  # [1, T, 4] - fx, fy, cx, cy
+        intrinsics = batch.get('intrinsics', None)
+        if intrinsics is not None:
+            intrinsics = intrinsics.to(self.device)  # [1, T, 4] - fx, fy, cx, cy
 
-            # Get depth file paths for completed depth loading (visualization)
-            depth_paths = batch.get('depth_paths', None)  # List[str] or None
-        else:
-            # Legacy CombinedDataset format (resized)
-            images = batch['image'].to(self.device)  # [1, T, 3, H, W]
-            gt_depths = batch['depth'].to(self.device)  # [1, T, H, W] - inverse depth!
-            intrinsics = None
-            depth_paths = None  # Not available in legacy format
+        # Get depth file paths for completed depth loading (visualization)
+        depth_paths = batch.get('depth_paths', None)  # List[str] or None
 
         # Ensure proper dimensions
         if images.ndim == 4:
@@ -342,14 +337,7 @@ class VideoComparisonTester:
         B, T = images.shape[:2]
         assert B == 1, "Batch size must be 1 for testing"
 
-        # Process GT depth
-        # Dataset name determines depth format:
-        # - *_seg datasets (waymo_seg, urbansyn_seg, vkitti_seg) → SegmentationDataset → inverse depth (1/m)
-        # - other datasets → ComparisonDataset → metric depth (m)
-
-        dataset_name = self.config.get('dataset', 'waymo')
-
-        # ComparisonDataset - already in meters
+        # Process GT depth - ComparisonDataset provides metric depth (meters)
         if gt_depths.ndim == 4:
             gt_depth_processed = gt_depths.unsqueeze(2)  # [1, T, H, W] -> [1, T, 1, H, W]
         else:
@@ -363,20 +351,7 @@ class VideoComparisonTester:
             if focal_lengths is not None:
                 focal_lengths = focal_lengths.to(self.device)
 
-        # Check if images are ImageNet normalized (from segmentation datasets)
-        # ComparisonDataset returns [0, 1] range
-        # Segmentation datasets return ImageNet normalized
-        sample_img = images[0, 0]  # Check first frame
-        is_imagenet_normalized = (sample_img.min() < -2.0 or sample_img.max() > 2.0)
-
-        # Unnormalize if needed (video models expect [0, 1] range)
-        if is_imagenet_normalized:
-            # Unnormalize ImageNet: x_original = x * std + mean
-            mean = torch.tensor([0.485, 0.456, 0.406], device=images.device).view(1, 1, 3, 1, 1)
-            std = torch.tensor([0.229, 0.224, 0.225], device=images.device).view(1, 1, 3, 1, 1)
-            images_unnorm = images * std + mean  # [1, T, 3, H, W] back to [0, 1]
-        else:
-            images_unnorm = images
+        # ComparisonDataset returns [0, 1] range - no unnormalization needed
 
         # Process entire sequence at once (VIDEO MODEL)
         logger.info(f"Processing {T} frames as a single video sequence...")
@@ -392,12 +367,12 @@ class VideoComparisonTester:
                 amp_dtype = torch.bfloat16 if self.config.get('amp_dtype', 'bf16') == 'bf16' else torch.float16
                 with torch.amp.autocast('cuda', dtype=amp_dtype):
                     _ = self.adapter.inference(
-                        images_unnorm,  # [1, T, 3, H, W]
+                        images,  # [1, T, 3, H, W]
                         intrinsics=intrinsics  # [1, T, 4] or None
                     )
             else:
                 _ = self.adapter.inference(
-                    images_unnorm,  # [1, T, 3, H, W]
+                    images,  # [1, T, 3, H, W]
                     intrinsics=intrinsics  # [1, T, 4] or None
                 )
 
@@ -415,12 +390,12 @@ class VideoComparisonTester:
                 amp_dtype = torch.bfloat16 if self.config.get('amp_dtype', 'bf16') == 'bf16' else torch.float16
                 with torch.amp.autocast('cuda', dtype=amp_dtype):
                     pred_depths = self.adapter.inference(
-                        images_unnorm,  # [1, T, 3, H, W]
+                        images,  # [1, T, 3, H, W]
                         intrinsics=intrinsics  # [1, T, 4] or None
                     )  # Returns [1, T, H, W] in meters
             else:
                 pred_depths = self.adapter.inference(
-                    images_unnorm,  # [1, T, 3, H, W]
+                    images,  # [1, T, 3, H, W]
                     intrinsics=intrinsics  # [1, T, 4] or None
                 )  # Returns [1, T, H, W] in meters
 
@@ -439,9 +414,10 @@ class VideoComparisonTester:
             gpu_mem_reserved = torch.cuda.memory_reserved(self.device) / 1e9
             logger.info(f"GPU Memory: Allocated={gpu_mem_allocated:.2f}GB, Reserved={gpu_mem_reserved:.2f}GB")
 
-        # Free inference-only tensors immediately
-        del images_unnorm
+        # Free GPU images, keep CPU copy in batch for visualization/rTC
+        del images
         torch.cuda.empty_cache()
+        images = batch['images']  # [1, T, 3, H, W] CPU
 
         # Ensure correct shape [T, 1, H, W] for compatibility with visualization
         if pred_depths.ndim == 4 and pred_depths.shape[0] == 1:
@@ -494,15 +470,67 @@ class VideoComparisonTester:
         del gt_depths, gt_depth_processed
         torch.cuda.empty_cache()
 
-        # === TC-only mode: skip per-frame metrics, TAE; compute rTC only ===
+        # === Scale/shift alignment for relative depth methods (per-sequence) ===
+        # Compute alignment but keep raw predictions for rTC/PSR (scale-invariant metrics).
+        # Only TAE needs aligned predictions (metric-scale reprojection).
+        seq_scale, seq_shift = 1.0, 0.0
+        pred_depths_aligned = pred_depths_cpu  # Default: no alignment (metric methods)
+
+        if self.depth_mode == 'relative':
+            gt_all = gt_depth_metric_cpu[:, 0]  # [T, gt_H, gt_W]
+            # Upsample pred to GT resolution for alignment
+            if need_upsample:
+                pred_for_align = torch.stack([
+                    F.interpolate(pred_depths_cpu[t:t+1], size=(gt_H, gt_W),
+                                  mode='bilinear', align_corners=True)[0]
+                    for t in range(pred_depths_cpu.shape[0])
+                ], dim=0)[:, 0]  # [T, gt_H, gt_W]
+            else:
+                pred_for_align = pred_depths_cpu[:, 0]  # [T, gt_H, gt_W]
+
+            valid_align = (gt_all > 0) & (gt_all < MAX_DEPTH) & \
+                          (pred_for_align > 0) & torch.isfinite(pred_for_align)
+            pred_valid = pred_for_align[valid_align]
+            gt_valid = gt_all[valid_align]
+
+            if len(pred_valid) > 100:
+                # Least-squares in disparity space: gt_disp = s * pred_disp + t
+                pred_disp = 1.0 / pred_valid
+                gt_disp = 1.0 / gt_valid
+                A = torch.stack([pred_disp, torch.ones_like(pred_disp)], dim=1)
+                try:
+                    solution = torch.linalg.lstsq(A, gt_disp, rcond=None).solution
+                    disp_scale, disp_shift = solution[0].item(), solution[1].item()
+                except:
+                    disp_scale = (torch.median(gt_disp / (pred_disp + 1e-8))).item()
+                    disp_shift = 0.0
+
+                # Create aligned copy (for TAE only), keep raw pred_depths_cpu intact
+                pred_disp_all = 1.0 / pred_depths_cpu.clamp(min=1e-8)
+                pred_disp_aligned = disp_scale * pred_disp_all + disp_shift
+                pred_depths_aligned = 1.0 / pred_disp_aligned.clamp(min=1e-8)
+
+                aligned_valid = pred_depths_aligned[pred_depths_aligned > 0]
+                logger.info(f"Sequence {sequence_id} alignment (disparity): s={disp_scale:.4f}, t={disp_shift:.4f}")
+                logger.info(f"  Aligned depth range: min={aligned_valid.min():.2f}, max={aligned_valid.max():.2f}, mean={aligned_valid.mean():.2f}")
+                seq_scale, seq_shift = disp_scale, disp_shift
+            else:
+                logger.warning(f"Sequence {sequence_id}: too few valid pixels ({len(pred_valid)}), skipping alignment")
+            del pred_for_align
+
+        # === TC mode: compute rTC, PSR (raw preds), TAE (aligned preds) ===
         if self.test_mode == 'tc':
             metrics = {
                 'fps': float(fps), 'dataset': str(batch.get('dataset_name', 'unknown')),
                 'num_frames': pred_depths_cpu.shape[0],
-                'abs_rel': 0.0, 'a1': 0.0, 'mae': 0.0, 'rmse': 0.0,
                 'tae': 0.0, 'tae_reproj': 0.0, 'tae_reproj_gt': 0.0,
             }
-            T_tc = pred_depths.shape[0]
+            if self.depth_mode == 'relative':
+                metrics['scale'] = seq_scale
+                metrics['shift'] = seq_shift
+
+            # --- rTC: use RAW predictions (scale-invariant) ---
+            T_tc = pred_depths_cpu.shape[0]
             if T_tc > 1:
                 if self.flow_tc is None:
                     self.flow_tc = FlowTemporalConsistency(
@@ -523,7 +551,7 @@ class VideoComparisonTester:
                     metrics['_rtc_worst_frame_idx'] = tc_result['worst_frame_idx']
                     logger.info(f"Flow TC: rTC={metrics['rtc']:.4f}, rTC_gt={metrics['rtc_gt']:.4f}")
 
-                    # TC visualizations (depth grids, ratio heatmaps, rTC plot)
+                    # TC visualizations
                     try:
                         rtc_best = tc_result['best_frame_idx']
                         rtc_worst = tc_result['worst_frame_idx']
@@ -565,8 +593,8 @@ class VideoComparisonTester:
                 metrics['rtc'] = 0.0
                 metrics['rtc_gt'] = 0.0
 
-            # === TAE in TC mode ===
-            T_tc_frames = pred_depths.shape[0]
+            # --- TAE: use ALIGNED predictions (needs metric scale) ---
+            T_tc_frames = pred_depths_cpu.shape[0]
             dataset_name_for_tae = batch.get('dataset_name', 'unknown')
             if isinstance(dataset_name_for_tae, (list, tuple)):
                 dataset_name_for_tae = dataset_name_for_tae[0]
@@ -574,20 +602,21 @@ class VideoComparisonTester:
             if T_tc_frames > 1 and 'image_paths' in batch and self.reproj_tae_calculator.is_supported(dataset_name_for_tae):
                 try:
                     image_paths_for_tae = batch['image_paths'][0]
-                    # TAE at GT resolution
+                    # TAE at GT resolution using aligned predictions
                     if need_upsample:
                         pred_at_gt_res = torch.stack([
-                            F.interpolate(pred_depths_cpu[t:t+1], size=(gt_H, gt_W),
+                            F.interpolate(pred_depths_aligned[t:t+1], size=(gt_H, gt_W),
                                           mode='bilinear', align_corners=True)[0]
                             for t in range(T_tc_frames)
                         ], dim=0)
                     else:
-                        pred_at_gt_res = pred_depths_cpu
+                        pred_at_gt_res = pred_depths_aligned
                     reproj_tae_result = self.reproj_tae_calculator.compute_tae(
                         pred_at_gt_res[:, 0],
                         gt_depth_metric_cpu[:, 0],
                         dataset_name_for_tae,
-                        image_paths_for_tae
+                        image_paths_for_tae,
+                        max_depth=MAX_DEPTH
                     )
                     if need_upsample:
                         del pred_at_gt_res
@@ -598,7 +627,7 @@ class VideoComparisonTester:
                 except Exception as e:
                     logger.warning(f"Failed to compute reprojection TAE: {e}")
 
-            # === PSR in TC mode (at pred resolution) ===
+            # --- PSR: use RAW predictions (measures scale stability) ---
             per_frame_scale_ratios_tc = []
             for t in range(T_tc_frames):
                 pred_frame = pred_depths_cpu[t, 0]
@@ -694,20 +723,22 @@ class VideoComparisonTester:
         elif len(pred_depths) > 1 and 'image_paths' in batch and self.reproj_tae_calculator.is_supported(dataset_name_for_tae):
             try:
                 image_paths_for_tae = batch['image_paths'][0]  # batch size is 1
-                # TAE at GT resolution
+                # TAE at GT resolution — use aligned predictions for relative depth
+                pred_for_tae = pred_depths_aligned if self.depth_mode == 'relative' else pred_depths_cpu
                 if need_upsample:
                     pred_at_gt_res = torch.stack([
-                        F.interpolate(pred_depths_cpu[t:t+1], size=(gt_H, gt_W),
+                        F.interpolate(pred_for_tae[t:t+1], size=(gt_H, gt_W),
                                       mode='bilinear', align_corners=True)[0]
-                        for t in range(pred_depths_cpu.shape[0])
+                        for t in range(pred_for_tae.shape[0])
                     ], dim=0)
                 else:
-                    pred_at_gt_res = pred_depths_cpu
+                    pred_at_gt_res = pred_for_tae
                 reproj_tae_result = self.reproj_tae_calculator.compute_tae(
                     pred_at_gt_res[:, 0],  # [T, gt_H, gt_W]
                     gt_depth_metric_cpu[:, 0],  # [T, gt_H, gt_W]
                     dataset_name_for_tae,
-                    image_paths_for_tae
+                    image_paths_for_tae,
+                    max_depth=MAX_DEPTH
                 )
                 if need_upsample:
                     del pred_at_gt_res
@@ -869,7 +900,8 @@ class VideoComparisonTester:
                     focal_lengths=focal_lengths[0] if focal_lengths is not None else None,
                     frame_interval=self.frame_interval,  # Pass frame interval for visualization
                     depth_paths=depth_paths,  # For completed depth visualization (ETH3D/Waymo)
-                    dataset_name=dataset_name_lower  # e.g., 'eth3d', 'waymo_seg'
+                    dataset_name=dataset_name_lower,  # e.g., 'eth3d', 'waymo_seg'
+                    max_depth=MAX_DEPTH
                 )
             else:
                 logger.info(f"Skipping sequence visualization for {dataset_name} (high resolution dataset)")
@@ -911,7 +943,8 @@ class VideoComparisonTester:
                 frame_idx=best_frame_idx,
                 dataset_name=dataset_name,
                 focal_length=frame_focal_length,
-                gt_depth_path=depth_paths[best_frame_idx] if depth_paths and best_frame_idx < len(depth_paths) else None
+                gt_depth_path=depth_paths[best_frame_idx] if depth_paths and best_frame_idx < len(depth_paths) else None,
+                max_depth=MAX_DEPTH
             )
 
         # Export individual frames if --best-figure or --frame option is enabled
@@ -1132,7 +1165,7 @@ class VideoComparisonTester:
         """Save tc_summary.json with rTC + TAE + PSR (dataset aggregate + per-sequence)."""
         per_sequence = []
         for r in all_results:
-            per_sequence.append({
+            entry = {
                 'sequence_id': r.get('sequence_id', -1),
                 'rtc': r.get('rtc', 0.0),
                 'rtc_gt': r.get('rtc_gt', 0.0),
@@ -1142,7 +1175,12 @@ class VideoComparisonTester:
                 'psr': r.get('psr', 0.0),
                 'psr_max': r.get('psr_max', 0.0),
                 'fps': r.get('fps', 0.0),
-            })
+            }
+            # Include scale/shift for relative depth alignment
+            if 'scale' in r:
+                entry['scale'] = r['scale']
+                entry['shift'] = r['shift']
+            per_sequence.append(entry)
 
         agg = {}
         for key in ['rtc', 'rtc_gt', 'tae', 'tae_reproj', 'tae_reproj_gt', 'psr', 'psr_max', 'fps']:
