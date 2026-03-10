@@ -532,7 +532,7 @@ if command -v docker &> /dev/null && [ -f "docker-compose.yml" ]; then
 
     # Run with Docker
     CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm comparison \
-        bash -c "source /opt/conda/etc/profile.d/conda.sh && conda activate $CONDA_ENV && $CMD"
+        bash -c "source /opt/conda/etc/profile.d/conda.sh && conda activate $CONDA_ENV && exec $CMD"
 else
     echo "Running directly (no Docker)..."
     echo "Command: $CMD"
