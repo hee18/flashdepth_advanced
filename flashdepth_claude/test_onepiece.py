@@ -114,6 +114,11 @@ class OnepieceTester:
         # Test mode: None (full), 'tc' (temporal consistency only), 'ea' (error & accuracy only)
         self.test_mode = config.get('test_mode', None)
 
+        # Save depth maps option
+        self.save_depth_maps = config.get('save_depth_maps', False)
+        if self.save_depth_maps:
+            logger.info("Depth map saving ENABLED (will save pred depth as .npy)")
+
     def _setup_model(self):
         """Load trained Onepiece V3 model."""
         model_config = dict(self.config.model)
@@ -555,6 +560,15 @@ class OnepieceTester:
         shift = torch.tensor(per_frame_shifts_raw).unsqueeze(0)  # [1, T]
         del pred_depths_list, rel_depths_list
         torch.cuda.empty_cache()
+
+        # Save predicted depth maps as .npy if enabled
+        if self.save_depth_maps:
+            depth_map_dir = self.save_dir / "depth_maps" / f"seq{sequence_id:04d}"
+            depth_map_dir.mkdir(parents=True, exist_ok=True)
+            for t in range(pred_depths_cpu.shape[0]):
+                np.save(depth_map_dir / f"pred_{t:04d}.npy", pred_depths_cpu[t, 0].float().numpy())
+            logger.info(f"Saved {pred_depths_cpu.shape[0]} depth maps to {depth_map_dir} "
+                       f"(resolution: {pred_depths_cpu.shape[-2]}x{pred_depths_cpu.shape[-1]})")
 
         # GT in actual meters (already actual from skip_gt_canonicalization=True)
         gt_depth_metric = 100.0 / (gt_depth_inverse_100[0] + 1e-8)  # [T, 1, H, W]
@@ -1795,6 +1809,11 @@ def main(config: DictConfig):
     if max_depth_arg is not None:
         OmegaConf.update(config, 'max_depth', float(max_depth_arg), force_add=True)
 
+    # Apply --save-depth-maps if passed via sys.argv preprocessing
+    save_depth_maps = getattr(main, '_save_depth_maps', False)
+    if save_depth_maps:
+        OmegaConf.update(config, 'save_depth_maps', True, force_add=True)
+
     tester = OnepieceTester(config)
     tester.test()
 
@@ -1802,10 +1821,11 @@ def main(config: DictConfig):
 if __name__ == "__main__":
     import sys
 
-    # Handle --test-mode, --frame, --max-depth flags BEFORE Hydra processes arguments
+    # Handle --test-mode, --frame, --max-depth, --save-depth-maps flags BEFORE Hydra processes arguments
     test_mode = None
     frame_arg = None
     max_depth_arg = None
+    save_depth_maps = False
     new_argv = []
     i = 0
     while i < len(sys.argv):
@@ -1827,6 +1847,9 @@ if __name__ == "__main__":
         elif sys.argv[i].startswith('--max-depth='):
             max_depth_arg = sys.argv[i].split('=', 1)[1]
             i += 1
+        elif sys.argv[i] == '--save-depth-maps':
+            save_depth_maps = True
+            i += 1
         else:
             new_argv.append(sys.argv[i])
             i += 1
@@ -1836,5 +1859,6 @@ if __name__ == "__main__":
     main._test_mode = test_mode
     main._frame_arg = frame_arg
     main._max_depth_arg = max_depth_arg
+    main._save_depth_maps = save_depth_maps
 
     main()

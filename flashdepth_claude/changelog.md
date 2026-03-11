@@ -1,5 +1,20 @@
 # Changelog
 
+## 2026-03-11: --save-depth-maps 플래그 추가 (pred depth를 .npy로 저장)
+
+### 변경 파일
+- `test_comparison.py`, `test_video_comparison.py`, `test_onepiece.py`
+- `run_comparison.sh`, `run_video_comparison.sh`, `run_docker.sh`
+
+### 내용
+- `--save-depth-maps` 플래그 추가: 모델 예측 depth map을 float32 `.npy` 파일로 저장
+- 저장 경로: `{results_dir}/depth_maps/seq{sequence_id:04d}/pred_{frame:04d}.npy`
+- 저장 해상도: 각 모델의 실제 예측 해상도 (GT 해상도로 업샘플하지 않음)
+- Shape: `[H, W]` float32 (채널 차원 제거)
+- 목적: 나중에 추가 지표 필요 시 모델 재추론 없이 저장된 depth map으로 계산 가능
+- GT depth는 데이터셋에 이미 존재하므로 저장하지 않음
+- 기본값: off (디스크 부담 없이 필요할 때만 활성화)
+
 ## 2026-03-10: FlashDepth test_video_comparison 통합 (scale/shift alignment + rTC/PSR/TAE)
 
 ### test_video_comparison.py — FlashDepth scale/shift alignment 추가

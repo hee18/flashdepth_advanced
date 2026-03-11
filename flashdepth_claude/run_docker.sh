@@ -373,6 +373,10 @@ while [[ $# -gt 0 ]]; do
             NO_SHIFT="true"
             shift
             ;;
+        --save-depth-maps)
+            SAVE_DEPTH_MAPS="true"
+            shift
+            ;;
         --model-type)
             MODEL_TYPE="$2"
             shift 2
@@ -2226,6 +2230,9 @@ case $COMMAND in
                 if [ -n "$MAX_DEPTH" ]; then
                     DOCKER_CMD="$DOCKER_CMD --max-depth $MAX_DEPTH"
                 fi
+                if [ "$SAVE_DEPTH_MAPS" = "true" ]; then
+                    DOCKER_CMD="$DOCKER_CMD --save-depth-maps"
+                fi
 
                 if eval $DOCKER_CMD; then
                     echo "✅ [$COMPLETED_RUNS/$TOTAL_RUNS] Onepiece on $ds completed"
@@ -2308,6 +2315,11 @@ case $COMMAND in
             # Add max-depth if specified
             if [ -n "$MAX_DEPTH" ]; then
                 DOCKER_CMD="$DOCKER_CMD --max-depth $MAX_DEPTH"
+            fi
+
+            # Add save-depth-maps if specified
+            if [ "$SAVE_DEPTH_MAPS" = "true" ]; then
+                DOCKER_CMD="$DOCKER_CMD --save-depth-maps"
             fi
 
             eval $DOCKER_CMD

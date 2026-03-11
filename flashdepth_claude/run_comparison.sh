@@ -87,6 +87,7 @@ Options:
   --test-mode <mode>       Test mode: tc (temporal consistency only)
   --tc-threshold <float>   Threshold for rTC metric (default: 1.25)
   --max-depth <float>      Max depth for evaluation in meters (default: 80)
+  --save-depth-maps        Save predicted depth maps as .npy files
   --help                   Show this help message
 
 Examples:
@@ -203,6 +204,10 @@ while [[ $# -gt 0 ]]; do
         --max-depth)
             MAX_DEPTH="$2"
             shift 2
+            ;;
+        --save-depth-maps)
+            SAVE_DEPTH_MAPS=true
+            shift
             ;;
         --help)
             show_help
@@ -429,6 +434,9 @@ if [ "$METHOD" = "all" ] || [ "$DATASET" = "all" ]; then
             if [ "$INDOOR" = true ]; then
                 RUN_ARGS="$RUN_ARGS --indoor"
             fi
+            if [ "$SAVE_DEPTH_MAPS" = true ]; then
+                RUN_ARGS="$RUN_ARGS --save-depth-maps"
+            fi
 
             # Recursive call (single model + single dataset)
             if bash "$0" "$CUR_METHOD" $RUN_ARGS; then
@@ -579,6 +587,10 @@ fi
 
 if [ -n "$MAX_DEPTH" ]; then
     CMD="$CMD --max-depth $MAX_DEPTH"
+fi
+
+if [ "$SAVE_DEPTH_MAPS" = true ]; then
+    CMD="$CMD --save-depth-maps"
 fi
 
 CMD="$CMD --visualization $VISUALIZATION"

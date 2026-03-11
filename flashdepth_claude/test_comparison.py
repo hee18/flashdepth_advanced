@@ -123,6 +123,11 @@ class ComparisonTester:
         self.max_depth = config.get('max_depth', 80.0)
         self.test_mode = config.get('test_mode', None)
 
+        # Save depth maps option
+        self.save_depth_maps = config.get('save_depth_maps', False)
+        if self.save_depth_maps:
+            logger.info("Depth map saving ENABLED (will save pred depth as .npy)")
+
         # Load model
         self.model = self._setup_model()
 
@@ -438,6 +443,15 @@ class ComparisonTester:
         # Stack predictions (already on CPU from per-frame transfer)
         pred_depths = torch.stack(pred_depths, dim=0)  # [T, 1, H, W] CPU
         pred_depths_cpu = pred_depths.float()  # Ensure float32 (DepthPro outputs half)
+
+        # Save predicted depth maps as .npy if enabled
+        if self.save_depth_maps:
+            depth_map_dir = self.save_dir / "depth_maps" / f"seq{sequence_id:04d}"
+            depth_map_dir.mkdir(parents=True, exist_ok=True)
+            for t in range(pred_depths_cpu.shape[0]):
+                np.save(depth_map_dir / f"pred_{t:04d}.npy", pred_depths_cpu[t, 0].numpy())
+            logger.info(f"Saved {pred_depths_cpu.shape[0]} depth maps to {depth_map_dir} "
+                       f"(resolution: {pred_depths_cpu.shape[2]}x{pred_depths_cpu.shape[3]})")
 
         # === Resolution handling (upsample pred to GT resolution for metrics) ===
         MAX_DEPTH = self.max_depth
@@ -1511,6 +1525,8 @@ def main():
                        help='Test mode: tc (temporal consistency only), ea (error & accuracy only, skip rTC)')
     parser.add_argument('--tc-threshold', type=float, default=1.1,
                        help='Threshold for rTC metric (default: 1.1)')
+    parser.add_argument('--save-depth-maps', action='store_true',
+                        help='Save predicted depth maps as .npy files')
     parser.add_argument('--max-depth', type=float, default=80.0,
                        help='Maximum depth threshold in meters for valid mask filtering (default: 80.0)')
 
@@ -1610,7 +1626,8 @@ def main():
         'limit_scenes': args.limit_scenes,
         'test_mode': args.test_mode,
         'tc_threshold': args.tc_threshold,
-        'max_depth': args.max_depth
+        'max_depth': args.max_depth,
+        'save_depth_maps': args.save_depth_maps
     }
 
     # Create tester and run (seq_list filtering handled by ComparisonDataset)

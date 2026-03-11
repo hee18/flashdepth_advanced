@@ -663,11 +663,8 @@ def load_waymo_seg_cameras(
     """
     Load Waymo Segmentation dataset camera intrinsics and poses.
 
-    Waymo data sources:
-    - camera_image/*.parquet: Frame-by-frame pose (vehicle_to_world)
-    - camera_calibration/*.parquet: Camera intrinsics and extrinsic (camera_to_vehicle)
-
-    Camera-to-world pose = vehicle_to_world @ camera_to_vehicle
+    First tries pre-extracted camera_data.npz (from extract_waymo_cameras.py).
+    Falls back to parquet files if .npz not found.
 
     Args:
         segment_name: Segment name (e.g., '10017090168044687777_6380_000_6400_000')
@@ -679,67 +676,64 @@ def load_waymo_seg_cameras(
         K: [3, 3] intrinsic matrix (for original 1920×1280 resolution)
         poses: Dict mapping frame_index to [4, 4] camera-to-world pose
     """
+    # Normalize segment name
+    seg_name_with_prefix = segment_name if segment_name.startswith('segment-') else f'segment-{segment_name}'
+    seg_name_bare = segment_name[len('segment-'):] if segment_name.startswith('segment-') else segment_name
+
+    waymo_seg_root = Path(waymo_seg_root) if waymo_seg_root else Path('.')
+
+    # --- Try pre-extracted .npz first ---
+    # waymo_seg_root is data_root (e.g., /data/datasets), structure: waymo_seg/val/segment-{id}/FRONT/
+    npz_path = waymo_seg_root / 'waymo_seg' / 'val' / seg_name_with_prefix / camera_name / 'camera_data.npz'
+    if npz_path.exists():
+        data = np.load(npz_path)
+        K = data['K']  # [3, 3]
+        poses_arr = data['poses']  # [N, 4, 4]
+        poses = {i: poses_arr[i] for i in range(len(poses_arr))}
+        return K, poses
+
+    # --- Fallback: parquet files (requires pandas + pyarrow) ---
     if not HAS_PANDAS:
-        raise ImportError("pandas is required for Waymo dataset support. Install with: pip install pandas pyarrow")
+        raise ImportError(
+            "Pre-extracted camera_data.npz not found and pandas/pyarrow not available.\n"
+            f"  Expected: {npz_path}\n"
+            "  Run: python extract_waymo_cameras.py <waymo_seg_root>"
+        )
 
-    # Remove 'segment-' prefix if present
-    if segment_name.startswith('segment-'):
-        segment_name = segment_name[len('segment-'):]
-
-    # Camera name to ID mapping
     camera_name_to_id = {
-        'FRONT': 1,
-        'FRONT_LEFT': 2,
-        'FRONT_RIGHT': 3,
-        'SIDE_LEFT': 4,
-        'SIDE_RIGHT': 5
+        'FRONT': 1, 'FRONT_LEFT': 2, 'FRONT_RIGHT': 3,
+        'SIDE_LEFT': 4, 'SIDE_RIGHT': 5
     }
     camera_id = camera_name_to_id.get(camera_name, 1)
 
-    # Find parquet files
-    # Note: waymo_seg has nested structure: waymo_seg/waymo_seg/camera_image/
-    waymo_seg_root = Path(waymo_seg_root) if waymo_seg_root else Path('.')
-    camera_image_path = waymo_seg_root / 'waymo_seg' / 'waymo_seg' / 'camera_image' / f'{segment_name}.parquet'
-    camera_calib_path = waymo_seg_root / 'waymo_seg' / 'waymo_seg' / 'camera_calibration' / f'{segment_name}.parquet'
+    camera_image_path = waymo_seg_root / 'waymo_seg' / 'waymo_seg' / 'camera_image' / f'{seg_name_bare}.parquet'
+    camera_calib_path = waymo_seg_root / 'waymo_seg' / 'waymo_seg' / 'camera_calibration' / f'{seg_name_bare}.parquet'
 
     if not camera_image_path.exists():
         raise FileNotFoundError(f"Camera image parquet not found: {camera_image_path}")
     if not camera_calib_path.exists():
         raise FileNotFoundError(f"Camera calibration parquet not found: {camera_calib_path}")
 
-    # Load camera calibration
     calib_df = pd.read_parquet(camera_calib_path)
     camera_calib = calib_df[calib_df['key.camera_name'] == camera_id].iloc[0]
 
-    # Extract intrinsics
     fx = camera_calib['[CameraCalibrationComponent].intrinsic.f_u']
     fy = camera_calib['[CameraCalibrationComponent].intrinsic.f_v']
     cx = camera_calib['[CameraCalibrationComponent].intrinsic.c_u']
     cy = camera_calib['[CameraCalibrationComponent].intrinsic.c_v']
 
-    K = np.array([
-        [fx, 0, cx],
-        [0, fy, cy],
-        [0, 0, 1]
-    ], dtype=np.float64)
+    K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float64)
 
-    # Extract camera-to-vehicle extrinsic
     camera_to_vehicle = np.array(
         camera_calib['[CameraCalibrationComponent].extrinsic.transform']
     ).reshape(4, 4)
 
-    # Load camera images (for poses)
     image_df = pd.read_parquet(camera_image_path)
     camera_df = image_df[image_df['key.camera_name'] == camera_id].sort_values('key.frame_timestamp_micros')
 
-    # Build frame_index -> pose mapping
-    # Frame index corresponds to sorted timestamp order (0, 1, 2, ...)
     poses = {}
     for frame_idx, (_, row) in enumerate(camera_df.iterrows()):
-        # Vehicle-to-world pose
         vehicle_to_world = np.array(row['[CameraImageComponent].pose.transform']).reshape(4, 4)
-
-        # Camera-to-world = vehicle_to_world @ camera_to_vehicle
         camera_to_world = vehicle_to_world @ camera_to_vehicle
         poses[frame_idx] = camera_to_world
 
