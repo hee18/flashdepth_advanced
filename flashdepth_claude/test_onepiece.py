@@ -354,6 +354,10 @@ class OnepieceTester:
             for key, value in r.items():
                 if key not in entry and not key.startswith('_') and not isinstance(value, (dict, list)):
                     entry[key] = float(value) if isinstance(value, (float, np.floating)) else value
+            # Include reset_frames list (SCD reset info)
+            if 'reset_frames' in r:
+                entry['reset_frames'] = r['reset_frames']
+                entry['num_resets'] = r.get('num_resets', len(r['reset_frames']))
             per_seq_data.append(entry)
 
         with open(self.save_dir / "per_sequence_results.json", 'w') as f:
@@ -492,6 +496,7 @@ class OnepieceTester:
         rel_depths_list = []
         per_frame_scales_raw = []
         per_frame_shifts_raw = []
+        per_frame_d_cls = []
         reset_frames = []
         start_time = None
         prev_cls = None
@@ -511,8 +516,12 @@ class OnepieceTester:
                 outputs_t = self.model.forward_onepiece_single_frame(frame, prev_cls=prev_cls)
                 prev_cls = outputs_t['cls_token']
 
+                d_cls_val = outputs_t.get('d_cls', 0.0)
+                per_frame_d_cls.append(d_cls_val)
+
                 if outputs_t.get('is_reset', False):
                     reset_frames.append(t)
+                    logger.info(f"  SCD reset at frame {t} (d_cls={d_cls_val:.4f}, tau={self.model.scene_cut_detector.tau})")
 
                 # De-canonicalize: canonical → actual meters
                 de_ratio_t = de_canonical_ratio_metric[0, t]
@@ -866,10 +875,17 @@ class OnepieceTester:
         metrics['_per_frame_optimal_scales'] = per_frame_optimal_scales
         metrics['_per_frame_optimal_shifts'] = per_frame_optimal_shifts
 
-        # Reset frames info (from SCD at inference)
+        # SCD info (d_cls per frame + reset frames)
+        metrics['_per_frame_d_cls'] = per_frame_d_cls
         if reset_frames:
             metrics['reset_frames'] = reset_frames
             metrics['num_resets'] = len(reset_frames)
+            logger.info(f"Seq {sequence_id}: SCD triggered {len(reset_frames)} resets at frames {reset_frames}")
+        else:
+            metrics['num_resets'] = 0
+        if per_frame_d_cls:
+            metrics['d_cls_max'] = float(max(per_frame_d_cls))
+            metrics['d_cls_mean'] = float(np.mean(per_frame_d_cls))
 
         # === Depth range analysis ===
         depth_ranges = [(0, 10), (10, 30), (30, int(self.max_depth))]

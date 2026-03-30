@@ -71,7 +71,7 @@ loss:
 
 # Scene Cut Detection (inference only)
 scene_cut:
-  tau: 0.05
+  tau: 0.15
   k: 80
 
 # Phase Transition

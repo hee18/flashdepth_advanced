@@ -677,6 +677,7 @@ class FlashDepth(nn.Module):
 
         # Scene cut detection
         is_reset = False
+        d_cls_val = 0.0
         if prev_cls is not None:
             cos_sim = F.cosine_similarity(
                 F.normalize(cls_token, dim=-1),
@@ -684,7 +685,8 @@ class FlashDepth(nn.Module):
                 dim=-1
             )
             d_cls = 1.0 - cos_sim
-            if d_cls.mean() > self.scene_cut_detector.tau:
+            d_cls_val = float(d_cls.mean())
+            if d_cls_val > self.scene_cut_detector.tau:
                 self.spatial_mamba.start_new_sequence()
                 is_reset = True
 
@@ -716,6 +718,7 @@ class FlashDepth(nn.Module):
             'shift': shift.squeeze(-1),        # [B]
             'cls_token': cls_token,            # [B, embed_dim]
             'is_reset': is_reset,
+            'd_cls': d_cls_val,                # float, CLS cosine distance
         }
 
     def final_head(self, x, patch_h, patch_w):

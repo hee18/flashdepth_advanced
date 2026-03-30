@@ -332,7 +332,7 @@ class ConvMetricHead(nn.Module):
         with torch.no_grad():
             # Scale bias: softplus(0.5413) ≈ 1.0
             self.conv[-1].bias.data[0] = 0.5413
-            # Shift bias: 0.1 * sigmoid(-5) ≈ 0
+            # Shift bias: sigmoid(-5) ≈ 0
             self.conv[-1].bias.data[1] = -5.0
 
         logger.info("ConvMetricHead initialized: scale≈1.0, shift≈0.0")
@@ -355,7 +355,7 @@ class ConvMetricHead(nn.Module):
         scale = F.softplus(raw_scale)  # Always positive
 
         if self.train_mode == "metric":
-            shift = 0.1 * torch.sigmoid(raw_shift)  # Range [0, 0.1]
+            shift = torch.sigmoid(raw_shift)  # Range [0, 1]
         else:  # inverse mode
             shift = raw_shift  # Unconstrained
 
