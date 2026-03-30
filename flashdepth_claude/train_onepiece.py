@@ -323,13 +323,13 @@ class OnepieceTrainer:
         return self.model.module if isinstance(self.model, DDP) else self.model
 
     def _configure_parameters_phase1(self):
-        """Phase 1: Only ConvMetricHead trainable. SpatialMamba frozen (zero-init → no-op)."""
+        """Phase 1: CLSMetricHead + CLS projection trainable. SpatialMamba frozen (zero-init → no-op)."""
         model = self._get_model()
         frozen_count = 0
         trainable_count = 0
 
         for name, param in model.named_parameters():
-            if 'onepiece_metric_head' in name:
+            if 'onepiece_metric_head' in name or 'cls_projection' in name:
                 param.requires_grad = True
                 trainable_count += param.numel()
             else:
@@ -339,10 +339,10 @@ class OnepieceTrainer:
         if self.rank == 0:
             self.logger.info(f"=== Phase 1 Parameters ===")
             self.logger.info(f"  Frozen: {frozen_count:,} (ViT + DPT + SpatialMamba + output_conv)")
-            self.logger.info(f"  Trainable: {trainable_count:,} (ConvMetricHead only)")
+            self.logger.info(f"  Trainable: {trainable_count:,} (CLSMetricHead + CLS projection)")
 
     def _configure_parameters_phase2(self):
-        """Phase 2: SpatialMamba + ConvMetricHead + DPT + output_conv trainable."""
+        """Phase 2: SpatialMamba + CLSMetricHead + CLS projection + DPT + output_conv trainable."""
         model = self._get_model()
         frozen_count = 0
         trainable_onepiece = 0
@@ -350,7 +350,7 @@ class OnepieceTrainer:
         trainable_output_conv = 0
 
         for name, param in model.named_parameters():
-            if 'spatial_mamba' in name or 'onepiece_metric_head' in name:
+            if 'spatial_mamba' in name or 'onepiece_metric_head' in name or 'cls_projection' in name:
                 param.requires_grad = True
                 trainable_onepiece += param.numel()
             elif 'depth_head' in name and 'output_conv' not in name:
@@ -370,7 +370,7 @@ class OnepieceTrainer:
         if self.rank == 0:
             self.logger.info(f"=== Phase 2 Parameters ===")
             self.logger.info(f"  Frozen: {frozen_count:,} (ViT encoder)")
-            self.logger.info(f"  Trainable Onepiece (SpatialMamba + MetricHead): {trainable_onepiece:,}")
+            self.logger.info(f"  Trainable Onepiece (SpatialMamba + CLSMetricHead + CLS proj): {trainable_onepiece:,}")
             self.logger.info(f"  Trainable DPT: {trainable_dpt:,}")
             self.logger.info(f"  Trainable output_conv: {trainable_output_conv:,}")
             self.logger.info(f"  Total trainable: {trainable_onepiece + trainable_dpt + trainable_output_conv:,}")
@@ -386,7 +386,7 @@ class OnepieceTrainer:
             # Keep onepiece modules in train mode
             if any(keyword in name for keyword in [
                 'spatial_mamba', 'onepiece_metric_head',
-                'scene_cut_detector'
+                'scene_cut_detector', 'cls_projection'
             ]):
                 continue
             # Phase 2: DPT and output_conv in train mode
@@ -499,7 +499,7 @@ class OnepieceTrainer:
             for name, param in model.named_parameters():
                 if not param.requires_grad:
                     continue
-                if 'spatial_mamba' in name or 'onepiece_metric_head' in name:
+                if 'spatial_mamba' in name or 'onepiece_metric_head' in name or 'cls_projection' in name:
                     onepiece_params.append(param)
                 elif 'output_conv' in name:
                     output_conv_params.append(param)

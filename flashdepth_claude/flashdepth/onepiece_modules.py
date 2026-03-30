@@ -1,15 +1,16 @@
 """
 Onepiece V3 Core Modules for FlashDepth-Metric.
 
-Architecture (Dual-Stream):
-    DPT features → SpatialMamba (downsample→Mamba→final_layer→upsample+add)
-        → Relative stream: post_mamba [B*T, 256, h, w] → final_head → relative depth
-        → Metric stream: mamba_raw [B*T, 256, h', w'] → ConvMetricHead → scale, shift
+Architecture (CLS-guided Dual-Stream):
+    CLS (projected 256-dim) + DPT features → SpatialMamba (downsample→prepend CLS→Mamba→split→upsample+add)
+        → CLS stream: cls_output [B*T, 256] → CLSMetricHead → scale, shift
+        → DPT stream: post_mamba [B*T, 256, h, w] → final_head → relative depth
 
 Components:
-    1. SpatialMamba: FlashDepth-style spatial Mamba on 1/10 downsampled DPT features
-    2. ConvMetricHead: Conv-based scale/shift prediction from low-res Mamba output
-    3. SceneCutDetector: CLS cosine distance for scene cut detection (inference only)
+    1. SpatialMamba: FlashDepth-style spatial Mamba with CLS prepend for temporal context
+    2. CLSMetricHead: MLP-based scale/shift prediction from Mamba-processed CLS token
+    3. ConvMetricHead: (Legacy) Conv-based scale/shift from low-res Mamba output
+    4. SceneCutDetector: CLS cosine distance for scene cut detection (inference only)
 """
 
 import torch
@@ -181,7 +182,7 @@ class SpatialMamba(nn.Module):
             max_batch_size=self.max_batch_size
         )
 
-    def forward(self, dpt_features, B, T):
+    def forward(self, dpt_features, B, T, cls_projected=None):
         """
         Batch training mode (per-frame loop with hidden state, matching FlashDepth).
 
@@ -189,13 +190,17 @@ class SpatialMamba(nn.Module):
             dpt_features: [B*T, dpt_dim, h, w] DPT path_1 features
             B: batch size
             T: number of frames
+            cls_projected: [B*T, dpt_dim] projected CLS tokens (optional)
 
         Returns:
             post_mamba: [B*T, dpt_dim, h, w] = DPT + upsample(final_layer(mamba_out))
-            mamba_raw_spatial: [B*T, dpt_dim, h', w'] = low-res Mamba output
+            cls_output: [B*T, dpt_dim] Mamba-processed CLS tokens (if cls_projected given)
+                        or mamba_raw_spatial [B*T, dpt_dim, h', w'] (legacy, if no CLS)
         """
         BT, c, h, w = dpt_features.shape
         assert BT == B * T, f"Expected {B*T}, got {BT}"
+
+        use_cls = cls_projected is not None
 
         # Save original for residual add
         original = rearrange(dpt_features, '(b t) c h w -> b t c h w', b=B, t=T)
@@ -208,62 +213,82 @@ class SpatialMamba(nn.Module):
         # Reshape for per-frame processing: [B, T, h'*w', c]
         down_seq = rearrange(down, '(b t) c h w -> b t (h w) c', b=B, t=T)
 
+        # Prepare CLS tokens if provided: [B, T, 1, c]
+        if use_cls:
+            cls_seq = rearrange(cls_projected, '(b t) c -> b t 1 c', b=B, t=T)
+
         # Initialize fresh inference params for training
         self.start_new_sequence()
 
         # Per-frame Mamba processing (matching FlashDepth pattern)
         mamba_outs = []
+        cls_outs = []
         for i in range(T):
             x = down_seq[:, i]  # [B, h'*w', c]
+
+            # Prepend CLS token
+            if use_cls:
+                x = torch.cat([cls_seq[:, i], x], dim=1)  # [B, 1+h'*w', c]
+
             for block in self.blocks:
                 x = block(x, inference_params=self.inference_params)
             self.inference_params.seqlen_offset += x.shape[1]
-            mamba_outs.append(x)
+
+            # Split CLS and DPT
+            if use_cls:
+                cls_outs.append(x[:, 0])      # [B, c]
+                mamba_outs.append(x[:, 1:])    # [B, h'*w', c]
+            else:
+                mamba_outs.append(x)
 
         mamba_out = torch.stack(mamba_outs, dim=1)  # [B, T, h'*w', c]
-
-        # Raw spatial output for MetricHead (before final_layer)
-        mamba_raw_spatial = rearrange(
-            mamba_out, 'b t (h w) c -> (b t) c h w', h=h_down, w=w_down
-        )
 
         # Upsample + final_layer + residual add (matching FlashDepth dpt_features_to_mamba)
         post_mamba_list = []
         for i in range(T):
-            # Upsample low-res mamba output to original DPT resolution
             frame_raw = rearrange(
                 mamba_out[:, i], 'b (h w) c -> b c h w', h=h_down, w=w_down
             )
             upsampled = F.interpolate(frame_raw, (h, w), mode='bilinear', align_corners=True)
 
-            # Apply final_layer (zero-init → identity at start)
             up_flat = rearrange(upsampled, 'b c h w -> b (h w) c')
             final_out = self.final_layer(up_flat)
             final_spatial = rearrange(final_out, 'b (h w) c -> b c h w', h=h, w=w)
 
-            # Residual add with original DPT features
             post = final_spatial + original[:, i]
             post_mamba_list.append(post)
 
         post_mamba = torch.stack(post_mamba_list, dim=1)  # [B, T, c, h, w]
         post_mamba = rearrange(post_mamba, 'b t c h w -> (b t) c h w')
 
-        return post_mamba, mamba_raw_spatial
+        if use_cls:
+            cls_output = torch.stack(cls_outs, dim=1)  # [B, T, c]
+            cls_output = rearrange(cls_output, 'b t c -> (b t) c')
+            return post_mamba, cls_output
+        else:
+            # Legacy: return mamba_raw_spatial for ConvMetricHead
+            mamba_raw_spatial = rearrange(
+                mamba_out, 'b t (h w) c -> (b t) c h w', h=h_down, w=w_down
+            )
+            return post_mamba, mamba_raw_spatial
 
-    def forward_single_frame(self, dpt_features_single):
+    def forward_single_frame(self, dpt_features_single, cls_projected=None):
         """
         Streaming inference mode. Single frame with hidden state.
 
         Args:
             dpt_features_single: [B, dpt_dim, h, w]
+            cls_projected: [B, dpt_dim] projected CLS token (optional)
 
         Returns:
             post_mamba: [B, dpt_dim, h, w]
-            mamba_raw_spatial: [B, dpt_dim, h', w']
+            cls_output: [B, dpt_dim] Mamba-processed CLS (if cls_projected given)
+                        or mamba_raw_spatial [B, dpt_dim, h', w'] (legacy, if no CLS)
         """
         if self.inference_params is None:
             self.start_new_sequence()
 
+        use_cls = cls_projected is not None
         B, c, h, w = dpt_features_single.shape
 
         # Save original for residual
@@ -277,23 +302,99 @@ class SpatialMamba(nn.Module):
         # Reshape: [B, h'*w', c]
         x = rearrange(down, 'b c h w -> b (h w) c')
 
+        # Prepend CLS token
+        if use_cls:
+            cls_token = cls_projected.unsqueeze(1)  # [B, 1, c]
+            x = torch.cat([cls_token, x], dim=1)    # [B, 1+h'*w', c]
+
         # Mamba blocks with hidden state
         for block in self.blocks:
             x = block(x, inference_params=self.inference_params)
         self.inference_params.seqlen_offset += x.shape[1]
 
-        # Raw spatial output for MetricHead
-        mamba_raw_spatial = rearrange(x, 'b (h w) c -> b c h w', h=h_down, w=w_down)
+        # Split CLS and DPT
+        if use_cls:
+            cls_output = x[:, 0]   # [B, c]
+            x = x[:, 1:]          # [B, h'*w', c]
+
+        # DPT spatial processing
+        dpt_spatial = rearrange(x, 'b (h w) c -> b c h w', h=h_down, w=w_down)
 
         # Upsample + final_layer + residual
-        upsampled = F.interpolate(mamba_raw_spatial, (h, w), mode='bilinear', align_corners=True)
+        upsampled = F.interpolate(dpt_spatial, (h, w), mode='bilinear', align_corners=True)
         up_flat = rearrange(upsampled, 'b c h w -> b (h w) c')
         final_out = self.final_layer(up_flat)
         final_spatial = rearrange(final_out, 'b (h w) c -> b c h w', h=h, w=w)
 
         post_mamba = final_spatial + original
 
-        return post_mamba, mamba_raw_spatial
+        if use_cls:
+            return post_mamba, cls_output
+        else:
+            return post_mamba, dpt_spatial
+
+
+class CLSMetricHead(nn.Module):
+    """
+    MLP-based scale/shift prediction from Mamba-processed CLS token.
+
+    Input: [B*T, dpt_dim] (CLS token after Mamba processing)
+    Output: scale [B*T, 1], shift [B*T, 1]
+
+    Pipeline: Linear(dpt_dim→hidden) → ReLU → Linear(hidden→2) → scale/shift
+    """
+
+    def __init__(self, dpt_dim=256, hidden_dim=64, train_mode="metric"):
+        super().__init__()
+        self.train_mode = train_mode
+
+        self.mlp = nn.Sequential(
+            nn.Linear(dpt_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 2)
+        )
+
+        self._initialize_weights()
+
+        logger.info(f"CLSMetricHead: dpt_dim={dpt_dim}, hidden={hidden_dim}, mode={train_mode}")
+
+    def _initialize_weights(self):
+        """Initialize for stable training start."""
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+        # Scale/Shift initialization on final linear
+        with torch.no_grad():
+            # Scale bias: softplus(0.5413) ≈ 1.0
+            self.mlp[-1].bias.data[0] = 0.5413
+            # Shift bias: sigmoid(-5) ≈ 0
+            self.mlp[-1].bias.data[1] = -5.0
+
+        logger.info("CLSMetricHead initialized: scale≈1.0, shift≈0.0")
+
+    def forward(self, cls_token):
+        """
+        Args:
+            cls_token: [B*T, dpt_dim] Mamba-processed CLS token
+
+        Returns:
+            scale: [B*T, 1] positive scale values
+            shift: [B*T, 1] shift values
+        """
+        out = self.mlp(cls_token)  # [B*T, 2]
+        raw_scale, raw_shift = out[:, 0:1], out[:, 1:2]
+
+        scale = F.softplus(raw_scale)  # Always positive
+
+        if self.train_mode == "metric":
+            shift = torch.sigmoid(raw_shift)  # Range [0, 1]
+        else:  # inverse mode
+            shift = raw_shift  # Unconstrained
+
+        return scale, shift
 
 
 class ConvMetricHead(nn.Module):

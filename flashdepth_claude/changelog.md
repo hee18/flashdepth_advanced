@@ -1,5 +1,43 @@
 # Changelog
 
+## 2026-03-30: CLS-guided Metric Head — Mamba에 CLS token prepend + CLSMetricHead
+
+### 배경
+- 기존 V3: SpatialMamba 출력(downsampled DPT feature)이 DPT temporal alignment과 Metric Head 입력 두 역할을 동시에 수행 → gradient conflict 우려
+- 해결: DINOv2 CLS token을 Mamba input에 prepend하여 temporal context를 부여한 후, CLS는 Metric Head로, DPT는 alignment으로 역할 분리
+
+### 변경 파일
+
+**`flashdepth/onepiece_modules.py`**
+- `SpatialMamba.forward()`, `forward_single_frame()`: `cls_projected` 파라미터 추가
+  - CLS를 DPT 앞에 prepend → Mamba 통과 → split하여 `cls_output` 반환
+  - CLS 미전달 시 기존 동작 유지 (legacy 호환)
+- `CLSMetricHead` 클래스 추가: MLP(256→64→2) 기반 scale/shift 예측
+  - ConvMetricHead(Conv 기반, spatial feature 입력) 대체
+  - 동일한 초기화: softplus(0.5413)≈1.0, sigmoid(-5)≈0.0
+
+**`flashdepth/model.py`**
+- `__init__`: `cls_projection = Linear(1024, 256)` 추가, `ConvMetricHead` → `CLSMetricHead`
+  - `cls_layer_indices = [2, 3]` (ViT layers 17, 23 평균 = fused CLS)
+- `forward_with_onepiece()`:
+  - Step 1에서 `_get_intermediate_layers_with_cls(cls_layer_indices=[2,3])` 사용
+  - Phase 1: CLS는 Mamba bypass (frozen이라 의미 없으므로), projection → MetricHead 직접
+  - Phase 2: CLS가 Mamba 통과 후 MetricHead로
+- `forward_with_onepiece_streaming()`: fused CLS 사용 (SCD + Mamba 모두)
+- `forward_onepiece_single_frame()`: 동일 패턴
+
+**`train_onepiece.py`**
+- `_configure_parameters_phase1()`: `cls_projection` trainable 추가
+- `_configure_parameters_phase2()`: `cls_projection`을 onepiece param group에 포함
+- `_set_train_mode()`: `cls_projection` train mode 유지
+- Phase 2 optimizer param group: `cls_projection` → onepiece group (base_lr)
+
+### 설계 결정
+- **CLS prepend (앞에 붙이기)**: causal Mamba에서 CLS가 현재 프레임 DPT에 오염되지 않음. 이전 프레임 hidden state를 통한 temporal context만 수신
+- **CLS projection 외부 배치**: Phase 1에서 SpatialMamba가 `torch.no_grad()`로 감싸지므로, projection을 FlashDepth 모듈로 분리하여 gradient flow 보장
+- **Phase 1 bypass**: Mamba가 frozen + 랜덤 초기화 상태라 CLS 통과 무의미 → 직접 MetricHead로
+- **SCD도 fused CLS 사용**: 코드 단순화, 추출 1회로 통일
+
 ## 2026-03-11: --save-depth-maps 플래그 추가 (pred depth를 .npy로 저장)
 
 ### 변경 파일
