@@ -1066,7 +1066,9 @@ class Gear5Tester:
             if self.test_mode == 'tc':
                 self._save_temporal_consistency(all_metrics)
                 self._save_tc_summary(all_metrics)
-                logger.info("TC-only mode: saved temporal_consistency.json, tc_summary.json")
+                from utils.temporal_consistency import FlowTemporalConsistency
+                FlowTemporalConsistency.save_multi_threshold_json(all_metrics, self.save_dir)
+                logger.info("TC-only mode: saved temporal_consistency.json, tc_summary.json, multi_threshold_rtc.json")
                 return
 
             # Save overall results
@@ -1297,6 +1299,10 @@ class Gear5Tester:
 
             # Save temporal_consistency.json (flow-based rTC)
             self._save_temporal_consistency(all_metrics)
+
+            # Save multi_threshold_rtc.json
+            from utils.temporal_consistency import FlowTemporalConsistency
+            FlowTemporalConsistency.save_multi_threshold_json(all_metrics, self.save_dir)
 
             # Aggregate and save object-wise metrics
             logger.info(f"DEBUG: object_wise_enabled={self.object_wise_enabled}, all_object_wise_metrics count={len(all_object_wise_metrics)}")
@@ -1913,6 +1919,7 @@ class Gear5Tester:
                 metrics['_rtc_per_frame_ratio_stats'] = tc_result['per_frame_ratio_stats']
                 metrics['_rtc_best_frame_idx'] = tc_result['best_frame_idx']
                 metrics['_rtc_worst_frame_idx'] = tc_result['worst_frame_idx']
+                metrics['_multi_threshold'] = tc_result.get('multi_threshold', {})
                 logger.info(f"Flow TC: rTC={metrics['rtc']:.4f}, rTC_gt={metrics['rtc_gt']:.4f}")
 
                 if self.enable_visualization:

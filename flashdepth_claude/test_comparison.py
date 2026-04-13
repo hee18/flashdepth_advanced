@@ -300,7 +300,8 @@ class ComparisonTester:
         if self.test_mode == 'tc':
             self._save_temporal_consistency(self.all_results)
             self._save_tc_summary(self.all_results)
-            logger.info("TC-only mode: saved temporal_consistency.json, tc_summary.json")
+            FlowTemporalConsistency.save_multi_threshold_json(self.all_results, self.save_dir)
+            logger.info("TC-only mode: saved temporal_consistency.json, tc_summary.json, multi_threshold_rtc.json")
             return
 
         # Aggregate and save results
@@ -515,6 +516,8 @@ class ComparisonTester:
                     metrics['_rtc_per_frame_ratio_stats'] = tc_result['per_frame_ratio_stats']
                     metrics['_rtc_best_frame_idx'] = tc_result['best_frame_idx']
                     metrics['_rtc_worst_frame_idx'] = tc_result['worst_frame_idx']
+                    if 'multi_threshold' in tc_result:
+                        metrics['_multi_threshold'] = tc_result['multi_threshold']
                     logger.info(f"Flow TC: rTC={metrics['rtc']:.4f}, rTC_gt={metrics['rtc_gt']:.4f}")
 
                     # TC visualizations (depth grids, ratio heatmaps, rTC plot)
@@ -746,6 +749,8 @@ class ComparisonTester:
                 metrics['_rtc_per_frame_ratio_stats'] = tc_result['per_frame_ratio_stats']
                 metrics['_rtc_best_frame_idx'] = tc_result['best_frame_idx']
                 metrics['_rtc_worst_frame_idx'] = tc_result['worst_frame_idx']
+                if 'multi_threshold' in tc_result:
+                    metrics['_multi_threshold'] = tc_result['multi_threshold']
                 logger.info(f"Flow TC: rTC={metrics['rtc']:.4f}, rTC_gt={metrics['rtc_gt']:.4f}")
             else:
                 metrics['rtc'] = 0.0
@@ -1047,6 +1052,9 @@ class ComparisonTester:
 
         # Save temporal_consistency.json (flow-based rTC)
         self._save_temporal_consistency(self.all_results)
+
+        # Save multi_threshold_rtc.json (multi-threshold rTC + flickering counts)
+        FlowTemporalConsistency.save_multi_threshold_json(self.all_results, self.save_dir)
 
         # Aggregate and save FG-wise metrics
         if self.fgwise_enabled:

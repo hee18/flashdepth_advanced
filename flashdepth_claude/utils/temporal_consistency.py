@@ -4,12 +4,20 @@ Flow-based Temporal Consistency (rTC) metric.
 Implements rTC from "Enforcing Temporal Consistency in Video Depth Estimation":
     rTC_i = (1/sum(M_i)) * sum(M_i * [max(D_i/D_hat_{i+1}, D_hat_{i+1}/D_i) < thr])
 
+Occlusion mask M_i follows the original paper's implementation:
+    M_i = exp(-sigma * ||X_i - X_hat_{i+1}||^2) * flow_magnitude_mask * depth_validity
+where X_hat is the warped color frame (detects occluded/invalid flow regions).
+
 Uses SEA-RAFT optical flow to warp depth maps between consecutive frames and
 measures the ratio of temporally consistent pixels.
+
+Multi-threshold analysis: computes rTC at thresholds 1.05-1.25 (step 0.05)
+and counts flickering frames (rTC < flicker_cutoff) per threshold.
 
 Complements reprojection-based TAE (which requires camera poses).
 """
 
+import json
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -19,6 +27,10 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 logger = logging.getLogger(__name__)
+
+# Multi-threshold analysis settings
+MULTI_THRESHOLDS = [1.05, 1.10, 1.15, 1.20, 1.25]
+FLICKER_CUTOFFS = [0.3, 0.5, 0.7]  # rTC < cutoff → flickering frame
 
 # ImageNet normalization constants (used by DINOv2 / FlashDepth)
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406])
@@ -37,18 +49,28 @@ class FlowTemporalConsistency:
     # Cap visualization resolution to avoid slow matplotlib rendering on high-res datasets
     VIS_MAX_LONG_EDGE = 1024
 
-    def __init__(self, device='cuda:0', thr=1.1, max_depth=70.0, checkpoint_path=None):
+    def __init__(self, device='cuda:0', thr=1.1, max_depth=70.0, checkpoint_path=None,
+                 occlusion_sigma=50.0, occlusion_hard_thr=0.01, flow_max_magnitude=250.0,
+                 flicker_cutoffs=None):
         """
         Args:
             device: torch device
             thr: ratio threshold for rTC (default 1.1)
             max_depth: maximum valid depth in meters
             checkpoint_path: path to SEA-RAFT weights (auto-detected if None)
+            occlusion_sigma: sigma for soft color occlusion mask (default 50.0, from TCMonoDepth)
+            occlusion_hard_thr: hard threshold on occlusion mask product (default 0.01)
+            flow_max_magnitude: maximum flow magnitude in pixels (default 250.0)
+            flicker_cutoffs: list of rTC cutoffs for flickering detection (default [0.3, 0.5, 0.7])
         """
         self.device = device
         self.thr = thr
         self.max_depth = max_depth
         self.checkpoint_path = checkpoint_path
+        self.occlusion_sigma = occlusion_sigma
+        self.occlusion_hard_thr = occlusion_hard_thr
+        self.flow_max_magnitude = flow_max_magnitude
+        self.flicker_cutoffs = flicker_cutoffs or FLICKER_CUTOFFS
         self._flow_estimator = None  # Lazy loaded
 
     def offload_to_cpu(self):
@@ -152,6 +174,8 @@ class FlowTemporalConsistency:
         per_frame_rtc_gt = []
         per_frame_ratio_stats = []
         all_valid_ratios = []  # For aggregated stats
+        # Multi-threshold: store per-frame ratios for post-hoc analysis
+        per_frame_ratios_list = []  # list of (ratio_tensor, num_valid) per pair
 
         for t in range(T - 1):
             # Estimate forward flow: frame_t -> frame_{t+1}
@@ -159,19 +183,24 @@ class FlowTemporalConsistency:
             frame_tp1 = images_01[t+1:t+2]  # [1, 3, H, W]
             flow, _ = flow_estimator.estimate_flow(frame_t, frame_tp1)  # [1, 2, H, W]
 
-            # === Pred rTC ===
+            # === Pred rTC (with color occlusion mask) ===
             rtc_val, ratio_stats = self._compute_pair_rtc(
-                pred_d[t:t+1], pred_d[t+1:t+2], flow
+                pred_d[t:t+1], pred_d[t+1:t+2], flow,
+                img_i=frame_t, img_ip1=frame_tp1
             )
             per_frame_rtc.append(rtc_val)
             per_frame_ratio_stats.append(ratio_stats)
             if ratio_stats.get('_valid_ratios') is not None:
                 all_valid_ratios.append(ratio_stats['_valid_ratios'])
+                per_frame_ratios_list.append(ratio_stats['_valid_ratios'])
+            else:
+                per_frame_ratios_list.append(None)
 
             # === GT rTC (oracle) ===
             if gt_d is not None:
                 rtc_gt_val, _ = self._compute_pair_rtc(
-                    gt_d[t:t+1], gt_d[t+1:t+2], flow
+                    gt_d[t:t+1], gt_d[t+1:t+2], flow,
+                    img_i=frame_t, img_ip1=frame_tp1
                 )
                 per_frame_rtc_gt.append(rtc_gt_val)
             else:
@@ -208,6 +237,11 @@ class FlowTemporalConsistency:
         mean_rtc = float(np.mean(per_frame_rtc)) if per_frame_rtc else 0.0
         mean_rtc_gt = float(np.mean(per_frame_rtc_gt)) if per_frame_rtc_gt else 0.0
 
+        # === Multi-threshold analysis ===
+        multi_threshold_result = self._compute_multi_threshold(
+            per_frame_ratios_list, per_frame_rtc_gt
+        )
+
         return {
             'rtc': mean_rtc,
             'rtc_gt': mean_rtc_gt,
@@ -216,17 +250,23 @@ class FlowTemporalConsistency:
             'per_frame_ratio_stats': clean_ratio_stats,
             'ratio_stats': agg_ratio_stats,
             'best_frame_idx': best_idx,
-            'worst_frame_idx': worst_idx
+            'worst_frame_idx': worst_idx,
+            'multi_threshold': multi_threshold_result,
         }
 
-    def _compute_pair_rtc(self, depth_i, depth_ip1, flow):
+    def _compute_pair_rtc(self, depth_i, depth_ip1, flow, img_i=None, img_ip1=None):
         """
         Compute rTC for a single frame pair (i, i+1).
+
+        Occlusion mask follows "Enforcing Temporal Consistency in Video Depth Estimation":
+            M_i = exp(-sigma * ||X_i - warp(X_{i+1})||^2) * flow_mask * depth_validity > hard_thr
 
         Args:
             depth_i: [1, 1, H, W] depth at frame i
             depth_ip1: [1, 1, H, W] depth at frame i+1
             flow: [1, 2, H, W] forward optical flow from i to i+1
+            img_i: [1, 3, H, W] RGB image at frame i (0-1 range), for occlusion mask
+            img_ip1: [1, 3, H, W] RGB image at frame i+1 (0-1 range), for occlusion mask
 
         Returns:
             rtc: float - ratio of consistent pixels
@@ -235,7 +275,6 @@ class FlowTemporalConsistency:
         _, _, H, W = depth_i.shape
 
         # Create sampling grid: pixel coordinates + flow
-        # grid_sample expects normalized coordinates in [-1, 1]
         grid_y, grid_x = torch.meshgrid(
             torch.arange(H, device=flow.device, dtype=flow.dtype),
             torch.arange(W, device=flow.device, dtype=flow.dtype),
@@ -245,7 +284,6 @@ class FlowTemporalConsistency:
         grid_y = grid_y.unsqueeze(0)  # [1, H, W]
 
         # Apply flow: where does pixel (x, y) in frame i go in frame i+1?
-        # flow[0] = horizontal (x), flow[1] = vertical (y)
         warped_x = grid_x + flow[:, 0]  # [1, H, W]
         warped_y = grid_y + flow[:, 1]  # [1, H, W]
 
@@ -259,18 +297,34 @@ class FlowTemporalConsistency:
             depth_ip1, grid, mode='bilinear', padding_mode='zeros', align_corners=True
         )  # [1, 1, H, W]
 
-        # Validity mask M_i
+        # === Validity mask M_i (following TCMonoDepth) ===
+        # 1. In-bounds check
         in_bounds = (warped_x >= 0) & (warped_x < W) & (warped_y >= 0) & (warped_y < H)
         in_bounds = in_bounds.unsqueeze(1)  # [1, 1, H, W]
 
+        # 2. Flow magnitude filter (reject extremely large flows)
+        flow_mag = torch.sqrt(flow[:, 0:1] ** 2 + flow[:, 1:2] ** 2)  # [1, 1, H, W]
+        flow_valid = flow_mag <= self.flow_max_magnitude
+
+        # 3. Depth validity
         d_i = depth_i
         d_hat = warped_depth
+        depth_valid = (d_i > 0) & (d_i < self.max_depth) & (d_hat > 0) & (d_hat < self.max_depth)
 
-        valid_mask = (
-            (d_i > 0) & (d_i < self.max_depth) &
-            (d_hat > 0) & (d_hat < self.max_depth) &
-            in_bounds
-        )
+        # 4. Color-based occlusion mask (soft): exp(-sigma * ||X_i - warp(X_{i+1})||^2)
+        if img_i is not None and img_ip1 is not None:
+            warped_img = F.grid_sample(
+                img_ip1, grid, mode='bilinear', padding_mode='zeros', align_corners=True
+            )  # [1, 3, H, W]
+            color_diff = torch.sqrt(torch.sum((img_i - warped_img) ** 2, dim=1, keepdim=True))  # [1, 1, H, W]
+            occlusion_mask = torch.exp(-self.occlusion_sigma * color_diff)  # [1, 1, H, W]
+
+            # Combined mask: soft occlusion * hard filters > threshold
+            combined_soft = occlusion_mask * in_bounds.float() * flow_valid.float() * depth_valid.float()
+            valid_mask = combined_soft > self.occlusion_hard_thr
+        else:
+            # Fallback: geometric mask only (no color info)
+            valid_mask = in_bounds & flow_valid & depth_valid
 
         num_valid = valid_mask.sum().item()
         if num_valid == 0:
@@ -297,6 +351,63 @@ class FlowTemporalConsistency:
         }
 
         return rtc, ratio_stats
+
+    def _compute_multi_threshold(self, per_frame_ratios_list, per_frame_rtc_gt):
+        """
+        Compute rTC at multiple thresholds and count flickering frames at multiple cutoffs.
+
+        Args:
+            per_frame_ratios_list: list of numpy arrays (per-pixel ratios per frame pair)
+            per_frame_rtc_gt: list of GT rTC values per frame pair
+
+        Returns:
+            dict with per-threshold rTC values, flickering counts at each cutoff
+        """
+        result = {}
+
+        for thr in MULTI_THRESHOLDS:
+            thr_key = f"{thr:.2f}"
+            per_frame_rtc_at_thr = []
+
+            for ratios in per_frame_ratios_list:
+                if ratios is not None and len(ratios) > 0:
+                    rtc_val = float(np.mean(ratios < thr))
+                else:
+                    rtc_val = 0.0
+                per_frame_rtc_at_thr.append(rtc_val)
+
+            mean_rtc = float(np.mean(per_frame_rtc_at_thr)) if per_frame_rtc_at_thr else 0.0
+            total_pairs = len(per_frame_rtc_at_thr)
+
+            # Flickering detection at multiple cutoffs
+            flickering = {}
+            for cutoff in self.flicker_cutoffs:
+                cutoff_key = f"{cutoff:.1f}"
+                flicker_frames = [i for i, rtc in enumerate(per_frame_rtc_at_thr)
+                                  if rtc < cutoff]
+                flickering[cutoff_key] = {
+                    'count': len(flicker_frames),
+                    'rate': len(flicker_frames) / max(total_pairs, 1),
+                    'frames': flicker_frames,
+                }
+
+            result[thr_key] = {
+                'rtc': mean_rtc,
+                'per_frame_rtc': [float(x) for x in per_frame_rtc_at_thr],
+                'total_pairs': total_pairs,
+                'flickering': flickering,
+            }
+
+        # Add metadata
+        result['_meta'] = {
+            'thresholds': MULTI_THRESHOLDS,
+            'flicker_cutoffs': self.flicker_cutoffs,
+            'occlusion_sigma': self.occlusion_sigma,
+            'occlusion_hard_thr': self.occlusion_hard_thr,
+            'flow_max_magnitude': self.flow_max_magnitude,
+        }
+
+        return result
 
     def get_ratio_heatmap(self, images, pred_depths, frame_idx):
         """
@@ -326,7 +437,9 @@ class FlowTemporalConsistency:
         pred_d = pred_depths.to(self.device).float()
 
         t = frame_idx
-        flow, _ = flow_estimator.estimate_flow(images_01[t:t+1], images_01[t+1:t+2])
+        img_t = images_01[t:t+1]
+        img_tp1 = images_01[t+1:t+2]
+        flow, _ = flow_estimator.estimate_flow(img_t, img_tp1)
 
         _, _, H, W = pred_d.shape
         grid_y, grid_x = torch.meshgrid(
@@ -350,7 +463,19 @@ class FlowTemporalConsistency:
         d_i = pred_d[t, 0]
         d_hat = warped_depth[0, 0]
 
-        valid = (d_i > 0) & (d_i < self.max_depth) & (d_hat > 0) & (d_hat < self.max_depth) & in_bounds[0]
+        # Occlusion mask (consistent with _compute_pair_rtc)
+        flow_mag = torch.sqrt(flow[:, 0] ** 2 + flow[:, 1] ** 2)  # [1, H, W]
+        flow_valid = flow_mag[0] <= self.flow_max_magnitude
+        depth_valid = (d_i > 0) & (d_i < self.max_depth) & (d_hat > 0) & (d_hat < self.max_depth)
+
+        warped_img = F.grid_sample(
+            img_tp1, grid, mode='bilinear', padding_mode='zeros', align_corners=True
+        )
+        color_diff = torch.sqrt(torch.sum((img_t - warped_img) ** 2, dim=1))  # [1, H, W]
+        occlusion_mask = torch.exp(-self.occlusion_sigma * color_diff[0])  # [H, W]
+
+        combined_soft = occlusion_mask * in_bounds[0].float() * flow_valid.float() * depth_valid.float()
+        valid = combined_soft > self.occlusion_hard_thr
 
         ratio_map = torch.zeros(H, W, device=self.device)
         if valid.sum() > 0:
@@ -548,3 +673,104 @@ class FlowTemporalConsistency:
         fig.savefig(save_dir / filename, dpi=150, bbox_inches='tight')
         plt.close(fig)
         logger.info(f"Saved rTC plot: {filename}")
+
+    @staticmethod
+    def save_multi_threshold_json(all_results, save_dir):
+        """
+        Save multi-threshold rTC analysis + flickering counts as JSON.
+
+        Aggregates per-sequence multi_threshold results into:
+        - Per-sequence: rTC, flicker_count, flicker_rate at each (threshold, cutoff)
+        - Dataset aggregate: mean rTC, total flicker_count, mean flicker_rate
+
+        Args:
+            all_results: list of dicts, each with 'multi_threshold' key from compute_rtc()
+            save_dir: Path to save directory
+        """
+        from pathlib import Path
+        save_dir = Path(save_dir)
+
+        # Collect per-sequence data
+        per_sequence = []
+        for i, r in enumerate(all_results):
+            mt = r.get('multi_threshold') or r.get('_multi_threshold')
+            if mt is None or mt == {}:
+                continue
+            seq_entry = {'sequence_idx': i}
+            for thr_key, thr_data in mt.items():
+                if thr_key.startswith('_'):
+                    continue
+                seq_entry[f'thr_{thr_key}'] = {
+                    'rtc': thr_data['rtc'],
+                    'total_pairs': thr_data['total_pairs'],
+                    'flickering': thr_data['flickering'],
+                }
+            per_sequence.append(seq_entry)
+
+        if not per_sequence:
+            logger.warning("No multi-threshold results to save")
+            return
+
+        # Get metadata from first result
+        meta = all_results[0].get('multi_threshold', {}).get('_meta', {})
+        thresholds = meta.get('thresholds', MULTI_THRESHOLDS)
+        flicker_cutoffs = meta.get('flicker_cutoffs', FLICKER_CUTOFFS)
+
+        # Aggregate across sequences
+        aggregate = {}
+        for thr in thresholds:
+            thr_key = f"{thr:.2f}"
+            rtc_values = []
+            flicker_data = {f"{c:.1f}": {'counts': [], 'rates': []} for c in flicker_cutoffs}
+
+            for seq in per_sequence:
+                entry = seq.get(f'thr_{thr_key}')
+                if entry is None:
+                    continue
+                rtc_values.append(entry['rtc'])
+                for cutoff_key, cutoff_data in entry['flickering'].items():
+                    if cutoff_key in flicker_data:
+                        flicker_data[cutoff_key]['counts'].append(cutoff_data['count'])
+                        flicker_data[cutoff_key]['rates'].append(cutoff_data['rate'])
+
+            flicker_agg = {}
+            for cutoff_key, fd in flicker_data.items():
+                flicker_agg[cutoff_key] = {
+                    'total_count': int(sum(fd['counts'])),
+                    'mean_count': float(np.mean(fd['counts'])) if fd['counts'] else 0.0,
+                    'mean_rate': float(np.mean(fd['rates'])) if fd['rates'] else 0.0,
+                }
+
+            aggregate[f'thr_{thr_key}'] = {
+                'mean_rtc': float(np.mean(rtc_values)) if rtc_values else 0.0,
+                'num_sequences': len(rtc_values),
+                'flickering': flicker_agg,
+            }
+
+        output = {
+            'meta': meta,
+            'aggregate': aggregate,
+            'per_sequence': per_sequence,
+        }
+
+        output_path = save_dir / 'multi_threshold_rtc.json'
+        with open(output_path, 'w') as f:
+            json.dump(output, f, indent=2)
+        logger.info(f"Saved multi-threshold rTC analysis: {output_path}")
+
+        # Log summary table
+        logger.info("=== Multi-threshold rTC & Flickering Summary ===")
+        header = f"{'thr':>6}"
+        for cutoff in flicker_cutoffs:
+            header += f" | rTC<{cutoff:.1f} count"
+        logger.info(f"{header} | mean_rTC")
+        for thr in thresholds:
+            thr_key = f"thr_{thr:.2f}"
+            agg = aggregate.get(thr_key, {})
+            line = f"{thr:>6.2f}"
+            for cutoff in flicker_cutoffs:
+                cutoff_key = f"{cutoff:.1f}"
+                fc = agg.get('flickering', {}).get(cutoff_key, {})
+                line += f" | {fc.get('total_count', 0):>12d}"
+            line += f" | {agg.get('mean_rtc', 0):.4f}"
+            logger.info(line)
