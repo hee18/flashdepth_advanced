@@ -1,5 +1,42 @@
 # Changelog
 
+## 2026-04-14: Onepiece V3 Small / Hybrid 모델 지원 추가
+
+### 배경
+- 기존 Onepiece V3는 ViT-L 단독 모델(O-Large)만 지원
+- FlashDepth의 Small(ViT-S) / Hybrid(ViT-S student + ViT-L teacher) 변형에 대응하는 Onepiece 버전 필요
+- Hybrid에서는 teacher ViT-L의 CLS token을 사용하여 metric head의 표현력 확보
+
+### 변경 파일
+
+**`flashdepth/model.py`**
+- `__init__`: `use_onepiece_hybrid` 플래그 추가. Hybrid일 때 `cls_projection`이 teacher embed_dim(1024)을 입력으로 받도록 분기 (`Linear(1024, 64)` vs `Linear(384, 64)`)
+- `forward_with_onepiece()`: Hybrid 분기 추가
+  - Student ViT-S → encoder features (DPT 입력)
+  - Teacher ViT-L → `_get_intermediate_layers_not_chunked` 한 번 호출로 CLS token + teacher features 동시 추출
+  - Teacher path_4 fusion → student DPT with fused_path4 (FlashDepth Hybrid와 동일)
+  - Onepiece 전용 temporal_layer=[] (DPT 내 Mamba 미사용)
+- `forward_with_onepiece_streaming()`: 동일한 Hybrid 분기 추가 (프레임별)
+- `forward_onepiece_single_frame()`: 동일한 Hybrid 분기 추가
+
+**`train_onepiece.py`**
+- 가중치 로딩: `cls_projection`을 exclude 목록에 추가 (차원 불일치 방지, scratch부터 학습)
+- `_configure_parameters_phase2()`: `hybrid_fusion` 파라미터를 trainable로 설정, `teacher_model`은 frozen
+- `_setup_optimizer()`: Phase 2에서 `fusion_params` 그룹 추가 (config `lr.fusion`으로 학습률 제어)
+- `_set_train_mode()`: Phase 2에서 `hybrid_fusion`을 train mode로 유지
+
+**`configs/onepiece/config_hybrid.yaml`** (신규)
+- `model.vit_size: vits`, `hybrid_configs.use_hybrid: true`
+- `load`: FlashDepth Hybrid 체크포인트 경로
+- `lr.fusion: 1.0e-4` (HybridFusion 학습률)
+
+### 모델별 CLS 소스 및 차원 정리
+| 모델 | CLS 소스 | cls_projection | dpt_dim | SpatialMamba d_model |
+|------|----------|---------------|---------|---------------------|
+| O-Large | ViT-L (self) | Linear(1024→256) | 256 | 256 |
+| O-Small | ViT-S (self) | Linear(384→64) | 64 | 64 |
+| O-Hybrid | ViT-L (teacher) | Linear(1024→64) | 64 | 64 |
+
 ## 2026-04-14: ZoeDepth 로컬 캐시 우선 + rTC SCD 제외 메트릭 추가
 
 ### 변경 파일

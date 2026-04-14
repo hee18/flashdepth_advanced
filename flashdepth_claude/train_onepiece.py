@@ -252,6 +252,9 @@ class OnepieceTrainer:
         model_config['scene_cut_tau'] = scene_cut_config.get('tau', 0.05)
         model_config['scene_cut_k'] = scene_cut_config.get('k', 80)
 
+        # Hybrid configs (top-level key, not under model)
+        model_config['hybrid_configs'] = self.config.get('hybrid_configs', None)
+
         model = FlashDepth(**model_config)
 
         # Load pre-trained FlashDepth checkpoint
@@ -277,7 +280,7 @@ class OnepieceTrainer:
             excluded_keys = []
             for k, v in state_dict.items():
                 if any(x in k for x in ['spatial_mamba', 'onepiece_metric_head', 'scene_cut_detector',
-                                         'unified_global_mamba']):
+                                         'unified_global_mamba', 'cls_projection']):
                     excluded_keys.append(k)
                 else:
                     loaded_dict[k] = v
@@ -342,25 +345,29 @@ class OnepieceTrainer:
             self.logger.info(f"  Trainable: {trainable_count:,} (CLSMetricHead + CLS projection)")
 
     def _configure_parameters_phase2(self):
-        """Phase 2: SpatialMamba + CLSMetricHead + CLS projection + DPT + output_conv trainable."""
+        """Phase 2: SpatialMamba + CLSMetricHead + CLS projection + DPT + output_conv + HybridFusion trainable."""
         model = self._get_model()
         frozen_count = 0
         trainable_onepiece = 0
         trainable_dpt = 0
         trainable_output_conv = 0
+        trainable_fusion = 0
 
         for name, param in model.named_parameters():
             if 'spatial_mamba' in name or 'onepiece_metric_head' in name or 'cls_projection' in name:
                 param.requires_grad = True
                 trainable_onepiece += param.numel()
+            elif 'hybrid_fusion' in name:
+                param.requires_grad = True
+                trainable_fusion += param.numel()
             elif 'depth_head' in name and 'output_conv' not in name:
                 param.requires_grad = True
                 trainable_dpt += param.numel()
             elif 'output_conv' in name:
                 param.requires_grad = True
                 trainable_output_conv += param.numel()
-            elif 'pretrained' in name:
-                # ViT encoder always frozen
+            elif 'pretrained' in name or 'teacher_model' in name:
+                # ViT encoder (student + teacher) always frozen
                 param.requires_grad = False
                 frozen_count += param.numel()
             else:
@@ -369,11 +376,13 @@ class OnepieceTrainer:
 
         if self.rank == 0:
             self.logger.info(f"=== Phase 2 Parameters ===")
-            self.logger.info(f"  Frozen: {frozen_count:,} (ViT encoder)")
+            self.logger.info(f"  Frozen: {frozen_count:,} (ViT encoder + teacher)")
             self.logger.info(f"  Trainable Onepiece (SpatialMamba + CLSMetricHead + CLS proj): {trainable_onepiece:,}")
             self.logger.info(f"  Trainable DPT: {trainable_dpt:,}")
             self.logger.info(f"  Trainable output_conv: {trainable_output_conv:,}")
-            self.logger.info(f"  Total trainable: {trainable_onepiece + trainable_dpt + trainable_output_conv:,}")
+            if trainable_fusion > 0:
+                self.logger.info(f"  Trainable HybridFusion: {trainable_fusion:,}")
+            self.logger.info(f"  Total trainable: {trainable_onepiece + trainable_dpt + trainable_output_conv + trainable_fusion:,}")
 
     def _set_train_mode(self):
         """Set trainable parts to train mode, frozen parts to eval mode."""
@@ -389,9 +398,9 @@ class OnepieceTrainer:
                 'scene_cut_detector', 'cls_projection'
             ]):
                 continue
-            # Phase 2: DPT and output_conv in train mode
+            # Phase 2: DPT, output_conv, and hybrid_fusion in train mode
             if self.current_phase >= 2 and any(keyword in name for keyword in [
-                'depth_head', 'output_conv'
+                'depth_head', 'output_conv', 'hybrid_fusion'
             ]):
                 continue
             module.eval()
@@ -496,11 +505,16 @@ class OnepieceTrainer:
             dpt_params = []
             output_conv_params = []
 
+            fusion_lr = lr_config.get('fusion', base_lr)
+            fusion_params = []
+
             for name, param in model.named_parameters():
                 if not param.requires_grad:
                     continue
                 if 'spatial_mamba' in name or 'onepiece_metric_head' in name or 'cls_projection' in name:
                     onepiece_params.append(param)
+                elif 'hybrid_fusion' in name:
+                    fusion_params.append(param)
                 elif 'output_conv' in name:
                     output_conv_params.append(param)
                 elif 'depth_head' in name:
@@ -511,6 +525,8 @@ class OnepieceTrainer:
                 {'params': dpt_params, 'lr': dpt_lr, 'name': 'dpt'},
                 {'params': output_conv_params, 'lr': dpt_lr, 'name': 'output_conv'},
             ]
+            if fusion_params:
+                param_groups.append({'params': fusion_params, 'lr': fusion_lr, 'name': 'fusion'})
 
         optimizer = torch.optim.AdamW(
             param_groups,

@@ -208,6 +208,9 @@ class OnepieceTester:
         model_config['scene_cut_tau'] = scene_cut_config.get('tau', 0.05)
         model_config['scene_cut_k'] = scene_cut_config.get('k', 80)
 
+        # Hybrid configs (top-level key, not under model)
+        model_config['hybrid_configs'] = self.config.get('hybrid_configs', None)
+
         model = FlashDepth(**model_config)
 
         checkpoint_path = self.config.get('load')
