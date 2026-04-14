@@ -705,6 +705,17 @@ class FlowTemporalConsistency:
                     'total_pairs': thr_data['total_pairs'],
                     'flickering': thr_data['flickering'],
                 }
+            # SCD-excluded multi_threshold (if available)
+            mt_excl = r.get('_multi_threshold_excl_scd')
+            if mt_excl:
+                for thr_key, thr_data in mt_excl.items():
+                    if thr_key.startswith('_'):
+                        continue
+                    seq_entry[f'thr_{thr_key}_excl_scd'] = {
+                        'rtc': thr_data['rtc'],
+                        'total_pairs': thr_data['total_pairs'],
+                        'flickering': thr_data['flickering'],
+                    }
             per_sequence.append(seq_entry)
 
         if not per_sequence:
@@ -747,11 +758,46 @@ class FlowTemporalConsistency:
                 'flickering': flicker_agg,
             }
 
+        # Aggregate excl_scd across sequences
+        aggregate_excl_scd = {}
+        has_excl_scd = any(f'thr_{thresholds[0]:.2f}_excl_scd' in seq for seq in per_sequence) if thresholds else False
+        if has_excl_scd:
+            for thr in thresholds:
+                thr_key = f"{thr:.2f}"
+                rtc_values_ex = []
+                flicker_data_ex = {f"{c:.1f}": {'counts': [], 'rates': []} for c in flicker_cutoffs}
+
+                for seq in per_sequence:
+                    entry = seq.get(f'thr_{thr_key}_excl_scd')
+                    if entry is None:
+                        continue
+                    rtc_values_ex.append(entry['rtc'])
+                    for cutoff_key, cutoff_data in entry['flickering'].items():
+                        if cutoff_key in flicker_data_ex:
+                            flicker_data_ex[cutoff_key]['counts'].append(cutoff_data['count'])
+                            flicker_data_ex[cutoff_key]['rates'].append(cutoff_data['rate'])
+
+                flicker_agg_ex = {}
+                for cutoff_key, fd in flicker_data_ex.items():
+                    flicker_agg_ex[cutoff_key] = {
+                        'total_count': int(sum(fd['counts'])),
+                        'mean_count': float(np.mean(fd['counts'])) if fd['counts'] else 0.0,
+                        'mean_rate': float(np.mean(fd['rates'])) if fd['rates'] else 0.0,
+                    }
+
+                aggregate_excl_scd[f'thr_{thr_key}'] = {
+                    'mean_rtc': float(np.mean(rtc_values_ex)) if rtc_values_ex else 0.0,
+                    'num_sequences': len(rtc_values_ex),
+                    'flickering': flicker_agg_ex,
+                }
+
         output = {
             'meta': meta,
             'aggregate': aggregate,
             'per_sequence': per_sequence,
         }
+        if aggregate_excl_scd:
+            output['aggregate_excl_scd'] = aggregate_excl_scd
 
         output_path = save_dir / 'multi_threshold_rtc.json'
         with open(output_path, 'w') as f:

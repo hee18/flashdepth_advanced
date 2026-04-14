@@ -38,9 +38,14 @@ class ZoeDepthAdapter(MethodAdapter):
 
         print(f"Loading ZoeDepth model: {model_name} from {repo}")
 
-        # Load with PyTorch 1.13.1 (official ZoeDepth requirement)
-        # This should work without compatibility issues
-        self.model = torch.hub.load(repo, model_name, pretrained=True, trust_repo=True)
+        # Try local cache first (avoids network dependency / GitHub 504 errors)
+        try:
+            self.model = torch.hub.load(repo, model_name, pretrained=True,
+                                        source='local', trust_repo=True)
+            print(f"ZoeDepth model loaded from local cache")
+        except Exception:
+            print(f"Local cache not found, downloading from GitHub...")
+            self.model = torch.hub.load(repo, model_name, pretrained=True, trust_repo=True)
 
         print(f"ZoeDepth model loaded successfully")
         return self.model

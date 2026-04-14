@@ -1,5 +1,24 @@
 # Changelog
 
+## 2026-04-14: ZoeDepth 로컬 캐시 우선 + rTC SCD 제외 메트릭 추가
+
+### 변경 파일
+
+**`adapters/zoedepth_adapter.py`**
+- `load_model()`: `torch.hub.load`에서 `source='local'`로 로컬 캐시 우선 사용, 실패 시 네트워크 fallback
+- 원인: Docker/tmux 환경에서 GitHub 504 타임아웃 발생
+
+**`test_onepiece.py`**
+- `_compute_excl_scd_metrics()` static method 추가: SCD reset 프레임이 포함된 pair를 제외한 rTC, flickering count 계산
+  - Reset frame t → pair index t-1 (frames t-1→t), t (frames t→t+1) 제외
+- tc-only 모드와 normal 모드 양쪽에서 excl_scd 메트릭 계산 및 저장
+- `metric_order`에 `rtc_excl_scd`, `rtc_gt_excl_scd` 추가
+- `_save_temporal_consistency()`: per_sequence, aggregated에 excl_scd 데이터 포함
+- `_save_tc_summary()`: per_sequence, aggregated에 excl_scd 데이터 포함
+
+**`utils/temporal_consistency.py`**
+- `save_multi_threshold_json()`: per_sequence에 `thr_X.XX_excl_scd` 항목 추가, `aggregate_excl_scd` 섹션 추가
+
 ## 2026-03-30: CLS-guided Metric Head — Mamba에 CLS token prepend + CLSMetricHead
 
 ### 배경

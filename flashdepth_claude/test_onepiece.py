@@ -119,6 +119,77 @@ class OnepieceTester:
         if self.save_depth_maps:
             logger.info("Depth map saving ENABLED (will save pred depth as .npy)")
 
+    @staticmethod
+    def _compute_excl_scd_metrics(tc_result, reset_frames, T):
+        """
+        Compute rTC and flickering metrics excluding SCD reset frame pairs.
+
+        For a reset at frame t, pair indices t-1 (frames t-1→t) and t (frames t→t+1) are excluded.
+        Returns dict with excl_scd versions of rTC, per_frame_rtc, and multi_threshold.
+        """
+        if not reset_frames or T < 2:
+            return None
+
+        # Build set of pair indices to exclude
+        excl_pairs = set()
+        for t in reset_frames:
+            if t > 0:
+                excl_pairs.add(t - 1)  # pair (t-1, t)
+            if t < T - 1:
+                excl_pairs.add(t)      # pair (t, t+1)
+
+        per_frame_rtc = tc_result['per_frame_rtc']
+        per_frame_rtc_gt = tc_result['per_frame_rtc_gt']
+
+        if not excl_pairs or len(excl_pairs) >= len(per_frame_rtc):
+            return None
+
+        # Filter per_frame_rtc
+        filtered_rtc = [v for i, v in enumerate(per_frame_rtc) if i not in excl_pairs]
+        filtered_rtc_gt = [v for i, v in enumerate(per_frame_rtc_gt) if i not in excl_pairs]
+
+        result = {
+            'rtc_excl_scd': float(np.mean(filtered_rtc)) if filtered_rtc else 0.0,
+            'rtc_gt_excl_scd': float(np.mean(filtered_rtc_gt)) if filtered_rtc_gt else 0.0,
+            '_per_frame_rtc_excl_scd': filtered_rtc,
+            '_per_frame_rtc_gt_excl_scd': filtered_rtc_gt,
+            '_excl_scd_pair_indices': sorted(excl_pairs),
+            '_excl_scd_num_excluded': len(excl_pairs),
+            '_excl_scd_num_remaining': len(filtered_rtc),
+        }
+
+        # Filter multi_threshold
+        mt = tc_result.get('multi_threshold', {})
+        if mt:
+            mt_excl = {}
+            for thr_key, thr_data in mt.items():
+                if thr_key.startswith('_'):
+                    continue
+                pf_rtc = thr_data.get('per_frame_rtc', [])
+                filtered_pf = [v for i, v in enumerate(pf_rtc) if i not in excl_pairs]
+                total_pairs = len(filtered_pf)
+                mean_rtc = float(np.mean(filtered_pf)) if filtered_pf else 0.0
+
+                flickering = {}
+                for cutoff_key, cutoff_data in thr_data.get('flickering', {}).items():
+                    # Re-detect flickering on filtered pairs only
+                    flicker_frames = [i for i, rtc in enumerate(filtered_pf) if rtc < float(cutoff_key)]
+                    flickering[cutoff_key] = {
+                        'count': len(flicker_frames),
+                        'rate': len(flicker_frames) / max(total_pairs, 1),
+                        'frames': flicker_frames,
+                    }
+
+                mt_excl[thr_key] = {
+                    'rtc': mean_rtc,
+                    'per_frame_rtc': [float(x) for x in filtered_pf],
+                    'total_pairs': total_pairs,
+                    'flickering': flickering,
+                }
+            result['_multi_threshold_excl_scd'] = mt_excl
+
+        return result
+
     def _setup_model(self):
         """Load trained Onepiece V3 model."""
         model_config = dict(self.config.model)
@@ -331,7 +402,8 @@ class OnepieceTester:
 
         # 1. test_results.json (aggregated)
         metric_order = ['abs_rel', 'a1', 'a2', 'a3', 'fps', 'tae', 'tae_reproj', 'tae_reproj_gt',
-                        'rtc', 'rtc_gt', 'psr', 'psr_max',
+                        'rtc', 'rtc_gt', 'rtc_excl_scd', 'rtc_gt_excl_scd',
+                        'psr', 'psr_max',
                         'mae', 'rmse',
                         'pred_scale_mean', 'pred_shift_mean',
                         'optimal_scale_mean', 'optimal_shift_mean']
@@ -652,6 +724,13 @@ class OnepieceTester:
                 metrics['_rtc_worst_frame_idx'] = tc_result['worst_frame_idx']
                 metrics['_multi_threshold'] = tc_result.get('multi_threshold', {})
                 logger.info(f"Flow TC: rTC={metrics['rtc']:.4f}, rTC_gt={metrics['rtc_gt']:.4f}")
+
+                # SCD-excluded rTC/flickering
+                excl_scd = self._compute_excl_scd_metrics(tc_result, reset_frames, T)
+                if excl_scd:
+                    metrics.update(excl_scd)
+                    logger.info(f"Flow TC (excl SCD): rTC={excl_scd['rtc_excl_scd']:.4f}, "
+                                f"excluded {excl_scd['_excl_scd_num_excluded']} pairs")
 
                 # TC visualizations
                 if self.enable_visualization:
@@ -1021,6 +1100,13 @@ class OnepieceTester:
             metrics['_rtc_worst_frame_idx'] = tc_result['worst_frame_idx']
             metrics['_multi_threshold'] = tc_result.get('multi_threshold', {})
             logger.info(f"Flow TC: rTC={metrics['rtc']:.4f}, rTC_gt={metrics['rtc_gt']:.4f}")
+
+            # SCD-excluded rTC/flickering
+            excl_scd = self._compute_excl_scd_metrics(tc_result, reset_frames, T)
+            if excl_scd:
+                metrics.update(excl_scd)
+                logger.info(f"Flow TC (excl SCD): rTC={excl_scd['rtc_excl_scd']:.4f}, "
+                            f"excluded {excl_scd['_excl_scd_num_excluded']} pairs")
         else:
             metrics['rtc'] = 0.0
             metrics['rtc_gt'] = 0.0
@@ -1699,6 +1785,13 @@ class OnepieceTester:
                 'best_frame_idx': result.get('_rtc_best_frame_idx', 0),
                 'worst_frame_idx': result.get('_rtc_worst_frame_idx', 0)
             }
+            # SCD-excluded rTC (if available)
+            if 'rtc_excl_scd' in result:
+                entry['rtc_excl_scd'] = result['rtc_excl_scd']
+                entry['rtc_gt_excl_scd'] = result.get('rtc_gt_excl_scd', 0.0)
+                entry['excl_scd_num_excluded'] = result.get('_excl_scd_num_excluded', 0)
+                entry['excl_scd_num_remaining'] = result.get('_excl_scd_num_remaining', 0)
+                entry['per_frame_rtc_excl_scd'] = result.get('_per_frame_rtc_excl_scd', [])
             per_sequence.append(entry)
 
         # Aggregated
@@ -1714,13 +1807,22 @@ class OnepieceTester:
                 if values:
                     agg_ratio_stats[key] = float(np.mean(values))
 
+        # Aggregate excl_scd rTC
+        rtc_excl_scd_values = [m['rtc_excl_scd'] for m in all_metrics if 'rtc_excl_scd' in m]
+        rtc_gt_excl_scd_values = [m['rtc_gt_excl_scd'] for m in all_metrics if 'rtc_gt_excl_scd' in m]
+
+        aggregated = {
+            'rtc': float(np.mean(rtc_values)) if rtc_values else 0.0,
+            'rtc_gt': float(np.mean(rtc_gt_values)) if rtc_gt_values else 0.0,
+            'ratio_stats': agg_ratio_stats
+        }
+        if rtc_excl_scd_values:
+            aggregated['rtc_excl_scd'] = float(np.mean(rtc_excl_scd_values))
+            aggregated['rtc_gt_excl_scd'] = float(np.mean(rtc_gt_excl_scd_values)) if rtc_gt_excl_scd_values else 0.0
+
         tc_output = {
             'config': {'threshold': self.tc_threshold, 'flow_model': 'sea_raft'},
-            'aggregated': {
-                'rtc': float(np.mean(rtc_values)) if rtc_values else 0.0,
-                'rtc_gt': float(np.mean(rtc_gt_values)) if rtc_gt_values else 0.0,
-                'ratio_stats': agg_ratio_stats
-            },
+            'aggregated': aggregated,
             'per_sequence': per_sequence
         }
 
@@ -1733,7 +1835,7 @@ class OnepieceTester:
         """Save tc_summary.json with rTC + TAE + PSR (dataset aggregate + per-sequence)."""
         per_sequence = []
         for r in all_metrics:
-            per_sequence.append({
+            entry = {
                 'sequence_id': r.get('sequence_id', -1),
                 'rtc': r.get('rtc', 0.0),
                 'rtc_gt': r.get('rtc_gt', 0.0),
@@ -1743,13 +1845,21 @@ class OnepieceTester:
                 'psr': r.get('psr', 0.0),
                 'psr_max': r.get('psr_max', 0.0),
                 'fps': r.get('fps', 0.0),
-            })
+            }
+            if 'rtc_excl_scd' in r:
+                entry['rtc_excl_scd'] = r['rtc_excl_scd']
+                entry['rtc_gt_excl_scd'] = r.get('rtc_gt_excl_scd', 0.0)
+            per_sequence.append(entry)
 
         # Aggregate (mean over sequences with valid values)
         agg = {}
         for key in ['rtc', 'rtc_gt', 'tae', 'tae_reproj', 'tae_reproj_gt', 'psr', 'psr_max', 'fps']:
             vals = [s[key] for s in per_sequence if s[key] != 0.0]
             agg[key] = float(np.mean(vals)) if vals else 0.0
+        # Aggregate excl_scd
+        excl_scd_vals = [s['rtc_excl_scd'] for s in per_sequence if 'rtc_excl_scd' in s]
+        if excl_scd_vals:
+            agg['rtc_excl_scd'] = float(np.mean(excl_scd_vals))
 
         summary = {
             'aggregated': agg,
@@ -1777,7 +1887,8 @@ class OnepieceTester:
 
         # Reorder
         metric_order = ['abs_rel', 'a1', 'a2', 'a3', 'fps', 'tae', 'tae_reproj', 'tae_reproj_gt',
-                        'rtc', 'rtc_gt', 'psr', 'psr_max',
+                        'rtc', 'rtc_gt', 'rtc_excl_scd', 'rtc_gt_excl_scd',
+                        'psr', 'psr_max',
                         'mae', 'rmse',
                         'pred_scale_mean', 'pred_shift_mean',
                         'optimal_scale_mean', 'optimal_shift_mean']
