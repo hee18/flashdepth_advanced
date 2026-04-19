@@ -1,0 +1,52 @@
+# Pedestrian Tracker Configuration
+# Onepiece depth + YOLO 11m-seg instance segmentation + tracking
+
+# Paths
+paths:
+  video: "/data/datasets/videos/avante_video.mp4"
+  output_dir: "pedestrian_tracker/outputs"
+  # Onepiece model
+  onepiece_config: "configs/onepiece/config.yaml"
+  onepiece_checkpoint: "train_results/results_34/onepiece/large/last.pth"
+  # YOLO model
+  yolo_model: "yolo11m-seg.pt"
+
+# Camera intrinsics (default: approximate values, adjust per video)
+camera:
+  fx: 1252.8
+  fy: 1252.8
+  cx: 826.6
+  cy: 470.0
+
+# Depth estimation
+depth:
+  input_size: 518
+  max_depth: 80.0
+  use_bfloat16: true
+
+# YOLO tracking
+yolo:
+  confidence: 0.5
+  iou_threshold: 0.5
+  tracker: "botsort.yaml"
+  person_only: true          # class 0 = person
+
+# Trajectory
+trajectory:
+  ema_alpha: 0.3             # EMA smoothing (0=full smooth, 1=no smooth)
+  use_eroded_mask: true      # erode mask before depth extraction
+  erode_kernel_size: 5
+  erode_iterations: 1
+  max_track_length: 300      # max trajectory points per ID
+
+# Visualization
+visualization:
+  depth_colormap: "Spectral"
+  depth_overlay_alpha: 0.6
+  show_bbox: true
+  show_depth_text: true
+  headless: true             # no GUI display
+  save_video: true
+  save_frames: false
+  save_trajectory_plot: true
+  save_trajectory_json: true

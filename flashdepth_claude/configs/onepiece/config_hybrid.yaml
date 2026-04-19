@@ -13,9 +13,9 @@ train_mode: metric               # "metric" or "inverse"
 # Dataset Configuration
 dataset:
   data_root: null
-  resolution: 'base'        # 518x518
-  video_length: 8            # 8 frames for temporal processing
-  train_datasets: [mvs-synth, dynamicreplica, tartanair, pointodyssey, spring]
+  resolution: '2k'          # 2K resolution (hybrid second stage)
+  video_length: 5            # 5 frames for temporal processing
+  train_datasets: [mvs-synth, spring]
   val_datasets: [sintel, waymo_seg]
 
 # Training Configuration
