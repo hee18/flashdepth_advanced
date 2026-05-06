@@ -442,11 +442,13 @@ class OnepieceTrainer:
         val_datasets = self.config.dataset.get('val_datasets', ['sintel', 'waymo_seg'])
         resolution = self.config.dataset.get('resolution', 'base')
         video_length = self.config.dataset.get('video_length', 8)
+        use_dual_cstm = self.config.get('use_dual_cstm', True)
 
         if self.rank == 0:
             self.logger.info(f"Train datasets: {train_datasets}")
             self.logger.info(f"Val datasets: {val_datasets}")
             self.logger.info(f"Resolution: {resolution}, video_length: {video_length}")
+            self.logger.info(f"Dual-CSTM: {'ENABLED' if use_dual_cstm else 'DISABLED (No-CSTM ablation)'}")
 
         train_dataset = CombinedDataset(
             root_dir=self.config.dataset.data_root,
@@ -454,7 +456,8 @@ class OnepieceTrainer:
             resolution=resolution,
             split='train',
             video_length=video_length,
-            color_aug=False
+            color_aug=False,
+            disable_canonical_transform=not use_dual_cstm,
         )
 
         val_dataset = CombinedDataset(

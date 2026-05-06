@@ -10,6 +10,7 @@ inference: false
 load: null          # Student checkpoint: Onepiece-S best.pth (pretrained.* + depth_head.* loaded, onepiece modules excluded)
 load_teacher: null  # Teacher checkpoint: Onepiece-L best.pth (pretrained.* + depth_head.* → teacher_model.*)
 train_mode: metric               # "metric" or "inverse"
+use_dual_cstm: true              # false → No Dual-CSTM ablation (use --no-cstm flag)
 
 # Dataset Configuration
 dataset:

@@ -549,16 +549,23 @@ class OnepieceTester:
         gt_depth_inverse_100 = gt_depth * 100.0  # [1, T, 1, H, W]
 
         # De-canonicalization ratios
-        CANONICAL_FX = get_canonical_focal_length(self.config)
-        if fx_ratio is not None and resize_ratio is not None:
-            de_canonical_ratio_inverse = fx_ratio / resize_ratio
-            de_canonical_ratio_metric = 1.0 / de_canonical_ratio_inverse
-        elif fx_actual_tensor is not None:
-            de_canonical_ratio_inverse = CANONICAL_FX / fx_actual_tensor
-            de_canonical_ratio_metric = 1.0 / de_canonical_ratio_inverse
-        else:
+        # When use_dual_cstm=False (No-CSTM ablation), model was trained without canonical
+        # transform → predictions are already in actual space → de-canon = identity
+        use_dual_cstm = self.config.get('use_dual_cstm', True)
+        if not use_dual_cstm:
             de_canonical_ratio_inverse = torch.ones(1, T, device=self.device)
             de_canonical_ratio_metric = torch.ones(1, T, device=self.device)
+        else:
+            CANONICAL_FX = get_canonical_focal_length(self.config)
+            if fx_ratio is not None and resize_ratio is not None:
+                de_canonical_ratio_inverse = fx_ratio / resize_ratio
+                de_canonical_ratio_metric = 1.0 / de_canonical_ratio_inverse
+            elif fx_actual_tensor is not None:
+                de_canonical_ratio_inverse = CANONICAL_FX / fx_actual_tensor
+                de_canonical_ratio_metric = 1.0 / de_canonical_ratio_inverse
+            else:
+                de_canonical_ratio_inverse = torch.ones(1, T, device=self.device)
+                de_canonical_ratio_metric = torch.ones(1, T, device=self.device)
 
         # Valid mask
         if actual_valid_mask is not None:

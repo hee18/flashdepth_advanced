@@ -7,6 +7,7 @@ config_dir: null
 inference: false
 load: configs/flashdepth-l/iter_10001.pth
 train_mode: metric               # "metric" or "inverse"
+use_dual_cstm: true              # false → No Dual-CSTM ablation (use --no-cstm flag)
 
 # Dataset Configuration
 dataset:
@@ -51,6 +52,7 @@ model:
   spatial_mamba_d_state: 256
   spatial_mamba_d_conv: 4
   spatial_mamba_downsample: 0.1
+  use_teacher_cls: true          # true=teacher ViT-L CLS (hybrid only), false=student CLS (--student-cls)
 
 # Hybrid Model Configuration
 hybrid_configs:

@@ -57,6 +57,7 @@ model:
   spatial_mamba_d_state: 256
   spatial_mamba_d_conv: 4
   spatial_mamba_downsample: 0.1
+  use_teacher_cls: true
 
 # Hybrid disabled for smoke test
 hybrid_configs:

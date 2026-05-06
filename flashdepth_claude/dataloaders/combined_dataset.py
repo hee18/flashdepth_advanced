@@ -24,7 +24,8 @@ from utils.dataset_intrinsics import (
 class CombinedDataset(Dataset):
     def __init__(self, root_dir, enable_dataset_flags, resolution=None, split='train',
                  video_length=8, seed=42, tmp_res=None, color_aug=False, strict_focal_length=True,
-                 unreal4k_seq=None, limit_scenes=None, seq_list=None, skip_gt_canonicalization=False):
+                 unreal4k_seq=None, limit_scenes=None, seq_list=None, skip_gt_canonicalization=False,
+                 disable_canonical_transform=False):
         '''
         enable_dataset_flags: list of datasets to use; e.g. ['spring', 'mvs-synth', 'urbansyn', 'eth3d', 'waymo', 'waymo_seg']
 
@@ -76,6 +77,8 @@ class CombinedDataset(Dataset):
         
         # Store skip_gt_canonicalization flag
         self.skip_gt_canonicalization = skip_gt_canonicalization
+        # When True, skip canonical transform in training split (No Dual-CSTM ablation)
+        self.disable_canonical_transform = disable_canonical_transform
 
         cache_dir = './dataloaders/pairs_cache' if split != 'test' else None
 
@@ -671,19 +674,28 @@ class CombinedDataset(Dataset):
             original_h, original_w = depth_inverse_actual.shape
             fx_actual = self._get_focal_length(dataset_idx, pair, (original_h, original_w))
 
-            # Apply Metric3D-style canonical transformation (now returns 6 values)
-            # This corrects GT depth based on actual vs theoretical resize ratios
-            depth_inverse_canonical, fx_canonical, fx_actual_returned, actual_valid_mask, fx_ratio, resize_ratio = self._apply_canonical_transform(
-                depth_inverse_actual, fx_actual, original_h, original_w, target_resolution, resize_factor
-            )
-
-            # Convert back to numpy for resizing
-            if isinstance(depth_inverse_canonical, torch.Tensor):
-                depth_inverse_canonical_np = depth_inverse_canonical.cpu().numpy()
-                actual_valid_mask_np = actual_valid_mask.cpu().numpy().astype(np.uint8)
+            if self.disable_canonical_transform:
+                # No Dual-CSTM: use actual depth directly, no focal-length correction
+                depth_inverse_canonical_np = depth_inverse_actual  # already numpy
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    depth_m = np.where(depth_inverse_actual > 1e-8, 1.0 / depth_inverse_actual, 0.0)
+                actual_valid_mask_np = ((depth_m > 0) & (depth_m < ACTUAL_MAX_DEPTH)).astype(np.uint8)
+                fx_canonical = fx_actual
+                fx_actual_returned = fx_actual
+                fx_ratio = 1.0
+                resize_ratio = 1.0
             else:
-                depth_inverse_canonical_np = depth_inverse_canonical
-                actual_valid_mask_np = actual_valid_mask.astype(np.uint8)
+                # Apply Metric3D-style canonical transformation (now returns 6 values)
+                # This corrects GT depth based on actual vs theoretical resize ratios
+                depth_inverse_canonical, fx_canonical, fx_actual_returned, actual_valid_mask, fx_ratio, resize_ratio = self._apply_canonical_transform(
+                    depth_inverse_actual, fx_actual, original_h, original_w, target_resolution, resize_factor
+                )
+                if isinstance(depth_inverse_canonical, torch.Tensor):
+                    depth_inverse_canonical_np = depth_inverse_canonical.cpu().numpy()
+                    actual_valid_mask_np = actual_valid_mask.cpu().numpy().astype(np.uint8)
+                else:
+                    depth_inverse_canonical_np = depth_inverse_canonical
+                    actual_valid_mask_np = actual_valid_mask.astype(np.uint8)
 
             # Resize depth using same logic as before
             depth_resized = _load_and_process_depth(

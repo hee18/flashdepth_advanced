@@ -1,5 +1,31 @@
 # Changelog
 
+## 2026-05-06: Ablation Study 지원 추가 (No Dual-CSTM + SCD 비교 테스트)
+
+### 변경 파일
+- **`dataloaders/combined_dataset.py`**: `disable_canonical_transform=False` 파라미터 추가. train split `__getitem__`에서 `True`이면 `_apply_canonical_transform` skip → `fx_ratio=1.0, resize_ratio=1.0` 반환
+- **`train_onepiece.py`**: `_setup_data_loaders()`에서 `config.use_dual_cstm` 읽어 `disable_canonical_transform = not use_dual_cstm`으로 train 데이터셋에 전달. 로그 추가
+- **`test_onepiece.py`**: `test_sequence()`에서 `use_dual_cstm=False`이면 de-canonicalization 비율을 1.0으로 강제 (예측이 이미 actual space)
+- **`configs/onepiece/config_l.yaml`, `config_s.yaml`, `config_hybrid.yaml`**: `use_dual_cstm: true` 추가
+- **`run_docker.sh`**: `--no-cstm` 플래그 추가 (`NO_CSTM=true` → train 명령에 `use_dual_cstm=false` 전달). `--dataset2`, `--vda-checkpoint` 추가. `test_scd_ablation` 커맨드 추가
+- **`test_scd_ablation.py`** (신규): SCD 비교 테스트 스크립트
+
+### Ablation 1: No Dual-CSTM
+- `--no-cstm` 플래그로 학습 시 focal length canonical transform 없이 actual depth로 직접 학습
+- 테스트 시 `use_dual_cstm=false`이면 de-canon 자동 skip
+- 사용법: `./run_docker.sh train_onepiece --no-cstm --config-variant l`
+
+### Ablation 2: SCD 비교 테스트 (test_scd_ablation.py)
+- N개 시퀀스를 매 --frames-per-seg(=10)마다 다른 시퀀스로 전환하여 stitched video 구성
+- 4개 모델 비교: Metric-FlashDepth(SCD on/off), FlashDepth, VDA
+- rTC(ratio temporal consistency)를 cut frame vs within-scene 분리 집계 → JSON 저장
+- cut 전후 depth map PNG 자동 저장 (cuts/cut_TTTT/ 디렉토리)
+- 같은 데이터셋/다른 시퀀스: `--dataset sintel`
+- 다른 데이터셋: `--dataset sintel --dataset2 waymo_seg`
+- Docker: `./run_docker.sh test_scd_ablation --dataset sintel --dataset2 waymo_seg --gear-checkpoint ... --gpu 0`
+
+---
+
 ## 2026-05-06: Hybrid Onepiece에 student CLS 옵션 추가 (--student-cls)
 
 ### 변경 파일

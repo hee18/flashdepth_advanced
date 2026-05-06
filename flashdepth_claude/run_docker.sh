@@ -84,6 +84,9 @@ show_usage() {
     echo "  --save-depth-maps    Save depth maps as .npy files"
     echo "  --fgwise             Enable FG-wise evaluation using ViT attention masks"
     echo "  --student-cls        Use student (ViT-S) CLS for Hybrid Onepiece instead of teacher (ViT-L) CLS"
+    echo "  --no-cstm            No Dual-CSTM ablation: skip canonical focal-length transform during training"
+    echo "  --vda                Enable VDA in SCD ablation test (auto-loads from refer_test/)"
+    echo "  --dataset2 DATASET   Second dataset for cross-dataset SCD cuts (test_scd_ablation only)"
     echo "  --measure-fps BOOL   Enable/disable FPS measurement (default: true)"
     echo ""
     echo "Examples:"
@@ -149,12 +152,15 @@ MODEL_TYPE="gear5"  # Model type for infer_avante: gear5, onepiece
 SAVE_DEPTH_MAPS="false"  # Save depth maps as .npy files
 TEACHER_CHECKPOINT=""  # Teacher model checkpoint for FSDP hybrid training
 USE_TEACHER_CLS="true"  # Use teacher (ViT-L) CLS for Hybrid Onepiece (false = student ViT-S CLS)
+NO_CSTM="false"         # No Dual-CSTM ablation: skip canonical transform during training
+USE_VDA="false"         # Enable VDA in SCD ablation test (auto-loads from refer_test/)
+SECOND_DATASET=""       # Second dataset for cross-dataset SCD test (--dataset2)
 
 # Parse arguments
 USER_BATCH_SIZE=""  # Track if user explicitly set batch size
 while [[ $# -gt 0 ]]; do
     case $1 in
-        build|train_gear5|train_gear5_ddp|test_gear5|train_onepiece|train_onepiece_ddp|train_onepiece_fsdp|test_onepiece|infer_avante|test_original_flashdepth|shell|clean|logs)
+        build|train_gear5|train_gear5_ddp|test_gear5|train_onepiece|train_onepiece_ddp|train_onepiece_fsdp|test_onepiece|test_scd_ablation|infer_avante|test_original_flashdepth|shell|clean|logs)
             COMMAND="$1"
             shift
             ;;
@@ -327,6 +333,22 @@ while [[ $# -gt 0 ]]; do
             ;;
         --student-cls)
             USE_TEACHER_CLS="false"
+            shift
+            ;;
+        --no-cstm)
+            NO_CSTM="true"
+            shift
+            ;;
+        --vda-checkpoint)
+            VDA_CHECKPOINT="$2"
+            shift 2
+            ;;
+        --dataset2)
+            SECOND_DATASET="$2"
+            shift 2
+            ;;
+        --vda)
+            USE_VDA="true"
             shift
             ;;
         -h|--help)
@@ -1033,6 +1055,7 @@ case $COMMAND in
         echo "  - WandB: $WANDB (--wandb, default: true)"
         echo "  - WandB name: ${WANDB_NAME:-auto} (--wandb-name)"
         echo "  - Checkpoint: ${FLASHDEPTH_CHECKPOINT:-config default} (--flashdepth-checkpoint)"
+        echo "  - No Dual-CSTM: $NO_CSTM (--no-cstm)"
         echo "  - Results directory: $RESULTS_DIR (--results-dir)"
         echo ""
 
@@ -1046,6 +1069,10 @@ case $COMMAND in
             training.wandb=$WANDB \
             model.use_teacher_cls=$USE_TEACHER_CLS \
             +results_dir=$RESULTS_DIR"
+
+        if [ "$NO_CSTM" = "true" ]; then
+            DOCKER_CMD="$DOCKER_CMD use_dual_cstm=false"
+        fi
 
         if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
             DOCKER_CMD="$DOCKER_CMD load=$FLASHDEPTH_CHECKPOINT"
@@ -1071,6 +1098,7 @@ case $COMMAND in
         echo "  - WandB: $WANDB (--wandb, default: true)"
         echo "  - WandB name: ${WANDB_NAME:-auto} (--wandb-name)"
         echo "  - Checkpoint: ${FLASHDEPTH_CHECKPOINT:-config default} (--flashdepth-checkpoint)"
+        echo "  - No Dual-CSTM: $NO_CSTM (--no-cstm)"
         echo "  - Results directory: $RESULTS_DIR (--results-dir)"
         echo ""
 
@@ -1093,6 +1121,10 @@ case $COMMAND in
             training.wandb=$WANDB \
             model.use_teacher_cls=$USE_TEACHER_CLS \
             +results_dir=$RESULTS_DIR"
+
+        if [ "$NO_CSTM" = "true" ]; then
+            DOCKER_CMD="$DOCKER_CMD use_dual_cstm=false"
+        fi
 
         if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
             DOCKER_CMD="$DOCKER_CMD load=$FLASHDEPTH_CHECKPOINT"
@@ -1135,6 +1167,7 @@ case $COMMAND in
         echo "  - WandB name: ${WANDB_NAME:-auto} (--wandb-name)"
         echo "  - Student checkpoint: ${FLASHDEPTH_CHECKPOINT:-config default} (--flashdepth-checkpoint)"
         echo "  - Teacher checkpoint: ${TEACHER_CHECKPOINT:-none} (--teacher-checkpoint)"
+        echo "  - No Dual-CSTM: $NO_CSTM (--no-cstm)"
         echo "  - Results directory: $RESULTS_DIR (--results-dir)"
         echo ""
 
@@ -1385,6 +1418,48 @@ case $COMMAND in
 
             eval $DOCKER_CMD
         fi
+        ;;
+
+    test_scd_ablation)
+        echo "Starting SCD Ablation Test..."
+        echo "Configuration:"
+        echo "  - Config variant: $CONFIG_VARIANT (--config-variant)"
+        echo "  - Dataset: ${OBJWISE_DATASET:-sintel} (--dataset)"
+        echo "  - Dataset2 (cross-dataset): ${SECOND_DATASET:-none} (--dataset2)"
+        echo "  - Resolution: $RESOLUTION (--resolution)"
+        echo "  - GPU: $GPU_ID"
+        echo "  - Gear checkpoint: ${GEAR_CHECKPOINT:-required}"
+        echo "  - FlashDepth checkpoint: ${FLASHDEPTH_CHECKPOINT:-skipped}"
+        echo "  - VDA: $([ "$USE_VDA" = "true" ] && echo "enabled (--vda)" || echo "disabled")"
+        echo "  - Results directory: $RESULTS_DIR"
+        echo ""
+
+        if [ -z "$GEAR_CHECKPOINT" ]; then
+            echo "ERROR: --gear-checkpoint is required for test_scd_ablation"
+            exit 1
+        fi
+
+        SCD_DATASET="${OBJWISE_DATASET:-sintel}"
+        SCD_CMD="python test_scd_ablation.py \
+            --dataset $SCD_DATASET \
+            --data-root /data/datasets \
+            --config-variant $CONFIG_VARIANT \
+            --resolution $RESOLUTION \
+            --gear-checkpoint $GEAR_CHECKPOINT \
+            --gpu 0 \
+            --results-dir /app/$RESULTS_DIR"
+
+        if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
+            SCD_CMD="$SCD_CMD --flashdepth-checkpoint $FLASHDEPTH_CHECKPOINT"
+        fi
+        if [ "$USE_VDA" = "true" ]; then
+            SCD_CMD="$SCD_CMD --vda"
+        fi
+        if [ -n "$SECOND_DATASET" ]; then
+            SCD_CMD="$SCD_CMD --dataset2 $SECOND_DATASET"
+        fi
+
+        CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm flashdepth $SCD_CMD
         ;;
 
     "")
