@@ -1,0 +1,115 @@
+# Onepiece V3 — FSDP2 Smoke Test Config (ViT-L, non-hybrid, 518×518)
+# Use with train_onepiece_fsdp.py to verify FSDP2 correctness before 2K hybrid run.
+#   torchrun --nproc_per_node=2 train_onepiece_fsdp.py \
+#     --config-path configs/onepiece --config-name config_fsdp \
+#     dataset.data_root=/data/datasets \
+#     training.total_iters=1001 training.iterations=1001 \
+#     results_dir=train_results/smoke_fsdp
+
+# General Settings
+config_variant: fsdp_smoke
+config_dir: null
+inference: false
+load: null
+load_teacher: null
+resume: null
+train_mode: metric
+
+# Dataset Configuration
+dataset:
+  data_root: null
+  resolution: 'base'         # 518×518
+  video_length: 8
+  train_datasets: [tartanair]
+  val_datasets: [tartanair]
+
+# Training Configuration
+training:
+  batch_size: 2              # Per GPU at 518×518 (less memory pressure than DDP due to FSDP shard)
+  workers: 4
+  gradient_checkpointing: true
+  save_freq: 5000
+  val_freq: 500
+  vis_freq: 250
+  total_iters: 40001
+  iterations: 40001
+  gradient_accumulation: 1
+  wandb: false
+  wandb_name: "onepiece_fsdp_smoke"
+  start_with_val: false
+  weight_decay: 1.0e-6
+  lr:
+    onepiece: 1.0e-4
+    dpt: 1.0e-5
+    warmup_steps: 500
+
+# Model Configuration
+model:
+  vit_size: "vitl"
+  patch_size: 14
+  attn_class: "MemEffAttention"
+  use_mamba: false
+  use_hydra: false
+  use_transformer_rnn: false
+  use_xlstm: false
+  use_onepiece: true
+  spatial_mamba_layers: 4
+  spatial_mamba_d_state: 256
+  spatial_mamba_d_conv: 4
+  spatial_mamba_downsample: 0.1
+
+# Hybrid disabled for smoke test
+hybrid_configs:
+  use_hybrid: false
+  teacher_model_path: null
+  teacher_resolution: 490
+  layers_to_skip: [1, 2, 3]
+  num_blocks: 4
+  mlp_expand: 2
+  num_heads: 2
+
+# FSDP2 Configuration
+fsdp:
+  cpu_offload: false
+  reshard_after_forward_student: false
+  reshard_after_forward_teacher: true
+
+# Loss Configuration
+loss:
+  log_l1_weight: 1.0
+  tgm_weight: 1.0
+  ofc_weight: 0.01
+  use_log_space: true
+
+# Scene Cut Detection (inference only)
+scene_cut:
+  tau: 0.15
+  k: 80
+
+# Phase Transition
+phase:
+  auto_transition_step: 1500
+  phase2_warmup_steps: 500
+
+# Evaluation Configuration
+eval:
+  compile: false
+  metrics: false
+  save_grid: false
+  outfolder: "test_fsdp_smoke"
+  test_datasets: [sintel]
+  test_dataset_resolution: 'base'
+  random_input: null
+  out_video: true
+  out_mp4: false
+  save_res: 518
+  save_depth_npy: false
+  save_vis_map: false
+  dummy_timing: false
+  large_dir: null
+  first_seq_only: false
+
+# Flow Estimation
+flow:
+  model: "sea_raft"
+  checkpoint: "third_party/SEA-RAFT/models/Tartan-C-T-TSKH-spring540x960-M.pth"

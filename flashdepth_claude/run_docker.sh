@@ -34,7 +34,8 @@ show_usage() {
     echo "  train_gear5_ddp Start Gear5 training with 2 GPUs (GPU 0,1)"
     echo "  test_gear5      Start Gear5 testing"
     echo "  train_onepiece       Start Onepiece training (Unified Global Mamba, single GPU)"
-    echo "  train_onepiece_ddp   Start Onepiece training with 2 GPUs"
+    echo "  train_onepiece_ddp   Start Onepiece training with 2 GPUs (DDP)"
+    echo "  train_onepiece_fsdp  Start Onepiece FSDP2 training with 2 GPUs (2K hybrid)"
     echo "  test_onepiece        Start Onepiece testing"
     echo "  infer_avante         Run inference on avante_images (custom dataset)"
     echo "  test_original_flashdepth  Test original FlashDepth (without Gear modules) for comparison"
@@ -78,9 +79,11 @@ show_usage() {
     echo "  --model-type TYPE    Model type for infer_avante: gear5 (default), onepiece"
     echo "  --cbar               Show colorbar next to depth visualization"
     echo "  --test-mode MODE     Test mode: empty (full), tc (temporal consistency only)"
-    echo "  --ddp-gpus IDS       GPU IDs for DDP training (default: 0,1)"
+    echo "  --ddp-gpus IDS       GPU IDs for DDP/FSDP training (default DDP: 0,1 / default FSDP: 2,3)
+  --teacher-checkpoint PATH  Teacher model checkpoint for FSDP hybrid training (Onepiece-L or FlashDepth-L)"
     echo "  --save-depth-maps    Save depth maps as .npy files"
     echo "  --fgwise             Enable FG-wise evaluation using ViT attention masks"
+    echo "  --student-cls        Use student (ViT-S) CLS for Hybrid Onepiece instead of teacher (ViT-L) CLS"
     echo "  --measure-fps BOOL   Enable/disable FPS measurement (default: true)"
     echo ""
     echo "Examples:"
@@ -89,7 +92,10 @@ show_usage() {
     echo "  $0 train_gear5 --mamba --gpu 0         # Gear5 training with Mamba2"
     echo "  $0 test_gear5 --gpu 0                  # Test Gear5"
     echo "  $0 train_onepiece --gpu 0              # Onepiece training (single GPU)"
-    echo "  $0 train_onepiece_ddp --ddp-gpus 0,1   # Onepiece DDP training"
+    echo "  $0 train_onepiece_ddp --ddp-gpus 0,1   # Onepiece DDP training
+  $0 train_onepiece_fsdp                           # Onepiece FSDP2 hybrid 2K training (GPUs 2,3)
+  $0 train_onepiece_fsdp --ddp-gpus 0,2           # Use GPU 0 and 2
+  $0 train_onepiece_fsdp --flashdepth-checkpoint train_results/results_s/best.pth --teacher-checkpoint train_results/results_l/best.pth  # Load from Onepiece-S+L"
     echo "  $0 test_onepiece --dataset all --gpu 0 # Test Onepiece on all datasets"
     echo "  $0 infer_avante --model-type onepiece --gear-checkpoint path/to/ckpt  # Avante inference"
     echo "  $0 test_original_flashdepth --gpu 0    # Test original FlashDepth (ViT-L)"
@@ -111,6 +117,7 @@ VID_LEN=50
 SINGLE_SEQUENCE=""  # Path to single sequence directory (optional)
 MEASURE_FPS="true"
 CONFIG_VARIANT="l"  # Config variant: l, s, hybrid
+USER_CONFIG_VARIANT=""  # Track if user explicitly set --config-variant
 CONFIG="flashdepth-l"  # FlashDepth config variant (flashdepth, flashdepth-l, flashdepth-s)
 INVERSE="false"  # Inverse colormap for depth visualization (original FlashDepth only)
 OBJWISE_DATASET=""  # Dataset for evaluation - empty means use config default
@@ -135,16 +142,19 @@ MAX_DEPTH="80.0"  # Max valid depth threshold (meters)
 CBAR="false"  # Show colorbar next to depth visualization
 TEST_MODE=""  # Test mode: empty (full), tc (temporal consistency only)
 DDP_GPUS="0,1"  # GPU IDs for DDP training
+USER_DDP_GPUS=""  # Track if user explicitly set --ddp-gpus (for FSDP default override)
 NO_INVERSE="false"  # Apply scale/shift in depth space instead of inverse depth
 NO_SHIFT="false"  # Disable shift, scale-only mode
 MODEL_TYPE="gear5"  # Model type for infer_avante: gear5, onepiece
 SAVE_DEPTH_MAPS="false"  # Save depth maps as .npy files
+TEACHER_CHECKPOINT=""  # Teacher model checkpoint for FSDP hybrid training
+USE_TEACHER_CLS="true"  # Use teacher (ViT-L) CLS for Hybrid Onepiece (false = student ViT-S CLS)
 
 # Parse arguments
 USER_BATCH_SIZE=""  # Track if user explicitly set batch size
 while [[ $# -gt 0 ]]; do
     case $1 in
-        build|train_gear5|train_gear5_ddp|test_gear5|train_onepiece|train_onepiece_ddp|test_onepiece|infer_avante|test_original_flashdepth|shell|clean|logs)
+        build|train_gear5|train_gear5_ddp|test_gear5|train_onepiece|train_onepiece_ddp|train_onepiece_fsdp|test_onepiece|infer_avante|test_original_flashdepth|shell|clean|logs)
             COMMAND="$1"
             shift
             ;;
@@ -195,6 +205,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         --config-variant)
             CONFIG_VARIANT="$2"
+            USER_CONFIG_VARIANT="$2"
             shift 2
             ;;
         --dataset)
@@ -307,7 +318,16 @@ while [[ $# -gt 0 ]]; do
             ;;
         --ddp-gpus)
             DDP_GPUS="$2"
+            USER_DDP_GPUS="$2"
             shift 2
+            ;;
+        --teacher-checkpoint)
+            TEACHER_CHECKPOINT="$2"
+            shift 2
+            ;;
+        --student-cls)
+            USE_TEACHER_CLS="false"
+            shift
             ;;
         -h|--help)
             show_usage
@@ -1024,6 +1044,7 @@ case $COMMAND in
             training.workers=$WORKERS \
             training.iterations=$TOTAL_ITERS \
             training.wandb=$WANDB \
+            model.use_teacher_cls=$USE_TEACHER_CLS \
             +results_dir=$RESULTS_DIR"
 
         if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
@@ -1070,10 +1091,79 @@ case $COMMAND in
             training.workers=$WORKERS \
             training.iterations=$TOTAL_ITERS \
             training.wandb=$WANDB \
+            model.use_teacher_cls=$USE_TEACHER_CLS \
             +results_dir=$RESULTS_DIR"
 
         if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
             DOCKER_CMD="$DOCKER_CMD load=$FLASHDEPTH_CHECKPOINT"
+        fi
+
+        if [ -n "$WANDB_NAME" ]; then
+            DOCKER_CMD="$DOCKER_CMD training.wandb_name=$WANDB_NAME"
+        fi
+
+        eval $DOCKER_CMD
+        ;;
+
+    train_onepiece_fsdp)
+        # FSDP2 Onepiece training — uses 2 GPUs with torchrun
+        # Default: config_hybrid_fsdp (2K hybrid).
+        # Smoke test (non-hybrid 518): pass --config-variant l explicitly.
+        if [ -n "$USER_CONFIG_VARIANT" ] && [ "$CONFIG_VARIANT" = "l" ]; then
+            FSDP_CONFIG="config_fsdp"          # explicit smoke-test: non-hybrid 518
+        else
+            FSDP_CONFIG="config_hybrid_fsdp"   # default: 2K hybrid
+        fi
+
+        # GPU selection: use --ddp-gpus if specified, otherwise default to 2,3
+        FSDP_GPUS="${USER_DDP_GPUS:-2,3}"
+
+        # Auto-adjust batch size for 2K if not explicitly set
+        if [ -z "$USER_BATCH_SIZE" ] && [ "$FSDP_CONFIG" = "config_hybrid_fsdp" ]; then
+            BATCH_SIZE=1
+            echo "  NOTE: Auto-set batch_size=1 for 2K hybrid FSDP (use --batch-size 2 to override)"
+        fi
+
+        echo "Starting Onepiece V3 FSDP2 training (2 GPUs, torchrun)..."
+        echo "Configuration:"
+        echo "  - Config file: configs/onepiece/$FSDP_CONFIG.yaml"
+        echo "  - Batch size per GPU: $BATCH_SIZE"
+        echo "  - Workers: $WORKERS"
+        echo "  - GPUs: $FSDP_GPUS (--ddp-gpus, default: 2,3)"
+        echo "  - Total iterations: $TOTAL_ITERS"
+        echo "  - WandB: $WANDB (--wandb, default: true)"
+        echo "  - WandB name: ${WANDB_NAME:-auto} (--wandb-name)"
+        echo "  - Student checkpoint: ${FLASHDEPTH_CHECKPOINT:-config default} (--flashdepth-checkpoint)"
+        echo "  - Teacher checkpoint: ${TEACHER_CHECKPOINT:-none} (--teacher-checkpoint)"
+        echo "  - Results directory: $RESULTS_DIR (--results-dir)"
+        echo ""
+
+        DOCKER_CMD="CUDA_VISIBLE_DEVICES=$FSDP_GPUS docker compose run --rm \
+            -e GLOO_SOCKET_IFNAME=eth0 \
+            -e NCCL_SOCKET_IFNAME=eth0 \
+            -e NCCL_P2P_DISABLE=1 \
+            -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+            -e WANDB_API_KEY=\${WANDB_API_KEY:-} \
+            flashdepth torchrun \
+            --standalone \
+            --nproc_per_node=2 \
+            train_onepiece_fsdp.py \
+            --config-path configs/onepiece \
+            --config-name $FSDP_CONFIG \
+            dataset.data_root=/data/datasets \
+            training.batch_size=$BATCH_SIZE \
+            training.workers=$WORKERS \
+            training.iterations=$TOTAL_ITERS \
+            training.wandb=$WANDB \
+            model.use_teacher_cls=$USE_TEACHER_CLS \
+            +results_dir=$RESULTS_DIR"
+
+        if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
+            DOCKER_CMD="$DOCKER_CMD load=$FLASHDEPTH_CHECKPOINT"
+        fi
+
+        if [ -n "$TEACHER_CHECKPOINT" ]; then
+            DOCKER_CMD="$DOCKER_CMD load_teacher=$TEACHER_CHECKPOINT"
         fi
 
         if [ -n "$WANDB_NAME" ]; then
@@ -1182,6 +1272,7 @@ case $COMMAND in
                     dataset.video_length=$CUR_VID_LEN \
                     training.workers=$CUR_WORKERS \
                     +frame_interval=$FRAME_INTERVAL \
+                    +resolution=$RESOLUTION \
                     +results_dir=$CUR_RESULTS_DIR \
                     eval.test_datasets=[$ds]"
 
@@ -1251,7 +1342,9 @@ case $COMMAND in
                 --config-name config_$CONFIG_VARIANT \
                 dataset.data_root=/data/datasets \
                 dataset.video_length=$VID_LEN \
+                training.workers=$WORKERS \
                 +frame_interval=$FRAME_INTERVAL \
+                +resolution=$RESOLUTION \
                 +results_dir=$RESULTS_DIR"
 
             if [ -n "$GEAR_CHECKPOINT" ]; then

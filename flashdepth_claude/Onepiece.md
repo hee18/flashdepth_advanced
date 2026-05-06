@@ -175,12 +175,19 @@ raw[:, 0] → scale,  raw[:, 1] → shift
 
 ### 2b. CLS Projection (`model.py`)
 
-DINOv2 fused CLS (1024-dim)를 DPT feature space (256-dim)로 변환.
+DINOv2 fused CLS를 DPT feature space (256-dim)로 변환.
 
 ```python
-self.cls_projection = nn.Linear(embed_dim, dpt_dim)  # 1024 → 256
+# Non-hybrid or hybrid with use_teacher_cls=False: student embed_dim → dpt_dim
+# Hybrid with use_teacher_cls=True (default): teacher embed_dim (1024) → dpt_dim
+self.cls_projection = nn.Linear(cls_embed_dim, dpt_dim)
 self.cls_layer_indices = [2, 3]  # ViT layers 17, 23 평균
 ```
+
+**Hybrid CLS 소스 선택** (`use_teacher_cls` flag):
+- `use_teacher_cls=True` (기본): teacher ViT-L CLS (1024-dim) → `cls_projection: Linear(1024→64)`
+- `use_teacher_cls=False` (`--student-cls`): student ViT-S CLS (384-dim) → `cls_projection: Linear(384→64)`
+- DPT fusion용 teacher forward pass는 두 경우 모두 실행됨
 
 FlashDepth 모듈에 별도 배치 (SpatialMamba 내부가 아님).
 → Phase 1에서 SpatialMamba가 `torch.no_grad()`로 감싸져도 CLS projection의 gradient flow 보장.

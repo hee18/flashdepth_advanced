@@ -1,5 +1,156 @@
 # Changelog
 
+## 2026-05-06: Hybrid Onepiece에 student CLS 옵션 추가 (--student-cls)
+
+### 변경 파일
+- **`flashdepth/model.py`**: `use_teacher_cls` flag 추가. `__init__`에서 `cls_embed_dim` 분기 처리. `forward_with_onepiece`, `forward_with_onepiece_streaming`, `forward_onepiece_single_frame` 3개 forward 메서드에서 `use_teacher_cls=False` 시 student ViT-S CLS 사용 경로 추가
+- **`configs/onepiece/config_hybrid.yaml`**: `model.use_teacher_cls: true` 기본값 추가
+- **`run_docker.sh`**: `--student-cls` 플래그 추가 (`USE_TEACHER_CLS=false` 설정). `train_onepiece`, `train_onepiece_ddp`, `train_onepiece_fsdp` 3개 명령에 `model.use_teacher_cls=$USE_TEACHER_CLS` 전달
+
+### 내용
+- 기존: Hybrid 모드에서 항상 teacher ViT-L CLS(1024-dim) 사용
+- 변경: `use_teacher_cls=false`이면 student ViT-S CLS(384-dim) 사용 가능
+- DPT fusion용 teacher forward pass는 두 경우 모두 실행 (teacher features는 여전히 필요)
+- `use_teacher_cls=false` 시 `cls_projection`은 `Linear(384, 64)` (기존 `Linear(1024, 64)`)
+
+### 사용법
+```bash
+./run_docker.sh train_onepiece_ddp --config-variant hybrid --student-cls
+```
+
+---
+
+## 2026-05-06: run_docker.sh test_onepiece --resolution 누락 버그 수정
+
+### 변경 파일
+**`run_docker.sh`**
+- `test_onepiece` 배치 모드 docker command에 `+resolution=$RESOLUTION` 추가
+- `test_onepiece` 싱글 모드 docker command에 `+resolution=$RESOLUTION`, `training.workers=$WORKERS` 추가
+
+### 버그 원인
+- `test_onepiece` 블록(배치/싱글 양쪽)에 `+resolution=$RESOLUTION`이 누락되어 `--resolution 2k` 플래그가 `test_onepiece.py`에 전달되지 않았음
+- `test_onepiece.py`는 `self.config.get('resolution', ...)` 으로 해당 값을 읽으므로, 미전달 시 config 기본값(`eval.test_dataset_resolution: 'base'`)으로 폴백되어 항상 base 해상도로 실행되었음
+- 싱글 모드에 `training.workers` 도 누락되어 DataLoader workers=0으로 동작하던 문제도 함께 수정
+
+---
+
+## 2026-04-21: FSDP2 forward_with_onepiece → __call__ 우회 버그 수정
+
+### 변경 파일
+**`train_onepiece_fsdp.py`**
+- `_setup_model()` 끝에 `model.forward = lambda *a, **kw: FlashDepth.forward_with_onepiece(model, *a, **kw)` 추가
+- `train_step`, `_save_training_visualization`, `validate` 3군데의 `model.forward_with_onepiece(...)` → `model(...)` 변경
+
+### 버그 원인
+- FSDP2는 `register_forward_pre_hook`을 `nn.Module.__call__`에 등록. pre_forward hook이 root-sharded params를 all-gather해서 DTensor → Tensor 복원
+- `model.forward_with_onepiece(...)` 직접 호출은 `__call__`을 건너뜀 → hook 미실행 → `patch_embed.proj.weight`가 DTensor 상태 → 입력 x는 Tensor → `RuntimeError: got mixed torch.Tensor and DTensor`
+- `model((images,), phase=...)` 형태로 호출하면 `__call__` → FSDP2 hook 정상 실행 → 가중치 복원 후 forward 실행
+
+---
+
+## 2026-04-21: FSDP2+AC DTensor/Tensor 충돌 버그 수정
+
+### 변경 파일
+**`train_onepiece_fsdp.py`**
+- `_setup_model()` 내 activation checkpointing의 `check_fn=lambda _: True` 제거
+- 변경: ViT block 타입과 DPT refinenet 타입만 개별 래핑
+  ```python
+  ViTBlockType = type(model.pretrained.blocks[0])
+  apply_activation_checkpointing(..., check_fn=lambda m: isinstance(m, ViTBlockType))
+  DPTRefinenetType = type(model.depth_head.scratch.refinenet1)
+  apply_activation_checkpointing(..., check_fn=lambda m: isinstance(m, DPTRefinenetType))
+  ```
+- Teacher AC 제거 (frozen → 메모리 절약 없음), hybrid_fusion AC 제거 (단일 유닛 샤딩)
+
+### 버그 원인
+- `check_fn=lambda _: True`는 `patch_embed.proj`(Conv2d) 등 FSDP2가 개별 샤딩하지 않는 모듈도 AC 래핑
+- Root `fully_shard(model)`이 `patch_embed.proj.weight`를 DTensor로 샤딩
+- AC re-run forward 시 input=Tensor, weight=DTensor → `RuntimeError: got mixed torch.Tensor and DTensor`
+- 해결: FSDP2 샤딩과 동일한 granularity(블록 단위)로만 AC 적용
+
+---
+
+## 2026-04-21: 로딩 제외 목록 수정 (spatial_mamba, onepiece_metric_head 로딩 허용)
+
+### 변경 파일
+**`train_onepiece.py`, `train_onepiece_fsdp.py`**
+- 기존: `spatial_mamba`, `onepiece_metric_head`, `scene_cut_detector`, `cls_projection`, `unified_global_mamba` 모두 제외
+- 변경: `cls_projection`(384→64 vs 1024→64 shape 불일치), `unified_global_mamba`(레거시)만 제외
+- 이유: Onepiece-S 체크포인트에서 Hybrid로 로딩 시 SpatialMamba, CLSMetricHead는 아키텍처 동일 → 랜덤 초기화보다 warm start가 유리
+- FlashDepth 체크포인트 사용 시는 기존과 동일 (해당 키 없으므로 strict=False로 처리)
+
+---
+
+## 2026-04-21: train_onepiece.py에 load_teacher 분리 로딩 추가
+
+### 변경 파일
+
+**`train_onepiece.py`**
+- `load_teacher` config 지원 추가 (train_onepiece_fsdp.py와 동일한 방식)
+- Onepiece-L 체크포인트의 `pretrained.*`, `depth_head.*`를 `teacher_model.*`에 별도 로딩
+- 원본 FlashDepth `init_setup.py`와 동일: `model.teacher_model.load_state_dict(remapped, strict=False)`
+
+**`configs/onepiece/config_hybrid.yaml`**
+- `load: null`, `load_teacher: null` 필드 추가 (FlashDepth hybrid 체크포인트 사용 제거)
+
+### 원본 파일 수정 없음
+- `flashdepth/model.py`, `train_onepiece_fsdp.py`, config_hybrid_fsdp.yaml 미변경
+
+---
+
+## 2026-04-21: FSDP2 run_docker.sh 지원 + load_teacher 분리 로딩 추가
+
+### 변경 파일
+
+**`run_docker.sh`**
+- `train_onepiece_fsdp` 커맨드 추가 (torchrun --nproc_per_node=2, FSDP2 전용 NCCL env)
+- `--teacher-checkpoint PATH` 옵션 추가 (Onepiece-L 또는 FlashDepth-L 체크포인트)
+- 2K hybrid 시 batch_size 자동 1로 설정, `--batch-size 2`로 override 가능
+
+**`train_onepiece_fsdp.py`**
+- `load_teacher` config 지원: Onepiece-L / FlashDepth-L 체크포인트를 teacher_model에 별도 로딩
+- 키 remapping: `pretrained.*`, `depth_head.*` → `teacher_model.pretrained.*`, `teacher_model.depth_head.*`
+- `load_teacher=null` 이면 기존대로 단일 `load` 체크포인트에서 teacher weights 함께 로딩
+
+**`configs/onepiece/config_hybrid_fsdp.yaml`**
+- `load_teacher: null` 필드 추가 (주석으로 사용법 설명)
+
+---
+
+## 2026-04-21: FSDP2 학습 스크립트 추가 (Onepiece Hybrid 2K 고해상도)
+
+### 배경
+- Onepiece Hybrid (ViT-S student + ViT-L teacher) 2K 해상도 학습 시 DDP로는 GPU당 메모리 한계 초과
+- PyTorch 2.4 FSDP2 composable API (`torch.distributed._composable.fsdp`)로 파라미터 샤딩
+
+### 신규 파일
+
+**`train_onepiece_fsdp.py`**
+- `train_onepiece.py` 기반, DDP → FSDP2 (`fully_shard`) 교체
+- 주요 변경사항:
+  - `from torch.distributed._composable.fsdp import fully_shard, MixedPrecisionPolicy`
+  - `from torch.distributed.device_mesh import init_device_mesh`
+  - Activation Checkpointing: `CheckpointImpl.NO_REENTRANT` (FSDP2 composable 요구사항)
+  - FSDP wrap 순서 (inner→outer): student ViT blocks → teacher ViT blocks → DPT refinenets → SpatialMamba → HybridFusion → root
+  - `MixedPrecisionPolicy(param/output=bf16, reduce=fp32)` — autocast 블록 제거
+  - `SpatialMamba`: `reshard_after_forward=False` (프레임 루프 내 반복 all-gather 방지)
+  - Teacher blocks: `reshard_after_forward=True` (frozen, peak 메모리 절약)
+  - `save_checkpoint`: `get_model_state_dict(full_state_dict=True, cpu_offload=True)` — rank 0에서 fp32 full state dict
+  - `validate()` / `_save_training_visualization()`: **모든 rank 참여** (FSDP all-gather 동기화 필수)
+  - `_get_model()`: DDP `.module` unwrap 불필요 (composable API는 in-place 수정)
+
+**`configs/onepiece/config_hybrid_fsdp.yaml`**
+- `config_hybrid.yaml` 기반, FSDP 전용 설정 추가
+- `training.batch_size: 1` (2K에서 메모리 여유분 확인 후 2로 증가 가능)
+- `fsdp.reshard_after_forward_student: false`, `reshard_after_forward_teacher: true`
+- `resume: null` 필드 추가 (FSDP 체크포인트 재개용)
+
+**`configs/onepiece/config_fsdp.yaml`**
+- non-hybrid 518×518 smoke test용 (FSDP2 동작 검증)
+
+### 원본 파일 수정 없음
+- `train_onepiece.py`, `flashdepth/model.py`, 기존 config 4종 모두 미변경
+
 ## 2026-04-14: Onepiece V3 Small / Hybrid 모델 지원 추가
 
 ### 배경

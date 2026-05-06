@@ -275,22 +275,52 @@ class OnepieceTrainer:
             # Remove module. prefix
             state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
 
-            # Exclude onepiece-specific keys (train from scratch)
+            # Exclude only keys whose shape differs between non-hybrid and hybrid.
+            # spatial_mamba / onepiece_metric_head: identical architecture in S and Hybrid → load them.
+            # cls_projection: Linear(384→64) in S vs Linear(1024→64) in Hybrid → shape mismatch, exclude.
+            # unified_global_mamba: legacy module not present in current model → exclude.
             loaded_dict = {}
             excluded_keys = []
             for k, v in state_dict.items():
-                if any(x in k for x in ['spatial_mamba', 'onepiece_metric_head', 'scene_cut_detector',
-                                         'unified_global_mamba', 'cls_projection']):
+                if any(x in k for x in ['cls_projection', 'unified_global_mamba']):
                     excluded_keys.append(k)
                 else:
                     loaded_dict[k] = v
 
             model.load_state_dict(loaded_dict, strict=False)
             if self.rank == 0:
-                self.logger.info(f"Loaded {len(loaded_dict)} parameters from FlashDepth checkpoint")
-                self.logger.info(f"Excluded {len(excluded_keys)} onepiece parameters (will train from scratch)")
+                self.logger.info(f"Loaded {len(loaded_dict)} parameters from checkpoint")
+                self.logger.info(f"Excluded {len(excluded_keys)} keys (cls_projection shape mismatch / legacy)")
         elif self.rank == 0:
             self.logger.warning(f"Checkpoint not found: {checkpoint_path}")
+
+        # Optional: load teacher weights from a separate Onepiece-L / FlashDepth-L checkpoint.
+        # Keys remapped: pretrained.* / depth_head.* → teacher_model.pretrained.* / teacher_model.depth_head.*
+        # Same mechanism as original FlashDepth init_setup.py (submodule load_state_dict, no prefix needed).
+        teacher_path = self.config.get('load_teacher')
+        if teacher_path and os.path.exists(teacher_path) and hasattr(model, 'teacher_model'):
+            if self.rank == 0:
+                self.logger.info(f"Loading teacher checkpoint: {teacher_path}")
+            t_ckpt = torch.load(teacher_path, map_location='cpu')
+            if isinstance(t_ckpt, dict) and 'model' in t_ckpt:
+                t_sd = t_ckpt['model']
+            elif isinstance(t_ckpt, dict) and 'state_dict' in t_ckpt:
+                t_sd = t_ckpt['state_dict']
+            else:
+                t_sd = t_ckpt
+            t_sd = {k.replace('module.', ''): v for k, v in t_sd.items()}
+            t_remapped = {k: v for k, v in t_sd.items()
+                          if k.startswith('pretrained.') or k.startswith('depth_head.')}
+            missing, unexpected = model.teacher_model.load_state_dict(t_remapped, strict=False)
+            if self.rank == 0:
+                self.logger.info(
+                    f"Teacher loaded: {len(t_remapped)} keys, "
+                    f"missing={len(missing)}, unexpected={len(unexpected)}"
+                )
+            for param in model.teacher_model.parameters():
+                param.requires_grad = False
+        elif teacher_path and not os.path.exists(teacher_path) and self.rank == 0:
+            self.logger.warning(f"load_teacher path not found: {teacher_path}")
 
         model = model.to(self.device)
 

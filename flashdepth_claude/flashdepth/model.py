@@ -124,13 +124,16 @@ class FlashDepth(nn.Module):
                 max_batch_size=batch_size
             )
 
-            # Hybrid Onepiece: use teacher (ViT-L) CLS instead of student CLS
+            # Hybrid Onepiece: optionally use teacher (ViT-L) CLS instead of student CLS
             self.use_onepiece_hybrid = self.hybrid_configs is not None
-            if self.use_onepiece_hybrid:
+            # use_teacher_cls=True (default): teacher ViT-L CLS for higher semantic quality
+            # use_teacher_cls=False: student ViT-S CLS (lighter, no teacher dependency for CLS)
+            self.use_teacher_cls = kwargs.get('use_teacher_cls', True)
+            if self.use_onepiece_hybrid and self.use_teacher_cls:
                 # CLS from teacher ViT-L (embed_dim=1024) → student dpt_dim (64)
                 cls_embed_dim = self.teacher_model.pretrained.embed_dim
             else:
-                # CLS from own encoder
+                # CLS from own encoder (student or non-hybrid)
                 cls_embed_dim = self.pretrained.embed_dim
             self.cls_projection = nn.Linear(cls_embed_dim, dpt_dim)
             # CLS layer indices for fused CLS (3rd, 4th intermediate layers)
@@ -153,7 +156,8 @@ class FlashDepth(nn.Module):
                 f"d_state={spatial_mamba_d_state}, d_conv={spatial_mamba_d_conv}, "
                 f"downsample={spatial_mamba_downsample}, train_mode={self.onepiece_train_mode}, "
                 f"cls_layer_indices={self.cls_layer_indices}, "
-                f"hybrid={self.use_onepiece_hybrid}, cls_embed_dim={cls_embed_dim}"
+                f"hybrid={self.use_onepiece_hybrid}, use_teacher_cls={self.use_teacher_cls}, "
+                f"cls_embed_dim={cls_embed_dim}"
             )
            
 
@@ -519,21 +523,26 @@ class FlashDepth(nn.Module):
         # ===== Step 1: DINOv2 encoder (always frozen) → features + CLS =====
         with torch.no_grad():
             if self.use_onepiece_hybrid:
-                # Hybrid: student encoder → features, teacher encoder → CLS + teacher features for fusion
-                student_features = self.pretrained.get_intermediate_layers(
-                    video_flat, self.intermediate_layer_idx[self.encoder]
-                )
-                # Teacher: extract features + CLS in one forward pass
+                # Teacher features always needed for DPT fusion
                 teacher_raw = self.teacher_model.pretrained._get_intermediate_layers_not_chunked(
                     video_flat, self.intermediate_layer_idx['vitl']
                 )
                 teacher_normed = [self.teacher_model.pretrained.norm(out) for out in teacher_raw]
-                # CLS from teacher (fused from selected layers)
-                selected_cls = [teacher_normed[idx][:, 0] for idx in self.cls_layer_indices]
-                cls_token = torch.stack(selected_cls, dim=0).mean(dim=0)  # [B*T, 1024]
-                # Teacher intermediate features (strip CLS for DPT)
                 teacher_features = [out[:, 1:] for out in teacher_normed]
-                encoder_features = student_features
+                if self.use_teacher_cls:
+                    # CLS from teacher ViT-L
+                    student_features = self.pretrained.get_intermediate_layers(
+                        video_flat, self.intermediate_layer_idx[self.encoder]
+                    )
+                    selected_cls = [teacher_normed[idx][:, 0] for idx in self.cls_layer_indices]
+                    cls_token = torch.stack(selected_cls, dim=0).mean(dim=0)  # [B*T, 1024]
+                    encoder_features = student_features
+                else:
+                    # CLS from student ViT-S (single pass: features + CLS)
+                    encoder_features, cls_token = self._get_intermediate_layers_with_cls(
+                        video_flat, self.intermediate_layer_idx[self.encoder],
+                        cls_layer_indices=self.cls_layer_indices
+                    )
             else:
                 # Non-hybrid: single encoder → features + CLS
                 encoder_features, cls_token = self._get_intermediate_layers_with_cls(
@@ -659,17 +668,25 @@ class FlashDepth(nn.Module):
             # Step 1: DINOv2 encoder (frozen) + CLS
             with torch.no_grad():
                 if self.use_onepiece_hybrid:
-                    # Hybrid: student features + teacher CLS
-                    encoder_features = self.pretrained.get_intermediate_layers(
-                        frame, self.intermediate_layer_idx[self.encoder]
-                    )
+                    # Teacher features always needed for DPT fusion
                     teacher_raw = self.teacher_model.pretrained._get_intermediate_layers_not_chunked(
                         frame, self.intermediate_layer_idx['vitl']
                     )
                     teacher_normed = [self.teacher_model.pretrained.norm(out) for out in teacher_raw]
-                    selected_cls = [teacher_normed[idx][:, 0] for idx in self.cls_layer_indices]
-                    cls_token = torch.stack(selected_cls, dim=0).mean(dim=0)  # [B, 1024]
                     teacher_features = [out[:, 1:] for out in teacher_normed]
+                    if self.use_teacher_cls:
+                        # CLS from teacher ViT-L
+                        encoder_features = self.pretrained.get_intermediate_layers(
+                            frame, self.intermediate_layer_idx[self.encoder]
+                        )
+                        selected_cls = [teacher_normed[idx][:, 0] for idx in self.cls_layer_indices]
+                        cls_token = torch.stack(selected_cls, dim=0).mean(dim=0)  # [B, 1024]
+                    else:
+                        # CLS from student ViT-S (single pass: features + CLS)
+                        encoder_features, cls_token = self._get_intermediate_layers_with_cls(
+                            frame, self.intermediate_layer_idx[self.encoder],
+                            cls_layer_indices=self.cls_layer_indices
+                        )
                 else:
                     encoder_features, cls_token = self._get_intermediate_layers_with_cls(
                         frame, self.intermediate_layer_idx[self.encoder],
@@ -765,17 +782,25 @@ class FlashDepth(nn.Module):
         # Step 1: DINOv2 + CLS
         with torch.no_grad():
             if self.use_onepiece_hybrid:
-                # Hybrid: student features + teacher CLS
-                encoder_features = self.pretrained.get_intermediate_layers(
-                    frame, self.intermediate_layer_idx[self.encoder]
-                )
+                # Teacher features always needed for DPT fusion
                 teacher_raw = self.teacher_model.pretrained._get_intermediate_layers_not_chunked(
                     frame, self.intermediate_layer_idx['vitl']
                 )
                 teacher_normed = [self.teacher_model.pretrained.norm(out) for out in teacher_raw]
-                selected_cls = [teacher_normed[idx][:, 0] for idx in self.cls_layer_indices]
-                cls_token = torch.stack(selected_cls, dim=0).mean(dim=0)  # [B, 1024]
                 teacher_features = [out[:, 1:] for out in teacher_normed]
+                if self.use_teacher_cls:
+                    # CLS from teacher ViT-L
+                    encoder_features = self.pretrained.get_intermediate_layers(
+                        frame, self.intermediate_layer_idx[self.encoder]
+                    )
+                    selected_cls = [teacher_normed[idx][:, 0] for idx in self.cls_layer_indices]
+                    cls_token = torch.stack(selected_cls, dim=0).mean(dim=0)  # [B, 1024]
+                else:
+                    # CLS from student ViT-S (single pass: features + CLS)
+                    encoder_features, cls_token = self._get_intermediate_layers_with_cls(
+                        frame, self.intermediate_layer_idx[self.encoder],
+                        cls_layer_indices=self.cls_layer_indices
+                    )
             else:
                 encoder_features, cls_token = self._get_intermediate_layers_with_cls(
                     frame, self.intermediate_layer_idx[self.encoder],
