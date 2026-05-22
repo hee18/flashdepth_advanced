@@ -53,6 +53,7 @@ model:
   spatial_mamba_d_conv: 4
   spatial_mamba_downsample: 0.1
   use_teacher_cls: true          # true=teacher ViT-L CLS (hybrid only), false=student CLS (--student-cls)
+  use_patch_mean: false          # true=layer-17 patch mean for Mamba+MetricHead instead of CLS
 
 # Hybrid Model Configuration
 hybrid_configs:
@@ -73,7 +74,7 @@ loss:
 
 # Scene Cut Detection (inference only)
 scene_cut:
-  tau: 0.15
+  tau: 0.10
   k: 80
 
 # Phase Transition

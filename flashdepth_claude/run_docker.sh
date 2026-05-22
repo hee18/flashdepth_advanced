@@ -38,6 +38,7 @@ show_usage() {
     echo "  train_onepiece_fsdp  Start Onepiece FSDP2 training with 2 GPUs (2K hybrid)"
     echo "  test_onepiece        Start Onepiece testing"
     echo "  infer_avante         Run inference on avante_images (custom dataset)"
+    echo "  measure_boundary_dcls  Measure d_cls at cut-in/cut-out boundaries only (fast, no full inference)"
     echo "  test_original_flashdepth  Test original FlashDepth (without Gear modules) for comparison"
     echo "  shell       Start interactive shell in container"
     echo "  clean       Remove containers and images"
@@ -84,6 +85,7 @@ show_usage() {
     echo "  --save-depth-maps    Save depth maps as .npy files"
     echo "  --fgwise             Enable FG-wise evaluation using ViT attention masks"
     echo "  --student-cls        Use student (ViT-S) CLS for Hybrid Onepiece instead of teacher (ViT-L) CLS"
+    echo "  --patch-mean         Use layer-17 patch mean instead of CLS for Mamba conditioning and MetricHead input"
     echo "  --no-cstm            No Dual-CSTM ablation: skip canonical focal-length transform during training"
     echo "  --vda                Enable VDA in SCD ablation test (auto-loads from refer_test/)"
     echo "  --dataset2 DATASET   Second dataset for cross-dataset SCD cuts (test_scd_ablation only)"
@@ -152,15 +154,18 @@ MODEL_TYPE="gear5"  # Model type for infer_avante: gear5, onepiece
 SAVE_DEPTH_MAPS="false"  # Save depth maps as .npy files
 TEACHER_CHECKPOINT=""  # Teacher model checkpoint for FSDP hybrid training
 USE_TEACHER_CLS="true"  # Use teacher (ViT-L) CLS for Hybrid Onepiece (false = student ViT-S CLS)
+USE_PATCH_MEAN="false"  # Use layer-17 patch mean instead of CLS for Mamba+MetricHead input
 NO_CSTM="false"         # No Dual-CSTM ablation: skip canonical transform during training
 USE_VDA="false"         # Enable VDA in SCD ablation test (auto-loads from refer_test/)
 SECOND_DATASET=""       # Second dataset for cross-dataset SCD test (--dataset2)
+SCD_MAX_SEQS=""         # Limit host sequences for SCD ablation (default: all)
+SCD_INSERT_FRAMES=""    # Number of insert frames for SCD ablation (default: 10)
 
 # Parse arguments
 USER_BATCH_SIZE=""  # Track if user explicitly set batch size
 while [[ $# -gt 0 ]]; do
     case $1 in
-        build|train_gear5|train_gear5_ddp|test_gear5|train_onepiece|train_onepiece_ddp|train_onepiece_fsdp|test_onepiece|test_scd_ablation|infer_avante|test_original_flashdepth|shell|clean|logs)
+        build|train_gear5|train_gear5_ddp|test_gear5|train_onepiece|train_onepiece_ddp|train_onepiece_fsdp|test_onepiece|test_scd_ablation|measure_boundary_dcls|infer_avante|test_original_flashdepth|shell|clean|logs)
             COMMAND="$1"
             shift
             ;;
@@ -335,6 +340,10 @@ while [[ $# -gt 0 ]]; do
             USE_TEACHER_CLS="false"
             shift
             ;;
+        --patch-mean)
+            USE_PATCH_MEAN="true"
+            shift
+            ;;
         --no-cstm)
             NO_CSTM="true"
             shift
@@ -350,6 +359,14 @@ while [[ $# -gt 0 ]]; do
         --vda)
             USE_VDA="true"
             shift
+            ;;
+        --max-seqs)
+            SCD_MAX_SEQS="$2"
+            shift 2
+            ;;
+        --insert-frames)
+            SCD_INSERT_FRAMES="$2"
+            shift 2
             ;;
         -h|--help)
             show_usage
@@ -684,22 +701,17 @@ case $COMMAND in
             CHECKPOINT="$FLASHDEPTH_CHECKPOINT"
         fi
 
-        # Convert to absolute path if needed
-        if [[ "$CHECKPOINT" != /app/* ]] && [[ "$CHECKPOINT" != /* ]]; then
-            CHECKPOINT="/app/$CHECKPOINT"
-        fi
-
-        # Set default checkpoint based on config variant if using default
-        if [ "$CHECKPOINT" = "/app/configs/flashdepth-l/iter_10001.pth" ]; then
+        # Set default checkpoint based on config variant if no checkpoint specified
+        if [ -z "$CHECKPOINT" ]; then
             case "$CONFIG_VARIANT" in
                 l)
-                    CHECKPOINT="/app/configs/flashdepth-l/iter_10001.pth"
+                    CHECKPOINT="configs/flashdepth-l/iter_10001.pth"
                     ;;
                 s)
-                    CHECKPOINT="/app/configs/flashdepth-s/iter_14001.pth"
+                    CHECKPOINT="configs/flashdepth-s/iter_14001.pth"
                     ;;
                 hybrid)
-                    CHECKPOINT="/app/configs/flashdepth/iter_43002.pth"
+                    CHECKPOINT="configs/flashdepth/iter_43002.pth"
                     ;;
                 *)
                     echo "Unknown config variant: $CONFIG_VARIANT"
@@ -707,6 +719,11 @@ case $COMMAND in
                     exit 1
                     ;;
             esac
+        fi
+
+        # Convert to absolute path if needed
+        if [[ "$CHECKPOINT" != /app/* ]] && [[ "$CHECKPOINT" != /* ]]; then
+            CHECKPOINT="/app/$CHECKPOINT"
         fi
 
         # Use OBJWISE_DATASET if set, otherwise default to nuscenes
@@ -786,9 +803,9 @@ case $COMMAND in
             else
                 local CLEAN_DIR="${RESULTS_DIR%/}"
                 if [[ "$CLEAN_DIR" != /* ]]; then
-                    local CUR_OUTFOLDER="/app/$CLEAN_DIR"
+                    local CUR_OUTFOLDER="/app/$CLEAN_DIR/${CUR_DIR_NAME}"
                 else
-                    local CUR_OUTFOLDER="$CLEAN_DIR"
+                    local CUR_OUTFOLDER="$CLEAN_DIR/${CUR_DIR_NAME}"
                 fi
                 local CUR_LOCAL_OUTFOLDER="${CUR_OUTFOLDER#/app/}"
             fi
@@ -1068,6 +1085,7 @@ case $COMMAND in
             training.iterations=$TOTAL_ITERS \
             training.wandb=$WANDB \
             model.use_teacher_cls=$USE_TEACHER_CLS \
+            model.use_patch_mean=$USE_PATCH_MEAN \
             +results_dir=$RESULTS_DIR"
 
         if [ "$NO_CSTM" = "true" ]; then
@@ -1120,6 +1138,7 @@ case $COMMAND in
             training.iterations=$TOTAL_ITERS \
             training.wandb=$WANDB \
             model.use_teacher_cls=$USE_TEACHER_CLS \
+            model.use_patch_mean=$USE_PATCH_MEAN \
             +results_dir=$RESULTS_DIR"
 
         if [ "$NO_CSTM" = "true" ]; then
@@ -1189,6 +1208,7 @@ case $COMMAND in
             training.iterations=$TOTAL_ITERS \
             training.wandb=$WANDB \
             model.use_teacher_cls=$USE_TEACHER_CLS \
+            model.use_patch_mean=$USE_PATCH_MEAN \
             +results_dir=$RESULTS_DIR"
 
         if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
@@ -1333,6 +1353,9 @@ case $COMMAND in
                 if [ "$SAVE_DEPTH_MAPS" = "true" ]; then
                     DOCKER_CMD="$DOCKER_CMD --save-depth-maps"
                 fi
+                if [ "$NO_CSTM" = "true" ]; then
+                    DOCKER_CMD="$DOCKER_CMD use_dual_cstm=false"
+                fi
 
                 if eval $DOCKER_CMD; then
                     echo "✅ [$COMPLETED_RUNS/$TOTAL_RUNS] Onepiece on $ds completed"
@@ -1415,51 +1438,168 @@ case $COMMAND in
             if [ "$SAVE_DEPTH_MAPS" = "true" ]; then
                 DOCKER_CMD="$DOCKER_CMD --save-depth-maps"
             fi
+            if [ "$NO_CSTM" = "true" ]; then
+                DOCKER_CMD="$DOCKER_CMD use_dual_cstm=false"
+            fi
 
             eval $DOCKER_CMD
         fi
         ;;
 
+    measure_boundary_dcls)
+        if [ -z "$GEAR_CHECKPOINT" ]; then
+            echo "ERROR: --gear-checkpoint is required for measure_boundary_dcls"
+            exit 1
+        fi
+
+        echo "Measuring d_cls at cut-in/cut-out boundaries..."
+        echo "Configuration:"
+        echo "  - Config variant: $CONFIG_VARIANT"
+        echo "  - GPU: $GPU_ID"
+        echo "  - Gear checkpoint: $GEAR_CHECKPOINT"
+        echo "  - Resolution: $RESOLUTION"
+        echo "  - Max sequences: ${SCD_MAX_SEQS:-all}"
+        echo "  - Insert frames: ${SCD_INSERT_FRAMES:-10}"
+        echo ""
+
+        DCLS_OUT_DIR="test_results/boundary_dcls"
+        mkdir -p "$DCLS_OUT_DIR"
+
+        DCLS_CMD="python measure_boundary_dcls.py \
+            --gear-checkpoint $GEAR_CHECKPOINT \
+            --config-variant $CONFIG_VARIANT \
+            --data-root /data/datasets \
+            --gpu 0 \
+            --resolution $RESOLUTION \
+            --output-dir /app/$DCLS_OUT_DIR"
+
+        if [ -n "$SCD_MAX_SEQS" ]; then
+            DCLS_CMD="$DCLS_CMD --max-seqs $SCD_MAX_SEQS"
+        fi
+        if [ -n "$SCD_INSERT_FRAMES" ]; then
+            DCLS_CMD="$DCLS_CMD --insert-frames $SCD_INSERT_FRAMES"
+        fi
+
+        CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm flashdepth $DCLS_CMD \
+            2>&1 | tee "$DCLS_OUT_DIR/boundary_dcls.log"
+        echo "Log saved → $DCLS_OUT_DIR/boundary_dcls.log"
+        echo "JSON saved → $DCLS_OUT_DIR/boundary_dcls_summary.json"
+        ;;
+
     test_scd_ablation)
         echo "Starting SCD Ablation Test..."
         echo "Configuration:"
-        echo "  - Config variant: $CONFIG_VARIANT (--config-variant)"
-        echo "  - Dataset: ${OBJWISE_DATASET:-sintel} (--dataset)"
-        echo "  - Dataset2 (cross-dataset): ${SECOND_DATASET:-none} (--dataset2)"
+        echo "  - Config variant: $CONFIG_VARIANT (--config-variant, l/s/hybrid)"
+        echo "  - Dataset (host): ${OBJWISE_DATASET:-sintel} (--dataset)"
+        echo "  - Dataset2 (insert): ${SECOND_DATASET:-none (same-dataset mode)} (--dataset2)"
         echo "  - Resolution: $RESOLUTION (--resolution)"
         echo "  - GPU: $GPU_ID"
         echo "  - Gear checkpoint: ${GEAR_CHECKPOINT:-required}"
-        echo "  - FlashDepth checkpoint: ${FLASHDEPTH_CHECKPOINT:-skipped}"
+        echo "  - FlashDepth checkpoint: ${FLASHDEPTH_CHECKPOINT:-skipped} (--flashdepth-checkpoint)"
         echo "  - VDA: $([ "$USE_VDA" = "true" ] && echo "enabled (--vda)" || echo "disabled")"
+        echo "  - Max sequences: ${SCD_MAX_SEQS:-all} (--max-seqs)"
+        echo "  - Insert frames: ${SCD_INSERT_FRAMES:-10} (--insert-frames)"
         echo "  - Results directory: $RESULTS_DIR"
         echo ""
+        echo "Scenarios:"
+        echo "  same-dataset:    host=seq_i, insert=seq_(i+2)%N"
+        echo "  cross (sintel insert): fixed Sintel seq13 frames 21-30"
+        echo "  cross (sintel base):   Sintel seq_k + ETH3D seq_k, k=0..9"
 
         if [ -z "$GEAR_CHECKPOINT" ]; then
             echo "ERROR: --gear-checkpoint is required for test_scd_ablation"
             exit 1
         fi
 
+        # Helper: build and run one SCD scenario
+        _run_scd_scenario() {
+            local DS="$1"       # host dataset
+            local DS2="$2"      # insert dataset (empty = same-dataset)
+            local OUT_DIR="$3"  # output subdirectory (relative to RESULTS_DIR)
+
+            local CMD="python test_scd_ablation.py \
+                --dataset $DS \
+                --data-root /data/datasets \
+                --config-variant $CONFIG_VARIANT \
+                --resolution $RESOLUTION \
+                --gear-checkpoint $GEAR_CHECKPOINT \
+                --gpu 0 \
+                --results-dir /app/$OUT_DIR"
+
+            if [ -n "$DS2" ]; then
+                CMD="$CMD --dataset2 $DS2"
+            fi
+            if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
+                CMD="$CMD --flashdepth-checkpoint $FLASHDEPTH_CHECKPOINT"
+            fi
+            if [ "$USE_VDA" = "true" ]; then
+                CMD="$CMD --vda"
+            fi
+            if [ -n "$SCD_MAX_SEQS" ]; then
+                CMD="$CMD --max-seqs $SCD_MAX_SEQS"
+            fi
+            if [ -n "$SCD_INSERT_FRAMES" ]; then
+                CMD="$CMD --insert-frames $SCD_INSERT_FRAMES"
+            fi
+
+            echo ""
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            if [ -n "$DS2" ]; then
+                echo "SCD Ablation: ${DS} base + ${DS2} insert → $OUT_DIR"
+            else
+                echo "SCD Ablation: same-dataset ${DS} → $OUT_DIR"
+            fi
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            mkdir -p "$OUT_DIR"
+            CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm flashdepth $CMD
+        }
+
         SCD_DATASET="${OBJWISE_DATASET:-sintel}"
-        SCD_CMD="python test_scd_ablation.py \
-            --dataset $SCD_DATASET \
-            --data-root /data/datasets \
-            --config-variant $CONFIG_VARIANT \
-            --resolution $RESOLUTION \
-            --gear-checkpoint $GEAR_CHECKPOINT \
-            --gpu 0 \
-            --results-dir /app/$RESULTS_DIR"
+        CLEAN_DIR="${RESULTS_DIR%/}"
 
-        if [ -n "$FLASHDEPTH_CHECKPOINT" ]; then
-            SCD_CMD="$SCD_CMD --flashdepth-checkpoint $FLASHDEPTH_CHECKPOINT"
-        fi
-        if [ "$USE_VDA" = "true" ]; then
-            SCD_CMD="$SCD_CMD --vda"
-        fi
-        if [ -n "$SECOND_DATASET" ]; then
-            SCD_CMD="$SCD_CMD --dataset2 $SECOND_DATASET"
-        fi
+        if [ "$SCD_DATASET" = "all" ]; then
+            # ── All scenarios ────────────────────────────────────────────────
+            echo ""
+            echo "Running ALL SCD ablation scenarios..."
+            echo "Results base: $CLEAN_DIR/"
+            echo ""
+            echo "Same-dataset: eth3d sintel waymo_seg vkitti unreal4k"
+            echo "Cross (Sintel insert): eth3d waymo_seg vkitti unreal4k"
+            echo "Cross (Sintel base + fixed ETH3D seq1 insert): sintel"
+            echo ""
 
-        CUDA_VISIBLE_DEVICES=$GPU_ID docker compose run --rm flashdepth $SCD_CMD
+            # ── Same-dataset: all test_onepiece datasets ──────────────────
+            for DS in eth3d sintel waymo_seg vkitti unreal4k; do
+                _run_scd_scenario "$DS" "" "$CLEAN_DIR/same_${DS}"
+            done
+
+            # ── Cross-dataset: fixed Sintel seq13 frames 21-30 insert ─────
+            # Applied to all non-Sintel datasets
+            for DS in eth3d waymo_seg vkitti unreal4k; do
+                _run_scd_scenario "$DS" "sintel" "$CLEAN_DIR/cross_${DS}_sintel"
+            done
+
+            # ── Cross-dataset: Sintel base + fixed ETH3D seq1 insert ──────
+            _run_scd_scenario "sintel" "eth3d" "$CLEAN_DIR/cross_sintel_eth3d"
+
+            echo ""
+            echo "========================================"
+            echo "All SCD ablation scenarios complete."
+            echo "Results: $CLEAN_DIR/"
+            echo "========================================"
+        else
+            # ── Single scenario ──────────────────────────────────────────────
+            if [ -n "$SECOND_DATASET" ]; then
+                OUT_DIR="$CLEAN_DIR/cross_${SCD_DATASET}_${SECOND_DATASET}"
+            else
+                OUT_DIR="$CLEAN_DIR/same_${SCD_DATASET}"
+            fi
+            # Use RESULTS_DIR directly if it looks like a full path (not default)
+            if [ "$RESULTS_DIR" != "test_results/scd_ablation" ]; then
+                OUT_DIR="$CLEAN_DIR"
+            fi
+            _run_scd_scenario "$SCD_DATASET" "$SECOND_DATASET" "$OUT_DIR"
+        fi
         ;;
 
     "")

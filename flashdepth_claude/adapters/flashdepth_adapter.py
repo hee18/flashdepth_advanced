@@ -7,6 +7,7 @@ Outputs depth in meters (converted from inverse depth * 100).
 
 import sys
 import logging
+import contextlib
 from pathlib import Path
 
 import torch
@@ -164,12 +165,20 @@ class FlashDepthAdapter(MethodAdapter):
         patch_h = H_proc // ps
         patch_w = W_proc // ps
 
+        # hybrid variant uses FlashAttention in hybrid_fusion, which requires fp16/bf16
+        autocast_ctx = (
+            torch.autocast('cuda', dtype=torch.bfloat16)
+            if self.config_variant == 'hybrid'
+            else contextlib.nullcontext()
+        )
+
         preds = []
         for i in range(T):
             frame = image_norm[:, i]  # [1, 3, H_proc, W_proc]
-            dpt_features = self.model.get_dpt_features(frame, input_shape=(1, C, H_proc, W_proc))
-            pred_depth = self.model.final_head(dpt_features, patch_h, patch_w)  # [1, H_proc, W_proc]
-            pred_depth = torch.clamp(pred_depth, min=0)
+            with autocast_ctx:
+                dpt_features = self.model.get_dpt_features(frame, input_shape=(1, C, H_proc, W_proc))
+                pred_depth = self.model.final_head(dpt_features, patch_h, patch_w)  # [1, H_proc, W_proc]
+            pred_depth = torch.clamp(pred_depth.float(), min=0)
             preds.append(pred_depth)
 
         # Stack: [1, T, H_proc, W_proc]

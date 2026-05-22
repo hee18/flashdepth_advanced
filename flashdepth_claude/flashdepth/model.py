@@ -129,6 +129,9 @@ class FlashDepth(nn.Module):
             # use_teacher_cls=True (default): teacher ViT-L CLS for higher semantic quality
             # use_teacher_cls=False: student ViT-S CLS (lighter, no teacher dependency for CLS)
             self.use_teacher_cls = kwargs.get('use_teacher_cls', True)
+            # use_patch_mean=True: use layer-17 mean patch token instead of CLS
+            #   for cls_projection → SpatialMamba conditioning and CLSMetricHead input
+            self.use_patch_mean = kwargs.get('use_patch_mean', False)
             if self.use_onepiece_hybrid and self.use_teacher_cls:
                 # CLS from teacher ViT-L (embed_dim=1024) → student dpt_dim (64)
                 cls_embed_dim = self.teacher_model.pretrained.embed_dim
@@ -136,8 +139,10 @@ class FlashDepth(nn.Module):
                 # CLS from own encoder (student or non-hybrid)
                 cls_embed_dim = self.pretrained.embed_dim
             self.cls_projection = nn.Linear(cls_embed_dim, dpt_dim)
-            # CLS layer indices for fused CLS (3rd, 4th intermediate layers)
+            # CLS layer indices for fused CLS (3rd, 4th intermediate layers = [17, 23])
             self.cls_layer_indices = [2, 3]
+            # patch_mean layer index: index 2 in [4,11,17,23] = layer 17
+            self.patch_mean_layer_idx = 2
 
             self.onepiece_train_mode = kwargs.get('onepiece_train_mode', 'metric')
             self.onepiece_metric_head = CLSMetricHead(
@@ -157,7 +162,7 @@ class FlashDepth(nn.Module):
                 f"downsample={spatial_mamba_downsample}, train_mode={self.onepiece_train_mode}, "
                 f"cls_layer_indices={self.cls_layer_indices}, "
                 f"hybrid={self.use_onepiece_hybrid}, use_teacher_cls={self.use_teacher_cls}, "
-                f"cls_embed_dim={cls_embed_dim}"
+                f"use_patch_mean={self.use_patch_mean}, cls_embed_dim={cls_embed_dim}"
             )
            
 
@@ -660,7 +665,7 @@ class FlashDepth(nn.Module):
         all_shift = []
         all_relative_depth = []
         reset_frames = []
-        prev_cls = None
+        prev_patch_mean = None
 
         for t in range(T):
             frame = video[:, t]  # [B, 3, H, W]
@@ -681,33 +686,37 @@ class FlashDepth(nn.Module):
                         )
                         selected_cls = [teacher_normed[idx][:, 0] for idx in self.cls_layer_indices]
                         cls_token = torch.stack(selected_cls, dim=0).mean(dim=0)  # [B, 1024]
+                        patch_mean = teacher_features[self.patch_mean_layer_idx].mean(dim=1)  # layer 17
                     else:
                         # CLS from student ViT-S (single pass: features + CLS)
                         encoder_features, cls_token = self._get_intermediate_layers_with_cls(
                             frame, self.intermediate_layer_idx[self.encoder],
                             cls_layer_indices=self.cls_layer_indices
                         )
+                        patch_mean = encoder_features[self.patch_mean_layer_idx].mean(dim=1)
                 else:
                     encoder_features, cls_token = self._get_intermediate_layers_with_cls(
                         frame, self.intermediate_layer_idx[self.encoder],
                         cls_layer_indices=self.cls_layer_indices
                     )
+                    patch_mean = encoder_features[self.patch_mean_layer_idx].mean(dim=1)  # layer 17
 
-            # Scene cut detection using fused CLS cosine distance
-            if prev_cls is not None:
+            # Scene cut detection using mean patch token cosine distance (layer 17)
+            if prev_patch_mean is not None:
                 cos_sim = F.cosine_similarity(
-                    F.normalize(cls_token, dim=-1),
-                    F.normalize(prev_cls, dim=-1),
+                    F.normalize(patch_mean, dim=-1),
+                    F.normalize(prev_patch_mean, dim=-1),
                     dim=-1
                 )
-                d_cls = 1.0 - cos_sim
-                if d_cls.mean() > self.scene_cut_detector.tau:
+                d_patch = 1.0 - cos_sim
+                if d_patch.mean() > self.scene_cut_detector.tau:
                     self.spatial_mamba.start_new_sequence()
                     reset_frames.append(t)
-            prev_cls = cls_token
+            prev_patch_mean = patch_mean
 
-            # Step 2: CLS projection
-            cls_projected = self.cls_projection(cls_token)  # [B, dpt_dim]
+            # Step 2: CLS projection (use patch_mean or CLS as Mamba conditioning)
+            proj_input = patch_mean if self.use_patch_mean else cls_token
+            cls_projected = self.cls_projection(proj_input)  # [B, dpt_dim]
 
             # Step 3: DPT (with hybrid fusion if applicable)
             with torch.no_grad():
@@ -762,16 +771,16 @@ class FlashDepth(nn.Module):
             'reset_frames': reset_frames,       # list of frame indices
         }
 
-    def forward_onepiece_single_frame(self, frame, prev_cls=None):
+    def forward_onepiece_single_frame(self, frame, prev_patch_mean=None):
         """
         Single frame helper for external callers (e.g., test_onepiece.py).
 
         Args:
             frame: [B, 3, H, W] single frame
-            prev_cls: previous CLS token for scene cut detection (optional)
+            prev_patch_mean: mean patch token from previous frame's layer-17 for SCD (optional)
 
         Returns:
-            dict with: metric_depth, relative_depth, scale, shift, cls_token, is_reset
+            dict with: metric_depth, relative_depth, scale, shift, cls_token, patch_mean, is_reset
         """
         if not self.use_onepiece:
             raise ValueError("Onepiece is not enabled.")
@@ -795,35 +804,39 @@ class FlashDepth(nn.Module):
                     )
                     selected_cls = [teacher_normed[idx][:, 0] for idx in self.cls_layer_indices]
                     cls_token = torch.stack(selected_cls, dim=0).mean(dim=0)  # [B, 1024]
+                    patch_mean = teacher_features[self.patch_mean_layer_idx].mean(dim=1)  # layer 17
                 else:
                     # CLS from student ViT-S (single pass: features + CLS)
                     encoder_features, cls_token = self._get_intermediate_layers_with_cls(
                         frame, self.intermediate_layer_idx[self.encoder],
                         cls_layer_indices=self.cls_layer_indices
                     )
+                    patch_mean = encoder_features[self.patch_mean_layer_idx].mean(dim=1)
             else:
                 encoder_features, cls_token = self._get_intermediate_layers_with_cls(
                     frame, self.intermediate_layer_idx[self.encoder],
                     cls_layer_indices=self.cls_layer_indices
                 )
+                patch_mean = encoder_features[self.patch_mean_layer_idx].mean(dim=1)  # layer 17
 
-        # Scene cut detection
+        # Scene cut detection using mean patch token cosine distance (layer 17)
         is_reset = False
-        d_cls_val = 0.0
-        if prev_cls is not None:
+        d_patch_mean_val = 0.0
+        if prev_patch_mean is not None:
             cos_sim = F.cosine_similarity(
-                F.normalize(cls_token, dim=-1),
-                F.normalize(prev_cls, dim=-1),
+                F.normalize(patch_mean, dim=-1),
+                F.normalize(prev_patch_mean, dim=-1),
                 dim=-1
             )
-            d_cls = 1.0 - cos_sim
-            d_cls_val = float(d_cls.mean())
-            if d_cls_val > self.scene_cut_detector.tau:
+            d_patch = 1.0 - cos_sim
+            d_patch_mean_val = float(d_patch.mean())
+            if d_patch_mean_val > self.scene_cut_detector.tau:
                 self.spatial_mamba.start_new_sequence()
                 is_reset = True
 
-        # Step 2: CLS projection
-        cls_projected = self.cls_projection(cls_token)  # [B, dpt_dim]
+        # Step 2: CLS projection (use patch_mean or CLS as Mamba conditioning)
+        proj_input = patch_mean if self.use_patch_mean else cls_token
+        cls_projected = self.cls_projection(proj_input)  # [B, dpt_dim]
 
         # Step 3: DPT (with hybrid fusion if applicable)
         with torch.no_grad():
@@ -860,13 +873,14 @@ class FlashDepth(nn.Module):
             metric_depth = scale.unsqueeze(-1) * depth_meters + shift.unsqueeze(-1)
 
         return {
-            'metric_depth': metric_depth,      # [B, H, W]
-            'relative_depth': relative_depth,  # [B, H, W]
-            'scale': scale.squeeze(-1),        # [B]
-            'shift': shift.squeeze(-1),        # [B]
-            'cls_token': cls_token,            # [B, embed_dim]
+            'metric_depth': metric_depth,        # [B, H, W]
+            'relative_depth': relative_depth,    # [B, H, W]
+            'scale': scale.squeeze(-1),          # [B]
+            'shift': shift.squeeze(-1),          # [B]
+            'cls_token': cls_token,              # [B, embed_dim]
+            'patch_mean': patch_mean,            # [B, embed_dim] for next frame's SCD
             'is_reset': is_reset,
-            'd_cls': d_cls_val,                # float, CLS cosine distance
+            'd_patch_mean': d_patch_mean_val,    # float, patch mean cosine distance
         }
 
     def final_head(self, x, patch_h, patch_w):

@@ -439,10 +439,105 @@ scene_cut:
 ./run_docker.sh test_onepiece --config-variant l \
     --gear-checkpoint train_results/onepiece/large/best.pth --gpu 0
 
+# Test Hybrid
+./run_docker.sh test_onepiece --config-variant hybrid \
+    --gear-checkpoint train_results/results_34/onepiece/hybrid/best.pth --gpu 0
+
 # Test with custom max depth
 ./run_docker.sh test_onepiece --config-variant l \
     --gear-checkpoint train_results/onepiece/large/best.pth --gpu 0 --max-depth 100
 ```
+
+### SCD Ablation Test
+
+`test_scd_ablation.py`로 Scene Cut Detection 효과를 정량 평가.
+host+insert+host 구조로 인위적 씬 컷을 만들어 rTC를 측정.
+
+**테스트 구조**:
+- `video = [host[:mid]] + [insert 10 frames] + [host[mid:]]`
+- cut points: `[mid, mid+10]` (2개)
+- host vid_len: 데이터셋별 기본값 (eth3d=30, sintel=50, waymo=200, ...)
+
+**시나리오**:
+
+| `--dataset` | `--dataset2` | 설명 |
+|---|---|---|
+| eth3d (임의) | 없음 | Same-dataset: seq_i host + seq_(i+2)%N insert |
+| eth3d | sintel | Cross: ETH3D seq_i + **고정** Sintel seq13 frames 21-30 |
+| sintel | eth3d | Cross: Sintel seq_k + ETH3D seq_k, k=0..9 (10 tests) |
+| A | B (generic) | Cross: A seq_k + B seq_k |
+
+```bash
+# Same-dataset (ETH3D)
+./run_docker.sh test_scd_ablation \
+    --dataset eth3d \
+    --config-variant l \
+    --gear-checkpoint train_results/results_34/onepiece/large/best.pth \
+    --results-dir test_results/scd_ablation/eth3d_same --gpu 0
+
+# Cross-dataset: ETH3D base + Sintel insert (고정)
+./run_docker.sh test_scd_ablation \
+    --dataset eth3d --dataset2 sintel \
+    --config-variant l \
+    --gear-checkpoint train_results/results_34/onepiece/large/best.pth \
+    --results-dir test_results/scd_ablation/eth3d_sintel --gpu 0
+
+# Cross-dataset: Sintel base + ETH3D inserts (hybrid variant)
+./run_docker.sh test_scd_ablation \
+    --dataset sintel --dataset2 eth3d \
+    --config-variant hybrid \
+    --gear-checkpoint train_results/results_34/onepiece/hybrid/best.pth \
+    --flashdepth-checkpoint configs/flashdepth/iter_43002.pth \
+    --results-dir test_results/scd_ablation/sintel_eth3d --gpu 0
+
+# VDA 비교 포함
+./run_docker.sh test_scd_ablation \
+    --dataset eth3d \
+    --config-variant l \
+    --gear-checkpoint train_results/results_34/onepiece/large/best.pth \
+    --vda --results-dir test_results/scd_ablation/eth3d_vda --gpu 0
+```
+
+**핵심 메트릭** (`analyze_insertion_rtc`):
+
+| 메트릭 | 설명 |
+|---|---|
+| `cut_in_rtc` | host→insert 경계: `rTC(depth[mid-1], depth[mid])` |
+| `cut_out_rtc` | insert→host 경계: `rTC(depth[mid+ins-1], depth[mid+ins])` |
+| `host_continuity_rtc` | **삽입 전후 인접 host 프레임 간 rTC**: `rTC(depth[mid-1], depth[mid+ins])` |
+| `host_within_rtc` | host 구간 내부 연속 rTC (기준선) |
+| `insert_within_rtc` | insert 구간 내부 연속 rTC (기준선) |
+| `pre_cut_rtc` | cut_in 직전 host 기준선 |
+| `post_cut_rtc` | cut_out 직후 host 기준선 |
+
+**`--dataset all`로 자동 실행 시나리오**:
+```
+same_eth3d/          same_sintel/         same_waymo_seg/     same_vkitti/
+cross_eth3d_sintel/  cross_sintel_eth3d/
+```
+
+```bash
+# 모든 시나리오 자동 실행
+./run_docker.sh test_scd_ablation --dataset all \
+    --config-variant l \
+    --gear-checkpoint train_results/results_34/onepiece/large/best.pth \
+    --results-dir test_results/scd_ablation/r34_l --gpu 0
+```
+
+**옵션**:
+| 옵션 | 기본값 | 설명 |
+|---|---|---|
+| `--insert-frames N` | 10 | 삽입 프레임 수 |
+| `--max-seqs N` | all | host 시퀀스 수 제한 |
+| `--scene-cut-tau` | 0.15 | SCD 임계값 (config 기본값) |
+| `--vda` | off | VDA 비교 활성화 |
+| `--flashdepth-checkpoint` | 없음 | 기본 FlashDepth 비교 (선택) |
+
+**출력**:
+- `scd_ablation_summary.json`: 전체 평균 (cut_in / cut_out / host_continuity / host_within / ...)
+- `scd_ablation_all_tests.json`: 테스트별 상세 결과
+- `seq{k:04d}/result.json`: 개별 테스트 결과
+- `seq{k:04d}/cuts/`: cut 주변 depth PNG
 
 ---
 
@@ -477,10 +572,14 @@ flashdepth_claude/
 │   └── onepiece/
 │       ├── config.yaml             # Default config (ViT-L)
 │       ├── config_l.yaml           # ViT-L variant
-│       └── config_s.yaml           # ViT-S variant
+│       ├── config_s.yaml           # ViT-S variant
+│       ├── config_hybrid.yaml      # Hybrid variant (ViT-S student + ViT-L teacher)
+│       └── config_hybrid_fsdp.yaml # Hybrid FSDP multi-GPU training config
 ├── train_onepiece.py               # OnepieceTrainer (Phase 1→2 auto-transition at 1500 steps)
+├── train_onepiece_fsdp.py          # FSDP multi-GPU trainer (hybrid large-scale)
 ├── test_onepiece.py                # OnepieceTester (streaming, SCD, reset_frames)
-├── test_gear5.py                   # Gear5 tester (copied from onepiece2)
+├── test_scd_ablation.py            # SCD ablation: host+insert+host rTC evaluation
+│                                   #   (l/s/hybrid, same-dataset / cross-dataset scenarios)
 ├── test_comparison.py              # Image-model comparison tester
 ├── test_video_comparison.py        # Video-model comparison tester
 ├── run_comparison.sh               # Shell script for image model evaluation
@@ -499,3 +598,6 @@ flashdepth_claude/
 5. **Inverse mode**: `train_mode: inverse`로 inverse depth regression 가능. Scale/shift activation 다름.
 6. **ViT-S auto-detect**: `dpt_dim=64`이면 SpatialMamba가 자동으로 `expand=4, headdim=32` 사용.
 7. **V3-prev 체크포인트 비호환**: ConvMetricHead → CLSMetricHead, cls_projection 추가로 기존 V3 체크포인트 재학습 필요.
+8. **Hybrid FlashAttention 요구사항**: hybrid_fusion 모듈이 FlashAttention을 사용하므로 fp16/bf16 필요. `test_video_comparison.py`와 `test_scd_ablation.py`에서 `torch.amp.autocast('cuda', dtype=torch.bfloat16)` 자동 적용.
+9. **SCD tau 기본값**: config 기본값은 0.15 (l/s/hybrid 공통). `test_scd_ablation.py` `--scene-cut-tau` 기본값도 0.15로 동일.
+10. **use_teacher_cls**: hybrid variant에서 teacher ViT-L CLS 사용 여부. 기본값 True. `--student-cls` 플래그로 False로 변경 가능 (ViT-S CLS 사용).

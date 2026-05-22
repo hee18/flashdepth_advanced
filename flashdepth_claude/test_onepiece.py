@@ -109,7 +109,7 @@ class OnepieceTester:
 
         # Flow-based temporal consistency (lazy-loaded)
         self.flow_tc = None
-        self.tc_threshold = config.get('tc_threshold', 1.1)
+        self.tc_threshold = config.get('tc_threshold', 1.25)
 
         # Test mode: None (full), 'tc' (temporal consistency only), 'ea' (error & accuracy only)
         self.test_mode = config.get('test_mode', None)
@@ -585,10 +585,10 @@ class OnepieceTester:
         rel_depths_list = []
         per_frame_scales_raw = []
         per_frame_shifts_raw = []
-        per_frame_d_cls = []
+        per_frame_d_patch_mean = []
         reset_frames = []
         start_time = None
-        prev_cls = None
+        prev_patch_mean = None
 
         with torch.amp.autocast('cuda', dtype=torch.bfloat16):
             # Reset Mamba state for new sequence
@@ -602,15 +602,15 @@ class OnepieceTester:
                     torch.cuda.synchronize()
                     start_time = time.time()
 
-                outputs_t = self.model.forward_onepiece_single_frame(frame, prev_cls=prev_cls)
-                prev_cls = outputs_t['cls_token']
+                outputs_t = self.model.forward_onepiece_single_frame(frame, prev_patch_mean=prev_patch_mean)
+                prev_patch_mean = outputs_t['patch_mean']
 
-                d_cls_val = outputs_t.get('d_cls', 0.0)
-                per_frame_d_cls.append(d_cls_val)
+                d_patch_mean_val = outputs_t.get('d_patch_mean', 0.0)
+                per_frame_d_patch_mean.append(d_patch_mean_val)
 
                 if outputs_t.get('is_reset', False):
                     reset_frames.append(t)
-                    logger.info(f"  SCD reset at frame {t} (d_cls={d_cls_val:.4f}, tau={self.model.scene_cut_detector.tau})")
+                    logger.info(f"  SCD reset at frame {t} (d_patch_mean={d_patch_mean_val:.4f}, tau={self.model.scene_cut_detector.tau})")
 
                 # De-canonicalize: canonical → actual meters
                 de_ratio_t = de_canonical_ratio_metric[0, t]
@@ -972,17 +972,17 @@ class OnepieceTester:
         metrics['_per_frame_optimal_scales'] = per_frame_optimal_scales
         metrics['_per_frame_optimal_shifts'] = per_frame_optimal_shifts
 
-        # SCD info (d_cls per frame + reset frames)
-        metrics['_per_frame_d_cls'] = per_frame_d_cls
+        # SCD info (d_patch_mean per frame + reset frames)
+        metrics['_per_frame_d_patch_mean'] = per_frame_d_patch_mean
         if reset_frames:
             metrics['reset_frames'] = reset_frames
             metrics['num_resets'] = len(reset_frames)
             logger.info(f"Seq {sequence_id}: SCD triggered {len(reset_frames)} resets at frames {reset_frames}")
         else:
             metrics['num_resets'] = 0
-        if per_frame_d_cls:
-            metrics['d_cls_max'] = float(max(per_frame_d_cls))
-            metrics['d_cls_mean'] = float(np.mean(per_frame_d_cls))
+        if per_frame_d_patch_mean:
+            metrics['d_patch_mean_max'] = float(max(per_frame_d_patch_mean))
+            metrics['d_patch_mean_mean'] = float(np.mean(per_frame_d_patch_mean))
 
         # === Depth range analysis ===
         depth_ranges = [(0, 10), (10, 30), (30, int(self.max_depth))]

@@ -194,7 +194,7 @@ class VideoDepthAnythingAdapter(MethodAdapter):
             target_fps=30,  # Dummy value, not used for depth prediction
             input_size=self.input_size,
             device=device_str,
-            fp32=False  # Use FP16 for speed
+            fp32=True  # Model weights are float32; fp16 input causes type mismatch
         )
 
         # Debug: Check raw output range (first inference only)

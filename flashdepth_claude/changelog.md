@@ -1,5 +1,166 @@
 # Changelog
 
+## 2026-05-22: SCD 신호 CLS → layer-17 patch mean 교체 + tau 0.15→0.10
+
+### 변경 파일
+- **`flashdepth/model.py`**: SCD 신호 교체, `use_patch_mean` flag 추가
+- **`test_onepiece.py`**: `prev_cls` → `prev_patch_mean` 인터페이스 반영, tc_threshold 기본값 수정
+- **`test_scd_ablation.py`**: `prev_patch_mean` 방식 반영, CLI 플래그 추가
+- **`configs/onepiece/config*.yaml`** (6개): `tau: 0.15` → `0.10`, `use_patch_mean: false` 추가
+- **`run_docker.sh`**: `measure_boundary_dcls` 커맨드 추가, `--patch-mean` / `--max-seqs` / `--insert-frames` 플래그 추가
+- **`adapters/flashdepth_adapter.py`**: hybrid variant에 bfloat16 autocast 추가, `fp32=True`로 수정
+
+### 변경 내용
+
+#### SCD 신호 교체 (`model.py`)
+- `SceneCutDetector`가 CLS 코사인 거리 대신 **layer-17 mean patch token** 코사인 거리로 씬컷 판단
+  - `patch_mean_layer_idx = 2` → `intermediate_layer_idx['vitl'] = [4,11,17,23]`의 index 2 = layer 17
+  - `forward_onepiece` / `forward_onepiece_single_frame` 모두 `prev_cls` → `prev_patch_mean`으로 교체
+  - 반환값에 `patch_mean` 추가, `d_cls` → `d_patch_mean` 로 rename
+- `use_patch_mean` flag 추가: `True`이면 CLS projection / CLSMetricHead 입력도 patch_mean으로 대체
+
+#### tau 조정 (configs)
+- 모든 onepiece config에서 `scene_cut.tau: 0.15` → `0.10` (더 민감하게 씬컷 감지)
+- `model.use_patch_mean: false` 항목 추가 (기본값 false = Mamba 조건은 여전히 CLS)
+
+#### test_onepiece.py
+- `forward_onepiece_single_frame` 호출 시 `prev_patch_mean` 사용으로 변경
+- 메트릭 `d_cls_max/mean` → `d_patch_mean_max/mean` rename
+- `tc_threshold` 기본값 `1.1` → `1.25` (rTC threshold와 동일하게 통일)
+
+#### run_docker.sh
+- `measure_boundary_dcls` 커맨드: cut-in/cut-out 경계에서 `d_patch_mean`만 빠르게 측정
+- `_run_scd_scenario` 헬퍼 함수로 SCD ablation 시나리오 반복 호출 리팩토링
+- `--patch-mean`, `--max-seqs`, `--insert-frames` 플래그 추가
+- checkpoint path 처리 순서 수정 (기본값 설정 → 절대경로 변환 순서 교정)
+- infer outfolder에 소스 디렉토리명 자동 추가 (`${CUR_DIR_NAME}`)
+
+#### adapters/flashdepth_adapter.py
+- hybrid variant 추론 시 `torch.autocast(bfloat16)` 적용 (FlashAttention dtype 요구 대응)
+- `fp32=False` → `fp32=True` 수정
+
+---
+
+## 2026-05-15: test_scd_ablation 데이터 로딩 수정 + ETH3D insert 고정 + bonn 제거
+
+### 변경 파일
+- **`test_scd_ablation.py`**: split='test', 프레임 체크 완화, ETH3D seq1 고정 삽입, bonn 제거
+- **`run_docker.sh`**: all-datasets 시나리오 업데이트 (unreal4k 추가, cross 전체 데이터셋 적용)
+
+### 변경 내용
+- `load_all_sequences`: `split='val'` → `split='test'` (test_onepiece와 동일), `images.shape[1] < vid_len` 체크 → `< 4` (짧은 시퀀스 허용)
+- Sintel base + ETH3D 삽입: 기존 seq_k 매칭 → **ETH3D seq1 고정** (모든 Sintel 시퀀스에 동일 insert)
+- `DATASET_VID_LEN`에서 bonn 제거
+- `--dataset all` 시나리오: same(5개) + cross_sintel_insert(4개) + cross_sintel_eth3d(1개) = 10개
+
+### all 시나리오 목록
+```
+same_eth3d/           same_sintel/          same_waymo_seg/
+same_vkitti/          same_unreal4k/
+cross_eth3d_sintel/   cross_waymo_seg_sintel/
+cross_vkitti_sintel/  cross_unreal4k_sintel/
+cross_sintel_eth3d/   (Sintel base + ETH3D seq1 고정)
+```
+
+---
+
+## 2026-05-15: test_scd_ablation --dataset all + 삽입 특화 rTC 메트릭 추가
+
+### 변경 파일
+- **`test_scd_ablation.py`**: `analyze_rtc` → `analyze_insertion_rtc` 교체, 3개 핵심 메트릭 추가
+- **`run_docker.sh`**: `--dataset all` 지원 (`_run_scd_scenario` 헬퍼 + 6개 시나리오 자동 실행)
+
+### 핵심 메트릭 (analyze_insertion_rtc)
+
+| 메트릭 | 설명 |
+|---|---|
+| `cut_in_rtc` | host→insert 경계 rTC (model이 컷을 감지했는가) |
+| `cut_out_rtc` | insert→host 경계 rTC (복귀 컷 감지) |
+| `host_continuity_rtc` | **삽입 전후 인접 host 프레임 간 rTC** (예: ETH3D 14 vs ETH3D 15) |
+| `host_within_rtc` | host 구간 내부 연속 프레임 rTC (기준선) |
+| `insert_within_rtc` | insert 구간 내부 연속 프레임 rTC (기준선) |
+| `pre_cut_rtc` | cut_in 직전 host 프레임들 rTC |
+| `post_cut_rtc` | cut_out 직후 host 프레임들 rTC |
+
+### --dataset all 시나리오 (run_docker.sh)
+
+```
+same_eth3d/          same-dataset ETH3D (seq_i + seq_(i+2)%N)
+same_sintel/         same-dataset Sintel
+same_waymo_seg/      same-dataset Waymo
+same_vkitti/         same-dataset VKITTI
+cross_eth3d_sintel/  ETH3D base + Sintel seq13 frames 21-30 (고정)
+cross_sintel_eth3d/  Sintel seq_k + ETH3D seq_k, k=0..9
+```
+
+### 사용법
+
+```bash
+# 모든 시나리오 자동 실행
+./run_docker.sh test_scd_ablation --dataset all \
+    --config-variant l \
+    --gear-checkpoint train_results/results_34/onepiece/large/best.pth \
+    --results-dir test_results/scd_ablation/r34_l --gpu 0
+
+# 단일 시나리오
+./run_docker.sh test_scd_ablation --dataset eth3d --dataset2 sintel \
+    --config-variant l \
+    --gear-checkpoint train_results/results_34/onepiece/large/best.pth \
+    --results-dir test_results/scd_ablation/eth3d_sintel --gpu 0
+```
+
+---
+
+## 2026-05-15: test_scd_ablation 테스트 구조 전면 재설계 + hybrid 지원
+
+### 변경 파일
+- **`test_scd_ablation.py`** (전면 재작성): host+insert+host 구조로 테스트 방식 변경
+- **`run_docker.sh`**: `test_scd_ablation` 섹션 업데이트, `--max-seqs`/`--insert-frames` 추가
+- **`Onepiece.md`**: SCD Ablation Test 섹션 추가, Hybrid 관련 내용 업데이트
+
+### 테스트 구조 변경 (기존 vs 신규)
+
+| 항목 | 기존 | 신규 |
+|---|---|---|
+| 구조 | [seg1][seg2]...[segN] (N개 연속 스티칭) | [host[:mid]][insert 10frames][host[mid:]] |
+| 컷 수 | N-1개 | **고정 2개** (mid, mid+insert_len) |
+| host 길이 | --frames-per-seg (고정값) | **데이터셋별 자동** (eth3d=30, sintel=50, ...) |
+| 제거된 옵션 | --frames-per-seg, --n-segs | — |
+| 추가된 옵션 | — | --insert-frames (기본 10), --max-seqs |
+
+### 시나리오
+- **Same-dataset**: seq_i를 host로, seq_(i+2)%N을 insert로 (N개 테스트)
+- **Cross + Sintel insert**: dataset2=sintel이면 Sintel seq13 frames 21-30 고정 insert
+- **Cross Sintel base + ETH3D**: dataset=sintel, dataset2=eth3d → Sintel seq_k + ETH3D seq_k (k=0..9)
+- **Generic cross**: A seq_k + B seq_k
+
+### hybrid config-variant 지원
+- `--config-variant hybrid` 추가 (argparse choices에 추가)
+- `load_metric_flashdepth()`: 하드코딩 `_VARIANT_CFGS` 대신 `configs/onepiece/config_*.yaml` 로드
+- hybrid FlashAttention 요구사항: `run_metric_fd()`의 기존 `autocast` 커버
+- `FlashDepthAdapter`에도 hybrid autocast 지원 (별도 커밋: adapters/flashdepth_adapter.py)
+
+### 결과 파일 구조
+- `scd_ablation_summary.json`: 전체 테스트 평균 (cut/within/pre/post rTC)
+- `scd_ablation_all_tests.json`: 테스트별 상세 결과
+- `seq{k:04d}/result.json`: 개별 테스트 결과
+- `seq{k:04d}/cuts/`: cut 주변 depth PNG
+
+---
+
+## 2026-05-15: FlashDepthAdapter hybrid variant autocast 수정
+
+### 변경 파일
+- **`adapters/flashdepth_adapter.py`**: `inference()` 루프에 hybrid variant용 `torch.autocast` 추가
+
+### 문제 및 수정
+- `hybrid` variant의 `hybrid_fusion` 모듈이 FlashAttention 사용 → fp16/bf16만 지원
+- `l` variant는 `hybrid_fusion` 없어서 float32로 동작하나, `hybrid`는 `FlashAttention only support fp16 and bf16 data type` 에러 발생
+- `contextlib.nullcontext()`로 l/s는 기존 유지, hybrid만 `torch.autocast('cuda', dtype=torch.bfloat16)` 적용
+- `pred_depth.float()`으로 후처리 일관성 유지
+
+---
+
 ## 2026-05-06: Ablation Study 지원 추가 (No Dual-CSTM + SCD 비교 테스트)
 
 ### 변경 파일
