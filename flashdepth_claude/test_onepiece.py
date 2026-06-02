@@ -205,7 +205,10 @@ class OnepieceTester:
         model_config['onepiece_train_mode'] = self.config.get('train_mode', 'metric')
 
         scene_cut_config = self.config.get('scene_cut', {})
-        model_config['scene_cut_tau'] = scene_cut_config.get('tau', 0.05)
+        if self.config.get('no_scd', False):
+            model_config['scene_cut_tau'] = float('inf')
+        else:
+            model_config['scene_cut_tau'] = scene_cut_config.get('tau', 0.05)
         model_config['scene_cut_k'] = scene_cut_config.get('k', 80)
 
         # Hybrid configs (top-level key, not under model)
@@ -1960,6 +1963,11 @@ def main(config: DictConfig):
     if save_depth_maps:
         OmegaConf.update(config, 'save_depth_maps', True, force_add=True)
 
+    # Apply --no-scd if passed via sys.argv preprocessing
+    no_scd = getattr(main, '_no_scd', False)
+    if no_scd:
+        OmegaConf.update(config, 'no_scd', True, force_add=True)
+
     tester = OnepieceTester(config)
     tester.test()
 
@@ -1972,6 +1980,7 @@ if __name__ == "__main__":
     frame_arg = None
     max_depth_arg = None
     save_depth_maps = False
+    no_scd = False
     new_argv = []
     i = 0
     while i < len(sys.argv):
@@ -1996,6 +2005,9 @@ if __name__ == "__main__":
         elif sys.argv[i] == '--save-depth-maps':
             save_depth_maps = True
             i += 1
+        elif sys.argv[i] == '--no-scd':
+            no_scd = True
+            i += 1
         else:
             new_argv.append(sys.argv[i])
             i += 1
@@ -2006,5 +2018,6 @@ if __name__ == "__main__":
     main._frame_arg = frame_arg
     main._max_depth_arg = max_depth_arg
     main._save_depth_maps = save_depth_maps
+    main._no_scd = no_scd
 
     main()

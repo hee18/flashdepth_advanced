@@ -87,7 +87,8 @@ show_usage() {
     echo "  --student-cls        Use student (ViT-S) CLS for Hybrid Onepiece instead of teacher (ViT-L) CLS"
     echo "  --patch-mean         Use layer-17 patch mean instead of CLS for Mamba conditioning and MetricHead input"
     echo "  --no-cstm            No Dual-CSTM ablation: skip canonical focal-length transform during training"
-    echo "  --vda                Enable VDA in SCD ablation test (auto-loads from refer_test/)"
+    echo "  --vda                Enable VDA in SCD ablation test (auto-loads from refer_test/)
+  --no-scd             Disable Scene Cut Detection for test_onepiece (tau=inf, state carries over all cuts)"
     echo "  --dataset2 DATASET   Second dataset for cross-dataset SCD cuts (test_scd_ablation only)"
     echo "  --measure-fps BOOL   Enable/disable FPS measurement (default: true)"
     echo ""
@@ -158,6 +159,7 @@ USE_PATCH_MEAN="false"  # Use layer-17 patch mean instead of CLS for Mamba+Metri
 NO_CSTM="false"         # No Dual-CSTM ablation: skip canonical transform during training
 USE_VDA="false"         # Enable VDA in SCD ablation test (auto-loads from refer_test/)
 SECOND_DATASET=""       # Second dataset for cross-dataset SCD test (--dataset2)
+NO_SCD="false"          # Disable Scene Cut Detection (tau=inf)
 SCD_MAX_SEQS=""         # Limit host sequences for SCD ablation (default: all)
 SCD_INSERT_FRAMES=""    # Number of insert frames for SCD ablation (default: 10)
 
@@ -358,6 +360,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --vda)
             USE_VDA="true"
+            shift
+            ;;
+        --no-scd)
+            NO_SCD="true"
             shift
             ;;
         --max-seqs)
@@ -1356,6 +1362,9 @@ case $COMMAND in
                 if [ "$NO_CSTM" = "true" ]; then
                     DOCKER_CMD="$DOCKER_CMD use_dual_cstm=false"
                 fi
+                if [ "$NO_SCD" = "true" ]; then
+                    DOCKER_CMD="$DOCKER_CMD --no-scd"
+                fi
 
                 if eval $DOCKER_CMD; then
                     echo "✅ [$COMPLETED_RUNS/$TOTAL_RUNS] Onepiece on $ds completed"
@@ -1440,6 +1449,9 @@ case $COMMAND in
             fi
             if [ "$NO_CSTM" = "true" ]; then
                 DOCKER_CMD="$DOCKER_CMD use_dual_cstm=false"
+            fi
+            if [ "$NO_SCD" = "true" ]; then
+                DOCKER_CMD="$DOCKER_CMD --no-scd"
             fi
 
             eval $DOCKER_CMD
