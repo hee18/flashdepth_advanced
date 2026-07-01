@@ -47,6 +47,8 @@ FlashDepth/
 *.ttgir
 *.ttir
 flashdepth_claude/.triton_cache
+.serena/
+.gemini/
 *.tar.gz
 flashdepth_claude/train_results/
 flashdepth_claude/test_results/
